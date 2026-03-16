@@ -1,6 +1,6 @@
 {
   "name": "wsh-upon-star",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Web Shell — browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
