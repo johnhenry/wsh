@@ -133,7 +133,7 @@ The `spec/` directory contains the protocol definition:
 
 ## Browser Compatibility
 
-Requires a browser (or Node.js 20+) with:
+Requires a browser (or Node.js 24+) with:
 
 - Web Crypto API with Ed25519 support
 - WebSocket (all browsers)
