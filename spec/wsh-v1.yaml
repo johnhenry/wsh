@@ -1,0 +1,1652 @@
+# wsh Protocol Specification — v1
+# This file is the single source of truth for all message types.
+# Run: node web/packages/wsh/spec/codegen.mjs
+
+protocol:
+  name: wsh
+  version: "wsh-v1"
+  wire_format: cbor
+  framing: length_prefixed_be32
+
+enums:
+  ChannelKind:
+    type: string
+    values: [pty, exec, meta, file, tcp, udp, job]
+    value_descriptions:
+      pty: "Interactive pseudo-terminal session with resize support"
+      exec: "One-shot command execution without a PTY"
+      meta: "Control metadata channel (session management)"
+      file: "File transfer channel (upload or download)"
+      tcp: "Gateway-proxied TCP stream to an external host:port"
+      udp: "Gateway-proxied UDP datagram socket to an external host:port"
+      job: "Background automation job channel for structured task execution"
+  AuthMethod:
+    type: string
+    values: [pubkey, password]
+  SessionDataMode:
+    type: string
+    values: [stream, virtual]
+    value_descriptions:
+      stream: "Session uses transport-opened byte streams"
+      virtual: "Session uses message-framed SessionData payloads"
+
+messages:
+  handshake:
+    Hello:
+      code: 0x01
+      description: >
+        First message sent by the client to initiate a connection.
+        Contains the protocol version, username, requested features,
+        and preferred authentication method.
+      fields:
+        version:
+          type: string
+          required: true
+        username:
+          type: string
+          required: true
+        features:
+          type: "string[]"
+          default: "[]"
+        auth_method:
+          type: AuthMethod
+          required: false
+
+    ServerHello:
+      code: 0x02
+      description: >
+        Server response to Hello.  Assigns a session_id, advertises
+        server features, and lists authorized key fingerprints.
+      fields:
+        session_id:
+          type: string
+          required: true
+        features:
+          type: "string[]"
+          default: "[]"
+        fingerprints:
+          type: "string[]"
+          default: "[]"
+
+    Challenge:
+      code: 0x03
+      description: >
+        Sent by the server with a random nonce for the client to sign
+        with its private key (pubkey auth) or as part of password auth.
+      fields:
+        nonce:
+          type: bytes
+          required: true
+
+    AuthMethods:
+      code: 0x04
+      description: >
+        Sent by the server to advertise which authentication methods
+        are available (pubkey, password, or both).
+      fields:
+        methods:
+          type: "AuthMethod[]"
+          required: true
+
+    Auth:
+      code: 0x05
+      description: >
+        Client authentication response.  Contains the method and
+        either a signature+public_key (pubkey) or password (password).
+      fields:
+        method:
+          type: AuthMethod
+          required: true
+        signature:
+          type: bytes
+          required: false
+        public_key:
+          type: bytes
+          required: false
+        password:
+          type: string
+          required: false
+
+    AuthOk:
+      code: 0x06
+      description: >
+        Sent by the server on successful authentication.  Contains
+        the session_id, a signed session token, and the token TTL.
+      fields:
+        session_id:
+          type: string
+          required: true
+        token:
+          type: bytes
+          required: true
+        ttl:
+          type: u64
+          required: true
+
+    AuthFail:
+      code: 0x07
+      description: >
+        Sent by the server when authentication fails.
+      fields:
+        reason:
+          type: string
+          required: true
+
+  channel:
+    Open:
+      code: 0x10
+      description: >
+        Request to open a new channel (PTY, exec, meta, or file).
+        The server replies with OpenOk or OpenFail.
+      fields:
+        kind:
+          type: ChannelKind
+          required: true
+        command:
+          type: string
+          required: false
+        cols:
+          type: u16
+          required: false
+        rows:
+          type: u16
+          required: false
+        env:
+          type: "map<string,string>"
+          required: false
+
+    OpenOk:
+      code: 0x11
+      description: >
+        Sent by the server to confirm a channel was opened successfully.
+        Contains the assigned channel_id and any associated stream_ids.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        stream_ids:
+          type: "u32[]"
+          default: "[]"
+        data_mode:
+          type: SessionDataMode
+          default: '"stream"'
+        capabilities:
+          type: "string[]"
+          default: "[]"
+
+    OpenFail:
+      code: 0x12
+      description: >
+        Sent by the server when a channel open request fails.
+      fields:
+        reason:
+          type: string
+          required: true
+
+    SessionData:
+      code: 0x17
+      description: >
+        Bidirectional data frame for sessions that use virtual message-backed
+        transport instead of transport-opened byte streams.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        data:
+          type: bytes
+          required: true
+
+    Resize:
+      code: 0x13
+      description: >
+        Sent by the client to resize a PTY channel's terminal dimensions.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        cols:
+          type: u16
+          required: true
+        rows:
+          type: u16
+          required: true
+
+    Signal:
+      code: 0x14
+      description: >
+        Sent by the client to deliver a signal to the process group
+        associated with a channel (e.g. SIGINT, SIGTERM).
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        signal:
+          type: string
+          required: true
+
+    Exit:
+      code: 0x15
+      description: >
+        Sent by the server when the process in a channel exits.
+        Contains the exit code of the terminated process.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        code:
+          type: i32
+          required: true
+
+    Close:
+      code: 0x16
+      description: >
+        Sent by either side to close a channel and release its resources.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+
+  transport:
+    Error:
+      code: 0x20
+      description: >
+        Generic error message sent by either side.  Contains a numeric
+        code and human-readable message.
+      fields:
+        code:
+          type: u32
+          required: true
+        message:
+          type: string
+          required: true
+
+    Ping:
+      code: 0x21
+      description: >
+        Keepalive ping.  The peer must reply with Pong using the same id.
+      fields:
+        id:
+          type: u64
+          required: true
+
+    Pong:
+      code: 0x22
+      description: >
+        Keepalive pong.  Echoes the id from the corresponding Ping.
+      fields:
+        id:
+          type: u64
+          required: true
+
+  session:
+    Attach:
+      code: 0x30
+      description: >
+        Attach to an existing session.  Requires a valid session token.
+        The server replays the ring buffer and broadcasts Presence.
+      fields:
+        session_id:
+          type: string
+          required: true
+        token:
+          type: bytes
+          required: true
+        mode:
+          type: string
+          default: '"control"'
+        device_label:
+          type: string
+          required: false
+          description: "Human-readable device/platform label (e.g. 'Chrome/macOS', 'wsh-cli/Linux')"
+
+    Resume:
+      code: 0x31
+      description: >
+        Resume a session from a specific sequence number.  Like Attach
+        but replays only output after last_seq for efficient reconnection.
+      fields:
+        session_id:
+          type: string
+          required: true
+        token:
+          type: bytes
+          required: true
+        last_seq:
+          type: u64
+          required: true
+
+    Rename:
+      code: 0x32
+      description: >
+        Rename a session.  Sent by the client to assign a human-readable
+        name to the session.
+      fields:
+        session_id:
+          type: string
+          required: true
+        name:
+          type: string
+          required: true
+
+    IdleWarning:
+      code: 0x33
+      description: >
+        Sent by the server when a session is approaching its idle
+        timeout.  The expires_in field indicates seconds remaining.
+      fields:
+        expires_in:
+          type: u64
+          required: true
+
+    Shutdown:
+      code: 0x34
+      description: >
+        Sent by the server on graceful shutdown (SIGTERM).  Clients
+        should save state and optionally retry after retry_after seconds.
+      fields:
+        reason:
+          type: string
+          required: true
+        retry_after:
+          type: u64
+          required: false
+
+    Snapshot:
+      code: 0x35
+      description: >
+        Mark a named position in the session recording for time-travel.
+      fields:
+        label:
+          type: string
+          required: true
+
+    Presence:
+      code: 0x36
+      description: >
+        Broadcast to all attached clients when attachments change.
+        Lists all currently attached sessions with their access modes.
+      fields:
+        attachments:
+          type: "AttachmentInfo[]"
+          required: true
+
+    ControlChanged:
+      code: 0x37
+      description: >
+        Broadcast when the controlling client of a session changes.
+      fields:
+        new_controller:
+          type: string
+          required: true
+
+    Metrics:
+      code: 0x38
+      description: >
+        Server metrics snapshot (CPU, memory, session count, RTT).
+        Sent in response to MetricsRequest.
+      fields:
+        cpu:
+          type: f64
+          required: false
+        memory:
+          type: u64
+          required: false
+        sessions:
+          type: u32
+          required: false
+        rtt:
+          type: u64
+          required: false
+
+    Clipboard:
+      code: 0x39
+      description: >
+        Clipboard sync message for OSC 52 support.  The server detects
+        OSC 52 escape sequences in PTY output, extracts the base64
+        payload, and sends this message to the client.  The client may
+        also send this message to set the server-side clipboard.
+      fields:
+        direction:
+          type: string
+          required: true
+          description: '"server_to_client" or "client_to_server"'
+        data:
+          type: string
+          required: true
+          description: "Base64-encoded clipboard content"
+
+    RecordingExport:
+      code: 0x3a
+      description: >
+        Request or deliver a session recording export.  When sent by client,
+        requests the recording.  When sent by server, delivers the JSONL data.
+      fields:
+        session_id:
+          type: string
+          required: true
+        format:
+          type: string
+          default: '"jsonl"'
+          description: '"jsonl" or "asciicast"'
+        data:
+          type: string
+          required: false
+          description: "Recording content (only in server response)"
+
+    CommandJournal:
+      code: 0x3b
+      description: >
+        Structured shell command history entry with metadata.
+      fields:
+        session_id:
+          type: string
+          required: true
+        command:
+          type: string
+          required: true
+        exit_code:
+          type: i32
+          required: false
+        duration_ms:
+          type: u64
+          required: false
+        cwd:
+          type: string
+          required: false
+        timestamp:
+          type: u64
+          required: true
+
+    MetricsRequest:
+      code: 0x3c
+      description: >
+        Client request for server metrics.
+      fields: {}
+
+    SuspendSession:
+      code: 0x3d
+      description: >
+        Suspend or resume a session's PTY process (SIGSTOP/SIGCONT).
+      fields:
+        session_id:
+          type: string
+          required: true
+        action:
+          type: string
+          required: true
+          description: '"suspend" or "resume"'
+
+    RestartPty:
+      code: 0x3e
+      description: >
+        Restart the PTY shell without killing the session.
+        Preserves session metadata and ring buffer.
+      fields:
+        session_id:
+          type: string
+          required: true
+        command:
+          type: string
+          required: false
+          description: "New command to run (default: user shell)"
+
+    SessionListRequest:
+      code: 0x3f
+      description: >
+        Request a list of sessions visible to the authenticated user.
+        The server replies with SessionList.
+      fields: {}
+
+    SessionList:
+      code: 0x5f
+      description: >
+        Server response to SessionListRequest. Contains summarized
+        metadata for each visible session.
+      fields:
+        sessions:
+          type: "SessionSummary[]"
+          required: true
+
+    Detach:
+      code: 0x60
+      description: >
+        Detach the current client from a specific session.
+      fields:
+        session_id:
+          type: string
+          required: true
+
+    DetachOk:
+      code: 0x61
+      description: >
+        Server acknowledgment for a successful detach operation.
+      fields:
+        session_id:
+          type: string
+          required: true
+
+    DetachFail:
+      code: 0x62
+      description: >
+        Server response when detaching from a session fails.
+      fields:
+        reason:
+          type: string
+          required: true
+
+  mcp:
+    McpDiscover:
+      code: 0x40
+      description: >
+        Request the list of available MCP tools from the server.
+        The server replies with McpTools.
+      fields: {}
+
+    McpTools:
+      code: 0x41
+      description: >
+        Server response to McpDiscover.  Lists all available MCP tools
+        with their names, descriptions, and parameter schemas.
+      fields:
+        tools:
+          type: "McpToolSpec[]"
+          required: true
+
+    McpCall:
+      code: 0x42
+      description: >
+        Invoke an MCP tool by name with JSON arguments.
+        The server replies with McpResult.
+      fields:
+        tool:
+          type: string
+          required: true
+        arguments:
+          type: json
+          required: true
+
+    McpResult:
+      code: 0x43
+      description: >
+        Result of an MCP tool invocation.  Contains the tool's
+        JSON response.
+      fields:
+        result:
+          type: json
+          required: true
+
+  reverse:
+    ReverseRegister:
+      code: 0x50
+      description: >
+        Register as a reverse peer so other clients can connect to
+        this client through the server.  Includes the public key for
+        fingerprint derivation and advertised capabilities.
+      fields:
+        username:
+          type: string
+          required: true
+        capabilities:
+          type: "string[]"
+          default: "[]"
+        peer_type:
+          type: string
+          default: '"host"'
+        shell_backend:
+          type: string
+          default: '"pty"'
+        supports_attach:
+          type: bool
+          default: false
+        supports_replay:
+          type: bool
+          default: false
+        supports_echo:
+          type: bool
+          default: false
+        supports_term_sync:
+          type: bool
+          default: false
+        public_key:
+          type: bytes
+          required: true
+
+    ReverseList:
+      code: 0x51
+      description: >
+        Request the list of registered reverse peers.
+        The server replies with ReversePeers.
+      fields: {}
+
+    ReversePeers:
+      code: 0x52
+      description: >
+        Server response to ReverseList.  Contains information about
+        all currently registered reverse peers.
+      fields:
+        peers:
+          type: "PeerInfo[]"
+          required: true
+
+    ReverseConnect:
+      code: 0x53
+      description: >
+        Connect to a registered reverse peer by fingerprint.
+        The server forwards the request to the target peer.
+      fields:
+        target_fingerprint:
+          type: string
+          required: true
+        username:
+          type: string
+          required: true
+
+    ReverseAccept:
+      code: 0x54
+      description: >
+        Sent by the target peer after it has created a reverse peer context
+        and is ready to receive channel open requests.
+      fields:
+        target_fingerprint:
+          type: string
+          required: true
+        username:
+          type: string
+          required: true
+        capabilities:
+          type: "string[]"
+          default: "[]"
+        peer_type:
+          type: string
+          default: '"host"'
+        shell_backend:
+          type: string
+          default: '"pty"'
+        supports_attach:
+          type: bool
+          default: false
+        supports_replay:
+          type: bool
+          default: false
+        supports_echo:
+          type: bool
+          default: false
+        supports_term_sync:
+          type: bool
+          default: false
+
+    ReverseReject:
+      code: 0x55
+      description: >
+        Sent by the target peer when it cannot accept a pending reverse
+        connection request.
+      fields:
+        target_fingerprint:
+          type: string
+          required: true
+        username:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: true
+
+  framing:
+    WsData:
+      code: 0x60
+      fields: {}
+      description: "WebSocket multiplexing framing marker, not a CBOR message"
+
+  # ── Gateway subsystem ────────────────────────────────────────────────
+  # The gateway subsystem allows clients to tunnel TCP/UDP connections and
+  # DNS lookups through the server, which acts as a network proxy.  Clients
+  # open outbound connections or listeners, and the server relays data
+  # between the client's wsh channels and the external network.  All
+  # gateway messages share the 0x70-0x7f opcode range and use a
+  # client-assigned gateway_id or listener_id to correlate requests with
+  # responses.
+  gateway:
+    OpenTcp:
+      code: 0x70
+      description: >
+        Sent by the client to request a TCP connection through the gateway.
+        The server resolves the host, opens a TCP socket, and replies with
+        GatewayOk on success or GatewayFail on error.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        host:
+          type: string
+          required: true
+        port:
+          type: u16
+          required: true
+
+    OpenUdp:
+      code: 0x71
+      description: >
+        Sent by the client to request a UDP socket through the gateway.
+        The server binds a local UDP socket for relaying datagrams to the
+        specified host:port and replies with GatewayOk or GatewayFail.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        host:
+          type: string
+          required: true
+        port:
+          type: u16
+          required: true
+
+    ResolveDns:
+      code: 0x72
+      description: >
+        Sent by the client to perform a DNS lookup through the gateway.
+        The server resolves the given hostname and replies with DnsResult
+        containing the resolved addresses, or GatewayFail on error.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        name:
+          type: string
+          required: true
+        record_type:
+          type: string
+          default: '"A"'
+
+    GatewayOk:
+      code: 0x73
+      description: >
+        Sent by the server to confirm that an OpenTcp or OpenUdp
+        request succeeded.  The gateway_id echoes the client's
+        original request.  resolved_addr contains the IP address
+        the server connected to.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        resolved_addr:
+          type: string
+          required: false
+
+    GatewayFail:
+      code: 0x74
+      description: >
+        Sent by the server when a gateway request (OpenTcp, OpenUdp,
+        or ResolveDns) fails.  The gateway_id echoes the client's
+        original request so it can match the failure.  ListenRequest
+        failures use ListenFail instead.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        code:
+          type: u32
+          required: true
+          description: >
+            Machine-readable failure reason.  Known values:
+            1=CONNECTION_REFUSED, 2=HOST_UNREACHABLE, 3=DNS_FAILED,
+            4=POLICY_DENIED, 5=GATEWAY_DISABLED.
+        message:
+          type: string
+          required: true
+
+    GatewayClose:
+      code: 0x75
+      description: >
+        Sent by either side to close an open gateway channel.  The client
+        sends it to tear down a proxied connection; the server sends it
+        when the remote peer disconnects or the connection is reset.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        reason:
+          type: string
+          required: false
+
+    InboundOpen:
+      code: 0x76
+      description: >
+        Sent by the server when a new inbound connection arrives on an
+        active listener.  The client must reply with InboundAccept to
+        accept the connection or InboundReject to refuse it.
+      fields:
+        listener_id:
+          type: u32
+          required: true
+        channel_id:
+          type: u32
+          required: true
+        peer_addr:
+          type: string
+          required: true
+        peer_port:
+          type: u16
+          required: true
+
+    InboundAccept:
+      code: 0x77
+      description: >
+        Sent by the client in response to InboundOpen to accept the
+        inbound connection.  After this, data flows over the channel
+        identified by channel_id.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        gateway_id:
+          type: u32
+          required: false
+
+    InboundReject:
+      code: 0x78
+      description: >
+        Sent by the client in response to InboundOpen to refuse the
+        inbound connection.  The server closes the remote socket and
+        releases the channel_id.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        reason:
+          type: string
+          required: false
+
+    DnsResult:
+      code: 0x79
+      description: >
+        Sent by the server in response to ResolveDns with the resolved
+        addresses.  Contains one or more IP address strings and an
+        optional TTL from the DNS response.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        addresses:
+          type: "string[]"
+          required: true
+        ttl:
+          type: u32
+          required: false
+
+    ListenRequest:
+      code: 0x7a
+      description: >
+        Sent by the client to ask the server to open a listening socket
+        on the given port and bind address.  The server replies with
+        ListenOk (including the actual bound port) or ListenFail.
+      fields:
+        listener_id:
+          type: u32
+          required: true
+        port:
+          type: u16
+          required: true
+        bind_addr:
+          type: string
+          default: '"0.0.0.0"'
+
+    ListenOk:
+      code: 0x7b
+      description: >
+        Sent by the server to confirm that a ListenRequest succeeded.
+        The actual_port may differ from the requested port when the
+        client requested port 0 (ephemeral port assignment).
+      fields:
+        listener_id:
+          type: u32
+          required: true
+        actual_port:
+          type: u16
+          required: true
+
+    ListenFail:
+      code: 0x7c
+      description: >
+        Sent by the server when a ListenRequest fails, for example
+        because the port is already in use or policy denies the bind.
+      fields:
+        listener_id:
+          type: u32
+          required: true
+        reason:
+          type: string
+          required: true
+
+    ListenClose:
+      code: 0x7d
+      description: >
+        Sent by the client to stop listening on a previously opened
+        listener.  The server closes the bound socket and releases
+        the listener_id.
+      fields:
+        listener_id:
+          type: u32
+          required: true
+
+    GatewayData:
+      code: 0x7e
+      description: >
+        Bidirectional data relay for an active gateway connection. Sent by
+        either side to forward payload bytes through a proxied TCP/UDP
+        channel identified by gateway_id.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        data:
+          type: bytes
+          required: true
+
+  # ── Guest sessions ──────────────────────────────────────────────────
+  # Ephemeral guest sessions allow session owners to create short-lived
+  # share links.  A guest invite produces a single-use token that a
+  # guest can present via GuestJoin to attach with limited permissions.
+  guest:
+    GuestInvite:
+      code: 0x80
+      description: >
+        Sent by the session owner to create an ephemeral guest token.
+        The server generates a short-lived token, stores it, and returns
+        a GuestInvite reply with the token in the session_id field so
+        the owner can share it with guests.
+      fields:
+        session_id:
+          type: string
+          required: true
+        ttl:
+          type: u64
+          required: true
+          description: "Token lifetime in seconds"
+        permissions:
+          type: "string[]"
+          default: '["read"]'
+          description: '"read", "write", or "control"'
+
+    GuestJoin:
+      code: 0x81
+      description: >
+        Sent by a guest to join a session using an ephemeral token.
+        On success the server replies with Presence; on failure AuthFail.
+      fields:
+        token:
+          type: string
+          required: true
+        device_label:
+          type: string
+          required: false
+
+    GuestRevoke:
+      code: 0x82
+      description: >
+        Sent by the session owner to revoke an outstanding guest token.
+      fields:
+        token:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: false
+
+  # ── Session sharing ─────────────────────────────────────────────────
+  # Multi-attach read-only URL sharing.  A session owner creates a
+  # share link that allows others to attach in read-only mode.
+  sharing:
+    ShareSession:
+      code: 0x83
+      description: >
+        Sent by the session owner to create a shareable read-only link.
+        The server generates a share_id and returns it for URL construction.
+      fields:
+        session_id:
+          type: string
+          required: true
+        mode:
+          type: string
+          default: '"read"'
+          description: '"read" or "write"'
+        ttl:
+          type: u64
+          required: true
+          description: "Share link lifetime in seconds"
+
+    ShareRevoke:
+      code: 0x84
+      description: >
+        Sent by the session owner to revoke an active share link.
+      fields:
+        share_id:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: false
+
+  # ── Stream compression ──────────────────────────────────────────────
+  # Negotiate per-connection compression.  Either side may propose
+  # compression; the peer accepts or rejects.  After CompressAck with
+  # accepted=true, all subsequent frames are compressed.
+  compression:
+    CompressBegin:
+      code: 0x85
+      description: >
+        Propose stream compression.  Sent by either side before data
+        transfer begins (or after renegotiation).
+      fields:
+        algorithm:
+          type: string
+          required: true
+          description: '"zstd", "lz4", or "deflate"'
+        level:
+          type: u32
+          default: 3
+          description: "Compression level (algorithm-specific)"
+
+    CompressAck:
+      code: 0x86
+      description: >
+        Accept or reject a compression proposal.
+      fields:
+        algorithm:
+          type: string
+          required: true
+        accepted:
+          type: bool
+          required: true
+
+  # ── Rate control ────────────────────────────────────────────────────
+  # Per-attachment flow control for slow consumers.  When an attached
+  # client falls behind, the server can drop or pause output delivery.
+  ratecontrol:
+    RateControl:
+      code: 0x87
+      description: >
+        Set per-attachment rate limits.  Sent by either side to configure
+        the maximum data rate for the session.
+      fields:
+        session_id:
+          type: string
+          required: true
+        max_bytes_per_sec:
+          type: u64
+          required: true
+        policy:
+          type: string
+          default: '"pause"'
+          description: '"pause" (backpressure) or "drop" (discard excess)'
+
+    RateWarning:
+      code: 0x88
+      description: >
+        Sent by the server when a client is falling behind.
+      fields:
+        session_id:
+          type: string
+          required: true
+        queued_bytes:
+          type: u64
+          required: true
+        action:
+          type: string
+          required: true
+          description: '"ok", "pausing", or "dropping"'
+
+  # ── Cross-session linking ────────────────────────────────────────────
+  # Jump host support — link one session to another server so data
+  # flows through the first server as a hop.
+  linking:
+    SessionLink:
+      code: 0x89
+      description: >
+        Request a cross-session link (jump host).  The server opens a
+        new wsh connection to target_host and bridges the two sessions.
+      fields:
+        source_session:
+          type: string
+          required: true
+        target_host:
+          type: string
+          required: true
+        target_port:
+          type: u16
+          required: true
+        target_user:
+          type: string
+          required: false
+
+    SessionUnlink:
+      code: 0x8a
+      description: >
+        Tear down a cross-session link.
+      fields:
+        link_id:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: false
+
+  # ── AI co-pilot ─────────────────────────────────────────────────────
+  # Read-only AI observer mode.  An AI model attaches to a session,
+  # observes terminal output, and can offer suggestions without
+  # directly controlling the session.
+  copilot:
+    CopilotAttach:
+      code: 0x8b
+      description: >
+        Sent by an AI agent to attach as a read-only co-pilot observer.
+      fields:
+        session_id:
+          type: string
+          required: true
+        model:
+          type: string
+          required: true
+          description: "Model identifier (e.g. 'claude-sonnet', 'gpt-4')"
+        context_window:
+          type: u64
+          required: false
+          description: "Model context window size in tokens"
+
+    CopilotSuggest:
+      code: 0x8c
+      description: >
+        Sent by the co-pilot to offer a suggestion to the session user.
+      fields:
+        session_id:
+          type: string
+          required: true
+        suggestion:
+          type: string
+          required: true
+        confidence:
+          type: f64
+          required: false
+          description: "Confidence score 0.0-1.0"
+
+    CopilotDetach:
+      code: 0x8d
+      description: >
+        Sent by either side to end the co-pilot attachment.
+      fields:
+        session_id:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: false
+
+  # ── E2E encryption ──────────────────────────────────────────────────
+  # Inner encryption layer for end-to-end confidentiality.  After key
+  # exchange, all session data is wrapped in EncryptedFrame messages
+  # so the server cannot read session content.
+  e2e:
+    KeyExchange:
+      code: 0x8e
+      description: >
+        X25519 key exchange for establishing a shared secret.
+        Both sides send their ephemeral public key; the shared
+        secret is derived via ECDH.
+      fields:
+        algorithm:
+          type: string
+          required: true
+          description: '"x25519" or "kyber768" (post-quantum)'
+        public_key:
+          type: bytes
+          required: true
+        session_id:
+          type: string
+          required: true
+
+    EncryptedFrame:
+      code: 0x8f
+      description: >
+        An encrypted payload.  After key exchange, all session
+        data is sent inside EncryptedFrame messages using
+        ChaCha20-Poly1305 AEAD.
+      fields:
+        nonce:
+          type: bytes
+          required: true
+          description: "12-byte AEAD nonce"
+        ciphertext:
+          type: bytes
+          required: true
+        session_id:
+          type: string
+          required: true
+
+  # ── Predictive local echo ────────────────────────────────────────────
+  # Mosh-style local echo.  The client speculatively renders keystrokes
+  # and the server confirms via EchoAck.  EchoState carries cursor
+  # position so the client can reconcile predictions.
+  echo:
+    EchoAck:
+      code: 0x90
+      description: >
+        Sent by the server to confirm that input up to echo_seq has
+        been processed and rendered.  The client can retire predictions
+        up to this sequence number.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        echo_seq:
+          type: u64
+          required: true
+
+    EchoState:
+      code: 0x91
+      description: >
+        Sent by the server with current terminal cursor state so the
+        client can reconcile local predictions with actual state.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        echo_seq:
+          type: u64
+          required: true
+        cursor_x:
+          type: u16
+          required: true
+        cursor_y:
+          type: u16
+          required: true
+        pending:
+          type: u32
+          required: true
+          description: "Number of unacknowledged input bytes on server"
+
+  # ── Terminal diff sync ───────────────────────────────────────────────
+  # True mosh replacement — instead of streaming raw bytes, the server
+  # maintains a virtual terminal framebuffer and sends diffs.  The
+  # client applies patches to its local copy.
+  termsync:
+    TermSync:
+      code: 0x92
+      description: >
+        Full terminal state synchronization point.  The server sends
+        a state_hash so the client can verify consistency.  If the
+        client's hash differs, it requests a full resync.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        frame_seq:
+          type: u64
+          required: true
+        state_hash:
+          type: bytes
+          required: true
+          description: "SHA-256 of the current framebuffer state"
+
+    TermDiff:
+      code: 0x93
+      description: >
+        Incremental screen diff.  Contains a binary patch that transforms
+        the framebuffer from base_seq state to frame_seq state.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        frame_seq:
+          type: u64
+          required: true
+        base_seq:
+          type: u64
+          required: true
+        patch:
+          type: bytes
+          required: true
+          description: "Binary diff patch (run-length encoded cell changes)"
+
+  # ── Horizontal scaling ───────────────────────────────────────────────
+  # Multi-node cluster support.  Nodes announce themselves and can
+  # redirect clients to less-loaded peers.  Stateless session tokens
+  # (HMAC-based) allow any node to validate without shared state.
+  scaling:
+    NodeAnnounce:
+      code: 0x94
+      description: >
+        Sent between cluster nodes to announce presence and load.
+        Used for load-aware routing decisions.
+      fields:
+        node_id:
+          type: string
+          required: true
+        endpoint:
+          type: string
+          required: true
+          description: "WebSocket/WebTransport URL for this node"
+        load:
+          type: f64
+          required: true
+          description: "Current load factor 0.0-1.0"
+        capacity:
+          type: u32
+          required: true
+          description: "Max concurrent sessions"
+
+    NodeRedirect:
+      code: 0x95
+      description: >
+        Sent by a node to redirect a client to a different node.
+        The client should reconnect to target_endpoint and present
+        its session token (which is valid across all cluster nodes).
+      fields:
+        target_node:
+          type: string
+          required: true
+        target_endpoint:
+          type: string
+          required: true
+        session_id:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: false
+
+  # ── Cross-principal session sharing ──────────────────────────────────
+  # Allow session owners to grant access to other authenticated users
+  # (principals).  This enables collaborative multi-user sessions.
+  principals:
+    SessionGrant:
+      code: 0x96
+      description: >
+        Grant another principal access to a session.  The principal
+        must be an authenticated user on the server.
+      fields:
+        session_id:
+          type: string
+          required: true
+        principal:
+          type: string
+          required: true
+          description: "Username or fingerprint of the grantee"
+        permissions:
+          type: "string[]"
+          default: '["read"]'
+          description: '"read", "write", or "control"'
+
+    SessionRevoke:
+      code: 0x97
+      description: >
+        Revoke a previously granted session access.
+      fields:
+        session_id:
+          type: string
+          required: true
+        principal:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: false
+
+  # ── Structured file channel ──────────────────────────────────────────
+  # SFTP replacement — structured file operations over wsh channels.
+  # Supports stat, list, read, write, mkdir, remove, rename.
+  filechannel:
+    FileOp:
+      code: 0x98
+      description: >
+        Request a file operation (stat, list, read, write, mkdir,
+        remove, rename).
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        op:
+          type: string
+          required: true
+          description: '"stat", "list", "read", "write", "mkdir", "remove", "rename"'
+        path:
+          type: string
+          required: true
+        offset:
+          type: u64
+          required: false
+          description: "Byte offset for read/write"
+        length:
+          type: u64
+          required: false
+          description: "Byte count for read"
+
+    FileResult:
+      code: 0x99
+      description: >
+        Result of a file operation.  Success with optional metadata,
+        or failure with error message.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        success:
+          type: bool
+          required: true
+        metadata:
+          type: json
+          default: "{}"
+          description: "File metadata (size, mode, mtime, etc.)"
+        error_message:
+          type: string
+          required: false
+
+    FileChunk:
+      code: 0x9a
+      description: >
+        Data chunk for file read/write transfers.  The final flag
+        indicates the last chunk in the sequence.
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        offset:
+          type: u64
+          required: true
+        data:
+          type: bytes
+          required: true
+        is_final:
+          type: bool
+          required: true
+          description: "True if this is the last chunk"
+
+  # ── Policy engine ────────────────────────────────────────────────────
+  # OPA-like enterprise policy enforcement.  Actions are evaluated
+  # against policy rules before execution.  Policies can be updated
+  # at runtime without server restart.
+  policy:
+    PolicyEval:
+      code: 0x9b
+      description: >
+        Request policy evaluation for an action.  The server checks
+        the action against loaded policy rules and returns a decision.
+      fields:
+        request_id:
+          type: string
+          required: true
+        action:
+          type: string
+          required: true
+          description: '"open_pty", "exec", "file_write", "gateway", etc.'
+        principal:
+          type: string
+          required: true
+        context:
+          type: json
+          default: "{}"
+          description: "Additional context (IP, time, session metadata)"
+
+    PolicyResult:
+      code: 0x9c
+      description: >
+        Policy evaluation result.
+      fields:
+        request_id:
+          type: string
+          required: true
+        allowed:
+          type: bool
+          required: true
+        reason:
+          type: string
+          required: false
+
+    PolicyUpdate:
+      code: 0x9d
+      description: >
+        Push a policy update.  The server reloads policy rules from
+        the provided document.
+      fields:
+        policy_id:
+          type: string
+          required: true
+        rules:
+          type: json
+          required: true
+          description: "Policy document (JSON rule set)"
+        version:
+          type: u64
+          required: true
+
+  # ── Terminal frontend ────────────────────────────────────────────────
+  # Negotiate terminal frontend configuration.  Allows the client to
+  # specify which terminal emulator to use (ghostty-web, xterm.js, etc.)
+  # and pass frontend-specific options.
+  terminal:
+    TerminalConfig:
+      code: 0x9e
+      description: >
+        Sent by the client to configure the terminal frontend for a
+        channel.  The server may use this to adjust PTY behavior
+        (e.g., TERM environment variable, color depth).
+      fields:
+        channel_id:
+          type: u32
+          required: true
+        frontend:
+          type: string
+          required: true
+          description: '"ghostty-web", "xterm.js", "hterm", or custom'
+        options:
+          type: json
+          default: "{}"
+          description: "Frontend-specific options (font, theme, keybindings)"
+
+nested_types:
+  AttachmentInfo:
+    fields:
+      session_id:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+      username:
+        type: string
+        required: false
+
+  PeerInfo:
+    fields:
+      fingerprint:
+        type: string
+        required: true
+      fingerprint_short:
+        type: string
+        required: true
+      username:
+        type: string
+        required: true
+      capabilities:
+        type: "string[]"
+        default: "[]"
+      peer_type:
+        type: string
+        default: '"host"'
+      shell_backend:
+        type: string
+        default: '"pty"'
+      source:
+        type: string
+        default: '"wsh-relay"'
+      supports_attach:
+        type: bool
+        default: false
+      supports_replay:
+        type: bool
+        default: false
+      supports_echo:
+        type: bool
+        default: false
+      supports_term_sync:
+        type: bool
+        default: false
+      last_seen:
+        type: u64
+        required: false
+
+  McpToolSpec:
+    fields:
+      name:
+        type: string
+        required: true
+      description:
+        type: string
+        required: true
+      parameters:
+        type: json
+        default: "{}"
+
+  SessionSummary:
+    fields:
+      session_id:
+        type: string
+        required: true
+      name:
+        type: string
+        required: false
+      username:
+        type: string
+        required: true
+      fingerprint_short:
+        type: string
+        required: true
+      created_at_secs:
+        type: u64
+        required: true
+      idle_secs:
+        type: u64
+        required: true
+      attached_count:
+        type: u32
+        required: true
+
+crypto:
+  auth_transcript:
+    algorithm: SHA-256
+    formula: 'SHA-256(PROTOCOL_VERSION || "\0" || session_id || nonce)'
+    note: "channelBinding can be appended but defaults to empty"
+  fingerprint:
+    algorithm: SHA-256
+    input: raw_ed25519_public_key_32_bytes
+    output: hex_encoded_64_chars
+  session_token:
+    format: "[8B expiry_be][32B HMAC-SHA256(secret, session_id || expiry)]"
+    total_bytes: 40
+  key_type: Ed25519
+  ssh_wire_format: '[4B len]["ssh-ed25519"][4B len][32B raw_key]'
+
+transport:
+  webtransport:
+    description: "QUIC streams as channels. 1 bidi = control. Per channel: 1 bidi + optional uni."
+  websocket:
+    framing: "[1B msg_type][4B stream_id][payload]"
+    ws_data_type: 0x60
