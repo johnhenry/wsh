@@ -558,11 +558,22 @@ impl WshServer {
         let features = self.build_feature_list();
         let hello_result = handshake::handle_hello(&hello, &server_fingerprints, Some(&features))?;
 
-        let sh_frame = frame_encode(&hello_result.server_hello)?;
-        send.write_all(&sh_frame)
-            .await
-            .map_err(|e| WshError::Transport(format!("WebTransport write failed: {e}")))?;
-
+        // Deliberately skip SERVER_HELLO and send only CHALLENGE — sending
+        // both back-to-back on one QUIC stream (no message-boundary framing
+        // at that layer, unlike discrete WebSocket frames) lets them arrive
+        // in a single `read()` on the client. wsh-upon-star's `WshClient`
+        // dispatches both messages synchronously from that one read, but
+        // only registers its *next* waiter (for CHALLENGE) in a microtask
+        // after the first `await` (for SERVER_HELLO) resolves — so the
+        // synchronously-dispatched CHALLENGE has no waiter yet and is
+        // silently dropped, hanging until timeout. Confirmed by testing
+        // (see docs/WSH-INTO-CLAWSER.md and tools/wsh-server.mjs, which hit
+        // and documented the exact same race on the Node reimplementation's
+        // WebSocket path and fixed it the same way). The client explicitly
+        // supports this — it falls back to the literal session-id string
+        // "pending" for the transcript when SERVER_HELLO is skipped, so the
+        // transcript verification below must use that same literal string
+        // rather than the real session id generated above.
         let challenge_frame = frame_encode(&hello_result.challenge)?;
         send.write_all(&challenge_frame)
             .await
@@ -628,11 +639,16 @@ impl WshServer {
             }
         }
 
-        // Verify
+        // Verify. Transcript session id is the literal "pending" here, not
+        // hello_result.session_id — see the comment above SERVER_HELLO being
+        // skipped. This also becomes the session id in the returned
+        // AuthResult (and thus AUTH_OK/ctx.session_id below); that's fine,
+        // per-connection bookkeeping elsewhere is keyed by the separate
+        // integer conn_id, not this string.
         match handshake::verify_auth(
             &auth,
             &hello_result.nonce,
-            &hello_result.session_id,
+            "pending",
             &self.authorized_keys,
             &self.secret,
             self.config.session_ttl,
