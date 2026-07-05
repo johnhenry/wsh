@@ -702,6 +702,111 @@ impl WshServer {
         Ok(())
     }
 
+    /// Spawn a background task that pumps PTY output to the client as
+    /// `SessionData` control messages, and sends `Exit` + `Close` once the
+    /// child process terminates.
+    ///
+    /// This is the "virtual" data-mode counterpart to a real multiplexed
+    /// data stream: neither the WebSocket transport (which only ever
+    /// reads/writes `FRAME_CONTROL` frames) nor the WebTransport transport
+    /// (which only accepts a single bidirectional control stream) implement
+    /// a second stream for session I/O, so output is delivered over the
+    /// existing control-channel envelope path via `peer_tx` — the same
+    /// sender `session_loop_ws`/`session_loop_quic` already drain for
+    /// gateway data and relay-forwarded messages.
+    fn spawn_pty_output_pump(
+        &self,
+        session_id: String,
+        channel_id: u32,
+        peer_tx: mpsc::Sender<Envelope>,
+    ) {
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            let (reader, child_handle) = match sessions
+                .with_session(&session_id, |session| {
+                    Ok((session.pty.reader(), session.pty.child_handle()))
+                })
+                .await
+            {
+                Ok(handles) => handles,
+                Err(e) => {
+                    warn!(session_id = %session_id, error = %e, "PTY output pump: session not found at startup");
+                    return;
+                }
+            };
+
+            loop {
+                let reader = reader.clone();
+                let read_result = tokio::task::spawn_blocking(move || {
+                    let mut buf = [0u8; 8192];
+                    let mut guard = reader.blocking_lock();
+                    guard.read(&mut buf).map(|n| (buf, n))
+                })
+                .await;
+
+                let (buf, n) = match read_result {
+                    Ok(Ok((buf, n))) => (buf, n),
+                    Ok(Err(_)) | Err(_) => {
+                        // Read error (including EIO on PTY close, common on Linux/macOS
+                        // when the child exits) — treat as EOF and fall through to wait().
+                        (
+                            [0u8; 8192],
+                            0,
+                        )
+                    }
+                };
+
+                if n == 0 {
+                    break;
+                }
+
+                sessions.touch(&session_id).await;
+
+                let data_msg = Envelope {
+                    msg_type: MsgType::SessionData,
+                    payload: Payload::SessionData(SessionDataPayload {
+                        channel_id,
+                        data: buf[..n].to_vec(),
+                    }),
+                };
+                if peer_tx.send(data_msg).await.is_err() {
+                    debug!(session_id = %session_id, "PTY output pump: peer channel closed, stopping");
+                    return;
+                }
+            }
+
+            // EOF on the PTY reader — the child has exited or is exiting.
+            // Wait for the exact exit code, then notify the client.
+            let code = tokio::task::spawn_blocking(move || {
+                let mut child = child_handle.blocking_lock();
+                child.wait()
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|status| status.exit_code().try_into().unwrap_or(-1))
+            .unwrap_or(-1);
+
+            info!(session_id = %session_id, channel_id, code, "PTY session ended");
+
+            let exit_msg = Envelope {
+                msg_type: MsgType::Exit,
+                payload: Payload::Exit(ExitPayload { channel_id, code }),
+            };
+            let _ = peer_tx.send(exit_msg).await;
+
+            let close_msg = Envelope {
+                msg_type: MsgType::Close,
+                payload: Payload::Close(ClosePayload { channel_id }),
+            };
+            let _ = peer_tx.send(close_msg).await;
+
+            if let Err(e) = sessions.remove(&session_id).await {
+                debug!(session_id = %session_id, error = %e, "PTY output pump: session already removed");
+            }
+        });
+    }
+
     /// Handle a WebSocket connection through the auth handshake.
     async fn handle_websocket(&self, mut conn: websocket::WebSocketConnection) -> WshResult<()> {
         let remote = conn.remote_addr;
@@ -1706,12 +1811,26 @@ impl WshServer {
                                         .insert(cid, session_id.clone());
                                 }
                                 info!(session_id = %session_id, channel_id, kind = ?p.kind, "channel opened");
+
+                                // Neither the WebSocket nor the WebTransport transport
+                                // layer implements a second multiplexed data stream for
+                                // session I/O (WS only ever reads/writes FRAME_CONTROL
+                                // frames; WebTransport's handle_webtransport() only
+                                // accepts a single bidirectional stream for control).
+                                // So session data must flow as SessionData/Exit control
+                                // messages ("virtual" mode), not raw stream bytes.
+                                self.spawn_pty_output_pump(
+                                    session_id.clone(),
+                                    channel_id,
+                                    ctx.peer_tx.clone(),
+                                );
+
                                 Ok(Some(Envelope {
                                     msg_type: MsgType::OpenOk,
                                     payload: Payload::OpenOk(OpenOkPayload {
                                         channel_id,
                                         stream_ids: vec![],
-                                        data_mode: SessionDataMode::Stream,
+                                        data_mode: SessionDataMode::Virtual,
                                         capabilities: vec![],
                                     }),
                                 }))
@@ -1746,6 +1865,30 @@ impl WshServer {
             }
             (MsgType::Signal, Payload::Signal(p)) => {
                 debug!(channel_id = p.channel_id, signal = %p.signal, "signal request");
+                Ok(None)
+            }
+            (MsgType::SessionData, Payload::SessionData(p)) => {
+                // Client stdin for a direct-host (non-relay) session in "virtual"
+                // data mode: write straight to the PTY. (Relay-forwarded
+                // SessionData for reverse/peer sessions is handled earlier in
+                // dispatch_message, before this match, via is_relay_forwardable.)
+                let target_session = {
+                    let ch_map = self.channel_sessions.read().await;
+                    ch_map.get(&p.channel_id).cloned()
+                };
+                if let Some(sid) = target_session {
+                    self.sessions.touch(&sid).await;
+                    let data = p.data.clone();
+                    if let Err(e) = self
+                        .sessions
+                        .with_session(&sid, |session| session.pty.write_blocking(&data))
+                        .await
+                    {
+                        warn!(channel_id = p.channel_id, session_id = %sid, error = %e, "PTY write failed");
+                    }
+                } else {
+                    warn!(channel_id = p.channel_id, "SessionData for unknown channel");
+                }
                 Ok(None)
             }
             (MsgType::Close, Payload::Close(p)) => {
