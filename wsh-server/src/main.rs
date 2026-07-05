@@ -199,6 +199,29 @@ fn load_tls_config(
 }
 
 /// Generate a self-signed certificate for development use.
+///
+/// `not_before`/`not_after` and `is_ca` are set explicitly rather than left
+/// at rcgen's defaults, which produce a cert with an intentionally
+/// "forever" validity window (1975-01-01..4096-01-01) and no Basic
+/// Constraints / Subject or Authority Key Identifier extensions at all —
+/// unusual compared to what e.g. `openssl req -x509` produces by default
+/// for a self-signed cert. These were explored as a possible fix for a
+/// WebTransport cross-implementation interop failure (a Node WebTransport
+/// client — `@fails-components/webtransport`'s http3-quiche binding, used
+/// by `tools/wsh-server.mjs` and attempted against this server in
+/// `tools/test/wsh-rust-server.test.mjs` — fails to open a session against
+/// this server's WebTransport/QUIC listener even with the peer's
+/// certificate hash pinned via `serverCertificateHashes`, which per spec
+/// should bypass full chain/date validation). A rigorous investigation (see
+/// docs/WSH-INTO-CLAWSER.md) ruled out the date range, the missing
+/// extensions, and even matching an `openssl`-generated cert byte-for-byte
+/// (down to ASN.1 extension order) as the cause — none of it changed the
+/// outcome once process/port hygiene during testing was tightened up, so
+/// whatever's actually failing is inside the native quiche binding's
+/// opaque certificate-hash-comparison code, not this server's cert.
+/// The changes here are kept anyway as unrelated-but-real hygiene
+/// improvements (a sane validity window, standard self-signed extensions)
+/// — they just don't fix the interop gap, which remains open.
 fn generate_self_signed_cert() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     let wsh_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -208,7 +231,6 @@ fn generate_self_signed_cert() -> Result<(PathBuf, PathBuf), Box<dyn std::error:
     let cert_path = wsh_dir.join("cert.pem");
     let key_path = wsh_dir.join("key.pem");
 
-    // Generate using rcgen
     let mut params = rcgen::CertificateParams::new(vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -218,6 +240,12 @@ fn generate_self_signed_cert() -> Result<(PathBuf, PathBuf), Box<dyn std::error:
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "wsh-server dev cert");
+
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(365);
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.use_authority_key_identifier_extension = true;
 
     let key_pair = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;

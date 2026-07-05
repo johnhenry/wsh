@@ -33,6 +33,7 @@ hex = "0.4"
 ed25519-dalek = "2"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+time = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
