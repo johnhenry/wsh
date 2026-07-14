@@ -1,7 +1,0 @@
-/target
-.reference/
-node_modules/
-.DS_Store
-extracted_conversations/
-.claude/settings.local.json
-.claude/worktrees/
