@@ -1,7 +1,7 @@
 {
-  "name": "wsh-upon-star",
-  "version": "0.1.1",
-  "description": "Web Shell — browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
+  "name": "@johnhenry/wsh",
+  "version": "0.0.0",
+  "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
   "exports": {
@@ -32,10 +32,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/johnhenry/wsh-upon-star"
+    "url": "git+https://github.com/johnhenry/wsh.git"
   },
   "author": "John Henry",
   "engines": {
     "node": ">=24.0.0"
-  }
+  },
+  "homepage": "https://opensource.johnhenry.me/wsh/"
 }

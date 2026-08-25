@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.0
+
+- **Renamed: `wsh-upon-star` is now `@johnhenry/wsh`, restarting at 0.0.0.**
+  Same library, same API — a shorter name, a new address, a new version era.
+  Previously published as `wsh-upon-star` (last release 0.1.1), now
+  deprecated. The GitHub repo moved to `github.com/johnhenry/wsh` (the old
+  path redirects).
+
+  ```sh
+  npm install @johnhenry/wsh
+  ```
+
+  Docs: https://opensource.johnhenry.me/wsh/. The 0.0.0 is a deliberate
+  restart on import, not a maturity signal.
+
+
 ## 0.1.0 (2026-03-15)
 
 Initial release.
