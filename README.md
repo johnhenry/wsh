@@ -1,5 +1,9 @@
 # wsh-upon-star
 
+> Previously published as `wsh-upon-star` (last release: 0.1.1, now deprecated).
+> Renamed to `@johnhenry/wsh` and restarted at 0.0.0 on import into the
+> @johnhenry family — a new name and era, not a maturity signal.
+
 Browser-native remote command execution over WebTransport/WebSocket with Ed25519 authentication.
 
 wsh-upon-star is a pure-JS client library that connects browsers to remote shells. It implements its own binary protocol (CBOR over length-prefixed frames) with Ed25519 challenge-response auth, channel multiplexing, session management, and MCP tool bridging.
@@ -7,14 +11,14 @@ wsh-upon-star is a pure-JS client library that connects browsers to remote shell
 ## Install
 
 ```bash
-npm install wsh-upon-star
+npm install @johnhenry/wsh
 ```
 
 Or via CDN:
 
 ```html
 <script type="module">
-  import { WshClient, generateKeyPair } from 'https://esm.sh/wsh-upon-star';
+  import { WshClient, generateKeyPair } from 'https://esm.sh/@johnhenry/wsh';
 </script>
 ```
 
@@ -34,7 +38,7 @@ Or via CDN:
 ## Quick Start
 
 ```js
-import { WshClient, generateKeyPair } from 'wsh-upon-star';
+import { WshClient, generateKeyPair } from '@johnhenry/wsh';
 
 // Generate an Ed25519 key pair
 const keyPair = await generateKeyPair(true);
@@ -75,7 +79,7 @@ await client.disconnect();
 ## One-Shot Command Execution
 
 ```js
-import { WshClient, generateKeyPair } from 'wsh-upon-star';
+import { WshClient, generateKeyPair } from '@johnhenry/wsh';
 
 const keyPair = await generateKeyPair(true);
 const { stdout, exitCode } = await WshClient.exec(
