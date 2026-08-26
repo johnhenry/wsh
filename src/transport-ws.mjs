@@ -15,10 +15,18 @@
  * Data streams carry raw bytes with no additional framing.
  */
 
-import { frameEncode, FrameDecoder } from './cbor.mjs';
+import { frameEncode, FrameDecoder, FrameSizeError } from './cbor.mjs';
 import { WshTransport } from './transport.mjs';
 
 // ── Frame type constants ─────────────────────────────────────────────
+//
+// NOTE: these are unrelated to MSG.WS_DATA (0x60) in messages.gen.mjs.
+// WS_DATA is a JS-only, CBOR-layer bookkeeping marker (it shares its
+// opcode with MSG.DETACH and is explicitly excluded from the Rust
+// message enum by spec/codegen.mjs) — it is never sent as the outer
+// envelope's frame-type byte below. See spec/wsh-v1.yaml's
+// `transport.websocket` section for the authoritative outer-envelope
+// framing docs.
 
 const FRAME_CONTROL      = 0x01;
 const FRAME_DATA         = 0x02;
@@ -329,7 +337,18 @@ export class WebSocketTransport extends WshTransport {
    * @param {Uint8Array} payload
    */
   #handleControlFrame(payload) {
-    const messages = this.#decoder.feed(payload);
+    let messages;
+    try {
+      messages = this.#decoder.feed(payload);
+    } catch (err) {
+      this._emitError(err);
+      if (err instanceof FrameSizeError) {
+        // Oversized claimed frame length — treat as a hostile or badly
+        // broken peer and tear down the connection rather than continue.
+        this.close().catch(() => {});
+      }
+      return;
+    }
     for (const msg of messages) {
       this._emitControl(msg);
     }

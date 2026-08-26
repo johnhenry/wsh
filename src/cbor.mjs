@@ -331,15 +331,56 @@ export function frameEncode(value) {
 }
 
 /**
+ * Default cap on a single frame's claimed payload length (16 MiB).
+ *
+ * This channel only ever carries CBOR control-message metadata (session
+ * lists, MCP tool results, recording-export/command-journal entries,
+ * etc.) — bulk data such as file transfers and PTY output travel over
+ * separate raw data streams with their own small chunking, not through
+ * this decoder. 16 MiB is generous headroom for legitimate control
+ * payloads while still bounding memory far below the 4 GiB a hostile or
+ * buggy peer could otherwise claim via the 32-bit length prefix.
+ */
+export const DEFAULT_MAX_FRAME_SIZE = 16 * 1024 * 1024;
+
+/**
+ * Thrown by {@link FrameDecoder#feed} when a frame's claimed length
+ * exceeds the decoder's configured maximum.
+ */
+export class FrameSizeError extends Error {
+  constructor(len, maxFrameSize) {
+    super(`Frame claims length ${len}, which exceeds the maximum of ${maxFrameSize} bytes`);
+    this.name = 'FrameSizeError';
+    this.len = len;
+    this.maxFrameSize = maxFrameSize;
+  }
+}
+
+/**
  * Streaming frame decoder. Feed it chunks and it yields complete messages.
  */
 export class FrameDecoder {
   #buffer = new Uint8Array(0);
+  #maxFrameSize;
+
+  /**
+   * @param {object} [opts]
+   * @param {number} [opts.maxFrameSize] - Maximum allowed claimed frame
+   *   length, in bytes. Frames claiming more than this are rejected as
+   *   soon as their length prefix is parsed, before any payload bytes
+   *   are buffered. Defaults to {@link DEFAULT_MAX_FRAME_SIZE}.
+   */
+  constructor({ maxFrameSize = DEFAULT_MAX_FRAME_SIZE } = {}) {
+    this.#maxFrameSize = maxFrameSize;
+  }
 
   /**
    * Feed bytes and return decoded messages.
    * @param {Uint8Array} chunk
    * @returns {Array} decoded JS values
+   * @throws {FrameSizeError} if a frame's claimed length exceeds the
+   *   configured maximum. The decoder's buffer is cleared before
+   *   throwing; callers should treat this as fatal for the connection.
    */
   feed(chunk) {
     this.#buffer = appendBuffer(this.#buffer, chunk);
@@ -347,6 +388,12 @@ export class FrameDecoder {
     while (this.#buffer.length >= 4) {
       const view = new DataView(this.#buffer.buffer, this.#buffer.byteOffset, 4);
       const len = view.getUint32(0);
+      if (len > this.#maxFrameSize) {
+        // Reject before accumulating toward the (possibly huge) claimed
+        // length — do not wait for the payload to arrive.
+        this.#buffer = new Uint8Array(0);
+        throw new FrameSizeError(len, this.#maxFrameSize);
+      }
       if (this.#buffer.length < 4 + len) break;
       const payload = this.#buffer.slice(4, 4 + len);
       this.#buffer = this.#buffer.slice(4 + len);

@@ -1325,5 +1325,10 @@ QUIC streams as channels. 1 bidi = control. Per channel: 1 bidi + optional uni.
 
 ### WebSocket
 
-- **Framing**: `[1B msg_type][4B stream_id][payload]`
-- **WS_DATA type**: `0x60`
+- **Framing**: `[1B frame_type][4B stream_id][payload]`
+- **control frame type**: `0x01`
+- **data frame type**: `0x02`
+- **open_stream frame type**: `0x03`
+- **close_stream frame type**: `0x04`
+
+Stream 0 carries length-prefixed CBOR control messages (frameEncode/FrameDecoder); other stream IDs carry raw data bytes with no extra framing. MSG.WS_DATA (0x60, defined under messages.framing.WsData in this spec) is an unrelated JS-only CBOR-opcode marker and is never sent as this frame_type byte -- see src/transport-ws.mjs for the reference implementation.
