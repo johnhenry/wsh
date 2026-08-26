@@ -1,5 +1,7 @@
 # wsh-upon-star
 
+Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.me/wsh/)
+
 > Previously published as `wsh-upon-star` (last release: 0.1.1, now deprecated).
 > Renamed to `@johnhenry/wsh` and restarted at 0.0.0 on import into the
 > @johnhenry family — a new name and era, not a maturity signal.
