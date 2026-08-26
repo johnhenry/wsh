@@ -28,11 +28,34 @@ export function cborDecode(data: Uint8Array): unknown;
 export function frameEncode(value: unknown): Uint8Array;
 
 /**
+ * Default cap on a single frame's claimed payload length (16 MiB).
+ */
+export const DEFAULT_MAX_FRAME_SIZE: number;
+
+/**
+ * Thrown by FrameDecoder#feed when a frame's claimed length exceeds the
+ * decoder's configured maximum.
+ */
+export class FrameSizeError extends Error {
+  constructor(len: number, maxFrameSize: number);
+  readonly len: number;
+  readonly maxFrameSize: number;
+}
+
+/**
  * Streaming frame decoder. Feed it chunks and it yields complete messages.
  */
 export class FrameDecoder {
   /**
+   * @param opts.maxFrameSize Maximum allowed claimed frame length in bytes.
+   *   Defaults to DEFAULT_MAX_FRAME_SIZE.
+   */
+  constructor(opts?: { maxFrameSize?: number });
+
+  /**
    * Feed bytes and return decoded messages.
+   * @throws {FrameSizeError} if a frame's claimed length exceeds the
+   *   configured maximum.
    */
   feed(chunk: Uint8Array): unknown[];
 

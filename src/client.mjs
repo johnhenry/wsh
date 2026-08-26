@@ -388,8 +388,11 @@ export class WshClient {
         }
 
         // We need a session ID for the transcript. Use the nonce-derived ID
-        // or a placeholder if the server hasn't provided one.
-        tempSessionId = tempSessionId || 'pending';
+        // or a fresh random placeholder if the server hasn't provided one.
+        // (A fixed literal here would make the transcript's session-id
+        // component identical across every connection taking this path,
+        // leaving only the nonce to bind the signature to this connection.)
+        tempSessionId = tempSessionId || crypto.randomUUID();
 
         const { signature, publicKeyRaw } = await signChallenge(
           keyPair.privateKey,
@@ -1445,7 +1448,9 @@ export class WshClient {
       } else if (firstResponse.type === MSG.CHALLENGE) {
         if (!keyPair) throw new Error('Server sent CHALLENGE but no key pair provided');
 
-        tempSessionId = tempSessionId || 'pending';
+        // See connect()'s CHALLENGE branch for why this must be random
+        // rather than a fixed literal.
+        tempSessionId = tempSessionId || crypto.randomUUID();
         const { signature, publicKeyRaw } = await signChallenge(
           keyPair.privateKey, keyPair.publicKey, tempSessionId, firstResponse.nonce
         );

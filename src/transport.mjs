@@ -5,7 +5,7 @@
  * Data streams carry raw bytes with no framing overhead.
  */
 
-import { frameEncode, FrameDecoder, cborEncode } from './cbor.mjs';
+import { frameEncode, FrameDecoder, cborEncode, FrameSizeError } from './cbor.mjs';
 
 // ── Transport states ─────────────────────────────────────────────────
 
@@ -286,6 +286,11 @@ export class WebTransportTransport extends WshTransport {
     } catch (err) {
       if (!this.#abort.signal.aborted) {
         this._emitError(new Error(`Control stream read error: ${err.message}`));
+        if (err instanceof FrameSizeError) {
+          // Oversized claimed frame length — treat as a hostile or badly
+          // broken peer and tear down the connection rather than continue.
+          this.close().catch(() => {});
+        }
       }
     } finally {
       reader.releaseLock();

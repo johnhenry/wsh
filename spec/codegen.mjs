@@ -1008,7 +1008,11 @@ function emitMarkdown(schema) {
   out.push('### WebSocket');
   out.push('');
   out.push(`- **Framing**: \`${schema.transport.websocket.framing}\``);
-  out.push(`- **WS_DATA type**: \`0x${schema.transport.websocket.ws_data_type.toString(16).padStart(2, '0')}\``);
+  for (const [name, code] of Object.entries(schema.transport.websocket.frame_types)) {
+    out.push(`- **${name} frame type**: \`0x${code.toString(16).padStart(2, '0')}\``);
+  }
+  out.push('');
+  out.push(schema.transport.websocket.note);
   out.push('');
 
   return out.join('\n');

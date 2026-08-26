@@ -1,6 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { cborEncode, cborDecode, frameEncode, FrameDecoder } from '../src/cbor.mjs';
+import {
+  cborEncode, cborDecode, frameEncode, FrameDecoder,
+  FrameSizeError, DEFAULT_MAX_FRAME_SIZE,
+} from '../src/cbor.mjs';
 
 describe('CBOR codec', () => {
   it('round-trips integers', () => {
@@ -125,6 +128,52 @@ describe('FrameDecoder', () => {
     const part2 = decoder.feed(frame.subarray(mid));
     assert.equal(part2.length, 1);
     assert.deepEqual(part2[0], msg);
+  });
+
+  // Regression test for: FrameDecoder had no maximum frame-size bound,
+  // allowing a peer to claim a length near UINT32_MAX and force the
+  // decoder to buffer unboundedly while waiting for the (possibly
+  // never-arriving) payload — a client-side memory-exhaustion DoS.
+  it('rejects a frame claiming a length near UINT32_MAX instead of buffering unboundedly', () => {
+    const decoder = new FrameDecoder();
+    const header = new Uint8Array(4);
+    new DataView(header.buffer).setUint32(0, 0xfffffffe); // ~4 GiB claimed length
+
+    assert.throws(() => decoder.feed(header), FrameSizeError);
+
+    // The bogus length must not be retained as "waiting for more bytes" —
+    // the decoder should not be sitting on a multi-gigabyte target.
+    assert.equal(decoder.pending, 0);
+  });
+
+  it('rejects an oversized frame before the payload has fully arrived', () => {
+    const decoder = new FrameDecoder({ maxFrameSize: 16 });
+    const msg = { data: 'this payload is well over sixteen bytes long' };
+    const frame = frameEncode(msg);
+    assert.ok(frame.length > 4 + 16);
+
+    // Feed only the 4-byte length prefix (which already claims more than
+    // the configured max) — decoding must fail immediately, without
+    // requiring the rest of the oversized payload to show up.
+    assert.throws(() => decoder.feed(frame.subarray(0, 4)), FrameSizeError);
+  });
+
+  it('respects a configurable maxFrameSize', () => {
+    const decoder = new FrameDecoder({ maxFrameSize: 8 });
+    const msg = { a: 'this is definitely more than eight bytes of CBOR' };
+    const frame = frameEncode(msg);
+    assert.throws(() => decoder.feed(frame), FrameSizeError);
+  });
+
+  it('still accepts frames within the default max frame size', () => {
+    const decoder = new FrameDecoder();
+    const msg = { data: 'x'.repeat(1024) };
+    const frame = frameEncode(msg);
+    assert.ok(frame.length < DEFAULT_MAX_FRAME_SIZE);
+
+    const messages = decoder.feed(frame);
+    assert.equal(messages.length, 1);
+    assert.deepEqual(messages[0], msg);
   });
 });
 
