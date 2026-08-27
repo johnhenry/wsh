@@ -2,18 +2,55 @@
 /**
  * wsh protocol codegen — reads wsh-v1.yaml, emits JS + Rust + Markdown.
  *
- * Usage: node web/packages/wsh/spec/codegen.mjs
+ * Usage: node spec/codegen.mjs
+ *
+ * Outputs (this repo is the single source of truth for the wire spec):
+ *   - JS   → <repo>/src/messages.gen.mjs        (always; in-repo)
+ *   - MD   → <repo>/spec/wsh-v1.md              (always; in-repo)
+ *   - Rust → the wsh-core crate in the clawser repo. clawser lives in a
+ *            separate repo, so its path is resolved in this order:
+ *              1. $WSH_RUST_OUT (explicit file path), else
+ *              2. $WSH_CLAWSER_DIR/crates/wsh-core/src/messages.gen.rs, else
+ *              3. a default guess next to this repo (../clawser and a few
+ *                 known local checkout locations).
+ *            If none resolve to an existing crate dir, the Rust emit is
+ *            SKIPPED with a warning (JS + MD still generate) — so codegen
+ *            works standalone without the clawser checkout present.
  *
  * Zero npm dependencies — uses only node:fs and node:path, plus a minimal
  * inline YAML parser sufficient for the schema subset we use.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolve(__dirname, '../../../..');
+const REPO_ROOT = resolve(__dirname, '..');
+
+// Resolve where the Rust output should land. clawser is a separate repo;
+// the wsh-core crate is at crates/wsh-core/src/messages.gen.rs within it.
+function resolveRustOut() {
+  const relCrate = 'crates/wsh-core/src/messages.gen.rs';
+  // 1. Explicit file path override.
+  if (process.env.WSH_RUST_OUT) return resolve(process.env.WSH_RUST_OUT);
+  // 2. Explicit clawser repo dir.
+  if (process.env.WSH_CLAWSER_DIR) {
+    return resolve(process.env.WSH_CLAWSER_DIR, relCrate);
+  }
+  // 3. Known local checkout locations (best-effort; skipped if absent).
+  const guesses = [
+    resolve(REPO_ROOT, '../clawser'),
+    resolve(REPO_ROOT, '../../Projects/@erisera/clawser'),
+    resolve(process.env.HOME || '', 'Projects/@erisera/clawser'),
+  ];
+  for (const dir of guesses) {
+    if (dir && existsSync(join(dir, 'crates/wsh-core/src'))) {
+      return join(dir, relCrate);
+    }
+  }
+  return null;
+}
 
 // ── Minimal YAML parser ─────────────────────────────────────────────
 // Handles: scalars, quoted strings, inline arrays [a, b], nested maps.
@@ -142,7 +179,7 @@ function emitJS(schema) {
   out.push('/**');
   out.push(' * wsh protocol control message types and constructors.');
   out.push(' * AUTO-GENERATED from wsh-v1.yaml — do not edit.');
-  out.push(' * Run: node web/packages/wsh/spec/codegen.mjs');
+  out.push(' * Run: node spec/codegen.mjs (from the @johnhenry/wsh repo root)');
   out.push(' */');
   out.push('');
 
@@ -497,7 +534,7 @@ function emitRust(schema) {
 
   out.push('// wsh protocol control message types.');
   out.push('// AUTO-GENERATED from wsh-v1.yaml — do not edit.');
-  out.push('// Run: node web/packages/wsh/spec/codegen.mjs');
+  out.push('// Run: node spec/codegen.mjs (from the @johnhenry/wsh repo root)');
   out.push('');
   out.push('use serde::{Deserialize, Serialize};');
   out.push('');
@@ -863,7 +900,7 @@ function emitMarkdown(schema) {
   out.push(`# ${schema.protocol.name} Protocol Specification — ${ver}`);
   out.push('');
   out.push('> Auto-generated from `wsh-v1.yaml`. Do not edit.');
-  out.push('> Run: `node web/packages/wsh/spec/codegen.mjs`');
+  out.push('> Run: `node spec/codegen.mjs` (from the @johnhenry/wsh repo root)');
   out.push('');
 
   // TOC
@@ -1024,19 +1061,29 @@ const jsOutput = emitJS(schema);
 const rustOutput = emitRust(schema);
 const mdOutput = emitMarkdown(schema);
 
-// Write outputs
-const jsPath = join(ROOT, 'web/packages/wsh/src/messages.gen.mjs');
-const rsPath = join(ROOT, 'crates/wsh-core/src/messages.gen.rs');
+// Write outputs. JS + MD are always in-repo; Rust targets the separate
+// clawser repo and is skipped (with a warning) when that checkout is absent.
+const jsPath = join(REPO_ROOT, 'src/messages.gen.mjs');
 const mdPath = join(__dirname, 'wsh-v1.md');
+const rsPath = resolveRustOut();
 
 mkdirSync(dirname(jsPath), { recursive: true });
-mkdirSync(dirname(rsPath), { recursive: true });
-
 writeFileSync(jsPath, jsOutput);
-writeFileSync(rsPath, rustOutput);
 writeFileSync(mdPath, mdOutput);
 
-console.log(`✓ JS  → ${jsPath}`);
-console.log(`✓ Rust → ${rsPath}`);
+console.log(`✓ JS   → ${jsPath}`);
 console.log(`✓ Spec → ${mdPath}`);
+
+if (rsPath) {
+  mkdirSync(dirname(rsPath), { recursive: true });
+  writeFileSync(rsPath, rustOutput);
+  console.log(`✓ Rust → ${rsPath}`);
+} else {
+  console.warn(
+    '⚠ Rust → SKIPPED: clawser checkout not found. Set WSH_CLAWSER_DIR ' +
+      '(the clawser repo root) or WSH_RUST_OUT (an explicit .rs path) to ' +
+      'regenerate crates/wsh-core/src/messages.gen.rs.',
+  );
+}
+
 console.log(`  ${allMessages.length} message types generated.`);

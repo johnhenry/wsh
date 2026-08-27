@@ -1,7 +1,7 @@
 /**
  * wsh protocol control message types and constructors.
  * AUTO-GENERATED from wsh-v1.yaml — do not edit.
- * Run: node web/packages/wsh/spec/codegen.mjs
+ * Run: node spec/codegen.mjs (from the @johnhenry/wsh repo root)
  */
 
 // ── Message type constants ────────────────────────────────────────────
