@@ -19,14 +19,20 @@ const hasEd25519 = auth && typeof crypto !== 'undefined' && typeof crypto.subtle
 
 /**
  * A minimal in-memory transport that skips SERVER_HELLO and replies to
- * HELLO with CHALLENGE directly, then replies to AUTH with AUTH_OK that
- * does *not* include a session_id — so the client's final sessionId is
- * exactly the fallback `tempSessionId` computed for the CHALLENGE branch.
- * This isolates the value under test (regression for the 'pending'
- * hardcoded session-id finding).
+ * HELLO with CHALLENGE directly (carrying a real, unique-per-connection
+ * session_id — a legitimate server always includes one), then replies to
+ * AUTH with AUTH_OK that does *not* include a session_id — so the
+ * client's final sessionId can only have come from the CHALLENGE message,
+ * proving the client never synthesizes one client-side.
  */
 class ChallengeFirstMockTransport extends WshTransport {
   sentMessages = [];
+  #sessionId;
+
+  constructor(sessionId) {
+    super();
+    this.#sessionId = sessionId;
+  }
 
   async _doConnect() {
     // no-op: immediately "connected"
@@ -44,7 +50,7 @@ class ChallengeFirstMockTransport extends WshTransport {
     // registration and get silently dropped.
     if (msg.type === MSG.HELLO) {
       setTimeout(() => {
-        this._emitControl({ type: MSG.CHALLENGE, nonce: new Uint8Array(32).fill(7) });
+        this._emitControl({ type: MSG.CHALLENGE, nonce: new Uint8Array(32).fill(7), session_id: this.#sessionId });
       }, 0);
     } else if (msg.type === MSG.AUTH) {
       setTimeout(() => {
@@ -59,18 +65,21 @@ class ChallengeFirstMockTransport extends WshTransport {
 }
 
 describe('WshClient auth handshake', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
-  // Regression test for: the client used the literal string 'pending' as
-  // the transcript session-id placeholder whenever a server skipped
-  // SERVER_HELLO and sent CHALLENGE directly, making the session-id
-  // component of the auth transcript identical across every connection
-  // taking that path.
+  // Regression test for: the client used to synthesize a session-id
+  // placeholder (previously the literal string 'pending', later
+  // crypto.randomUUID()) whenever a server skipped SERVER_HELLO and sent
+  // CHALLENGE directly. Now that Challenge.session_id is a required wire
+  // field, the client must use exactly what the server provides — never
+  // synthesize its own value, and never silently fall back to a fixed
+  // literal that would collapse the transcript's session-id component
+  // across every connection taking this path.
 
-  it('connect(): CHALLENGE-first handshake uses a fresh per-connection session id, not "pending"', async () => {
+  it('connect(): CHALLENGE-first handshake uses exactly the session id the server provided', async () => {
     const keyPair = await auth.generateKeyPair(true);
 
-    async function runOnce() {
+    async function runOnce(sessionId) {
       const client = new clientMod.WshClient({
-        transportFactories: { ws: () => new ChallengeFirstMockTransport() },
+        transportFactories: { ws: () => new ChallengeFirstMockTransport(sessionId) },
       });
       return client.connect('ws://test.invalid', {
         username: 'alice',
@@ -79,31 +88,29 @@ describe('WshClient auth handshake', { skip: !hasEd25519 && 'Ed25519 not availab
       });
     }
 
-    const id1 = await runOnce();
-    const id2 = await runOnce();
+    const id1 = await runOnce('server-session-1');
+    const id2 = await runOnce('server-session-2');
 
-    assert.notEqual(id1, 'pending');
-    assert.notEqual(id2, 'pending');
-    assert.notEqual(id1, id2, 'two separate connections must not reuse the same fallback session id');
+    assert.equal(id1, 'server-session-1');
+    assert.equal(id2, 'server-session-2');
   });
 
-  it('connectWithTransport()/#performAuth(): CHALLENGE-first handshake uses a fresh per-connection session id, not "pending"', async () => {
+  it('connectWithTransport()/#performAuth(): CHALLENGE-first handshake uses exactly the session id the server provided', async () => {
     const keyPair = await auth.generateKeyPair(true);
 
-    async function runOnce() {
+    async function runOnce(sessionId) {
       const client = new clientMod.WshClient();
-      const transport = new ChallengeFirstMockTransport();
+      const transport = new ChallengeFirstMockTransport(sessionId);
       return client.connectWithTransport(transport, 'ws://test.invalid', {
         username: 'bob',
         keyPair,
       });
     }
 
-    const id1 = await runOnce();
-    const id2 = await runOnce();
+    const id1 = await runOnce('server-session-3');
+    const id2 = await runOnce('server-session-4');
 
-    assert.notEqual(id1, 'pending');
-    assert.notEqual(id2, 'pending');
-    assert.notEqual(id1, id2, 'two separate connections must not reuse the same fallback session id');
+    assert.equal(id1, 'server-session-3');
+    assert.equal(id2, 'server-session-4');
   });
 });

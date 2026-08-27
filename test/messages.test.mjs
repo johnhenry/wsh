@@ -107,9 +107,10 @@ describe('message constructors', () => {
 
   it('challenge', () => {
     const nonce = new Uint8Array(32);
-    const msg = challenge({ nonce });
+    const msg = challenge({ nonce, sessionId: 'sess-1' });
     assert.equal(msg.type, MSG.CHALLENGE);
     assert.equal(msg.nonce, nonce);
+    assert.equal(msg.session_id, 'sess-1');
   });
 
   it('auth (pubkey)', () => {

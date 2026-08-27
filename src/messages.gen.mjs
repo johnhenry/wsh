@@ -200,10 +200,11 @@ export function serverHello({ sessionId, features = [], fingerprints = [] } = {}
   };
 }
 
-export function challenge({ nonce } = {}) {
+export function challenge({ nonce, sessionId } = {}) {
   return {
     type: MSG.CHALLENGE,
     nonce,
+    session_id: sessionId,
   };
 }
 

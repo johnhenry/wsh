@@ -38,7 +38,7 @@ function makeServer(sendToClient, authorizedFingerprints) {
         case MSG.HELLO: {
           state.nonce = generateNonce();
           send(serverHello({ sessionId: state.sessionId, features: ['exec'] }));
-          send(challenge({ nonce: state.nonce }));
+          send(challenge({ nonce: state.nonce, sessionId: state.sessionId }));
           break;
         }
         case MSG.AUTH: {

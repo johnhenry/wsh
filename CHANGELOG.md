@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+
+- **`Challenge` now carries `session_id` directly.** The auth transcript's
+  session-id component used to depend on message ordering: a client had
+  to receive and process ServerHello before Challenge to learn the real
+  session id, and the 0.3.0 dispatch-race fix addressed the specific
+  failure mode that caused (a client-side message-processing race). This
+  goes one step further and removes the *dependency* itself: Challenge
+  is now the single source of truth for session_id, so ServerHello can
+  arrive in any order, be dropped, or be skipped entirely by a server
+  with zero effect on transcript correctness. `WshClient` no longer
+  synthesizes a session id under any circumstance -- it's always exactly
+  what the server sent in Challenge.
+  **Breaking**: `Challenge.session_id` is now a required field; servers
+  must supply it.
+
 ## 0.3.0
 
 - **Fixed a real message-dispatch race** in both transports

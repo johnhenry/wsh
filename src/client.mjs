@@ -357,11 +357,13 @@ export class WshClient {
             return this.#sessionId;
           }
 
-          // Sign the challenge.
+          // Sign the challenge. Challenge.session_id (not the one from
+          // ServerHello) is authoritative for the transcript — see the
+          // comment in the CHALLENGE-first branch below for why.
           const { signature, publicKeyRaw } = await signChallenge(
             keyPair.privateKey,
             keyPair.publicKey,
-            tempSessionId,
+            challengeMsg.session_id,
             challengeMsg.nonce,
             { username }
           );
@@ -388,17 +390,18 @@ export class WshClient {
           throw new Error('Server sent CHALLENGE but no key pair was provided');
         }
 
-        // We need a session ID for the transcript. Use the nonce-derived ID
-        // or a fresh random placeholder if the server hasn't provided one.
-        // (A fixed literal here would make the transcript's session-id
-        // component identical across every connection taking this path,
-        // leaving only the nonce to bind the signature to this connection.)
-        tempSessionId = tempSessionId || crypto.randomUUID();
-
+        // Challenge carries session_id directly (protocol requirement as
+        // of wsh-v1's Challenge.session_id field), so the transcript's
+        // session-id component is always the server's real, authoritative
+        // value regardless of whether ServerHello was sent, dropped, or
+        // arrived out of order. No synthesizing a placeholder here. Keep
+        // tempSessionId as a fallback for this.#sessionId below in case
+        // AUTH_OK's own session_id is ever absent.
+        tempSessionId = firstResponse.session_id;
         const { signature, publicKeyRaw } = await signChallenge(
           keyPair.privateKey,
           keyPair.publicKey,
-          tempSessionId,
+          firstResponse.session_id,
           firstResponse.nonce,
           { username }
         );
@@ -1436,7 +1439,7 @@ export class WshClient {
           }
 
           const { signature, publicKeyRaw } = await signChallenge(
-            keyPair.privateKey, keyPair.publicKey, tempSessionId, challengeMsg.nonce, { username }
+            keyPair.privateKey, keyPair.publicKey, challengeMsg.session_id, challengeMsg.nonce, { username }
           );
 
           await this.#transport.sendControl(authMsg({
@@ -1450,11 +1453,13 @@ export class WshClient {
       } else if (firstResponse.type === MSG.CHALLENGE) {
         if (!keyPair) throw new Error('Server sent CHALLENGE but no key pair provided');
 
-        // See connect()'s CHALLENGE branch for why this must be random
-        // rather than a fixed literal.
-        tempSessionId = tempSessionId || crypto.randomUUID();
+        // Challenge carries session_id directly — see connect()'s
+        // CHALLENGE branch for why. Keep tempSessionId as a fallback for
+        // this.#sessionId below in case AUTH_OK's own session_id is ever
+        // absent.
+        tempSessionId = firstResponse.session_id;
         const { signature, publicKeyRaw } = await signChallenge(
-          keyPair.privateKey, keyPair.publicKey, tempSessionId, firstResponse.nonce, { username }
+          keyPair.privateKey, keyPair.publicKey, firstResponse.session_id, firstResponse.nonce, { username }
         );
 
         await this.#transport.sendControl(authMsg({

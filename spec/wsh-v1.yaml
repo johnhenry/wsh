@@ -73,9 +73,17 @@ messages:
       description: >
         Sent by the server with a random nonce for the client to sign
         with its private key (pubkey auth) or as part of password auth.
+        Carries session_id directly so the auth transcript never depends
+        on the client having already received (and processed) ServerHello
+        first -- ServerHello and Challenge can arrive in either order, or
+        ServerHello can be skipped entirely, with no effect on the
+        transcript's correctness.
       fields:
         nonce:
           type: bytes
+          required: true
+        session_id:
+          type: string
           required: true
 
     AuthMethods:

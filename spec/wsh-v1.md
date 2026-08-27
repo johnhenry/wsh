@@ -191,6 +191,7 @@ Category: **handshake**
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
 | `nonce` | `bytes` | yes | — |
+| `session_id` | `string` | yes | — |
 
 ### AuthMethods (`0x04`)
 
