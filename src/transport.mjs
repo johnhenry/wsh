@@ -281,6 +281,19 @@ export class WebTransportTransport extends WshTransport {
         const messages = this.#decoder.feed(value);
         for (const msg of messages) {
           this._emitControl(msg);
+          // Yield to the microtask queue between messages. A QUIC stream
+          // has no per-message framing at the transport layer, so a single
+          // read() can return bytes for several messages at once (e.g.
+          // SERVER_HELLO immediately followed by CHALLENGE). Emitting them
+          // in a tight synchronous loop starves any `await`'d continuation
+          // triggered by handling an earlier message (e.g. registering the
+          // CHALLENGE waiter after SERVER_HELLO resolves) — that
+          // continuation is a microtask, and without a yield here it never
+          // gets to run before the next message is dispatched. Since
+          // microtasks run FIFO, a continuation queued while handling msg
+          // N always completes before this yield's own continuation
+          // resumes to dispatch msg N+1.
+          await Promise.resolve();
         }
       }
     } catch (err) {

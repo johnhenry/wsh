@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+- **Fixed a real message-dispatch race** in both transports
+  (`WebSocketTransport`, `WebTransportTransport`): when several inbound
+  protocol messages arrived within a single underlying read (e.g. SERVER_HELLO
+  immediately followed by CHALLENGE, landing in one WebSocket `message` event
+  or one QUIC stream read), they were dispatched to handlers in a tight
+  synchronous loop with no yield between them. A handler that resolves a
+  pending waiter (e.g. SERVER_HELLO resolving the "wait for SERVER_HELLO or
+  CHALLENGE" promise) only registers its *next* waiter (for CHALLENGE) in an
+  `await`'d continuation — a microtask — which never got a chance to run
+  before the next message was dispatched, silently dropping it and hanging
+  until timeout. Both transports now drain inbound messages one at a time
+  with an `await Promise.resolve()` yield between each dispatch, letting
+  FIFO microtask ordering guarantee the next waiter is registered in time.
+  This is the fix for the bug that motivated servers to skip sending
+  SERVER_HELLO and fall back to a shared literal session-id — servers no
+  longer need that workaround against a client built from this version.
+
 ## 0.2.0
 
 - **Security fix: the auth challenge transcript now binds `username`.**
