@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+- **Security fix: the auth challenge transcript now binds `username`.**
+  Previously `transcript = SHA-256("wsh-v1\0" || session_id || nonce || channelBinding)`
+  never covered the username at all — a signature said nothing about which
+  identity it was presented under. Now:
+  `transcript = SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce || channelBinding)`,
+  where `lp()` is a 4-byte big-endian length prefix on the two
+  variable-length string fields (needed so concatenation can't collide).
+  **Breaking**: `buildTranscript`/`signChallenge`/`verifyChallenge` now
+  take an options object (`{ username, channelBinding }`) instead of a
+  positional `channelBinding` argument.
+- Fixed the codegen script (`spec/codegen.mjs`) to resolve its two-repo
+  output paths correctly (JS in this repo, Rust in the companion server
+  repo) instead of the stale vendored-layout paths.
+
 ## 0.0.0
 
 - **Renamed: `wsh-upon-star` is now `@johnhenry/wsh`, restarting at 0.0.0.**
