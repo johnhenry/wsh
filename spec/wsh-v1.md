@@ -1,7 +1,7 @@
 # wsh Protocol Specification — wsh-v1
 
 > Auto-generated from `wsh-v1.yaml`. Do not edit.
-> Run: `node web/packages/wsh/spec/codegen.mjs`
+> Run: `node spec/codegen.mjs` (from the @johnhenry/wsh repo root)
 
 ## Table of Contents
 
