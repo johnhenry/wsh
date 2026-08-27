@@ -483,6 +483,9 @@ pub async fn run_connect(
         payload: Payload::ReverseConnect(ReverseConnectPayload {
             target_fingerprint: target_fingerprint.to_string(),
             username: username.clone(),
+            // Ignored by the server -- it overwrites this with the
+            // authenticated fingerprint of this connection before forwarding.
+            from_fingerprint: String::new(),
         }),
     };
 

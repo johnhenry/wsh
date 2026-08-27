@@ -1265,32 +1265,6 @@ impl WshServer {
     /// Check whether a message type should be forwarded through a relay bridge
     /// rather than processed locally. These are the "data plane" messages that
     /// flow between CLI and browser during a reverse connection.
-    fn is_relay_forwardable(msg_type: MsgType) -> bool {
-        matches!(
-            msg_type,
-            MsgType::Open
-                | MsgType::OpenOk
-                | MsgType::OpenFail
-                | MsgType::Close
-                | MsgType::Exit
-                | MsgType::Resize
-                | MsgType::Signal
-                | MsgType::SessionData
-                | MsgType::GatewayData
-                | MsgType::GatewayOk
-                | MsgType::GatewayFail
-                | MsgType::GatewayClose
-                | MsgType::McpDiscover
-                | MsgType::McpTools
-                | MsgType::McpCall
-                | MsgType::McpResult
-                | MsgType::EchoAck
-                | MsgType::EchoState
-                | MsgType::TermSync
-                | MsgType::TermDiff
-        )
-    }
-
     async fn dispatch_message(
         &self,
         envelope: Envelope,
@@ -1353,13 +1327,32 @@ impl WshServer {
         // them locally. This creates a transparent bidirectional bridge between
         // CLI client and browser peer.
         if let Some(conn_id) = ctx.conn_id {
-            if Self::is_relay_forwardable(envelope.msg_type) {
+            if is_relay_forwardable(envelope.msg_type) {
                 let relay_pairs = self.relay_pairs.read().await;
                 if let Some(&partner_id) = relay_pairs.get(&conn_id) {
                     drop(relay_pairs);
                     let senders = self.peer_senders.read().await;
                     if let Some(sender) = senders.get(&partner_id) {
-                        let _ = sender.try_send(envelope);
+                        // Wrap in RelayForward so the receiving peer can verify
+                        // who actually sent this rather than trusting the relay
+                        // blindly. from_fingerprint is the server's own record
+                        // of this connection's authenticated identity, never a
+                        // client-supplied value.
+                        match wsh_core::cbor_encode(&envelope) {
+                            Ok(inner) => {
+                                let wrapped = Envelope {
+                                    msg_type: MsgType::RelayForward,
+                                    payload: Payload::RelayForward(RelayForwardPayload {
+                                        from_fingerprint: ctx.fingerprint.clone(),
+                                        inner,
+                                    }),
+                                };
+                                let _ = sender.try_send(wrapped);
+                            }
+                            Err(err) => {
+                                warn!(conn_id, %err, "failed to encode relay-forwarded envelope");
+                            }
+                        }
                         return Ok(None); // forwarded, don't process locally
                     }
                     // Partner sender gone — clean up stale relay pair
@@ -1449,6 +1442,7 @@ impl WshServer {
                                 payload: Payload::ReverseConnect(ReverseConnectPayload {
                                     target_fingerprint: p.target_fingerprint.clone(),
                                     username: p.username.clone(),
+                                    from_fingerprint: ctx.fingerprint.clone(),
                                 }),
                             };
                             if target_tx.try_send(fwd).is_err() {

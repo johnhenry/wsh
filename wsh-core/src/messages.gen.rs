@@ -58,6 +58,7 @@ pub enum MsgType {
     ReverseConnect = 0x53,
     ReverseAccept = 0x54,
     ReverseReject = 0x55,
+    RelayForward = 0x56,
 
     SessionList = 0x5f,
     Detach = 0x60,
@@ -180,6 +181,7 @@ impl TryFrom<u8> for MsgType {
             0x53 => Ok(Self::ReverseConnect),
             0x54 => Ok(Self::ReverseAccept),
             0x55 => Ok(Self::ReverseReject),
+            0x56 => Ok(Self::RelayForward),
             0x5f => Ok(Self::SessionList),
             0x60 => Ok(Self::Detach),
             0x61 => Ok(Self::DetachOk),
@@ -233,6 +235,14 @@ impl TryFrom<u8> for MsgType {
             _ => Err(format!("unknown message type: 0x{v:02x}")),
         }
     }
+}
+
+/// Message types a relay may forward inside a RelayForward wrapper.
+pub fn is_relay_forwardable(t: MsgType) -> bool {
+    matches!(
+        t,
+        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff
+    )
 }
 
 /// ChannelKind enum.
@@ -329,6 +339,7 @@ pub enum Payload {
     ReverseConnect(ReverseConnectPayload),
     ReverseAccept(ReverseAcceptPayload),
     ReverseReject(ReverseRejectPayload),
+    RelayForward(RelayForwardPayload),
     SessionList(SessionListPayload),
     Detach(DetachPayload),
     DetachOk(DetachOkPayload),
@@ -432,6 +443,7 @@ impl Payload {
             MsgType::ReverseConnect => Ok(Self::ReverseConnect(ciborium::from_reader(cursor)?)),
             MsgType::ReverseAccept => Ok(Self::ReverseAccept(ciborium::from_reader(cursor)?)),
             MsgType::ReverseReject => Ok(Self::ReverseReject(ciborium::from_reader(cursor)?)),
+            MsgType::RelayForward => Ok(Self::RelayForward(ciborium::from_reader(cursor)?)),
             MsgType::SessionList => Ok(Self::SessionList(ciborium::from_reader(cursor)?)),
             MsgType::Detach => Ok(Self::Detach(ciborium::from_reader(cursor)?)),
             MsgType::DetachOk => Ok(Self::DetachOk(ciborium::from_reader(cursor)?)),
@@ -842,6 +854,7 @@ pub struct ReversePeersPayload {
 pub struct ReverseConnectPayload {
     pub target_fingerprint: String,
     pub username: String,
+    pub from_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -879,6 +892,14 @@ pub struct ReverseRejectPayload {
     pub target_fingerprint: String,
     pub username: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayForwardPayload {
+    pub from_fingerprint: String,
+    #[serde(with = "serde_bytes")]
+    pub inner: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

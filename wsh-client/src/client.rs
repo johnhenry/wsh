@@ -3,7 +3,7 @@
 //! `WshClient` manages the connection lifecycle: transport selection, handshake,
 //! authentication, session management, and keepalive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +82,12 @@ pub struct WshClient {
     reverse_connect_rx: Arc<Mutex<Option<mpsc::Receiver<Envelope>>>>,
     /// Receiver for relay-forwarded control/data messages (take-once).
     relay_message_rx: Arc<Mutex<Option<mpsc::Receiver<Envelope>>>>,
+    /// Fingerprints of reverse-connect peers this client has accepted a
+    /// bridge with. RelayForward-wrapped messages are only unwrapped and
+    /// delivered if their from_fingerprint is in this set -- populated by
+    /// app code via `trust_relay_peer` once it decides to accept/establish
+    /// a given peer (see `ReverseConnectPayload.from_fingerprint`).
+    accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Server-provided session summary from `SessionList`.
@@ -125,6 +131,7 @@ impl WshClient {
         let reverse_connect_rx = Arc::new(Mutex::new(Some(rc_rx)));
         let (relay_tx, relay_rx) = mpsc::channel::<Envelope>(128);
         let relay_message_rx = Arc::new(Mutex::new(Some(relay_rx)));
+        let accepted_relay_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let mut client = Self {
             transport: transport.clone(),
@@ -139,6 +146,7 @@ impl WshClient {
             connected: connected.clone(),
             reverse_connect_rx,
             relay_message_rx,
+            accepted_relay_peers: accepted_relay_peers.clone(),
         };
 
         // Perform handshake with timeout
@@ -159,6 +167,7 @@ impl WshClient {
             let sessions = sessions.clone();
             let connected = connected.clone();
             let outgoing_tx_clone = outgoing_tx.clone();
+            let accepted_relay_peers = accepted_relay_peers.clone();
 
             tokio::spawn(async move {
                 Self::dispatch_loop(
@@ -171,6 +180,7 @@ impl WshClient {
                     outgoing_tx_clone,
                     Some(rc_tx),
                     Some(relay_tx),
+                    accepted_relay_peers,
                 )
                 .await;
             })
@@ -253,6 +263,23 @@ impl WshClient {
     /// Can only be called once.
     pub async fn take_relay_message_rx(&self) -> Option<mpsc::Receiver<Envelope>> {
         self.relay_message_rx.lock().await.take()
+    }
+
+    /// Mark a peer fingerprint as an accepted reverse-connect bridge partner.
+    ///
+    /// Call this once a `ReverseConnect` has been accepted (either side):
+    /// the target after sending `ReverseAccept` in response to an incoming
+    /// request, or the operator after receiving `ReverseAccept` for a
+    /// request it sent. Only `RelayForward`-wrapped messages whose
+    /// `from_fingerprint` is trusted this way are unwrapped and delivered.
+    pub async fn trust_relay_peer(&self, fingerprint: String) {
+        self.accepted_relay_peers.lock().await.insert(fingerprint);
+    }
+
+    /// Stop trusting a peer as a relay-forward bridge partner (e.g. on
+    /// session end).
+    pub async fn untrust_relay_peer(&self, fingerprint: &str) {
+        self.accepted_relay_peers.lock().await.remove(fingerprint);
     }
 
     /// Send a control message without waiting for any response (fire-and-forget).
@@ -727,6 +754,7 @@ impl WshClient {
         outgoing_tx: mpsc::Sender<Vec<u8>>,
         reverse_connect_tx: Option<mpsc::Sender<Envelope>>,
         relay_message_tx: Option<mpsc::Sender<Envelope>>,
+        accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
     ) {
         loop {
             let is_connected = { *connected.lock().await };
@@ -796,6 +824,7 @@ impl WshClient {
                                         &outgoing_tx,
                                         &reverse_connect_tx,
                                         &relay_message_tx,
+                                        &accepted_relay_peers,
                                     ).await;
                                 }
                                 Err(e) => {
@@ -818,14 +847,58 @@ impl WshClient {
     }
 
     /// Handle an incoming control message.
-    async fn handle_incoming(
+    fn handle_incoming<'a>(
         envelope: Envelope,
-        response_tx: &Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
-        sessions: &Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
-        outgoing_tx: &mpsc::Sender<Vec<u8>>,
-        reverse_connect_tx: &Option<mpsc::Sender<Envelope>>,
-        relay_message_tx: &Option<mpsc::Sender<Envelope>>,
-    ) {
+        response_tx: &'a Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        sessions: &'a Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
+        outgoing_tx: &'a mpsc::Sender<Vec<u8>>,
+        reverse_connect_tx: &'a Option<mpsc::Sender<Envelope>>,
+        relay_message_tx: &'a Option<mpsc::Sender<Envelope>>,
+        accepted_relay_peers: &'a Arc<Mutex<HashSet<String>>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+        // Unwrap RelayForward: only deliver the inner message if it came
+        // from a peer this client has actually accepted a bridge with, and
+        // only if the inner message's own type is on the shared
+        // relay-forwardable allowlist (defense in depth against a
+        // misbehaving or compromised relay server).
+        if let MsgType::RelayForward = envelope.msg_type {
+            if let Payload::RelayForward(p) = &envelope.payload {
+                let trusted = accepted_relay_peers.lock().await.contains(&p.from_fingerprint);
+                if !trusted {
+                    tracing::warn!(
+                        from = %p.from_fingerprint,
+                        "dropping RelayForward from untrusted/unaccepted peer"
+                    );
+                    return;
+                }
+                match decode_envelope(&p.inner) {
+                    Ok(inner) if is_relay_forwardable(inner.msg_type) => {
+                        Self::handle_incoming(
+                            inner,
+                            response_tx,
+                            sessions,
+                            outgoing_tx,
+                            reverse_connect_tx,
+                            relay_message_tx,
+                            accepted_relay_peers,
+                        )
+                        .await;
+                    }
+                    Ok(inner) => {
+                        tracing::warn!(
+                            msg_type = ?inner.msg_type,
+                            "dropping RelayForward wrapping a non-forwardable message type"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to decode RelayForward inner envelope");
+                    }
+                }
+            }
+            return;
+        }
+
         let msg_type_u8: u8 = envelope.msg_type.into();
 
         match envelope.msg_type {
@@ -958,33 +1031,8 @@ impl WshClient {
                 tracing::debug!("unhandled control message: {:?}", MsgType::try_from(msg_type_u8));
             }
         }
+        })
     }
-}
-
-fn is_relay_forwardable(msg_type: MsgType) -> bool {
-    matches!(
-        msg_type,
-        MsgType::Open
-            | MsgType::OpenOk
-            | MsgType::OpenFail
-            | MsgType::Close
-            | MsgType::Exit
-            | MsgType::Resize
-            | MsgType::Signal
-            | MsgType::SessionData
-            | MsgType::GatewayData
-            | MsgType::GatewayOk
-            | MsgType::GatewayFail
-            | MsgType::GatewayClose
-            | MsgType::McpDiscover
-            | MsgType::McpTools
-            | MsgType::McpCall
-            | MsgType::McpResult
-            | MsgType::EchoAck
-            | MsgType::EchoState
-            | MsgType::TermSync
-            | MsgType::TermDiff
-    )
 }
 
 fn envelope_channel_id(envelope: &Envelope) -> Option<u32> {
@@ -1053,7 +1101,7 @@ impl Drop for WshClient {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use tokio::sync::{mpsc, Mutex};
@@ -1148,6 +1196,7 @@ mod tests {
             &outgoing_tx,
             &None,
             &None,
+            &Arc::new(Mutex::new(HashSet::new())),
         )
         .await;
 
@@ -1182,6 +1231,7 @@ mod tests {
             &outgoing_tx,
             &None,
             &None,
+            &Arc::new(Mutex::new(HashSet::new())),
         )
         .await;
 
@@ -1209,6 +1259,7 @@ mod tests {
             &outgoing_tx,
             &None,
             &Some(relay_tx),
+            &Arc::new(Mutex::new(HashSet::new())),
         )
         .await;
 
@@ -1244,6 +1295,7 @@ mod tests {
             connected: Arc::new(Mutex::new(true)),
             reverse_connect_rx: Arc::new(Mutex::new(None)),
             relay_message_rx: Arc::new(Mutex::new(None)),
+            accepted_relay_peers: Arc::new(Mutex::new(HashSet::new())),
         };
 
         let response_task = tokio::spawn(async move {

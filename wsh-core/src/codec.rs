@@ -25,6 +25,13 @@ pub fn cbor_decode<T: serde::de::DeserializeOwned>(data: &[u8]) -> WshResult<T> 
     Ok(value)
 }
 
+/// Encode a value into a bare CBOR payload (without length prefix).
+pub fn cbor_encode<T: serde::Serialize>(value: &T) -> WshResult<Vec<u8>> {
+    let mut payload = Vec::new();
+    ciborium::into_writer(value, &mut payload)?;
+    Ok(payload)
+}
+
 /// Decode an envelope using the message type to disambiguate flattened payloads.
 pub fn decode_envelope(data: &[u8]) -> WshResult<Envelope> {
     #[derive(serde::Deserialize)]

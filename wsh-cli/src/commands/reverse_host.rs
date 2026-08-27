@@ -290,7 +290,9 @@ impl ReverseHostRuntime {
                     "reattaching reverse host connection"
                 );
                 self.active_request = Some(request.clone());
-                self.client()?
+                let client = self.client()?;
+                client.trust_relay_peer(request.from_fingerprint.clone()).await;
+                client
                     .send_fire_and_forget(Envelope {
                         msg_type: MsgType::ReverseAccept,
                         payload: Payload::ReverseAccept(self.options.reverse_accept_payload(request)),
@@ -325,7 +327,9 @@ impl ReverseHostRuntime {
         })
         .await;
         self.active_request = Some(request.clone());
-        self.client()?
+        let client = self.client()?;
+        client.trust_relay_peer(request.from_fingerprint.clone()).await;
+        client
             .send_fire_and_forget(Envelope {
                 msg_type: MsgType::ReverseAccept,
                 payload: Payload::ReverseAccept(self.options.reverse_accept_payload(request)),
@@ -1947,14 +1951,17 @@ mod tests {
         let left = ReverseConnectPayload {
             target_fingerprint: "fp".into(),
             username: "alice".into(),
+            from_fingerprint: "operator".into(),
         };
         let right = ReverseConnectPayload {
             target_fingerprint: "fp".into(),
             username: "alice".into(),
+            from_fingerprint: "operator".into(),
         };
         let wrong_user = ReverseConnectPayload {
             target_fingerprint: "fp".into(),
             username: "bob".into(),
+            from_fingerprint: "operator".into(),
         };
 
         assert!(same_reverse_request(&left, &right));
