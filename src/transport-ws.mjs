@@ -16,7 +16,7 @@
  */
 
 import { frameEncode, FrameDecoder, FrameSizeError } from './cbor.mjs';
-import { WshTransport } from './transport.mjs';
+import { WshTransport, dispatchSerially, SerialQueue } from './transport.mjs';
 
 // ── Frame type constants ─────────────────────────────────────────────
 //
@@ -207,25 +207,15 @@ export class WebSocketTransport extends WshTransport {
   #closedByUs = false;
 
   /**
-   * Queue of raw inbound messages awaiting dispatch, plus a drain-in-progress
-   * flag. Needed because some `WebSocket` implementations (notably Node's
-   * `ws` package parsing several frames out of one TCP read) can fire
-   * multiple synchronous `message` events within a single JS task, all
-   * before any microtask gets to run. If we dispatched each message inline,
-   * a handler that resolves a pending waiter (e.g. SERVER_HELLO resolving
-   * the "wait for SERVER_HELLO or CHALLENGE" promise) wouldn't get a chance
-   * to run its `await`'d continuation — which registers the *next* waiter
-   * (e.g. for CHALLENGE) — before the next queued message arrives. That
-   * continuation is a microtask; a same-task, no-yield dispatch loop starves
-   * it, so the next message's waiter isn't registered yet and gets dropped.
-   * Draining the queue with an `await Promise.resolve()` between each
-   * message yields to the microtask queue after every dispatch, and since
-   * microtasks run FIFO, any continuation queued by handling message N
-   * (which runs first) completes before message N+1 is dispatched.
-   * @type {ArrayBuffer[]}
+   * Serializes dispatch of raw inbound WebSocket messages. Needed because
+   * some `WebSocket` implementations (notably Node's `ws` package parsing
+   * several frames out of one TCP read) can fire multiple synchronous
+   * `message` events within a single JS task, all before any microtask
+   * gets to run — see `SerialQueue`'s doc comment in transport.mjs for
+   * why dispatching those inline would be unsafe.
+   * @type {SerialQueue}
    */
-  #messageQueue = [];
-  #draining = false;
+  #inbox = new SerialQueue((raw) => this.#handleMessage(raw));
 
   // ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -236,8 +226,7 @@ export class WebSocketTransport extends WshTransport {
     this.#nextLocalId = 1;
     this.#openResolvers.clear();
     this.#closedByUs = false;
-    this.#messageQueue.length = 0;
-    this.#draining = false;
+    this.#inbox.clear();
 
     return new Promise((resolve, reject) => {
       // Normalize URL scheme: wsh:// → wss://, http:// → ws://.
@@ -265,8 +254,7 @@ export class WebSocketTransport extends WshTransport {
       });
 
       ws.addEventListener('message', (ev) => {
-        this.#messageQueue.push(ev.data);
-        this.#drainMessageQueue();
+        this.#inbox.push(ev.data);
       });
     });
   }
@@ -320,33 +308,14 @@ export class WebSocketTransport extends WshTransport {
   // ── Inbound message dispatch ───────────────────────────────────────
 
   /**
-   * Drain `#messageQueue` one message at a time, yielding to the microtask
-   * queue between each dispatch. See the `#messageQueue` field doc for why:
-   * this is what lets a waiter registered by an earlier message's `await`
-   * continuation (e.g. registering the CHALLENGE waiter after SERVER_HELLO
-   * resolves) actually be in place before the next queued message arrives,
-   * even when the underlying WebSocket implementation delivered several
-   * messages synchronously in one task.
-   */
-  async #drainMessageQueue() {
-    if (this.#draining) return;
-    this.#draining = true;
-    try {
-      while (this.#messageQueue.length > 0) {
-        const raw = this.#messageQueue.shift();
-        this.#handleMessage(raw);
-        await Promise.resolve();
-      }
-    } finally {
-      this.#draining = false;
-    }
-  }
-
-  /**
-   * Handle a raw WebSocket message (ArrayBuffer).
+   * Handle a raw WebSocket message (ArrayBuffer). Called serially by
+   * `#inbox` — never invoked directly from the `message` event listener.
+   * Async (and awaited by `#inbox`'s SerialQueue) because the
+   * FRAME_CONTROL case can itself dispatch several decoded messages —
+   * see `#handleControlFrame`.
    * @param {ArrayBuffer} raw
    */
-  #handleMessage(raw) {
+  async #handleMessage(raw) {
     if (typeof raw === 'string') {
       this._emitError(new Error('Received text WebSocket frame; expected binary'));
       return;
@@ -363,7 +332,7 @@ export class WebSocketTransport extends WshTransport {
 
     switch (frame.type) {
       case FRAME_CONTROL:
-        this.#handleControlFrame(frame.payload);
+        await this.#handleControlFrame(frame.payload);
         break;
       case FRAME_DATA:
         this.#handleDataFrame(frame.streamId, frame.payload);
@@ -380,10 +349,14 @@ export class WebSocketTransport extends WshTransport {
   }
 
   /**
-   * Decode CBOR-framed control messages from stream 0.
+   * Decode CBOR-framed control messages from stream 0. A single mux
+   * frame's payload can decode into more than one protocol message (the
+   * CBOR decoder is stateful/streaming), so dispatch uses
+   * `dispatchSerially` — see its doc comment for why a plain for-loop
+   * here would be unsafe.
    * @param {Uint8Array} payload
    */
-  #handleControlFrame(payload) {
+  async #handleControlFrame(payload) {
     let messages;
     try {
       messages = this.#decoder.feed(payload);
@@ -396,9 +369,7 @@ export class WebSocketTransport extends WshTransport {
       }
       return;
     }
-    for (const msg of messages) {
-      this._emitControl(msg);
-    }
+    await dispatchSerially(messages, (msg) => this._emitControl(msg));
   }
 
   /**

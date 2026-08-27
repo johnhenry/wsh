@@ -7,6 +7,97 @@
 
 import { frameEncode, FrameDecoder, cborEncode, FrameSizeError } from './cbor.mjs';
 
+// ── Serial dispatch (shared by both transports) ───────────────────────
+//
+// A push-based transport can hand this library more than one decoded
+// protocol message at once — either because several arrived in a single
+// underlying read (e.g. multiple WebSocket `message` events fired
+// synchronously from one TCP read, or one CBOR decoder call returning
+// several frames from one already-received chunk) — with no guaranteed
+// yield to the microtask queue between them. That matters because a
+// message handler can be `async`: it resolves a pending waiter
+// synchronously, but the code that runs *after* that resolution (e.g.
+// registering the *next* waiter) only runs as a microtask continuation.
+// Dispatching message N+1 before that continuation gets a turn means
+// N+1 arrives with state that N's handling hasn't finished setting up
+// yet — most visibly, a dropped CHALLENGE that arrived batched with
+// SERVER_HELLO (see CHANGELOG 0.3.0). `dispatchSerially` and
+// `SerialQueue` both fix this the same way: yield to the microtask
+// queue after every single dispatch, so FIFO microtask ordering
+// guarantees any continuation queued by message N runs before message
+// N+1 is handled.
+
+/**
+ * Invoke `handler` once per item in `items`, awaiting each call before
+ * starting the next. Use this for a *fixed* batch that's already fully
+ * available (e.g. everything a single decoder.feed() call returned) —
+ * see `SerialQueue` for items that arrive incrementally over time via a
+ * push callback.
+ *
+ * `handler` may be sync or async — either way, `await handler(item)`
+ * yields to the microtask queue at least once before the next item is
+ * dispatched (awaiting any value does, even a plain `undefined`), and if
+ * `handler` is itself async, this also waits for its *own* internal work
+ * (including any nested dispatchSerially/SerialQueue use) to fully
+ * settle first. That matters when a handler for item N does async work
+ * that must complete before N+1 is safe to dispatch — a fire-and-forget
+ * (non-awaited) handler call wouldn't provide that guarantee, only a
+ * same-tick yield.
+ * @param {Iterable<*>} items
+ * @param {(item: *) => (void | Promise<void>)} handler
+ */
+export async function dispatchSerially(items, handler) {
+  for (const item of items) {
+    await handler(item);
+  }
+}
+
+/**
+ * A queue drained one item at a time, awaiting each dispatch before
+ * starting the next (see `dispatchSerially`'s doc comment for exactly
+ * what that guarantees for sync vs. async handlers). Use this where
+ * items arrive incrementally over time via a push callback (e.g. a
+ * transport's raw `message` event) rather than as one fixed,
+ * already-available batch (see `dispatchSerially` for that case).
+ * `push()` is safe to call at any time, including while a previous
+ * drain is still in progress — the same drain loop just picks up the
+ * newly-pushed item in its next iteration.
+ */
+export class SerialQueue {
+  #items = [];
+  #handler;
+  #draining = false;
+
+  /** @param {(item: *) => (void | Promise<void>)} handler */
+  constructor(handler) {
+    this.#handler = handler;
+  }
+
+  /** @param {*} item */
+  push(item) {
+    this.#items.push(item);
+    this.#drain();
+  }
+
+  /** Discard any queued-but-not-yet-dispatched items (e.g. on reconnect). */
+  clear() {
+    this.#items.length = 0;
+  }
+
+  async #drain() {
+    if (this.#draining) return;
+    this.#draining = true;
+    try {
+      while (this.#items.length > 0) {
+        const item = this.#items.shift();
+        await this.#handler(item);
+      }
+    } finally {
+      this.#draining = false;
+    }
+  }
+}
+
 // ── Transport states ─────────────────────────────────────────────────
 
 const STATE_DISCONNECTED = 'disconnected';
@@ -278,23 +369,13 @@ export class WebTransportTransport extends WshTransport {
         const { done, value } = await reader.read();
         if (done) break;
 
+        // A QUIC stream has no per-message framing at the transport layer,
+        // so a single read() can return bytes for several messages at
+        // once (e.g. SERVER_HELLO immediately followed by CHALLENGE).
+        // dispatchSerially yields between each — see its doc comment for
+        // why that matters.
         const messages = this.#decoder.feed(value);
-        for (const msg of messages) {
-          this._emitControl(msg);
-          // Yield to the microtask queue between messages. A QUIC stream
-          // has no per-message framing at the transport layer, so a single
-          // read() can return bytes for several messages at once (e.g.
-          // SERVER_HELLO immediately followed by CHALLENGE). Emitting them
-          // in a tight synchronous loop starves any `await`'d continuation
-          // triggered by handling an earlier message (e.g. registering the
-          // CHALLENGE waiter after SERVER_HELLO resolves) — that
-          // continuation is a microtask, and without a yield here it never
-          // gets to run before the next message is dispatched. Since
-          // microtasks run FIFO, a continuation queued while handling msg
-          // N always completes before this yield's own continuation
-          // resumes to dispatch msg N+1.
-          await Promise.resolve();
-        }
+        await dispatchSerially(messages, (msg) => this._emitControl(msg));
       }
     } catch (err) {
       if (!this.#abort.signal.aborted) {

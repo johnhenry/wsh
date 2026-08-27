@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.0
+
+- **Fixed a second instance of the 0.3.0 dispatch race, and deduplicated
+  the fix into two shared, exported primitives.** Auditing for the same
+  bug shape after 0.3.0 found `WebSocketTransport#handleControlFrame`
+  had it too: a single mux frame's payload can decode into more than one
+  protocol message (the CBOR decoder is stateful/streaming), and the
+  dispatch loop for those decoded messages had no yield between them —
+  the same unsafe shape as the message-arrival-level race 0.3.0 fixed,
+  just one layer deeper, and previously missed.
+  - New exports: `dispatchSerially(items, handler)` for dispatching a
+    fixed, already-available batch one at a time, and `SerialQueue`
+    for items arriving incrementally via a push callback (e.g. a raw
+    transport `message` event) — both documented with why a plain
+    for-loop or naive queue is unsafe here. Both transports' three
+    separate hand-rolled instances of this pattern (the 0.3.0 fix in
+    each transport, plus this newly-found one) are now this one
+    reviewed, tested implementation.
+  - Both primitives `await handler(item)` rather than firing it and
+    yielding separately, so a handler that's itself async (e.g. one
+    that internally calls `dispatchSerially` again) is *fully* waited
+    on before the next item dispatches, not just yielded past for one
+    microtask tick.
+  - New `test/serial-dispatch.test.mjs`: adversarial tests that
+    deterministically reproduce the race shape (rather than relying on
+    incidentally-timed real traffic to trigger it), so a future change
+    that reintroduces a fire-and-forget dispatch loop fails a fast, direct
+    test instead of surfacing as an intermittent hang.
+
 ## 0.4.0
 
 - **`Challenge` now carries `session_id` directly.** The auth transcript's
