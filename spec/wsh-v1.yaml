@@ -641,11 +641,21 @@ messages:
       description: >
         Connect to a registered reverse peer by fingerprint.
         The server forwards the request to the target peer.
+        from_fingerprint identifies the requesting operator and MUST be
+        set by the server from the operator's own authenticated identity
+        when forwarding to the target -- never trust a client-supplied
+        value for this field, since the whole point is telling the
+        target who is actually asking. Before this field existed, a
+        target peer's onReverseConnect handler had no reliable way to
+        know who was requesting the connection at all.
       fields:
         target_fingerprint:
           type: string
           required: true
         username:
+          type: string
+          required: true
+        from_fingerprint:
           type: string
           required: true
 
@@ -697,6 +707,33 @@ messages:
           required: true
         reason:
           type: string
+          required: true
+
+    RelayForward:
+      code: 0x56
+      description: >
+        Wraps a message the relay is forwarding between two peers over an
+        established reverse connection (post-handshake channel/session/
+        tool traffic -- Open, Close, McpCall, SessionData, etc; see each
+        message's relay_forwardable flag for the full set). from_fingerprint
+        is the ORIGINATING peer's authenticated identity, set by the relay
+        server -- never trust a client-supplied value. inner is the
+        complete CBOR-encoded envelope bytes of the forwarded message,
+        opaque at this layer (decode it as a normal envelope once
+        from_fingerprint has been checked against the receiving client's
+        own set of peers it has an accepted reverse-connection with, and
+        the decoded inner message's type has been checked against the
+        relay_forwardable allowlist). Introduced to close two gaps:
+        forwarded traffic previously carried no sender identity at all,
+        and the client/server relay_forwardable allowlists had drifted
+        out of sync because each was hand-maintained separately instead
+        of generated from one source of truth.
+      fields:
+        from_fingerprint:
+          type: string
+          required: true
+        inner:
+          type: bytes
           required: true
 
   # ── Gateway subsystem ────────────────────────────────────────────────
@@ -1657,3 +1694,11 @@ transport:
       open_stream: 0x03
       close_stream: 0x04
     note: "Stream 0 carries length-prefixed CBOR control messages (frameEncode/FrameDecoder); other stream IDs carry raw data bytes with no extra framing. See src/transport-ws.mjs for the reference implementation."
+
+relay:
+  # Single source of truth for which message types a relay may forward
+  # inside a RelayForward wrapper. Generated into JS (RELAY_FORWARDABLE,
+  # a Set) and Rust (is_relay_forwardable(), a match) by codegen.mjs, so
+  # the two implementations can no longer drift out of sync the way the
+  # hand-maintained allowlists did before RelayForward existed.
+  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, PolicyEval, EchoAck, EchoState, TermSync, TermDiff]

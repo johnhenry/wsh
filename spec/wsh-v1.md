@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 94
+- **Total message types**: 95
 
 ## Enums
 
@@ -103,6 +103,7 @@ Type: `string`
 | `0x53` | ReverseConnect | reverse |
 | `0x54` | ReverseAccept | reverse |
 | `0x55` | ReverseReject | reverse |
+| `0x56` | RelayForward | reverse |
 | `0x5f` | SessionList | session |
 | `0x60` | Detach | session |
 | `0x61` | DetachOk | session |
@@ -621,6 +622,7 @@ Category: **reverse**
 |-------|------|----------|---------|
 | `target_fingerprint` | `string` | yes | — |
 | `username` | `string` | yes | — |
+| `from_fingerprint` | `string` | yes | — |
 
 ### ReverseAccept (`0x54`)
 
@@ -651,6 +653,17 @@ Category: **reverse**
 | `target_fingerprint` | `string` | yes | — |
 | `username` | `string` | yes | — |
 | `reason` | `string` | yes | — |
+
+### RelayForward (`0x56`)
+
+Category: **reverse**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `from_fingerprint` | `string` | yes | — |
+| `inner` | `bytes` | yes | — |
 
 ### SessionList (`0x5f`)
 

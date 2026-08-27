@@ -17,6 +17,7 @@ export {
   presence, controlChanged, metrics,
   mcpDiscover, mcpTools, mcpCall, mcpResult,
   reverseRegister, reverseList, reversePeers, reverseConnect, reverseAccept, reverseReject,
+  relayForward, RELAY_FORWARDABLE, isRelayForwardable,
   openTcp, openUdp, resolveDns, gatewayOk, gatewayFail, gatewayClose,
   inboundOpen, inboundAccept, inboundReject, dnsResult,
   listenRequest, listenOk, listenFail, listenClose, gatewayData,

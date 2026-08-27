@@ -371,6 +371,25 @@ function emitJS(schema) {
     out.push('');
   }
 
+  // Relay-forwardable allowlist (single source of truth: schema.relay.forwardable)
+  out.push('// ── Relay forwarding ─────────────────────────────────────────────────');
+  out.push('');
+  out.push('// Message types a relay may forward inside a RelayForward wrapper.');
+  out.push('export const RELAY_FORWARDABLE = new Set([');
+  for (const name of schema.relay.forwardable) {
+    out.push(`  MSG.${toScreamingSnake(name)},`);
+  }
+  out.push(']);');
+  out.push('');
+  out.push('/**');
+  out.push(' * @param {number} typeNum');
+  out.push(' * @returns {boolean}');
+  out.push(' */');
+  out.push('export function isRelayForwardable(typeNum) {');
+  out.push('  return RELAY_FORWARDABLE.has(typeNum);');
+  out.push('}');
+  out.push('');
+
   // Utility functions
   out.push('// ── Utility ───────────────────────────────────────────────────────────');
   out.push('');
@@ -579,6 +598,19 @@ function emitRust(schema) {
   out.push('            _ => Err(format!("unknown message type: 0x{v:02x}")),');
   out.push('        }');
   out.push('    }');
+  out.push('}');
+  out.push('');
+
+  // Relay-forwardable allowlist (single source of truth: schema.relay.forwardable)
+  out.push('/// Message types a relay may forward inside a RelayForward wrapper.');
+  out.push('pub fn is_relay_forwardable(t: MsgType) -> bool {');
+  out.push('    matches!(');
+  out.push('        t,');
+  out.push(
+    '        ' +
+      schema.relay.forwardable.map(name => `MsgType::${name}`).join(' | ')
+  );
+  out.push('    )');
   out.push('}');
   out.push('');
 

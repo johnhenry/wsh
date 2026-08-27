@@ -421,6 +421,7 @@ export function reversePeers(opts?: {
 export function reverseConnect(opts?: {
   targetFingerprint?: string;
   username?: string;
+  fromFingerprint?: string;
 }): WshMessage;
 
 export function reverseAccept(opts?: {
@@ -440,6 +441,16 @@ export function reverseReject(opts?: {
   username?: string;
   reason?: string;
 }): WshMessage;
+
+export function relayForward(opts?: {
+  fromFingerprint?: string;
+  inner?: Uint8Array;
+}): WshMessage;
+
+/** Message types a relay may forward inside a RelayForward wrapper. */
+export const RELAY_FORWARDABLE: ReadonlySet<number>;
+
+export function isRelayForwardable(typeNum: number): boolean;
 
 // -- Message constructors (gateway) --
 
@@ -1094,6 +1105,18 @@ export class WshClient {
    * Send a control message over the authenticated relay connection.
    */
   sendRelayControl(msg: WshMessage): Promise<void>;
+
+  /**
+   * Mark a peer fingerprint as an accepted reverse-connect bridge partner.
+   * Only RelayForward-wrapped messages whose from_fingerprint is trusted
+   * this way are unwrapped and delivered via onRelayMessage.
+   */
+  trustRelayPeer(fingerprint: string): void;
+
+  /**
+   * Stop trusting a peer as a relay-forward bridge partner.
+   */
+  untrustRelayPeer(fingerprint: string): void;
 
   /**
    * Upload a blob to a remote path.

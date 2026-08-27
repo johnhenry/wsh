@@ -29,9 +29,11 @@ import {
   keyExchange as keyExchangeMsg,
   fileOp as fileOpMsg,
   policyEval as policyEvalMsg, policyUpdate as policyUpdateMsg,
+  isRelayForwardable,
 } from './messages.mjs';
 import { signChallenge, exportPublicKeyRaw } from './auth.mjs';
 import { WshSession } from './session.mjs';
+import { cborDecode } from './cbor.mjs';
 
 // ── Client states ─────────────────────────────────────────────────────
 
@@ -137,6 +139,14 @@ export class WshClient {
 
   /** @type {Map<number, WshSession>} Active sessions keyed by channel ID. */
   #sessions = new Map();
+
+  /**
+   * Fingerprints of reverse-connect peers this client has accepted a relay
+   * bridge with. RelayForward-wrapped messages are only unwrapped and
+   * delivered if their from_fingerprint is in this set — see trustRelayPeer.
+   * @type {Set<string>}
+   */
+  #acceptedRelayPeers = new Set();
 
   /** @type {number} Monotonically increasing channel ID counter. */
   #channelCounter = 0;
@@ -778,14 +788,22 @@ export class WshClient {
     this.#assertAuthenticated('reverseConnect');
 
     await this.#transport.sendControl(
-      reverseConnectMsg({ targetFingerprint, username: '' })
+      // fromFingerprint is ignored by the server -- it overwrites it with
+      // this connection's own authenticated fingerprint before forwarding.
+      reverseConnectMsg({ targetFingerprint, username: '', fromFingerprint: '' })
     );
 
-    return this.#waitForMessage(
+    const response = await this.#waitForMessage(
       [MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT],
       timeout,
       'Timed out waiting for reverse-connect response'
     );
+
+    if (response.type === MSG.REVERSE_ACCEPT) {
+      this.trustRelayPeer(response.target_fingerprint);
+    }
+
+    return response;
   }
 
   /**
@@ -800,6 +818,30 @@ export class WshClient {
   async sendRelayControl(msg) {
     this.#assertAuthenticated('sendRelayControl');
     await this.#transport.sendControl(msg);
+  }
+
+  /**
+   * Mark a peer fingerprint as an accepted reverse-connect bridge partner.
+   *
+   * Call this once a ReverseConnect has been accepted (either side): the
+   * target after sending ReverseAccept in response to an incoming request
+   * (using the request's from_fingerprint), or the operator after receiving
+   * ReverseAccept for a request it sent (handled automatically by
+   * reverseConnect()). Only RelayForward-wrapped messages whose
+   * from_fingerprint is trusted this way are unwrapped and delivered.
+   *
+   * @param {string} fingerprint
+   */
+  trustRelayPeer(fingerprint) {
+    this.#acceptedRelayPeers.add(fingerprint);
+  }
+
+  /**
+   * Stop trusting a peer as a relay-forward bridge partner (e.g. on session end).
+   * @param {string} fingerprint
+   */
+  untrustRelayPeer(fingerprint) {
+    this.#acceptedRelayPeers.delete(fingerprint);
   }
 
   // ── File transfer ───────────────────────────────────────────────────
@@ -1502,6 +1544,33 @@ export class WshClient {
   #handleControl(msg) {
     const type = msg.type;
 
+    // Unwrap RelayForward: only deliver the inner message if it came from a
+    // peer this client has actually accepted a bridge with (see
+    // trustRelayPeer), and only if the inner message's own type is on the
+    // shared relay-forwardable allowlist (defense in depth against a
+    // misbehaving or compromised relay server). from_fingerprint is set by
+    // the server from the sender's authenticated identity -- never trust it
+    // beyond checking membership in #acceptedRelayPeers.
+    if (type === MSG.RELAY_FORWARD) {
+      if (!this.#acceptedRelayPeers.has(msg.from_fingerprint)) {
+        console.warn('[wsh:client] dropping RelayForward from untrusted/unaccepted peer:', msg.from_fingerprint);
+        return;
+      }
+      let inner;
+      try {
+        inner = cborDecode(msg.inner);
+      } catch (err) {
+        console.error('[wsh:client] failed to decode RelayForward inner envelope:', err);
+        return;
+      }
+      if (!isRelayForwardable(inner.type)) {
+        console.warn('[wsh:client] dropping RelayForward wrapping a non-forwardable type:', inner.type);
+        return;
+      }
+      this.#handleControl(inner);
+      return;
+    }
+
     // First, check if any waiters are listening for this message type.
     if (this.#waiters.has(type)) {
       const queue = this.#waiters.get(type);
@@ -1802,22 +1871,15 @@ export class WshClient {
    * that a client would not normally receive from the server, but that
    * arrives via the relay bridge from a remote CLI peer.
    *
+   * Backed by the generated allowlist (single source of truth: the
+   * `relay.forwardable` list in spec/wsh-v1.yaml) so this can no longer
+   * drift out of sync with the server's own allowlist.
+   *
    * @param {number} type - Message opcode
    * @returns {boolean}
    */
   _isRelayForwardable(type) {
-    return [
-      MSG.OPEN, MSG.MCP_DISCOVER, MSG.MCP_CALL,
-      MSG.CLOSE, MSG.RESIZE, MSG.SIGNAL,
-      MSG.SESSION_DATA,
-      MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT,
-      MSG.GUEST_JOIN, MSG.GUEST_REVOKE,         // Unit 4
-      MSG.COPILOT_ATTACH, MSG.COPILOT_DETACH,   // Unit 9
-      MSG.FILE_OP,                               // Unit 11
-      MSG.POLICY_EVAL,                           // Unit 12
-      MSG.ECHO_ACK, MSG.ECHO_STATE,
-      MSG.TERM_SYNC, MSG.TERM_DIFF,
-    ].includes(type);
+    return isRelayForwardable(type);
   }
 
   /**

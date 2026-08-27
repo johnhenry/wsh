@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.8.0
+
+- **Relay-forward sender identity + unified allowlist (breaking).**
+  Relay-forwarded traffic previously carried no sender identity at all,
+  and the client/server "which message types may be relay-forwarded"
+  allowlists had drifted out of sync (hand-maintained separately, 19 vs
+  21 opcodes). Fixes:
+  - `ReverseConnect` gains a required `from_fingerprint` field, filled by
+    the relay server from the requester's authenticated identity — never
+    trust a client-supplied value.
+  - New `RelayForward` message (`0x56`) wraps traffic the relay forwards
+    over an established reverse connection (`Open`, `Close`, `McpCall`,
+    `SessionData`, etc.) in `{from_fingerprint, inner}`, where
+    `from_fingerprint` is set by the relay server and `inner` is the
+    complete CBOR-encoded envelope bytes of the forwarded message.
+  - New top-level `relay.forwardable` list in `spec/wsh-v1.yaml` is now
+    the single source of truth for which message types may be relay
+    forwarded, generated into a JS `RELAY_FORWARDABLE` Set +
+    `isRelayForwardable()` and a Rust `is_relay_forwardable()`.
+  - `WshClient` now tracks accepted relay-bridge peers (`trustRelayPeer`/
+    `untrustRelayPeer`) and only unwraps + delivers a `RelayForward` if
+    its `from_fingerprint` is a peer the app has actually accepted a
+    bridge with, and the decoded inner message's type is on the
+    allowlist. `reverseConnect()` trusts the target automatically on
+    `ReverseAccept`; apps handling incoming `ReverseConnect` should call
+    `trustRelayPeer(msg.from_fingerprint)` once they accept.
+
 ## 0.7.0
 
 - **New exports**: `WS_FRAME_TYPE` (the WebSocket transport's mux

@@ -62,6 +62,7 @@ export const MSG = Object.freeze({
   REVERSE_CONNECT:   0x53,
   REVERSE_ACCEPT:    0x54,
   REVERSE_REJECT:    0x55,
+  RELAY_FORWARD:     0x56,
 
   // Session
   SESSION_LIST:      0x5f,
@@ -483,11 +484,12 @@ export function reversePeers({ peers } = {}) {
   };
 }
 
-export function reverseConnect({ targetFingerprint, username } = {}) {
+export function reverseConnect({ targetFingerprint, username, fromFingerprint } = {}) {
   return {
     type: MSG.REVERSE_CONNECT,
     target_fingerprint: targetFingerprint,
     username,
+    from_fingerprint: fromFingerprint,
   };
 }
 
@@ -512,6 +514,14 @@ export function reverseReject({ targetFingerprint, username, reason } = {}) {
     target_fingerprint: targetFingerprint,
     username,
     reason,
+  };
+}
+
+export function relayForward({ fromFingerprint, inner } = {}) {
+  return {
+    type: MSG.RELAY_FORWARD,
+    from_fingerprint: fromFingerprint,
+    inner,
   };
 }
 
@@ -901,6 +911,48 @@ export function terminalConfig({ channelId, frontend, options = {} } = {}) {
     frontend,
     options,
   };
+}
+
+// ── Relay forwarding ─────────────────────────────────────────────────
+
+// Message types a relay may forward inside a RelayForward wrapper.
+export const RELAY_FORWARDABLE = new Set([
+  MSG.OPEN,
+  MSG.OPEN_OK,
+  MSG.OPEN_FAIL,
+  MSG.CLOSE,
+  MSG.EXIT,
+  MSG.RESIZE,
+  MSG.SIGNAL,
+  MSG.SESSION_DATA,
+  MSG.GATEWAY_DATA,
+  MSG.GATEWAY_OK,
+  MSG.GATEWAY_FAIL,
+  MSG.GATEWAY_CLOSE,
+  MSG.MCP_DISCOVER,
+  MSG.MCP_TOOLS,
+  MSG.MCP_CALL,
+  MSG.MCP_RESULT,
+  MSG.REVERSE_ACCEPT,
+  MSG.REVERSE_REJECT,
+  MSG.GUEST_JOIN,
+  MSG.GUEST_REVOKE,
+  MSG.COPILOT_ATTACH,
+  MSG.COPILOT_DETACH,
+  MSG.FILE_OP,
+  MSG.POLICY_EVAL,
+  MSG.ECHO_ACK,
+  MSG.ECHO_STATE,
+  MSG.TERM_SYNC,
+  MSG.TERM_DIFF,
+]);
+
+/**
+ * @param {number} typeNum
+ * @returns {boolean}
+ */
+export function isRelayForwardable(typeNum) {
+  return RELAY_FORWARDABLE.has(typeNum);
 }
 
 // ── Utility ───────────────────────────────────────────────────────────
