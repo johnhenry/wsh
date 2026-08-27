@@ -31,32 +31,20 @@ import {
 } from '../src/messages.mjs';
 
 describe('MSG constants', () => {
-  // DETACH (0x60) and WS_DATA (0x60) intentionally share the same opcode:
-  // WS_DATA is a framing-layer marker, DETACH is a session-layer message.
-  const KNOWN_ALIASES = new Set([0x60]);
-
-  it('has unique values (except known aliases)', () => {
+  it('has unique values', () => {
     const values = Object.values(MSG);
     const seen = new Map();
     for (const [name, value] of Object.entries(MSG)) {
-      if (seen.has(value) && !KNOWN_ALIASES.has(value)) {
+      if (seen.has(value)) {
         assert.fail(`Duplicate MSG value 0x${value.toString(16)}: ${seen.get(value)} and ${name}`);
       }
       seen.set(value, name);
     }
-    // Verify we have the expected count (total entries minus known aliases)
-    const aliasCount = [...KNOWN_ALIASES].reduce((n, v) => {
-      const names = Object.entries(MSG).filter(([, val]) => val === v);
-      return n + names.length - 1;
-    }, 0);
-    const unique = new Set(values);
-    assert.equal(values.length - aliasCount, unique.size, 'MSG values must be unique (excluding known aliases)');
+    assert.equal(values.length, new Set(values).size, 'MSG values must be unique');
   });
 
-  it('MSG_NAMES maps back correctly (last-wins for aliases)', () => {
+  it('MSG_NAMES maps back correctly', () => {
     for (const [name, value] of Object.entries(MSG)) {
-      // For aliased opcodes, MSG_NAMES maps to whichever name was last in Object.entries
-      if (KNOWN_ALIASES.has(value)) continue;
       assert.equal(MSG_NAMES[value], name);
     }
   });
@@ -1373,12 +1361,6 @@ describe('MSG opcode values — reverse', () => {
     assert.equal(MSG.REVERSE_LIST, 0x51);
     assert.equal(MSG.REVERSE_PEERS, 0x52);
     assert.equal(MSG.REVERSE_CONNECT, 0x53);
-  });
-});
-
-describe('MSG opcode values — framing', () => {
-  it('WS_DATA has correct hex value', () => {
-    assert.equal(MSG.WS_DATA, 0x60);
   });
 });
 

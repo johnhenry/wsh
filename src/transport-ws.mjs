@@ -20,13 +20,9 @@ import { WshTransport, dispatchSerially, SerialQueue } from './transport.mjs';
 
 // ── Frame type constants ─────────────────────────────────────────────
 //
-// NOTE: these are unrelated to MSG.WS_DATA (0x60) in messages.gen.mjs.
-// WS_DATA is a JS-only, CBOR-layer bookkeeping marker (it shares its
-// opcode with MSG.DETACH and is explicitly excluded from the Rust
-// message enum by spec/codegen.mjs) — it is never sent as the outer
-// envelope's frame-type byte below. See spec/wsh-v1.yaml's
-// `transport.websocket` section for the authoritative outer-envelope
-// framing docs.
+// Unrelated to the CBOR-layer MSG opcodes (messages.gen.mjs) -- these are
+// the outer envelope's frame-type byte. See spec/wsh-v1.yaml's
+// `transport.websocket` section for the authoritative framing docs.
 
 const FRAME_CONTROL      = 0x01;
 const FRAME_DATA         = 0x02;

@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 95 (including WS_DATA framing marker)
+- **Total message types**: 94
 
 ## Enums
 
@@ -105,7 +105,6 @@ Type: `string`
 | `0x55` | ReverseReject | reverse |
 | `0x5f` | SessionList | session |
 | `0x60` | Detach | session |
-| `0x60` | WsData | framing |
 | `0x61` | DetachOk | session |
 | `0x62` | DetachFail | session |
 | `0x70` | OpenTcp | gateway |
@@ -672,14 +671,6 @@ Category: **session**
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
 | `session_id` | `string` | yes | — |
-
-### WsData (`0x60`)
-
-Category: **framing**
-
-> WebSocket multiplexing framing marker, not a CBOR message
-
-*No fields.*
 
 ### DetachOk (`0x61`)
 
@@ -1332,4 +1323,4 @@ QUIC streams as channels. 1 bidi = control. Per channel: 1 bidi + optional uni.
 - **open_stream frame type**: `0x03`
 - **close_stream frame type**: `0x04`
 
-Stream 0 carries length-prefixed CBOR control messages (frameEncode/FrameDecoder); other stream IDs carry raw data bytes with no extra framing. MSG.WS_DATA (0x60, defined under messages.framing.WsData in this spec) is an unrelated JS-only CBOR-opcode marker and is never sent as this frame_type byte -- see src/transport-ws.mjs for the reference implementation.
+Stream 0 carries length-prefixed CBOR control messages (frameEncode/FrameDecoder); other stream IDs carry raw data bytes with no extra framing. See src/transport-ws.mjs for the reference implementation.

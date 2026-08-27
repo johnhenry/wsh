@@ -127,9 +127,6 @@ export const MSG: {
   readonly REVERSE_ACCEPT: 0x54;
   readonly REVERSE_REJECT: 0x55;
 
-  // Framing
-  readonly WS_DATA: 0x60;
-
   // Gateway
   readonly OPEN_TCP: 0x70;
   readonly OPEN_UDP: 0x71;

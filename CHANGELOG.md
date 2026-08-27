@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0
+
+- **Removed `WsData`, resolving the `0x60` opcode collision with
+  `Detach`.** `WsData` (`messages.framing`) was dead: never constructed
+  in real code, never sent as an actual frame, explicitly excluded from
+  the Rust message enum, with empty fields. Rather than move it to a new
+  opcode, removed it outright -- it was cruft that caused a real bug (a
+  95-key/94-unique-value `MSG` map, with `MSG_NAMES[0x60]` silently
+  resolving to whichever of `Detach`/`WsData` happened to iterate last),
+  which a prior pass had "fixed" by documenting the collision as
+  intentional instead of investigating it. `MSG` now has 94 message
+  types with fully unique opcodes.
+  **Breaking**: `MSG.WS_DATA` and the `wsData()` constructor no longer
+  exist.
+
 ## 0.5.0
 
 - **Fixed a second instance of the 0.3.0 dispatch race, and deduplicated

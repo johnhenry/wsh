@@ -240,9 +240,6 @@ function emitJS(schema) {
   out.push('');
 
   for (const msg of allMessages) {
-    // Skip WsData — it's a framing marker, not a CBOR message
-    if (msg.name === 'WsData') continue;
-
     const fnName = toCamelCase(msg.name);
     const constName = toScreamingSnake(msg.name);
     const fields = msg.fields || {};
@@ -539,7 +536,9 @@ function emitRust(schema) {
   out.push('use serde::{Deserialize, Serialize};');
   out.push('');
 
-  // Rust messages exclude WsData (it's a JS-only framing marker)
+  // Rust excludes any 'framing' category messages, if the schema ever
+  // declares one again (JS-only transport-layer markers, not real
+  // over-the-wire protocol messages) -- no category currently uses this.
   const rustMessages = allMessages.filter(m => m.category !== 'framing');
 
   // MsgType enum
@@ -922,7 +921,7 @@ function emitMarkdown(schema) {
   out.push(`- **Version**: \`${ver}\``);
   out.push(`- **Wire format**: ${schema.protocol.wire_format.toUpperCase()}`);
   out.push(`- **Framing**: ${schema.protocol.framing.replace(/_/g, ' ')}`);
-  out.push(`- **Total message types**: ${allMessages.length} (including WS_DATA framing marker)`);
+  out.push(`- **Total message types**: ${allMessages.length}`);
   out.push('');
 
   // Enums

@@ -66,11 +66,6 @@ export const MSG = Object.freeze({
   // Session
   SESSION_LIST:      0x5f,
   DETACH:            0x60,
-
-  // Framing
-  WS_DATA:           0x60,
-
-  // Session
   DETACH_OK:         0x61,
   DETACH_FAIL:       0x62,
 

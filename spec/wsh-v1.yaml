@@ -699,12 +699,6 @@ messages:
           type: string
           required: true
 
-  framing:
-    WsData:
-      code: 0x60
-      fields: {}
-      description: "WebSocket multiplexing framing marker, not a CBOR message"
-
   # ── Gateway subsystem ────────────────────────────────────────────────
   # The gateway subsystem allows clients to tunnel TCP/UDP connections and
   # DNS lookups through the server, which acts as a network proxy.  Clients
@@ -1662,4 +1656,4 @@ transport:
       data: 0x02
       open_stream: 0x03
       close_stream: 0x04
-    note: "Stream 0 carries length-prefixed CBOR control messages (frameEncode/FrameDecoder); other stream IDs carry raw data bytes with no extra framing. MSG.WS_DATA (0x60, defined under messages.framing.WsData in this spec) is an unrelated JS-only CBOR-opcode marker and is never sent as this frame_type byte -- see src/transport-ws.mjs for the reference implementation."
+    note: "Stream 0 carries length-prefixed CBOR control messages (frameEncode/FrameDecoder); other stream IDs carry raw data bytes with no extra framing. See src/transport-ws.mjs for the reference implementation."
