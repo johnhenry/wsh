@@ -1299,8 +1299,8 @@ Category: **terminal**
 ### Auth Transcript
 
 - **Algorithm**: SHA-256
-- **Formula**: `SHA-256(PROTOCOL_VERSION || " " || session_id || nonce)`
-- **Note**: channelBinding can be appended but defaults to empty
+- **Formula**: `SHA-256(PROTOCOL_VERSION || " " || lp(username) || lp(session_id) || nonce)`
+- **Note**: lp() is a 4-byte big-endian length prefix, applied to username and session_id since both are variable-length strings that would otherwise be ambiguous when concatenated. username binds the transcript to a specific identity so a signature can't be replayed under a different username. channelBinding can be appended but defaults to empty (no server host-identity binding exists in the protocol yet).
 
 ### Fingerprint
 

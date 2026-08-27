@@ -111,26 +111,61 @@ export async function verify(publicKey, signature, data) {
 // ── Authentication Transcript ─────────────────────────────────────────
 
 /**
+ * Length-prefix a byte string with a 4-byte big-endian length, so two
+ * variable-length fields concatenated in sequence can't collide (e.g.
+ * username="ab", session="c" must hash differently from username="a",
+ * session="bc").
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+function lengthPrefixed(bytes) {
+  const out = new Uint8Array(4 + bytes.length);
+  new DataView(out.buffer).setUint32(0, bytes.length);
+  out.set(bytes, 4);
+  return out;
+}
+
+/**
  * Build the authentication transcript hash for challenge-response signing.
  *
- * transcript = SHA-256("wsh-v1\0" || session_id || nonce || channel_binding)
+ * transcript = SHA-256(
+ *   "wsh-v1\0" || lp(username) || lp(session_id) || nonce || channel_binding
+ * )
+ *
+ * `username` is bound so a signature produced for one username can't be
+ * replayed/relabeled as another. `session_id` and `username` are each
+ * length-prefixed (lp) since both are variable-length.
+ *
+ * `channelBinding` is reserved for a transport-layer identity binding (e.g.
+ * a TLS exporter value) — no caller currently populates it. Note this is
+ * NOT currently a binding to the *server's* identity: the protocol has no
+ * server host-identity concept today (SERVER_HELLO.fingerprints lists
+ * client keys the server authorizes, not the server's own key), and TLS
+ * exporter values aren't obtainable from a browser WebSocket/WebTransport
+ * client at all. See the wsh-modernization tracking issue for the
+ * follow-up covering server host-identity + TOFU pinning.
  *
  * @param {string} sessionId
  * @param {Uint8Array} nonce - 32-byte server nonce
- * @param {Uint8Array} [channelBinding] - Optional TLS channel binding
+ * @param {object} [opts]
+ * @param {string} [opts.username] - Username this transcript is bound to
+ * @param {Uint8Array} [opts.channelBinding] - Optional transport-layer binding
  * @returns {Promise<Uint8Array>} 32-byte SHA-256 hash
  */
-export async function buildTranscript(sessionId, nonce, channelBinding = new Uint8Array(0)) {
+export async function buildTranscript(sessionId, nonce, { username = '', channelBinding = new Uint8Array(0) } = {}) {
   const enc = new TextEncoder();
   const versionBytes = enc.encode(PROTOCOL_VERSION + '\0');
-  const sessionBytes = enc.encode(sessionId);
+  const usernameField = lengthPrefixed(enc.encode(username));
+  const sessionField = lengthPrefixed(enc.encode(sessionId));
 
-  const total = versionBytes.length + sessionBytes.length + nonce.length + channelBinding.length;
+  const total = versionBytes.length + usernameField.length + sessionField.length
+    + nonce.length + channelBinding.length;
   const data = new Uint8Array(total);
   let offset = 0;
 
   data.set(versionBytes, offset); offset += versionBytes.length;
-  data.set(sessionBytes, offset); offset += sessionBytes.length;
+  data.set(usernameField, offset); offset += usernameField.length;
+  data.set(sessionField, offset); offset += sessionField.length;
   data.set(nonce, offset); offset += nonce.length;
   data.set(channelBinding, offset);
 
@@ -148,11 +183,13 @@ export async function buildTranscript(sessionId, nonce, channelBinding = new Uin
  * @param {CryptoKey} publicKey
  * @param {string} sessionId
  * @param {Uint8Array} nonce
- * @param {Uint8Array} [channelBinding]
+ * @param {object} [opts]
+ * @param {string} [opts.username]
+ * @param {Uint8Array} [opts.channelBinding]
  * @returns {Promise<{ signature: Uint8Array, publicKeyRaw: Uint8Array }>}
  */
-export async function signChallenge(privateKey, publicKey, sessionId, nonce, channelBinding) {
-  const transcript = await buildTranscript(sessionId, nonce, channelBinding);
+export async function signChallenge(privateKey, publicKey, sessionId, nonce, opts) {
+  const transcript = await buildTranscript(sessionId, nonce, opts);
   const [signature, publicKeyRaw] = await Promise.all([
     sign(privateKey, transcript),
     exportPublicKeyRaw(publicKey),
@@ -167,11 +204,13 @@ export async function signChallenge(privateKey, publicKey, sessionId, nonce, cha
  * @param {Uint8Array} signature
  * @param {string} sessionId
  * @param {Uint8Array} nonce
- * @param {Uint8Array} [channelBinding]
+ * @param {object} [opts]
+ * @param {string} [opts.username]
+ * @param {Uint8Array} [opts.channelBinding]
  * @returns {Promise<boolean>}
  */
-export async function verifyChallenge(publicKey, signature, sessionId, nonce, channelBinding) {
-  const transcript = await buildTranscript(sessionId, nonce, channelBinding);
+export async function verifyChallenge(publicKey, signature, sessionId, nonce, opts) {
+  const transcript = await buildTranscript(sessionId, nonce, opts);
   return verify(publicKey, signature, transcript);
 }
 

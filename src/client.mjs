@@ -362,7 +362,8 @@ export class WshClient {
             keyPair.privateKey,
             keyPair.publicKey,
             tempSessionId,
-            challengeMsg.nonce
+            challengeMsg.nonce,
+            { username }
           );
 
           await transport.sendControl(
@@ -398,7 +399,8 @@ export class WshClient {
           keyPair.privateKey,
           keyPair.publicKey,
           tempSessionId,
-          firstResponse.nonce
+          firstResponse.nonce,
+          { username }
         );
 
         await transport.sendControl(
@@ -1434,7 +1436,7 @@ export class WshClient {
           }
 
           const { signature, publicKeyRaw } = await signChallenge(
-            keyPair.privateKey, keyPair.publicKey, tempSessionId, challengeMsg.nonce
+            keyPair.privateKey, keyPair.publicKey, tempSessionId, challengeMsg.nonce, { username }
           );
 
           await this.#transport.sendControl(authMsg({
@@ -1452,7 +1454,7 @@ export class WshClient {
         // rather than a fixed literal.
         tempSessionId = tempSessionId || crypto.randomUUID();
         const { signature, publicKeyRaw } = await signChallenge(
-          keyPair.privateKey, keyPair.publicKey, tempSessionId, firstResponse.nonce
+          keyPair.privateKey, keyPair.publicKey, tempSessionId, firstResponse.nonce, { username }
         );
 
         await this.#transport.sendControl(authMsg({

@@ -251,22 +251,39 @@ const hasEd25519 = authModule && typeof crypto !== 'undefined' && typeof crypto.
 
 describe('auth transcript', { skip: !hasEd25519 && 'Ed25519 not available' }, () => {
 
-  it('buildTranscript formula matches Rust: SHA-256("wsh-v1\\0" || session_id || nonce)', async () => {
+  it('buildTranscript formula matches Rust: SHA-256("wsh-v1\\0" || lp(username) || lp(session_id) || nonce)', async () => {
     const sessionId = 'test-session-123';
     const nonce = new Uint8Array(32).fill(42);
+    const username = 'alice';
 
-    const transcript = await authModule.buildTranscript(sessionId, nonce);
+    const transcript = await authModule.buildTranscript(sessionId, nonce, { username });
     assert.equal(transcript.length, 32);
 
     // Manually compute the expected hash to verify the formula
     const enc = new TextEncoder();
+    const lp = (bytes) => {
+      const out = new Uint8Array(4 + bytes.length);
+      new DataView(out.buffer).setUint32(0, bytes.length);
+      out.set(bytes, 4);
+      return out;
+    };
     const data = new Uint8Array([
       ...enc.encode('wsh-v1\0'),
-      ...enc.encode(sessionId),
+      ...lp(enc.encode(username)),
+      ...lp(enc.encode(sessionId)),
       ...nonce,
     ]);
     const expected = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
     assert.deepEqual([...transcript], [...expected]);
+  });
+
+  it('buildTranscript defaults username to empty string when omitted', async () => {
+    const sessionId = 'session-abc';
+    const nonce = new Uint8Array(32).fill(7);
+
+    const t1 = await authModule.buildTranscript(sessionId, nonce);
+    const t2 = await authModule.buildTranscript(sessionId, nonce, { username: '' });
+    assert.deepEqual([...t1], [...t2]);
   });
 
   it('buildTranscript with empty channelBinding matches without channelBinding', async () => {
@@ -277,8 +294,17 @@ describe('auth transcript', { skip: !hasEd25519 && 'Ed25519 not available' }, ()
     const nonce = new Uint8Array(32).fill(7);
 
     const t1 = await authModule.buildTranscript(sessionId, nonce);
-    const t2 = await authModule.buildTranscript(sessionId, nonce, new Uint8Array(0));
+    const t2 = await authModule.buildTranscript(sessionId, nonce, { channelBinding: new Uint8Array(0) });
     assert.deepEqual([...t1], [...t2]);
+  });
+
+  it('buildTranscript differs for different usernames (same session/nonce)', async () => {
+    const sessionId = 'session-same';
+    const nonce = new Uint8Array(32).fill(3);
+
+    const t1 = await authModule.buildTranscript(sessionId, nonce, { username: 'alice' });
+    const t2 = await authModule.buildTranscript(sessionId, nonce, { username: 'mallory' });
+    assert.notDeepEqual([...t1], [...t2]);
   });
 
   it('signChallenge produces 64-byte signature + 32-byte pubkey', async () => {
