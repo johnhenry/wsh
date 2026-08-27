@@ -29,6 +29,24 @@ const FRAME_DATA         = 0x02;
 const FRAME_OPEN_STREAM  = 0x03;
 const FRAME_CLOSE_STREAM = 0x04;
 
+/**
+ * The mux frame-type byte values, exported for anything outside this
+ * module that needs to name or inspect them correctly — tooling,
+ * logging, or an alternative from-scratch implementation of this
+ * transport in another runtime, which needs these exact wire values to
+ * interoperate. Not related to `MSG` (messages.gen.mjs): that's the
+ * CBOR-layer protocol-message opcode space carried *inside* a
+ * FRAME_CONTROL payload, a separate numbering space at a different
+ * layer of the stack. (An earlier, since-removed `MSG.WS_DATA` conflated
+ * the two and collided with a real MSG opcode — see CHANGELOG 0.6.0.)
+ */
+export const WS_FRAME_TYPE = Object.freeze({
+  CONTROL: FRAME_CONTROL,
+  DATA: FRAME_DATA,
+  OPEN_STREAM: FRAME_OPEN_STREAM,
+  CLOSE_STREAM: FRAME_CLOSE_STREAM,
+});
+
 // ── Header helpers ───────────────────────────────────────────────────
 
 const HEADER_SIZE = 5; // 1 byte type + 4 bytes stream ID

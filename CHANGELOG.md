@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0
+
+- **New exports**: `WS_FRAME_TYPE` (the WebSocket transport's mux
+  frame-type byte values -- `CONTROL`/`DATA`/`OPEN_STREAM`/`CLOSE_STREAM`
+  -- previously module-private) and `dispatchSerially`/`SerialQueue`
+  (the 0.5.0 dispatch-ordering primitives, previously only used
+  internally). Both are useful to anything outside this package that
+  needs to speak the wire protocol correctly or reuse the same
+  ordering-safety pattern -- most concretely, a from-scratch
+  implementation of this transport in another runtime.
+
 ## 0.6.0
 
 - **Removed `WsData`, resolving the `0x60` opcode collision with

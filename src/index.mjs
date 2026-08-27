@@ -49,8 +49,8 @@ export {
 } from './auth.mjs';
 
 // Transport
-export { WshTransport, WebTransportTransport } from './transport.mjs';
-export { WebSocketTransport } from './transport-ws.mjs';
+export { WshTransport, WebTransportTransport, dispatchSerially, SerialQueue } from './transport.mjs';
+export { WebSocketTransport, WS_FRAME_TYPE } from './transport-ws.mjs';
 
 // Session + Client
 export { WshSession } from './session.mjs';

@@ -114,4 +114,21 @@ describe('wsh exports', () => {
     assert.equal(mod.policyEval({ requestId: '1', action: 'exec', principal: 'user' }).type, MSG.POLICY_EVAL);
     assert.equal(mod.terminalConfig({ channelId: 1, frontend: 'xterm' }).type, MSG.TERMINAL_CONFIG);
   });
+
+  it('exports WS_FRAME_TYPE with the correct mux frame-type values', async () => {
+    const { WS_FRAME_TYPE } = await import('../src/index.mjs');
+    assert.deepEqual(WS_FRAME_TYPE, {
+      CONTROL: 0x01,
+      DATA: 0x02,
+      OPEN_STREAM: 0x03,
+      CLOSE_STREAM: 0x04,
+    });
+    assert.ok(Object.isFrozen(WS_FRAME_TYPE));
+  });
+
+  it('exports dispatchSerially and SerialQueue', async () => {
+    const { dispatchSerially, SerialQueue } = await import('../src/index.mjs');
+    assert.equal(typeof dispatchSerially, 'function');
+    assert.equal(typeof SerialQueue, 'function');
+  });
 });
