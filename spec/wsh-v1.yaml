@@ -1632,8 +1632,8 @@ nested_types:
 crypto:
   auth_transcript:
     algorithm: SHA-256
-    formula: 'SHA-256(PROTOCOL_VERSION || "\0" || session_id || nonce)'
-    note: "channelBinding can be appended but defaults to empty"
+    formula: 'SHA-256(PROTOCOL_VERSION || "\0" || lp(username) || lp(session_id) || nonce)'
+    note: "lp() is a 4-byte big-endian length prefix, applied to username and session_id since both are variable-length strings that would otherwise be ambiguous when concatenated. username binds the transcript to a specific identity so a signature can't be replayed under a different username. channelBinding can be appended but defaults to empty (no server host-identity binding exists in the protocol yet)."
   fingerprint:
     algorithm: SHA-256
     input: raw_ed25519_public_key_32_bytes
