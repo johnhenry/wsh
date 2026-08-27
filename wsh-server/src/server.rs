@@ -558,22 +558,21 @@ impl WshServer {
         let features = self.build_feature_list();
         let hello_result = handshake::handle_hello(&hello, &server_fingerprints, Some(&features))?;
 
-        // Deliberately skip SERVER_HELLO and send only CHALLENGE — sending
-        // both back-to-back on one QUIC stream (no message-boundary framing
-        // at that layer, unlike discrete WebSocket frames) lets them arrive
-        // in a single `read()` on the client. wsh-upon-star's `WshClient`
-        // dispatches both messages synchronously from that one read, but
-        // only registers its *next* waiter (for CHALLENGE) in a microtask
-        // after the first `await` (for SERVER_HELLO) resolves — so the
-        // synchronously-dispatched CHALLENGE has no waiter yet and is
-        // silently dropped, hanging until timeout. Confirmed by testing
-        // (see docs/WSH-INTO-CLAWSER.md and tools/wsh-server.mjs, which hit
-        // and documented the exact same race on the Node reimplementation's
-        // WebSocket path and fixed it the same way). The client explicitly
-        // supports this — it falls back to the literal session-id string
-        // "pending" for the transcript when SERVER_HELLO is skipped, so the
-        // transcript verification below must use that same literal string
-        // rather than the real session id generated above.
+        // Send SERVER_HELLO with the real session id, then CHALLENGE. This
+        // used to deliberately skip SERVER_HELLO (falling back to a shared
+        // literal "pending" session id for the transcript) to dodge a
+        // client-side dispatch race: a QUIC stream has no message-boundary
+        // framing at that layer, so both messages could land in one
+        // client-side `read()`, and the client could dispatch CHALLENGE
+        // before SERVER_HELLO's `await`'d continuation had registered the
+        // CHALLENGE waiter, silently dropping it. That race is now fixed at
+        // the source (@johnhenry/wsh >= 0.3.0's WebTransportTransport
+        // drains inbound messages one at a time with a microtask yield
+        // between each dispatch), so both messages can be sent normally.
+        let server_hello_frame = frame_encode(&hello_result.server_hello)?;
+        send.write_all(&server_hello_frame)
+            .await
+            .map_err(|e| WshError::Transport(format!("WebTransport write failed: {e}")))?;
         let challenge_frame = frame_encode(&hello_result.challenge)?;
         send.write_all(&challenge_frame)
             .await
@@ -639,16 +638,14 @@ impl WshServer {
             }
         }
 
-        // Verify. Transcript session id is the literal "pending" here, not
-        // hello_result.session_id — see the comment above SERVER_HELLO being
-        // skipped. This also becomes the session id in the returned
-        // AuthResult (and thus AUTH_OK/ctx.session_id below); that's fine,
-        // per-connection bookkeeping elsewhere is keyed by the separate
-        // integer conn_id, not this string.
+        // Verify against the real session id from SERVER_HELLO — see the
+        // comment above where it's sent for why this no longer needs the
+        // "pending" placeholder.
         match handshake::verify_auth(
             &auth,
             &hello_result.nonce,
-            "pending",
+            &hello_result.session_id,
+            &hello.username,
             &self.authorized_keys,
             &self.secret,
             self.config.session_ttl,
@@ -926,6 +923,7 @@ impl WshServer {
             &auth,
             &hello_result.nonce,
             &hello_result.session_id,
+            &hello.username,
             &self.authorized_keys,
             &self.secret,
             self.config.session_ttl,

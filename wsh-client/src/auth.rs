@@ -2,7 +2,7 @@
 //!
 //! Provides keypair generation, challenge signing, and verification.
 //! The challenge transcript matches the JS implementation:
-//!   `SHA-256("wsh-v1\0" || session_id || nonce)`
+//!   `SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce)`
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -16,16 +16,27 @@ pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
     (signing_key, verifying_key)
 }
 
+/// 4-byte big-endian length prefix, matching @johnhenry/wsh's `lengthPrefixed()`.
+fn length_prefixed(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
 /// Build the challenge transcript that both client and server compute.
 ///
-/// Format: `SHA-256("wsh-v1\0" || session_id || nonce)`
+/// Format: `SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce)`
 ///
-/// The null byte separator matches the JS implementation exactly.
-fn build_transcript(session_id: &str, nonce: &[u8]) -> Vec<u8> {
+/// `lp()` length-prefixes the two variable-length string fields so they
+/// can't collide when concatenated; `username` binds the transcript to a
+/// specific identity. Matches the JS implementation exactly.
+fn build_transcript(username: &str, session_id: &str, nonce: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(PROTOCOL_VERSION.as_bytes());
     hasher.update(b"\0");
-    hasher.update(session_id.as_bytes());
+    hasher.update(length_prefixed(username.as_bytes()));
+    hasher.update(length_prefixed(session_id.as_bytes()));
     hasher.update(nonce);
     hasher.finalize().to_vec()
 }
@@ -33,8 +44,8 @@ fn build_transcript(session_id: &str, nonce: &[u8]) -> Vec<u8> {
 /// Sign a server challenge using the client's signing key.
 ///
 /// Returns the raw Ed25519 signature bytes (64 bytes).
-pub fn sign_challenge(signing_key: &SigningKey, session_id: &str, nonce: &[u8]) -> Vec<u8> {
-    let transcript = build_transcript(session_id, nonce);
+pub fn sign_challenge(signing_key: &SigningKey, username: &str, session_id: &str, nonce: &[u8]) -> Vec<u8> {
+    let transcript = build_transcript(username, session_id, nonce);
     let signature = signing_key.sign(&transcript);
     signature.to_bytes().to_vec()
 }
@@ -43,10 +54,11 @@ pub fn sign_challenge(signing_key: &SigningKey, session_id: &str, nonce: &[u8]) 
 pub fn verify_challenge(
     verifying_key: &VerifyingKey,
     signature: &[u8],
+    username: &str,
     session_id: &str,
     nonce: &[u8],
 ) -> bool {
-    let transcript = build_transcript(session_id, nonce);
+    let transcript = build_transcript(username, session_id, nonce);
 
     let sig = match ed25519_dalek::Signature::from_slice(signature) {
         Ok(s) => s,
@@ -94,9 +106,9 @@ mod tests {
         let session_id = "test-session-123";
         let nonce = b"random-nonce-bytes";
 
-        let sig = sign_challenge(&sk, session_id, nonce);
+        let sig = sign_challenge(&sk, "alice", session_id, nonce);
         assert_eq!(sig.len(), 64);
-        assert!(verify_challenge(&vk, &sig, session_id, nonce));
+        assert!(verify_challenge(&vk, &sig, "alice", session_id, nonce));
     }
 
     #[test]
@@ -104,8 +116,8 @@ mod tests {
         let (sk, vk) = generate_keypair();
         let nonce = b"nonce";
 
-        let sig = sign_challenge(&sk, "session-a", nonce);
-        assert!(!verify_challenge(&vk, &sig, "session-b", nonce));
+        let sig = sign_challenge(&sk, "alice", "session-a", nonce);
+        assert!(!verify_challenge(&vk, &sig, "alice", "session-b", nonce));
     }
 
     #[test]
@@ -113,8 +125,18 @@ mod tests {
         let (sk, vk) = generate_keypair();
         let session_id = "session";
 
-        let sig = sign_challenge(&sk, session_id, b"nonce-a");
-        assert!(!verify_challenge(&vk, &sig, session_id, b"nonce-b"));
+        let sig = sign_challenge(&sk, "alice", session_id, b"nonce-a");
+        assert!(!verify_challenge(&vk, &sig, "alice", session_id, b"nonce-b"));
+    }
+
+    #[test]
+    fn wrong_username_fails() {
+        let (sk, vk) = generate_keypair();
+        let session_id = "session";
+        let nonce = b"nonce";
+
+        let sig = sign_challenge(&sk, "alice", session_id, nonce);
+        assert!(!verify_challenge(&vk, &sig, "mallory", session_id, nonce));
     }
 
     #[test]
@@ -124,8 +146,8 @@ mod tests {
         let session_id = "session";
         let nonce = b"nonce";
 
-        let sig = sign_challenge(&sk, session_id, nonce);
-        assert!(!verify_challenge(&vk2, &sig, session_id, nonce));
+        let sig = sign_challenge(&sk, "alice", session_id, nonce);
+        assert!(!verify_challenge(&vk2, &sig, "alice", session_id, nonce));
     }
 
     #[test]
@@ -138,8 +160,8 @@ mod tests {
 
     #[test]
     fn transcript_deterministic() {
-        let t1 = build_transcript("sess", b"nonce");
-        let t2 = build_transcript("sess", b"nonce");
+        let t1 = build_transcript("alice", "sess", b"nonce");
+        let t2 = build_transcript("alice", "sess", b"nonce");
         assert_eq!(t1, t2);
         assert_eq!(t1.len(), 32); // SHA-256 output
     }

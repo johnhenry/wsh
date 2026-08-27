@@ -103,6 +103,7 @@ pub fn handle_hello(
         msg_type: MsgType::Challenge,
         payload: Payload::Challenge(ChallengePayload {
             nonce: nonce.clone(),
+            session_id: session_id.clone(),
         }),
     };
 
@@ -118,10 +119,14 @@ pub fn handle_hello(
 /// Verify an AUTH message against authorized keys or password.
 ///
 /// `session_id` is the one from SERVER_HELLO — it's part of the auth transcript.
+/// `username` is the one from the HELLO that preceded this AUTH — also part
+/// of the transcript, so a signature can't be replayed under another
+/// username.
 pub fn verify_auth(
     auth: &AuthPayload,
     nonce: &[u8],
     session_id: &str,
+    username: &str,
     authorized_keys: &[AuthorizedKey],
     server_secret: &[u8],
     session_ttl: u64,
@@ -137,6 +142,7 @@ pub fn verify_auth(
                 auth,
                 nonce,
                 session_id,
+                username,
                 authorized_keys,
                 server_secret,
                 session_ttl,
@@ -151,14 +157,27 @@ pub fn verify_auth(
     }
 }
 
+/// 4-byte big-endian length prefix, matching @johnhenry/wsh's `lengthPrefixed()`.
+fn length_prefixed(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
 /// Build the challenge transcript (must match JS and Rust client implementations).
 ///
-/// Format: `SHA-256("wsh-v1\0" || session_id || nonce)`
-fn build_transcript(session_id: &str, nonce: &[u8]) -> Vec<u8> {
+/// Format: `SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce)`
+/// where `lp()` length-prefixes the two variable-length string fields so
+/// they can't collide when concatenated. `username` binds the transcript to
+/// a specific identity, so a signature produced for one username can't be
+/// replayed/relabeled as another.
+fn build_transcript(username: &str, session_id: &str, nonce: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(PROTOCOL_VERSION.as_bytes());
     hasher.update(b"\0");
-    hasher.update(session_id.as_bytes());
+    hasher.update(length_prefixed(username.as_bytes()));
+    hasher.update(length_prefixed(session_id.as_bytes()));
     hasher.update(nonce);
     hasher.finalize().to_vec()
 }
@@ -168,6 +187,7 @@ fn verify_pubkey_auth(
     auth: &AuthPayload,
     nonce: &[u8],
     session_id: &str,
+    username: &str,
     authorized_keys: &[AuthorizedKey],
     server_secret: &[u8],
     session_ttl: u64,
@@ -189,8 +209,8 @@ fn verify_pubkey_auth(
     }
 
     // Verify the signature over the transcript.
-    // Transcript: SHA-256("wsh-v1\0" || session_id || nonce)
-    let transcript = build_transcript(session_id, nonce);
+    // Transcript: SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce)
+    let transcript = build_transcript(username, session_id, nonce);
 
     // Import the public key and verify Ed25519 signature.
     let vk_bytes: [u8; 32] = public_key

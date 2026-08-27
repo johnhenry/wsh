@@ -507,7 +507,7 @@ impl WshClient {
         let server_hello_data = self.recv_raw().await?;
         let server_hello = decode_envelope(&server_hello_data)?;
 
-        let (server_session_id, server_fingerprints) = match &server_hello.payload {
+        let (_server_hello_session_id, server_fingerprints) = match &server_hello.payload {
             Payload::ServerHello(sh) => (sh.session_id.clone(), sh.fingerprints.clone()),
             _ => return Err(WshError::InvalidMessage("expected SERVER_HELLO".into())),
         };
@@ -523,8 +523,11 @@ impl WshClient {
         let challenge_data = self.recv_raw().await?;
         let challenge = decode_envelope(&challenge_data)?;
 
-        let nonce = match &challenge.payload {
-            Payload::Challenge(c) => c.nonce.clone(),
+        // Challenge.session_id (not SERVER_HELLO's) is authoritative for the
+        // transcript -- it's the one guaranteed present regardless of
+        // whether a given server sends SERVER_HELLO at all.
+        let (nonce, server_session_id) = match &challenge.payload {
+            Payload::Challenge(c) => (c.nonce.clone(), c.session_id.clone()),
             _ => return Err(WshError::InvalidMessage("expected CHALLENGE".into())),
         };
 
@@ -536,7 +539,7 @@ impl WshClient {
                 let keystore = crate::keystore::KeyStore::default_location()?;
                 let (signing_key, verifying_key) = keystore.load(key_name)?;
 
-                let signature = auth::sign_challenge(&signing_key, &server_session_id, &nonce);
+                let signature = auth::sign_challenge(&signing_key, &config.username, &server_session_id, &nonce);
                 let public_key = auth::public_key_bytes(&verifying_key);
 
                 Envelope {

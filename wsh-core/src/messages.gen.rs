@@ -1,6 +1,6 @@
 // wsh protocol control message types.
 // AUTO-GENERATED from wsh-v1.yaml — do not edit.
-// Run: node web/packages/wsh/spec/codegen.mjs
+// Run: node spec/codegen.mjs (from the @johnhenry/wsh repo root)
 
 use serde::{Deserialize, Serialize};
 
@@ -524,6 +524,7 @@ pub struct ServerHelloPayload {
 pub struct ChallengePayload {
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

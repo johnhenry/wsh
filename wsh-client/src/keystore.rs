@@ -380,10 +380,11 @@ mod tests {
         assert!(exported.starts_with("ssh-ed25519 "));
 
         // Sign/verify round-trip with loaded key
-        let sig = crate::auth::sign_challenge(&sk, "test-sess", b"nonce");
+        let sig = crate::auth::sign_challenge(&sk, "alice", "test-sess", b"nonce");
         assert!(crate::auth::verify_challenge(
             &vk,
             &sig,
+            "alice",
             "test-sess",
             b"nonce"
         ));
