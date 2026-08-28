@@ -869,13 +869,14 @@ export function fileResult({ channelId, success, metadata = {}, errorMessage } =
   return msg;
 }
 
-export function fileChunk({ channelId, offset, data, isFinal } = {}) {
+export function fileChunk({ channelId, offset, data, isFinal, totalSize } = {}) {
   return {
     type: MSG.FILE_CHUNK,
     channel_id: channelId,
     offset,
     data,
     is_final: isFinal,
+    total_size: totalSize,
   };
 }
 
@@ -940,6 +941,8 @@ export const RELAY_FORWARDABLE = new Set([
   MSG.COPILOT_ATTACH,
   MSG.COPILOT_DETACH,
   MSG.FILE_OP,
+  MSG.FILE_RESULT,
+  MSG.FILE_CHUNK,
   MSG.POLICY_EVAL,
   MSG.ECHO_ACK,
   MSG.ECHO_STATE,

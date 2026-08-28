@@ -1481,8 +1481,18 @@ messages:
     FileChunk:
       code: 0x9a
       description: >
-        Data chunk for file read/write transfers.  The final flag
-        indicates the last chunk in the sequence.
+        Data chunk for file read/write transfers -- the single wire scheme
+        for moving file bytes, replacing the old raw-stream length-prefixed
+        header (WshClient.upload/download) and WshFileTransfer's ad-hoc
+        Open.path/Open.size fields. Sent as an ordinary control-channel
+        message over a 'file'-kind channel (Open/OpenOk first), so it works
+        identically whether the channel's data_mode is stream or virtual --
+        it never depends on a real second multiplexed stream existing.
+        total_size lets a receiver detect a truncated transfer: for a
+        well-formed transfer, the chunk with is_final=true always has
+        offset + len(data) == total_size, and if the channel closes before
+        such a chunk arrives, the transfer is known-truncated rather than
+        silently short.
       fields:
         channel_id:
           type: u32
@@ -1497,6 +1507,10 @@ messages:
           type: bool
           required: true
           description: "True if this is the last chunk"
+        total_size:
+          type: u64
+          required: true
+          description: "Total transfer size in bytes, constant across every chunk in the sequence"
 
   # ── Policy engine ────────────────────────────────────────────────────
   # OPA-like enterprise policy enforcement.  Actions are evaluated
@@ -1701,4 +1715,4 @@ relay:
   # a Set) and Rust (is_relay_forwardable(), a match) by codegen.mjs, so
   # the two implementations can no longer drift out of sync the way the
   # hand-maintained allowlists did before RelayForward existed.
-  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, PolicyEval, EchoAck, EchoState, TermSync, TermDiff]
+  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff]

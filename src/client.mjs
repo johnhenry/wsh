@@ -28,6 +28,7 @@ import {
   copilotDetach as copilotDetachMsg,
   keyExchange as keyExchangeMsg,
   fileOp as fileOpMsg,
+  fileChunk as fileChunkMsg,
   policyEval as policyEvalMsg, policyUpdate as policyUpdateMsg,
   isRelayForwardable,
 } from './messages.mjs';
@@ -51,73 +52,6 @@ const DEFAULT_PING_INTERVAL  = 30_000;  // ms
 const DEFAULT_EXEC_TIMEOUT   = 60_000;  // ms
 const FILE_CHUNK_SIZE        = 65_536;
 
-const textEncoder = new TextEncoder();
-
-function buildUploadHeader(path, totalSize) {
-  const pathBytes = textEncoder.encode(path);
-  const header = new Uint8Array(4 + pathBytes.length + 8);
-  const view = new DataView(header.buffer);
-  view.setUint32(0, pathBytes.length);
-  header.set(pathBytes, 4);
-  writeU64(header, 4 + pathBytes.length, totalSize);
-  return header;
-}
-
-function buildDownloadHeader(path) {
-  const pathBytes = textEncoder.encode(path);
-  const header = new Uint8Array(4 + pathBytes.length);
-  const view = new DataView(header.buffer);
-  view.setUint32(0, pathBytes.length);
-  header.set(pathBytes, 4);
-  return header;
-}
-
-function writeU64(buffer, offset, value) {
-  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  const big = BigInt(value);
-  view.setBigUint64(offset, big);
-}
-
-function decodeU64(bytes) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return Number(view.getBigUint64(0));
-}
-
-function createSessionReader(session) {
-  let remainder = new Uint8Array();
-  return {
-    async readExact(totalBytes) {
-      const output = new Uint8Array(totalBytes);
-      let offset = 0;
-
-      while (offset < totalBytes) {
-        if (remainder.byteLength === 0) {
-          const chunk = await session.read();
-          if (chunk === null) {
-            return null;
-          }
-          remainder = chunk;
-        }
-
-        const take = Math.min(totalBytes - offset, remainder.byteLength);
-        output.set(remainder.subarray(0, take), offset);
-        offset += take;
-        remainder = remainder.subarray(take);
-      }
-
-      return output;
-    },
-    async readChunk() {
-      if (remainder.byteLength > 0) {
-        const chunk = remainder;
-        remainder = new Uint8Array();
-        return chunk;
-      }
-      return await session.read();
-    },
-  };
-}
-
 // ── Client class ──────────────────────────────────────────────────────
 
 export class WshClient {
@@ -139,6 +73,23 @@ export class WshClient {
 
   /** @type {Map<number, WshSession>} Active sessions keyed by channel ID. */
   #sessions = new Map();
+
+  /**
+   * FIFO queue of in-flight openSession() calls awaiting the next
+   * OPEN_OK/OPEN_FAIL. Handled as a dedicated synchronous case in
+   * #handleControl (not the generic #waitForMessage machinery) so that
+   * #sessions.set() happens in the same synchronous dispatch step as
+   * OPEN_OK itself, with no microtask hop in between. That matters
+   * because a server can legitimately push channel-scoped data (e.g. the
+   * first FileChunk of a download) immediately after OPEN_OK, landing in
+   * the same message batch -- dispatchSerially only guarantees one
+   * microtask tick of separation between batch items, and registering the
+   * session via a promise continuation takes more hops than that, so the
+   * next item in the batch could still find #sessions.has(channelId)
+   * false and be misrouted/dropped.
+   * @type {Array<{kind: string, resolve: function, reject: function, timer: number}>}
+   */
+  #pendingOpens = [];
 
   /**
    * Fingerprints of reverse-connect peers this client has accepted a relay
@@ -475,42 +426,25 @@ export class WshClient {
       openMsg({ kind: type, command, cols, rows, env })
     );
 
-    // Wait for OPEN_OK or OPEN_FAIL.
-    const response = await this.#waitForMessage(
-      [MSG.OPEN_OK, MSG.OPEN_FAIL],
-      timeout,
-      'Timed out waiting for session open response'
-    );
-
-    if (response.type === MSG.OPEN_FAIL) {
-      throw new Error(`Failed to open session: ${response.reason || 'rejected'}`);
-    }
-
-    const serverChannelId = response.channel_id ?? requestedChannelId;
-    const streamIds = response.stream_ids ?? {};
-    const dataMode = response.data_mode === 'virtual' ? 'virtual' : 'stream';
-    const capabilities = Array.isArray(response.capabilities) ? response.capabilities : [];
-
-    // Create the session object.
-    const session = new WshSession(
-      this.#transport,
-      serverChannelId,
-      streamIds,
-      type,
-      { dataMode, capabilities }
-    );
-    this.#sessions.set(serverChannelId, session);
-
-    if (dataMode === 'virtual') {
-      session._activateVirtual((msg) => this.sendRelayControl(msg));
-      return session;
-    }
-
-    // Open the data stream and bind it to the session.
-    const stream = await this.#transport.openStream();
-    session._bind(stream.readable, stream.writable);
-
-    return session;
+    // Registered as a dedicated pending-open (not the generic
+    // #waitForMessage waiter) so #handleControl can construct and
+    // register the WshSession synchronously the instant OPEN_OK arrives
+    // — see #pendingOpens's doc comment for why that matters.
+    return new Promise((resolve, reject) => {
+      const entry = {
+        mode: 'session',
+        kind: type,
+        requestedChannelId,
+        resolve,
+        reject,
+      };
+      entry.timer = setTimeout(() => {
+        const idx = this.#pendingOpens.indexOf(entry);
+        if (idx !== -1) this.#pendingOpens.splice(idx, 1);
+        reject(new Error('Timed out waiting for session open response'));
+      }, timeout);
+      this.#pendingOpens.push(entry);
+    });
   }
 
   /**
@@ -541,16 +475,25 @@ export class WshClient {
   async attachSession(targetSessionId, { readOnly = false, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
     this.#assertAuthenticated('attachSession');
 
-    const mode = readOnly ? 'readonly' : 'control';
+    const attachMode = readOnly ? 'readonly' : 'control';
     await this.#transport.sendControl(
-      attachMsg({ sessionId: targetSessionId, token: this.#resumeToken, mode })
+      attachMsg({ sessionId: targetSessionId, token: this.#resumeToken, mode: attachMode })
     );
 
-    const response = await this.#waitForMessage(
-      [MSG.OPEN_OK, MSG.OPEN_FAIL],
-      timeout,
-      'Timed out waiting for attach response'
-    );
+    // Shares #pendingOpens with openSession() -- both wait on the same
+    // OPEN_OK/OPEN_FAIL response stream, in the order their requests were
+    // sent (see #pendingOpens's doc comment). Unlike openSession(),
+    // attachSession() doesn't construct a WshSession, so it just wants
+    // the raw response either way.
+    const response = await new Promise((resolve, reject) => {
+      const entry = { mode: 'raw', resolve, reject };
+      entry.timer = setTimeout(() => {
+        const idx = this.#pendingOpens.indexOf(entry);
+        if (idx !== -1) this.#pendingOpens.splice(idx, 1);
+        reject(new Error('Timed out waiting for attach response'));
+      }, timeout);
+      this.#pendingOpens.push(entry);
+    });
 
     if (response.type === MSG.OPEN_FAIL) {
       throw new Error(`Failed to attach: ${response.reason || 'rejected'}`);
@@ -849,7 +792,11 @@ export class WshClient {
   /**
    * Upload a blob to a remote path.
    *
-   * Opens a file channel, writes the data, and waits for acknowledgment.
+   * Opens a file channel, then sends the data as a sequence of FileChunk
+   * control messages (offset-addressed, the last one marked is_final) and
+   * waits for the server to confirm completion. Works the same whether the
+   * channel's data plane is stream- or virtual-backed, since FileChunk is
+   * an ordinary control message rather than raw stream bytes.
    *
    * @param {Blob|Uint8Array} blob - Data to upload
    * @param {string} remotePath - Destination path on the server
@@ -863,21 +810,31 @@ export class WshClient {
       ? new Uint8Array(await blob.arrayBuffer())
       : blob;
     const total = data.byteLength;
-    const header = buildUploadHeader(remotePath, total);
-    let sent = 0;
 
     try {
-      await session.write(header);
-      for (let i = 0; i < total; i += FILE_CHUNK_SIZE) {
-        const end = Math.min(i + FILE_CHUNK_SIZE, total);
-        await session.write(data.subarray(i, end));
+      let sent = 0;
+      do {
+        const end = Math.min(sent + FILE_CHUNK_SIZE, total);
+        await this.#transport.sendControl(fileChunkMsg({
+          channelId: session.channelId,
+          offset: sent,
+          data: data.subarray(sent, end),
+          isFinal: end >= total,
+          totalSize: total,
+        }));
         sent = end;
         onProgress?.(sent);
-      }
+      } while (sent < total);
 
-      const ack = await session.read();
-      if (ack === null) {
-        throw new Error('Upload failed: unexpected EOF waiting for server acknowledgement');
+      // The server confirms completion the same way an exec session
+      // signals it finished: Exit with a code, then Close. Resolve on
+      // whichever arrives first.
+      const code = await new Promise((resolve) => {
+        session.onExit = (c) => { session.onExit = null; resolve(c); };
+        session.onClose = () => resolve(null);
+      });
+      if (code !== 0) {
+        throw new Error(`Upload failed with exit code ${code ?? 'unknown'}`);
       }
     } finally {
       await session.close().catch(() => {});
@@ -887,36 +844,45 @@ export class WshClient {
   /**
    * Download a file from a remote path.
    *
+   * Opens a file channel and reads the file as a sequence of FileChunk
+   * control messages until the final chunk arrives. offset/total_size are
+   * checked so a truncated transfer (channel closes before is_final, or
+   * the final chunk doesn't actually reach total_size) is detected rather
+   * than silently returned as a short file.
+   *
    * @param {string} remotePath - Source path on the server
+   * @param {object} [opts]
+   * @param {function({received: number, total: number}): void} [opts.onProgress]
+   * @param {number} [opts.timeout=10000] - Timeout in ms waiting for the channel to open
    * @returns {Promise<Uint8Array>} File contents
    */
-  async download(remotePath) {
+  async download(remotePath, { onProgress, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
     this.#assertAuthenticated('download');
-    const session = await this.openSession({ type: 'file', command: `download:${remotePath}` });
+    const session = await this.openSession({ type: 'file', command: `download:${remotePath}`, timeout });
 
     try {
-      const reader = createSessionReader(session);
-      await session.write(buildDownloadHeader(remotePath));
+      let data = null;
+      let received = 0;
 
-      const sizeChunk = await reader.readExact(8);
-      if (sizeChunk === null) {
-        throw new Error('Download failed: unexpected EOF reading file size');
-      }
-      const totalSize = decodeU64(sizeChunk);
-      const data = new Uint8Array(totalSize);
-      let offset = 0;
-
-      while (offset < totalSize) {
-        const chunk = await reader.readChunk();
+      while (true) {
+        const chunk = await session._readFileChunk();
         if (chunk === null) {
-          throw new Error('Download failed: unexpected EOF reading file payload');
+          throw new Error('Download failed: connection closed before the transfer completed (truncated)');
         }
-        const remaining = totalSize - offset;
-        data.set(chunk.subarray(0, remaining), offset);
-        offset += Math.min(chunk.byteLength, remaining);
-      }
+        if (data === null) {
+          data = new Uint8Array(chunk.total_size ?? 0);
+        }
+        data.set(chunk.data, chunk.offset);
+        received = chunk.offset + chunk.data.byteLength;
+        onProgress?.({ received, total: data.byteLength });
 
-      return data;
+        if (chunk.is_final) {
+          if (received !== data.byteLength) {
+            throw new Error(`Download failed: truncated transfer (received ${received} of ${data.byteLength} bytes)`);
+          }
+          return data;
+        }
+      }
     } finally {
       await session.close().catch(() => {});
     }
@@ -1571,6 +1537,62 @@ export class WshClient {
       return;
     }
 
+    // OPEN_OK/OPEN_FAIL: handled as a dedicated case (not the generic
+    // waiter mechanism below) so the WshSession gets constructed and
+    // registered in #sessions synchronously, in the same dispatch step as
+    // OPEN_OK itself — see #pendingOpens's doc comment for why.
+    if (type === MSG.OPEN_OK || type === MSG.OPEN_FAIL) {
+      const pending = this.#pendingOpens.shift();
+      if (!pending) return;
+      clearTimeout(pending.timer);
+
+      // attachSession() wants the raw response either way and never
+      // constructs a session -- it has no #sessions-registration race to
+      // protect against.
+      if (pending.mode === 'raw') {
+        pending.resolve(msg);
+        return;
+      }
+
+      if (type === MSG.OPEN_FAIL) {
+        pending.reject(new Error(`Failed to open session: ${msg.reason || 'rejected'}`));
+        return;
+      }
+
+      const serverChannelId = msg.channel_id ?? pending.requestedChannelId;
+      const streamIds = msg.stream_ids ?? {};
+      const dataMode = msg.data_mode === 'virtual' ? 'virtual' : 'stream';
+      const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
+
+      const session = new WshSession(
+        this.#transport,
+        serverChannelId,
+        streamIds,
+        pending.kind,
+        { dataMode, capabilities }
+      );
+      this.#sessions.set(serverChannelId, session);
+
+      if (dataMode === 'virtual') {
+        session._activateVirtual((m) => this.sendRelayControl(m));
+        pending.resolve(session);
+        return;
+      }
+
+      // Stream mode needs a real transport stream, which is inherently
+      // async — but #sessions.set() above already happened synchronously,
+      // so channel-scoped control messages arriving before the stream
+      // finishes binding still route correctly.
+      this.#transport.openStream().then(
+        (stream) => {
+          session._bind(stream.readable, stream.writable);
+          pending.resolve(session);
+        },
+        (err) => pending.reject(err)
+      );
+      return;
+    }
+
     // First, check if any waiters are listening for this message type.
     if (this.#waiters.has(type)) {
       const queue = this.#waiters.get(type);
@@ -1822,6 +1844,12 @@ export class WshClient {
       }
     }
     this.#waiters.clear();
+
+    for (const pending of this.#pendingOpens) {
+      clearTimeout(pending.timer);
+      pending.reject(err);
+    }
+    this.#pendingOpens.length = 0;
   }
 
   // ── Internal: ping/pong keepalive ───────────────────────────────────

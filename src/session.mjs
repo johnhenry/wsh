@@ -131,6 +131,16 @@ export class WshSession {
   /** @type {object|null} */
   #lastTermDiff = null;
 
+  /**
+   * Queue of received FileChunk payloads not yet consumed by
+   * _readFileChunk(). 'file'-kind sessions only.
+   * @type {Array<object>}
+   */
+  #fileChunkQueue = [];
+
+  /** @type {{resolve: function, reject: function}|null} */
+  #fileChunkWaiter = null;
+
   // ── Constructor ─────────────────────────────────────────────────────
 
   /**
@@ -358,6 +368,7 @@ export class WshSession {
 
     this.#stdinWriter = null;
     this.#stdoutReadable = null;
+    this.#resolvePendingFileChunk(null);
     this.#emitClose();
   }
 
@@ -382,6 +393,17 @@ export class WshSession {
         break;
       }
 
+      case MSG.FILE_CHUNK: {
+        if (this.#fileChunkWaiter) {
+          const { resolve } = this.#fileChunkWaiter;
+          this.#fileChunkWaiter = null;
+          resolve(msg);
+        } else {
+          this.#fileChunkQueue.push(msg);
+        }
+        break;
+      }
+
       case MSG.EXIT: {
         this.#exitCode = msg.code ?? -1;
         try {
@@ -399,6 +421,7 @@ export class WshSession {
           this.#abort.abort();
           this.#virtualBackend?.close();
           this.#releaseStreams();
+          this.#resolvePendingFileChunk(null);
           this.#emitClose();
         }
         break;
@@ -466,6 +489,45 @@ export class WshSession {
       default:
         // Unknown control message for this channel — ignore gracefully.
         break;
+    }
+  }
+
+  // ── File transfer ────────────────────────────────────────────────────
+
+  /**
+   * Wait for the next FileChunk control message on this channel.
+   * Used by WshClient.upload/download for 'file'-kind sessions — file
+   * transfer moves bytes as ordinary FileChunk control messages rather
+   * than through write()/read(), so it works the same whether the
+   * channel's data plane is stream- or virtual-backed.
+   *
+   * Returns `null` if the session closes before another chunk arrives
+   * (a truncated transfer, distinct from a chunk with is_final=true).
+   *
+   * @returns {Promise<object|null>}
+   * @internal
+   */
+  async _readFileChunk() {
+    if (this.#fileChunkQueue.length > 0) {
+      return this.#fileChunkQueue.shift();
+    }
+    if (this.#state === STATE_CLOSED) {
+      return null;
+    }
+    return new Promise((resolve, reject) => {
+      this.#fileChunkWaiter = { resolve, reject };
+    });
+  }
+
+  /**
+   * Resolve (or clear) any pending _readFileChunk() waiter.
+   * @private
+   */
+  #resolvePendingFileChunk(value) {
+    if (this.#fileChunkWaiter) {
+      const { resolve } = this.#fileChunkWaiter;
+      this.#fileChunkWaiter = null;
+      resolve(value);
     }
   }
 

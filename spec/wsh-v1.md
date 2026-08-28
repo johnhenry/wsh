@@ -1202,6 +1202,7 @@ Category: **filechannel**
 | `offset` | `u64` | yes | — |
 | `data` | `bytes` | yes | — |
 | `is_final` | `bool` | yes | — |
+| `total_size` | `u64` | yes | — |
 
 ### PolicyEval (`0x9b`)
 

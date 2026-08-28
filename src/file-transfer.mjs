@@ -1,24 +1,31 @@
 /**
- * WshFileTransfer — dedicated stream file transfer (scp-like) over a wsh connection.
+ * WshFileTransfer — scp-like file transfer over a wsh connection.
  *
- * Uploads and downloads files using the wsh channel protocol with 'file' kind
- * channels. Data flows over a dedicated bidirectional stream in 64KB chunks.
+ * Uploads and downloads delegate to the underlying client's upload()/
+ * download() (FileChunk control messages over a 'file'-kind channel —
+ * see client.mjs). list() is a separate helper that runs `ls -la` over
+ * a plain exec channel.
  */
 
 import { MSG, open, CHANNEL_KIND } from './messages.mjs';
-
-/** Transfer chunk size: 64KB. */
-const CHUNK_SIZE = 65536;
 
 /** Default timeout for waiting on control messages (30 seconds). */
 const RESPONSE_TIMEOUT_MS = 30_000;
 
 export class WshFileTransfer {
-  /** @type {{ sendControl: function, openStream: function, onControl: function }} */
+  /**
+   * @type {{
+   *   upload: function, download: function,
+   *   sendControl: function, openStream: function, onControl: function,
+   * }}
+   */
   #client;
 
   /**
-   * @param {object} client - A WshClient or any transport object exposing:
+   * @param {object} client - A WshClient (or any object exposing upload()/
+   *   download() with the same signatures — those are used directly for
+   *   upload/download). list() additionally needs, for the underlying exec
+   *   channel it runs `ls -la` over:
    *   - sendControl(msg): send a control message
    *   - openStream(): open a new bidirectional stream
    *   - onControl: settable callback for incoming control messages
@@ -32,12 +39,10 @@ export class WshFileTransfer {
   /**
    * Upload data to a remote path.
    *
-   * Protocol flow:
-   *   1. Send OPEN { kind: 'file', command: 'upload', path }
-   *   2. Receive OPEN_OK { channel_id, stream_ids }
-   *   3. Write data to dedicated stream in 64KB chunks
-   *   4. Close the write side of the stream
-   *   5. Wait for EXIT message with status code
+   * Delegates to the underlying client's `upload()`, which sends the data
+   * as a sequence of `FileChunk` control messages over a `'file'`-kind
+   * channel — the single wire scheme for file transfer (see
+   * `WshClient.upload` in `client.mjs`).
    *
    * @param {Uint8Array | ArrayBuffer} data - File content to upload
    * @param {string} remotePath - Destination path on the remote host
@@ -47,97 +52,31 @@ export class WshFileTransfer {
    * @returns {Promise<{ success: boolean, bytesTransferred: number }>}
    */
   async upload(data, remotePath, { onProgress, timeout = RESPONSE_TIMEOUT_MS } = {}) {
-    if (typeof this.#client.upload === 'function') {
-      await this.#client.upload(data, remotePath, {
-        onProgress: (value) => {
-          if (typeof value === 'number') {
-            onProgress?.({ sent: value, total: data.byteLength ?? data.length ?? 0 });
-            return;
-          }
-          onProgress?.(value);
-        },
-        timeout,
-      });
-      const bytes = data instanceof Uint8Array ? data.byteLength : data.byteLength ?? data.length ?? 0;
-      return { success: true, bytesTransferred: bytes };
+    if (typeof this.#client.upload !== 'function') {
+      throw new Error('WshFileTransfer requires a client exposing upload() (e.g. WshClient)');
     }
 
-    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
-    if (!(bytes instanceof Uint8Array)) {
-      throw new TypeError('Data must be a Uint8Array or ArrayBuffer');
-    }
-    if (!remotePath || typeof remotePath !== 'string') {
-      throw new Error('remotePath is required');
-    }
-
-    // 1. Request a file upload channel
-    const openMsg = open({
-      kind: CHANNEL_KIND.FILE,
-      command: 'upload',
+    await this.#client.upload(data, remotePath, {
+      onProgress: (value) => {
+        if (typeof value === 'number') {
+          onProgress?.({ sent: value, total: data.byteLength ?? data.length ?? 0 });
+          return;
+        }
+        onProgress?.(value);
+      },
+      timeout,
     });
-    openMsg.path = remotePath;
-    openMsg.size = bytes.length;
-
-    await this.#client.sendControl(openMsg);
-
-    // 2. Wait for OPEN_OK or OPEN_FAIL
-    const response = await this._waitForMessage(
-      (msg) => msg.type === MSG.OPEN_OK || msg.type === MSG.OPEN_FAIL,
-      timeout
-    );
-
-    if (response.type === MSG.OPEN_FAIL) {
-      throw new Error(`Upload rejected: ${response.reason || 'unknown reason'}`);
-    }
-
-    const channelId = response.channel_id;
-
-    // 3. Open a dedicated data stream and write in chunks
-    const stream = await this.#client.openStream();
-    const writer = stream.writable.getWriter();
-    let sent = 0;
-
-    try {
-      while (sent < bytes.length) {
-        const end = Math.min(sent + CHUNK_SIZE, bytes.length);
-        const chunk = bytes.subarray(sent, end);
-        await writer.write(chunk);
-        sent = end;
-        try {
-          onProgress?.({ sent, total: bytes.length });
-        } catch { /* ignore callback errors */ }
-      }
-    } finally {
-      // 4. Close the write side to signal end of data
-      try {
-        await writer.close();
-      } catch {
-        // Stream may already be closed on error
-      }
-    }
-
-    // 5. Wait for EXIT confirmation
-    const exitMsg = await this._waitForMessage(
-      (msg) => msg.type === MSG.EXIT && msg.channel_id === channelId,
-      timeout
-    );
-
-    const success = exitMsg.code === 0;
-    if (!success) {
-      throw new Error(`Upload failed with exit code ${exitMsg.code}`);
-    }
-
-    return { success, bytesTransferred: sent };
+    const bytes = data instanceof Uint8Array ? data.byteLength : data.byteLength ?? data.length ?? 0;
+    return { success: true, bytesTransferred: bytes };
   }
 
   /**
    * Download a file from a remote path.
    *
-   * Protocol flow:
-   *   1. Send OPEN { kind: 'file', command: 'download', path }
-   *   2. Receive OPEN_OK { channel_id, stream_ids }
-   *   3. Read from the dedicated stream, accumulating chunks
-   *   4. Return complete file content as Uint8Array
+   * Delegates to the underlying client's `download()`, which reads the
+   * data as a sequence of `FileChunk` control messages over a
+   * `'file'`-kind channel — the single wire scheme for file transfer (see
+   * `WshClient.download` in `client.mjs`).
    *
    * @param {string} remotePath - File path on the remote host
    * @param {object} [opts]
@@ -146,76 +85,10 @@ export class WshFileTransfer {
    * @returns {Promise<Uint8Array>} File content
    */
   async download(remotePath, { onProgress, timeout = RESPONSE_TIMEOUT_MS } = {}) {
-    if (typeof this.#client.download === 'function') {
-      return await this.#client.download(remotePath, { onProgress, timeout });
+    if (typeof this.#client.download !== 'function') {
+      throw new Error('WshFileTransfer requires a client exposing download() (e.g. WshClient)');
     }
-
-    if (!remotePath || typeof remotePath !== 'string') {
-      throw new Error('remotePath is required');
-    }
-
-    // 1. Request a file download channel
-    const openMsg = open({
-      kind: CHANNEL_KIND.FILE,
-      command: 'download',
-    });
-    openMsg.path = remotePath;
-
-    await this.#client.sendControl(openMsg);
-
-    // 2. Wait for OPEN_OK or OPEN_FAIL
-    const response = await this._waitForMessage(
-      (msg) => msg.type === MSG.OPEN_OK || msg.type === MSG.OPEN_FAIL,
-      timeout
-    );
-
-    if (response.type === MSG.OPEN_FAIL) {
-      throw new Error(`Download rejected: ${response.reason || 'unknown reason'}`);
-    }
-
-    const channelId = response.channel_id;
-    const totalSize = response.size; // Server may include total file size
-
-    // 3. Open a dedicated data stream and read chunks
-    const stream = await this.#client.openStream();
-    const reader = stream.readable.getReader();
-    const chunks = [];
-    let received = 0;
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        chunks.push(value);
-        received += value.length;
-
-        try {
-          onProgress?.({ received, total: totalSize });
-        } catch { /* ignore callback errors */ }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-
-    // 4. Wait for EXIT confirmation
-    try {
-      const exitMsg = await this._waitForMessage(
-        (msg) => msg.type === MSG.EXIT && msg.channel_id === channelId,
-        timeout
-      );
-      if (exitMsg.code !== 0) {
-        throw new Error(`Download failed with exit code ${exitMsg.code}`);
-      }
-    } catch (err) {
-      // If the stream closed cleanly and we got data, the EXIT may have
-      // already been consumed or the server may not send one for downloads.
-      // Only rethrow if we have no data.
-      if (received === 0) throw err;
-    }
-
-    // Concatenate chunks into a single Uint8Array
-    return this._concatChunks(chunks, received);
+    return await this.#client.download(remotePath, { onProgress, timeout });
   }
 
   /**
