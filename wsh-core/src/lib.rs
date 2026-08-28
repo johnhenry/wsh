@@ -8,6 +8,7 @@ pub mod error;
 pub mod identity;
 pub mod keys;
 pub mod messages;
+pub mod qmux;
 pub mod remote_runtime;
 pub mod token;
 pub mod transport;
