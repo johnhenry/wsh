@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.9.0
+
+- **Unify file transfer onto FileChunk control messages (breaking).**
+  Consolidates the three incompatible file-transfer schemes this
+  library and its consumers had accumulated: `WshClient.upload`/
+  `download`'s raw-stream length-prefixed header, `WshFileTransfer`'s
+  dead ad-hoc `Open.path`/`Open.size` fields (unreachable in practice,
+  and would break instantly against a Rust `deny_unknown_fields`
+  server the moment they were exercised), and the spec's already-
+  declared-but-fully-dead `FileChunk` message. `FileChunk` is now the
+  single wire scheme, chosen because it travels as an ordinary
+  control-channel message rather than raw stream bytes -- it works
+  identically whether a channel's `data_mode` is stream- or virtual-
+  backed, so it never depends on a real second multiplexed stream
+  (which no server in this ecosystem implements).
+  - `FileChunk` gains a required `total_size` field so a truncated
+    transfer (channel closes before an `is_final` chunk reaches
+    `total_size`) is detectable rather than silently returned as a
+    short file. Added to the `relay.forwardable` allowlist along with
+    `FileResult`.
+  - `WshClient.upload`/`download` rewritten to send/receive `FileChunk`
+    messages; `download()` gains `onProgress`/`timeout` options for
+    parity with `upload()`.
+  - `WshFileTransfer`'s dead ad-hoc-`Open`-fields fallback removed;
+    `upload()`/`download()` now always delegate to the client.
+- **Fixed a dispatch-ordering bug** that could silently drop the first
+  byte(s) of a download (or any channel-scoped message arriving in the
+  same batch as `OPEN_OK`): `openSession()` used to register the
+  session in `WshClient`'s internal session map only as a microtask
+  continuation of its `OPEN_OK` waiter -- two hops removed from message
+  dispatch -- so a server that pushes channel-scoped data immediately
+  after `OPEN_OK` (exactly what a fast `download()` response does)
+  could have that data dispatched before the session existed to receive
+  it. `OPEN_OK`/`OPEN_FAIL` are now handled as a dedicated case in the
+  client's control-message dispatch that constructs and registers the
+  session synchronously, in the same dispatch step as `OPEN_OK` itself.
+
 ## 0.8.0
 
 - **Relay-forward sender identity + unified allowlist (breaking).**
