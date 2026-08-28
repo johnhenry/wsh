@@ -19,6 +19,18 @@ pub struct PeerMetadata {
     pub supports_replay: bool,
     pub supports_echo: bool,
     pub supports_term_sync: bool,
+    /// Raw 32-byte Ed25519 public key from the peer's signed record
+    /// (wsh #17). Populated only once the record has been verified to
+    /// belong to the registering connection's own authenticated identity.
+    pub public_key: Vec<u8>,
+    /// The signing peer's own monotonic counter, from the signed record.
+    /// Used to reject stale re-registrations (a lower-or-equal `seq`
+    /// than the last accepted one for this fingerprint).
+    pub seq: u64,
+    /// Raw Ed25519 signature over the peer record's transcript (wsh #17),
+    /// forwarded verbatim in `ReversePeers` so operators can re-verify
+    /// independent of trusting this relay.
+    pub record_signature: Vec<u8>,
 }
 
 impl Default for PeerMetadata {
@@ -30,6 +42,9 @@ impl Default for PeerMetadata {
             supports_replay: false,
             supports_echo: false,
             supports_term_sync: false,
+            public_key: Vec::new(),
+            seq: 0,
+            record_signature: Vec::new(),
         }
     }
 }
@@ -55,6 +70,12 @@ pub struct PeerEntry {
     pub supports_echo: bool,
     /// Whether the peer emits terminal sync telemetry.
     pub supports_term_sync: bool,
+    /// Raw 32-byte Ed25519 public key from the peer's signed record (wsh #17).
+    pub public_key: Vec<u8>,
+    /// The signing peer's own monotonic counter, from the signed record.
+    pub seq: u64,
+    /// Raw Ed25519 signature over the peer record's transcript (wsh #17).
+    pub record_signature: Vec<u8>,
     /// When the peer registered.
     pub registered_at: Instant,
     /// Last heartbeat / activity.
@@ -132,6 +153,9 @@ impl PeerRegistry {
             supports_replay: metadata.supports_replay,
             supports_echo: metadata.supports_echo,
             supports_term_sync: metadata.supports_term_sync,
+            public_key: metadata.public_key,
+            seq: metadata.seq,
+            record_signature: metadata.record_signature,
             registered_at: now,
             last_seen: now,
             connection_id: conn_id,
@@ -156,6 +180,12 @@ impl PeerRegistry {
             index.remove(fingerprint);
             debug!(fingerprint = %&fingerprint[..8.min(fingerprint.len())], "peer unregistered");
         }
+    }
+
+    /// Look up a peer by its exact (full) fingerprint, e.g. to check the
+    /// last-accepted `seq` before accepting a re-registration (wsh #17).
+    pub async fn get(&self, fingerprint: &str) -> Option<PeerEntry> {
+        self.peers.read().await.get(fingerprint).cloned()
     }
 
     /// Touch a peer's last_seen timestamp.

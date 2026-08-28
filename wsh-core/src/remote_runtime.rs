@@ -224,6 +224,9 @@ mod tests {
             supports_echo: true,
             supports_term_sync: true,
             last_seen: Some(5),
+            public_key: None,
+            seq: None,
+            record_signature: None,
         };
 
         let descriptor = RemotePeerDescriptor::from_wsh_peer_info(&peer, "relay.example", 4422);

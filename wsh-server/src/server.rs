@@ -1668,7 +1668,62 @@ impl WshServer {
         match (&envelope.msg_type, &envelope.payload) {
             // ── Reverse peer messages ───────────────────────────────
             (MsgType::ReverseRegister, Payload::ReverseRegister(p)) => {
-                let fp = fingerprint(&p.public_key);
+                // Verify the peer's self-signed record before accepting
+                // registration at all (wsh #17) -- p.public_key must belong
+                // to *this* connection's own authenticated identity
+                // (ctx.fingerprint, established during AUTH), not merely be
+                // *some* validly-signed key the client happens to control.
+                // Also enforces the signed record's monotonic seq, so a
+                // later stale re-registration can't silently regress a
+                // peer's advertised capabilities. All rejections are
+                // silent drops (log + no response), matching this
+                // protocol's existing forgiving conventions elsewhere.
+                if p.public_key.is_empty() || p.record_signature.is_empty() {
+                    warn!(
+                        fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                        "rejecting ReverseRegister: missing signed-record fields"
+                    );
+                    return Ok(None);
+                }
+                let claimed_fingerprint = fingerprint(&p.public_key);
+                if claimed_fingerprint != ctx.fingerprint {
+                    warn!(
+                        fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                        "rejecting ReverseRegister: public_key does not match the authenticated identity"
+                    );
+                    return Ok(None);
+                }
+                if let Some(existing) = self.peer_registry.get(&ctx.fingerprint).await {
+                    if p.seq <= existing.seq {
+                        warn!(
+                            fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                            seq = p.seq,
+                            existing_seq = existing.seq,
+                            "rejecting stale ReverseRegister"
+                        );
+                        return Ok(None);
+                    }
+                }
+                let record = wsh_core::PeerRecord {
+                    username: p.username.clone(),
+                    peer_type: p.peer_type.clone(),
+                    shell_backend: p.shell_backend.clone(),
+                    capabilities: p.capabilities.clone(),
+                    supports_attach: p.supports_attach,
+                    supports_replay: p.supports_replay,
+                    supports_echo: p.supports_echo,
+                    supports_term_sync: p.supports_term_sync,
+                    seq: p.seq,
+                };
+                if !wsh_core::verify_peer_record(&p.public_key, &p.record_signature, &record) {
+                    warn!(
+                        fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                        "rejecting ReverseRegister: signature verification failed"
+                    );
+                    return Ok(None);
+                }
+
+                let fp = ctx.fingerprint.clone();
                 // Register in the relay peer registry, passing the server-assigned conn_id
                 // so that ReverseConnect lookups match peer_senders keys.
                 let cid = ctx.conn_id.unwrap_or(0);
@@ -1685,6 +1740,9 @@ impl WshServer {
                             supports_replay: p.supports_replay,
                             supports_echo: p.supports_echo,
                             supports_term_sync: p.supports_term_sync,
+                            public_key: p.public_key.clone(),
+                            seq: p.seq,
+                            record_signature: p.record_signature.clone(),
                         },
                         Some(cid),
                     )
@@ -1718,6 +1776,9 @@ impl WshServer {
                         supports_echo: e.supports_echo,
                         supports_term_sync: e.supports_term_sync,
                         last_seen: Some(e.last_seen.elapsed().as_secs()),
+                        public_key: if e.public_key.is_empty() { None } else { Some(e.public_key.clone()) },
+                        seq: Some(e.seq),
+                        record_signature: if e.record_signature.is_empty() { None } else { Some(e.record_signature.clone()) },
                     })
                     .collect();
                 Ok(Some(Envelope {

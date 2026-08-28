@@ -1388,11 +1388,11 @@ pub struct PeerInfo {
     pub supports_term_sync: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
     pub public_key: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
     pub record_signature: Option<Vec<u8>>,
 }
 
