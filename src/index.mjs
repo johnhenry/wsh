@@ -53,6 +53,17 @@ export {
 export { WshTransport, WebTransportTransport, dispatchSerially, SerialQueue } from './transport.mjs';
 export { WebSocketTransport, WS_FRAME_TYPE } from './transport-ws.mjs';
 
+// QMux (QUIC-v1 frames over an ordered byte stream, draft-ietf-quic-qmux-02)
+// -- the wire multiplexing layer WebSocketTransport speaks. Exposed so an
+// alternate server implementation (not just the Rust wsh-server, which
+// vendors its own port) can speak the same framing without reimplementing
+// it -- see clawser's tools/wsh-server.mjs for exactly this use case.
+export { QMuxConnection, DEFAULTS as QMUX_DEFAULTS } from './qmux-connection.mjs';
+export {
+  ERROR_CODE as QMUX_ERROR_CODE, STREAM_INITIATOR as QMUX_STREAM_INITIATOR,
+  firstBidiStreamId, nextBidiStreamId, isClientInitiated, isBidirectional,
+} from './qmux.mjs';
+
 // Session + Client
 export { WshSession } from './session.mjs';
 export { WshVirtualSessionBackend, normalizeSessionData } from './virtual-session.mjs';

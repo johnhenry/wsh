@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.11.0
+
+- **Breaking: replaced the hand-rolled 5-byte WebSocket mux with QMux**
+  (draft-ietf-quic-qmux-02) — QUIC-v1 frame encoding (STREAM,
+  RESET_STREAM, STOP_SENDING, MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS,
+  DATA_BLOCKED/STREAM_DATA_BLOCKED/STREAMS_BLOCKED, CONNECTION_CLOSE,
+  DATAGRAM, and a `QX_TRANSPORT_PARAMETERS` handshake frame) running
+  directly over the existing reliable, ordered WebSocket byte stream.
+  New modules `src/qmux.mjs` (wire codec) and `src/qmux-connection.mjs`
+  (stream state machine + windowed flow control, real backpressure
+  where the old mux had none). `WebSocketTransport` (`src/
+  transport-ws.mjs`) now speaks QMux end to end: the control channel is
+  QMux stream 0 rather than a bare `[type][stream_id]`-prefixed frame.
+  Also adopts **RESET_STREAM_AT** (draft-ietf-quic-reliable-stream-
+  reset-09) for reliable-prefix stream cancellation. wsh has exactly
+  one consumer (clawser) and both its client and server move together,
+  so this is a breaking wire change shipped in place rather than a
+  parallel protocol version — no dual-version negotiation exists or is
+  planned. `WS_FRAME_TYPE` is kept exported from `transport-ws.mjs` as
+  a deprecated, now-unused constant for source compatibility.
+- **New exports for building alternate server implementations**:
+  `QMuxConnection`, `QMUX_DEFAULTS`, `QMUX_ERROR_CODE`,
+  `QMUX_STREAM_INITIATOR`, `firstBidiStreamId`, `nextBidiStreamId`,
+  `isClientInitiated`, `isBidirectional` — previously QMux's wire
+  primitives were internal-only, forcing any non-`WebSocketTransport`
+  server (e.g. clawser's Node `tools/wsh-server.mjs`, a from-scratch
+  reimplementation of the protocol server side) to either depend on
+  unexported internals or reimplement the whole mux by hand.
+
 ## 0.10.0
 
 - **New `WshClient` methods closing a JS/Rust parity gap**:
