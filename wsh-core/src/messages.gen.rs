@@ -596,6 +596,10 @@ pub struct OpenOkPayload {
     pub data_mode: SessionDataMode,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub token: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,8 +655,8 @@ pub struct ErrorPayload {
 #[serde(deny_unknown_fields)]
 pub struct AttachPayload {
     pub session_id: String,
-    #[serde(with = "serde_bytes")]
-    pub token: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub token: Option<Vec<u8>>,
     #[serde(default = "default_attach_mode")]
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

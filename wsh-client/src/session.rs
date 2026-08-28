@@ -82,6 +82,15 @@ pub struct WshSession {
     data_mode: SessionDataMode,
     /// Server-advertised capabilities for this session.
     capabilities: Vec<String>,
+    /// The server-assigned session_id this channel belongs to, from
+    /// `OpenOk` (clawser #48). `None` for channel kinds without
+    /// Attach/Resume-able sessions (e.g. file channels).
+    session_id: Option<String>,
+    /// The session-scoped HMAC token minted by the server at Open time
+    /// (clawser #48), also from `OpenOk`. Pass it to `resume_session` (or
+    /// optionally to `attach_session`) from a later connection to reclaim
+    /// this exact session. `None` alongside `session_id`.
+    resume_token: Option<Vec<u8>>,
     /// Current state.
     state: Arc<Mutex<SessionState>>,
     /// Last known remote exit code, when available.
@@ -133,6 +142,8 @@ impl WshSession {
             kind,
             data_mode: SessionDataMode::Stream,
             capabilities,
+            session_id: None,
+            resume_token: None,
             state: Arc::new(Mutex::new(SessionState::Open)),
             exit_code: Arc::new(Mutex::new(None)),
             backend: SessionBackend::Stream(Arc::new(Mutex::new(stream))),
@@ -152,6 +163,8 @@ impl WshSession {
             kind,
             data_mode: SessionDataMode::Virtual,
             capabilities,
+            session_id: None,
+            resume_token: None,
             state: Arc::new(Mutex::new(SessionState::Open)),
             exit_code: Arc::new(Mutex::new(None)),
             backend: SessionBackend::Virtual(Arc::new(VirtualSessionBackend::new())),
@@ -159,9 +172,40 @@ impl WshSession {
         }
     }
 
+    /// Attach the server-provided session_id/token from `OpenOk` (clawser
+    /// #48). Builder-style; call once right after construction, before the
+    /// session is wrapped in `Arc` (the fields never change afterward).
+    /// `None`/`None` for channel kinds without an Attach/Resume-able
+    /// session (e.g. file channels), matching `OpenOk`'s own optionality.
+    #[must_use]
+    pub(crate) fn with_session_credentials(
+        mut self,
+        session_id: Option<String>,
+        resume_token: Option<Vec<u8>>,
+    ) -> Self {
+        self.session_id = session_id;
+        self.resume_token = resume_token;
+        self
+    }
+
     /// The channel ID assigned by the server.
     pub fn channel_id(&self) -> u32 {
         self.channel_id
+    }
+
+    /// The server-assigned session_id this channel belongs to, if any
+    /// (clawser #48; `None` for channel kinds with no Attach/Resume-able
+    /// session, e.g. file channels).
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// The session-scoped resume token minted at Open time, if any
+    /// (clawser #48). Pass it to `WshClient::resume_session` from a later
+    /// connection to reclaim this exact session, proving you're the same
+    /// credentialed opener rather than merely an authorized principal.
+    pub fn resume_token(&self) -> Option<&[u8]> {
+        self.resume_token.as_deref()
     }
 
     /// The kind of this channel.

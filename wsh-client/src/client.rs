@@ -339,20 +339,26 @@ impl WshClient {
                             t.open_stream().await?
                         };
 
-                        Arc::new(WshSession::new_stream(
+                        Arc::new(
+                            WshSession::new_stream(
+                                ok.channel_id,
+                                kind,
+                                stream.stream,
+                                self.control_action_tx.clone(),
+                                ok.capabilities.clone(),
+                            )
+                            .with_session_credentials(ok.session_id.clone(), ok.token.clone()),
+                        )
+                    }
+                    SessionDataMode::Virtual => Arc::new(
+                        WshSession::new_virtual(
                             ok.channel_id,
                             kind,
-                            stream.stream,
                             self.control_action_tx.clone(),
                             ok.capabilities.clone(),
-                        ))
-                    }
-                    SessionDataMode::Virtual => Arc::new(WshSession::new_virtual(
-                        ok.channel_id,
-                        kind,
-                        self.control_action_tx.clone(),
-                        ok.capabilities.clone(),
-                    )),
+                        )
+                        .with_session_credentials(ok.session_id.clone(), ok.token.clone()),
+                    ),
                 };
 
                 {
@@ -431,12 +437,25 @@ impl WshClient {
     }
 
     /// Attach to an existing session (read-only or control mode).
-    pub async fn attach_session(&self, session_id: &str, read_only: bool) -> WshResult<()> {
-        let token = self
-            .token
-            .as_ref()
-            .ok_or_else(|| WshError::AuthFailed("no session token available".into()))?;
-
+    ///
+    /// `token` is optional (clawser #48): the server accepts either a
+    /// valid session-scoped token (from `WshSession::resume_token`, if
+    /// this process is the one that opened the session) OR the caller
+    /// already owning/being ACL-granted access to `session_id` --
+    /// `check_session_access` server-side. Pass `None` for the common
+    /// case of a principal attaching via ownership or a `SessionGrant`
+    /// grant, who never held the session's token to begin with (only the
+    /// opener receives one, via `OpenOk`). This previously fell back to
+    /// this connection's own AUTH-level token (`WshClient::token`), which
+    /// is bound to a completely different session_id (the connection's
+    /// auth session, not the target PTY/exec session) and so could never
+    /// actually verify -- that was the root cause of clawser #48.
+    pub async fn attach_session(
+        &self,
+        session_id: &str,
+        read_only: bool,
+        token: Option<&[u8]>,
+    ) -> WshResult<()> {
         let mode = if read_only {
             "view".to_string()
         } else {
@@ -447,7 +466,7 @@ impl WshClient {
             msg_type: MsgType::Attach,
             payload: Payload::Attach(AttachPayload {
                 session_id: session_id.to_string(),
-                token: token.clone(),
+                token: token.map(|t| t.to_vec()),
                 mode,
                 device_label: None,
             }),
@@ -459,6 +478,44 @@ impl WshClient {
             Payload::Error(err) => Err(WshError::Channel(err.message)),
             _ => Err(WshError::InvalidMessage(
                 "unexpected response to ATTACH".into(),
+            )),
+        }
+    }
+
+    /// Resume a previously-opened session, replaying its ring buffer.
+    ///
+    /// Unlike `attach_session`, `token` is required: Resume is
+    /// specifically for the connection that was handed this exact token
+    /// (via `OpenOk`/`WshSession::resume_token`, when it originally opened
+    /// the session) coming back, so the server verifies it unconditionally
+    /// rather than falling back to an ACL/ownership check. Use
+    /// `attach_session` instead for a principal who only has ACL/ownership
+    /// access but never held the token.
+    ///
+    /// `last_seq` is currently advisory server-side (the ring buffer
+    /// replays its full contents regardless), but is still required on
+    /// the wire for future partial-replay support.
+    pub async fn resume_session(
+        &self,
+        session_id: &str,
+        token: &[u8],
+        last_seq: u64,
+    ) -> WshResult<()> {
+        let envelope = Envelope {
+            msg_type: MsgType::Resume,
+            payload: Payload::Resume(ResumePayload {
+                session_id: session_id.to_string(),
+                token: token.to_vec(),
+                last_seq,
+            }),
+        };
+
+        let response = self.send_and_wait(envelope, MsgType::Presence).await?;
+        match response.payload {
+            Payload::Presence(_) => Ok(()),
+            Payload::Error(err) => Err(WshError::Channel(err.message)),
+            _ => Err(WshError::InvalidMessage(
+                "unexpected response to RESUME".into(),
             )),
         }
     }
@@ -1528,6 +1585,8 @@ mod tests {
                     stream_ids: vec![],
                     data_mode: SessionDataMode::Virtual,
                     capabilities: vec!["resize".into(), "signal".into()],
+                    session_id: Some("sess-31".into()),
+                    token: Some(vec![9u8; 40]),
                 }),
             })
             .unwrap();
@@ -1540,17 +1599,23 @@ mod tests {
             session.capabilities(),
             &["resize".to_string(), "signal".to_string()]
         );
+        // clawser #48: OpenOk now carries the session_id/token this channel
+        // belongs to (pty/exec only), so a later Attach/Resume from another
+        // connection has something real to present.
+        assert_eq!(session.session_id(), Some("sess-31"));
+        assert_eq!(session.resume_token(), Some(&[9u8; 40][..]));
         response_task.await.unwrap();
     }
 
     // ── initiate_e2e (wsh #18) ──────────────────────────────────────
     //
     // No integration test goes through the real wsh-server relay here:
-    // that relay currently requires two different connections to share a
-    // session_id via Attach/Resume, which (as of this writing) has no
-    // working token-minting path for PTY/exec sessions server-side -- see
-    // the GitHub issue filed alongside this change. Instead, these tests
-    // build two independent `WshClient`s over `AnyTransport::Test` and
+    // that relay requires two different connections to share a session_id
+    // via Attach/Resume (fixed in clawser #48 -- see wsh-server's own test
+    // suite and tools/test/wsh-rust-server.test.mjs for real two-party
+    // coverage through the actual server). These *unit* tests don't spin
+    // up a server at all, so instead they build two independent
+    // `WshClient`s over `AnyTransport::Test` and
     // wire each one's outgoing control frames directly into the other's
     // `handle_incoming`, i.e. a loopback transport pair fully under test
     // control, exercising the exact same `initiate_e2e` code path real

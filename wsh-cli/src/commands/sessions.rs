@@ -75,8 +75,12 @@ pub async fn run_attach(
         identity
     };
     let client = connect_client(&resolved, effective_identity).await?;
+    // No token: this is a fresh connection re-attaching by session_id
+    // alone, relying on check_session_access (ownership -- `wsh attach`
+    // reconnects as the same authenticated user who opened the session)
+    // rather than a token this process never held (clawser #48).
     client
-        .attach_session(session, false)
+        .attach_session(session, false, None)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("failed to attach to session '{session}'"))?;

@@ -539,6 +539,12 @@ impl ReverseHostRuntime {
                     stream_ids: vec![],
                     data_mode: SessionDataMode::Virtual,
                     capabilities,
+                    // Reverse-host channels aren't tracked by the main
+                    // server's session-management surface (no ACLs, no
+                    // Attach/Resume support here), so there's no
+                    // session_id/token to mint.
+                    session_id: None,
+                    token: None,
                 }),
             })
             .await
@@ -956,6 +962,8 @@ impl ReverseHostRuntime {
                     stream_ids: vec![],
                     data_mode: SessionDataMode::Virtual,
                     capabilities,
+                    session_id: None,
+                    token: None,
                 }),
             })
             .await

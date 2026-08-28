@@ -1871,20 +1871,52 @@ impl WshServer {
                     }
                 }
 
-                if let Err(e) = verify_token(&self.secret, &p.session_id, &p.token) {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::Error,
-                        payload: Payload::Error(ErrorPayload {
-                            code: 2,
-                            message: format!("invalid token: {e}"),
-                        }),
-                    }));
-                }
-                // Verify the caller owns or has been granted access to this session
-                if !self
+                // Authorization (clawser #48): EITHER a valid session token
+                // OR check_session_access (owner or SessionGrant-ACL'd) is
+                // sufficient -- neither is required on its own.
+                //
+                // Why not require the token, now that Open actually mints
+                // one? Because check_session_access is already the
+                // authoritative authorization check elsewhere in this file
+                // (SessionListRequest, Detach, ...), and it's derived from
+                // ctx.username -- only ever set via a real completed AUTH,
+                // never client-supplied. A principal granted access via
+                // SessionGrant has no way to ever obtain the session's
+                // token (only the opener receives it, via OpenOk), so
+                // requiring it here would leave ACL grants just as
+                // unreachable as this whole message type was before this
+                // fix -- the exact gap clawser #48 is about closing.
+                //
+                // Why accept the token as an alternative, rather than
+                // dropping it entirely? It still means something: proof of
+                // holding the specific credential minted for this session,
+                // independent of check_session_access. That's useful for
+                // e.g. the owner attaching from a brand-new connection
+                // where nothing has established ctx.username yet as
+                // matching the session's owner through some other means --
+                // though in practice check_session_access already covers
+                // that once AUTH completes, since ctx.username is set by
+                // then. Kept mainly for symmetry with Resume and to avoid
+                // a spurious failure mode: a client that *does* have a
+                // valid token but ends up with a stale/wrong ACL state
+                // isn't gratuitously blocked.
+                //
+                // A token that's present but fails verification does NOT
+                // by itself reject the request -- it only fails to grant
+                // access on its own. This matters because it means a
+                // client bug that sends a garbage/stale token (the
+                // original form of this exact issue: the JS/Rust clients
+                // used to send the wrong, connection-level auth token)
+                // can't accidentally block an otherwise-authorized
+                // ACL/ownership attach.
+                let token_ok = p
+                    .token
+                    .as_ref()
+                    .is_some_and(|t| verify_token(&self.secret, &p.session_id, t).is_ok());
+                let access_ok = self
                     .check_session_access(&p.session_id, &ctx.username)
-                    .await
-                {
+                    .await;
+                if !token_ok && !access_ok {
                     return Ok(Some(Envelope {
                         msg_type: MsgType::Error,
                         payload: Payload::Error(ErrorPayload {
@@ -1993,6 +2025,14 @@ impl WshServer {
                 }
             }
             (MsgType::Resume, Payload::Resume(p)) => {
+                // Unlike Attach, Resume's token is required and
+                // unconditionally verified (clawser #48) -- Resume is
+                // specifically "the connection that was handed this exact
+                // token, at Open time, is coming back", so demanding proof
+                // of that precise credential is the entire point. A
+                // principal who only has ACL/ownership access but never
+                // held the token (e.g. someone else's SessionGrant
+                // grantee) should use Attach instead, not Resume.
                 if let Err(e) = verify_token(&self.secret, &p.session_id, &p.token) {
                     return Ok(Some(Envelope {
                         msg_type: MsgType::Error,
@@ -2193,6 +2233,20 @@ impl WshServer {
                                     ctx.peer_tx.clone(),
                                 );
 
+                                // Mint the session-scoped HMAC token here, at the
+                                // only point a PTY/exec session_id actually comes
+                                // into existence (clawser #48: previously no code
+                                // path ever minted one, so Attach/Resume's
+                                // verify_token check could never succeed for any
+                                // caller). Returned only to the opener via OpenOk
+                                // -- see Attach/Resume's handlers below for how
+                                // each uses it.
+                                let session_token = wsh_core::create_token(
+                                    &self.secret,
+                                    &session_id,
+                                    self.config.session_ttl,
+                                );
+
                                 Ok(Some(Envelope {
                                     msg_type: MsgType::OpenOk,
                                     payload: Payload::OpenOk(OpenOkPayload {
@@ -2200,6 +2254,8 @@ impl WshServer {
                                         stream_ids: vec![],
                                         data_mode: SessionDataMode::Virtual,
                                         capabilities: vec![],
+                                        session_id: Some(session_id.clone()),
+                                        token: Some(session_token),
                                     }),
                                 }))
                             }
@@ -2244,6 +2300,10 @@ impl WshServer {
                                             stream_ids: vec![],
                                             data_mode: SessionDataMode::Virtual,
                                             capabilities: vec![],
+                                            // File channels have no Attach/Resume-able
+                                            // session -- session_id/token are pty/exec-only.
+                                            session_id: None,
+                                            token: None,
                                         }),
                                     }))
                                 }
@@ -2270,6 +2330,8 @@ impl WshServer {
                                             stream_ids: vec![],
                                             data_mode: SessionDataMode::Virtual,
                                             capabilities: vec![],
+                                            session_id: None,
+                                            token: None,
                                         }),
                                     }))
                                 }
