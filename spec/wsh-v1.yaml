@@ -1254,36 +1254,64 @@ messages:
   # key exchange, session data would be wrapped in EncryptedFrame messages
   # so the server cannot read session content. Currently incomplete on
   # both sides of the wire: WshClient.initiateE2E() performs a real X25519
-  # ECDH exchange and derives an AES-256-GCM key (src/client.mjs), but
-  # nothing constructs or consumes an EncryptedFrame with it -- the
-  # derived key is never actually used to seal/open anything. The Rust
-  # client has no KeyExchange/EncryptedFrame support at all; the Rust
-  # server only relays both message types opaquely between session
-  # participants (correct for true E2E, but doesn't imply either side
-  # actually encrypts). Do not rely on this for confidentiality today.
-  # Completing it (real AEAD sealing on both languages) is tracked
-  # alongside the hybrid PQ handshake work (X25519 + ML-KEM-768) rather
-  # than as a standalone fix, since that work revisits this same
-  # KeyExchange path anyway.
+  # ECDH exchange (optionally hybrid with ML-KEM-768, see below) and
+  # derives an AES-256-GCM key (src/client.mjs), but nothing constructs or
+  # consumes an EncryptedFrame with it -- the derived key is never
+  # actually used to seal/open anything. The Rust client has no
+  # KeyExchange/EncryptedFrame support at all; the Rust server only
+  # relays both message types opaquely between session participants
+  # (correct for true E2E, but doesn't imply either side actually
+  # encrypts). Do not rely on this for confidentiality today. Completing
+  # it (real AEAD sealing on both languages) is tracked as a follow-up,
+  # separate from the hybrid PQ handshake work this section now covers.
   e2e:
     KeyExchange:
       code: 0x8e
       description: >
-        X25519 key exchange for establishing a shared secret.
-        Both sides send their ephemeral public key; the shared
-        secret is derived via ECDH. See the e2e section note above --
-        the derived secret is not yet wired to any actual encryption.
+        Key exchange for establishing a shared secret, X25519 or hybrid
+        X25519+ML-KEM-768. See the e2e section note above -- the derived
+        secret is not yet wired to any actual encryption.
+
+        Classical mode ("X25519"): both sides send only public_key
+        (their ephemeral X25519 public key); the shared secret is
+        derived via ECDH directly.
+
+        Hybrid mode ("X25519+ML-KEM-768"): round 1 is the same as
+        classical, plus both sides also send kem_public_key (a fresh
+        ML-KEM-768 public key). After round 1, each side deterministically
+        derives the same "encapsulator"/"decapsulator" role assignment by
+        comparing the two exchanged X25519 public_key values byte-lexico-
+        graphically (the lower one is the encapsulator) -- this needs no
+        extra round trip since both sides already have both values. The
+        encapsulator then encapsulates against the decapsulator's
+        kem_public_key and sends a second KeyExchange carrying only
+        kem_ciphertext (no public_key/kem_public_key); the decapsulator
+        decapsulates it. Both sides combine the X25519 ECDH output and
+        the ML-KEM-768 shared secret via HKDF-SHA256 into the final
+        AES-256-GCM key. A peer that doesn't echo kem_public_key back in
+        its own round-1 message doesn't support hybrid mode -- fall back
+        to classical X25519-only rather than failing the exchange
+        (algorithm agility, not a hard cutover).
       fields:
         algorithm:
           type: string
           required: true
-          description: '"x25519" or "kyber768" (post-quantum)'
+          description: '"X25519" or "X25519+ML-KEM-768"'
         public_key:
           type: bytes
-          required: true
+          required: false
+          description: "Ephemeral X25519 public key. Omitted only on the hybrid round-2 (kem_ciphertext-only) message."
         session_id:
           type: string
           required: true
+        kem_public_key:
+          type: bytes
+          required: false
+          description: "Hybrid mode round 1 only: a fresh ML-KEM-768 public key (1184 bytes)."
+        kem_ciphertext:
+          type: bytes
+          required: false
+          description: "Hybrid mode round 2 only, encapsulator -> decapsulator: the ML-KEM-768 ciphertext (1088 bytes)."
 
     EncryptedFrame:
       code: 0x8f

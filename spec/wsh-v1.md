@@ -1050,8 +1050,10 @@ Category: **e2e**
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
 | `algorithm` | `string` | yes | — |
-| `public_key` | `bytes` | yes | — |
+| `public_key` | `bytes` | no | — |
 | `session_id` | `string` | yes | — |
+| `kem_public_key` | `bytes` | no | — |
+| `kem_ciphertext` | `bytes` | no | — |
 
 ### EncryptedFrame (`0x8f`)
 

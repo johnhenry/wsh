@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.13.0
+
+- **Hybrid X25519+ML-KEM-768 E2E key exchange**: `initiateE2E(sessionId,
+  'X25519+ML-KEM-768')` now supports a post-quantum-hybrid mode
+  alongside the existing classical `'X25519'` default. New module
+  `src/mlkem.mjs` prefers the native (still experimental) WebCrypto
+  `ML-KEM-768` algorithm (Node 24.7+, some browsers) so this stays a
+  zero-*required*-runtime-dependency library; falls back to the new
+  optional `@noble/post-quantum` dependency's pure-JS implementation
+  only when native support is absent, via a dynamic import. Hybrid mode
+  adds one one-way message beyond classical mode's single round trip:
+  after both sides exchange ephemeral X25519 + fresh ML-KEM-768 public
+  keys, each independently derives the same encapsulator/decapsulator
+  role assignment by comparing the two X25519 public keys
+  byte-lexicographically (no extra round trip needed for role
+  negotiation), the encapsulator sends the ML-KEM-768 ciphertext, and
+  both combine the X25519 ECDH output with the ML-KEM-768 shared secret
+  via HKDF-SHA256. Falls back to classical automatically if the peer
+  doesn't support hybrid mode (algorithm agility, not a hard cutover) --
+  check the returned `hybrid` flag. `KeyExchange`'s spec gained optional
+  `kem_public_key`/`kem_ciphertext` fields and `public_key` became
+  optional (omitted on the hybrid-only ciphertext-carrying message).
+  This extends the existing `initiateE2E()`/`KeyExchange` primitive,
+  which remains experimental and not yet wired to any actual
+  `EncryptedFrame` encryption (unchanged from before this release --
+  see the spec's e2e section note).
+
 ## 0.12.0
 
 - **Breaking: signed peer records for reverse-mode registration** (libp2p

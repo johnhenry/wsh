@@ -1,6 +1,6 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
@@ -13,6 +13,9 @@
     "LICENSE",
     "README.md"
   ],
+  "optionalDependencies": {
+    "@noble/post-quantum": "^0.7.0"
+  },
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "examples": "for f in examples/0*.mjs; do echo \"== $f\" && node \"$f\" || exit 1; done",

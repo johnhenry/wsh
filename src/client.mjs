@@ -36,6 +36,7 @@ import {
   isRelayForwardable,
 } from './messages.mjs';
 import { signChallenge, exportPublicKeyRaw, signPeerRecord, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
+import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
 import { WshSession } from './session.mjs';
 import { cborDecode } from './cbor.mjs';
 
@@ -83,6 +84,44 @@ async function verifyPeerInfoRecord(peer) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Lexicographic byte comparison, used by `initiateE2E`'s hybrid mode to
+ * deterministically assign the ML-KEM "encapsulator" role without an
+ * extra round trip: both sides already have both ephemeral X25519
+ * public keys after round 1, so whichever side's own key sorts lower
+ * encapsulates.
+ * @returns {number} <0 if a<b, >0 if a>b, 0 if equal
+ */
+function compareBytes(a, b) {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return a.length - b.length;
+}
+
+/**
+ * Combine the classical (X25519 ECDH) and post-quantum (ML-KEM-768) key
+ * exchange outputs into one AES-256-GCM key via HKDF-SHA256, so the
+ * final key is only as weak as the *stronger* of the two if either
+ * primitive is ever broken.
+ * @param {Uint8Array} x25519Bits - 32-byte ECDH shared secret
+ * @param {Uint8Array} kemSharedSecret - 32-byte ML-KEM-768 shared secret
+ * @returns {Promise<Uint8Array>} 32 bytes of combined key material
+ */
+async function combineHybridSecret(x25519Bits, kemSharedSecret) {
+  const ikm = new Uint8Array(x25519Bits.length + kemSharedSecret.length);
+  ikm.set(x25519Bits, 0);
+  ikm.set(kemSharedSecret, x25519Bits.length);
+  const hkdfKey = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode('wsh-hybrid-e2e-v1') },
+    hkdfKey,
+    256
+  );
+  return new Uint8Array(bits);
 }
 
 // ── Client class ──────────────────────────────────────────────────────
@@ -1292,28 +1331,50 @@ export class WshClient {
   // ── E2E Encryption ────────────────────────────────────────────────
 
   /**
-   * Initiate end-to-end encryption for a session using X25519 key exchange.
+   * Initiate end-to-end encryption for a session.
+   *
+   * `algorithm: 'X25519'` (default): classical ECDH only, one round trip
+   * -- both sides send their ephemeral public key, derive the shared
+   * secret directly.
+   *
+   * `algorithm: 'X25519+ML-KEM-768'`: hybrid classical+post-quantum. Round
+   * 1 is the same as classical, plus both sides also send a fresh
+   * ML-KEM-768 public key. Each side then deterministically derives the
+   * same "encapsulator"/"decapsulator" role assignment by comparing the
+   * two exchanged X25519 public keys byte-lexicographically (no extra
+   * round trip needed, since both sides already have both values after
+   * round 1) -- the encapsulator encapsulates against the decapsulator's
+   * ML-KEM-768 key and sends the ciphertext in a second KeyExchange
+   * message; the decapsulator decapsulates it. Both combine the X25519
+   * and ML-KEM-768 outputs via HKDF-SHA256. Falls back to classical
+   * automatically if the peer's round-1 message doesn't include a
+   * kem_public_key (it doesn't support hybrid mode) -- algorithm
+   * agility, not a hard cutover; check the returned `hybrid` flag to see
+   * which actually happened.
+   *
    * @param {string} sessionId - Session ID
-   * @param {string} [algorithm='X25519'] - Key exchange algorithm
+   * @param {string} [algorithm='X25519'] - 'X25519' or 'X25519+ML-KEM-768'
    * @param {number} [timeout=10000]
-   * @returns {Promise<{sharedSecret: CryptoKey, peerPublicKey: Uint8Array}>}
+   * @returns {Promise<{sharedSecret: CryptoKey, peerPublicKey: Uint8Array, hybrid: boolean}>}
    */
   async initiateE2E(sessionId, algorithm = 'X25519', timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('initiateE2E');
+    const wantHybrid = algorithm === 'X25519+ML-KEM-768';
 
-    // Generate ephemeral X25519 key pair
+    // Generate ephemeral X25519 key pair (and, for hybrid, a fresh
+    // ML-KEM-768 key pair too).
     const ephemeral = await crypto.subtle.generateKey(
       { name: 'X25519' },
       false,
       ['deriveBits']
     );
-
     const localPub = new Uint8Array(
       await crypto.subtle.exportKey('raw', ephemeral.publicKey)
     );
+    const localKem = wantHybrid ? await generateMlKemKeyPair() : null;
 
     await this.#transport.sendControl(
-      keyExchangeMsg({ algorithm, publicKey: localPub, sessionId })
+      keyExchangeMsg({ algorithm, publicKey: localPub, sessionId, kemPublicKey: localKem?.publicKey })
     );
 
     const peerMsg = await this.#waitForMessage(
@@ -1322,7 +1383,7 @@ export class WshClient {
       'Timed out waiting for peer key exchange'
     );
 
-    // Import peer's public key and derive shared secret
+    // Import peer's public key and derive the classical shared secret.
     const peerKey = await crypto.subtle.importKey(
       'raw',
       peerMsg.public_key,
@@ -1330,23 +1391,46 @@ export class WshClient {
       false,
       []
     );
-
-    const sharedBits = await crypto.subtle.deriveBits(
+    const sharedBits = new Uint8Array(await crypto.subtle.deriveBits(
       { name: 'X25519', public: peerKey },
       ephemeral.privateKey,
       256
-    );
+    ));
 
-    // Derive an AES-GCM key from the shared secret
+    const hybridActive = wantHybrid && !!localKem && !!peerMsg.kem_public_key;
+    let combinedBits = sharedBits;
+
+    if (hybridActive) {
+      const peerKemPublicKey = new Uint8Array(peerMsg.kem_public_key);
+      const isEncapsulator = compareBytes(localPub, new Uint8Array(peerMsg.public_key)) < 0;
+
+      let kemSharedSecret;
+      if (isEncapsulator) {
+        const { ciphertext, sharedSecret } = await mlKemEncapsulate(peerKemPublicKey);
+        kemSharedSecret = sharedSecret;
+        await this.#transport.sendControl(keyExchangeMsg({ algorithm, sessionId, kemCiphertext: ciphertext }));
+      } else {
+        const ctMsg = await this.#waitForMessage(
+          [MSG.KEY_EXCHANGE],
+          timeout,
+          'Timed out waiting for peer ML-KEM-768 ciphertext'
+        );
+        kemSharedSecret = await mlKemDecapsulate(localKem.secretKeySeed, new Uint8Array(ctMsg.kem_ciphertext));
+      }
+
+      combinedBits = await combineHybridSecret(sharedBits, kemSharedSecret);
+    }
+
+    // Derive an AES-GCM key from the (possibly hybrid-combined) shared secret
     const sharedSecret = await crypto.subtle.importKey(
       'raw',
-      sharedBits,
+      combinedBits,
       { name: 'AES-GCM', length: 256 },
       false,
       ['encrypt', 'decrypt']
     );
 
-    return { sharedSecret, peerPublicKey: new Uint8Array(peerMsg.public_key) };
+    return { sharedSecret, peerPublicKey: new Uint8Array(peerMsg.public_key), hybrid: hybridActive };
   }
 
   // ── Structured File Channel ───────────────────────────────────────

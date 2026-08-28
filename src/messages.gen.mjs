@@ -771,13 +771,12 @@ export function copilotDetach({ sessionId, reason } = {}) {
   return msg;
 }
 
-export function keyExchange({ algorithm, publicKey, sessionId } = {}) {
-  return {
-    type: MSG.KEY_EXCHANGE,
-    algorithm,
-    public_key: publicKey,
-    session_id: sessionId,
-  };
+export function keyExchange({ algorithm, publicKey, sessionId, kemPublicKey, kemCiphertext } = {}) {
+  const msg = { type: MSG.KEY_EXCHANGE, algorithm, session_id: sessionId };
+  if (publicKey !== undefined) msg.public_key = publicKey;
+  if (kemPublicKey !== undefined) msg.kem_public_key = kemPublicKey;
+  if (kemCiphertext !== undefined) msg.kem_ciphertext = kemCiphertext;
+  return msg;
 }
 
 export function encryptedFrame({ nonce, ciphertext, sessionId } = {}) {

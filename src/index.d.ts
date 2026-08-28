@@ -633,6 +633,37 @@ export function verifyChallenge(
   channelBinding?: Uint8Array,
 ): Promise<boolean>;
 
+/** Fields of a signed peer record (reverse-mode registration). See `signPeerRecord`. */
+export interface WshPeerRecord {
+  username: string;
+  peerType?: string;
+  shellBackend?: string;
+  capabilities?: string[];
+  supportsAttach?: boolean;
+  supportsReplay?: boolean;
+  supportsEcho?: boolean;
+  supportsTermSync?: boolean;
+  /** The signing peer's own monotonic counter (current-time-millis in practice). */
+  seq: number;
+}
+
+/**
+ * Build the signed transcript for a peer record -- domain-separated from
+ * `buildTranscript`'s auth-challenge transcript even under the same key.
+ * @returns 32-byte SHA-256 hash
+ */
+export function buildPeerRecordTranscript(record: WshPeerRecord): Promise<Uint8Array>;
+
+/** Client-side: sign a peer record with the identity key pair. */
+export function signPeerRecord(
+  privateKey: CryptoKey,
+  publicKey: CryptoKey,
+  record: WshPeerRecord,
+): Promise<{ signature: Uint8Array; publicKeyRaw: Uint8Array }>;
+
+/** Verify a peer record's signature against the claimed record fields. */
+export function verifyPeerRecord(publicKey: CryptoKey, signature: Uint8Array, record: WshPeerRecord): Promise<boolean>;
+
 /**
  * Compute the SHA-256 fingerprint of a raw public key.
  * @returns hex-encoded fingerprint
@@ -984,6 +1015,33 @@ export interface WshPeerInfo {
   supports_echo: boolean;
   supports_term_sync: boolean;
   last_seen: number | null;
+  /** Raw 32-byte Ed25519 public key from the peer's signed record, if present. */
+  public_key?: Uint8Array;
+  /** The signing peer's own monotonic counter, from the signed record. */
+  seq?: number;
+  /** Raw Ed25519 signature over the peer record's transcript, if present. */
+  record_signature?: Uint8Array;
+  /**
+   * Not a wire field -- computed client-side by `listPeers()` from
+   * `public_key`/`seq`/`record_signature` via `verifyPeerRecord`. `true`
+   * only if the signature verifies AND the key's fingerprint matches
+   * `fingerprint`; `false` for missing/tampered/mismatched records.
+   */
+  verified: boolean;
+}
+
+/** Result from WshClient.initiateE2E(). */
+export interface WshE2EResult {
+  /** Non-extractable AES-256-GCM key derived from the exchange. */
+  sharedSecret: CryptoKey;
+  /** The peer's ephemeral X25519 public key. */
+  peerPublicKey: Uint8Array;
+  /**
+   * Whether hybrid X25519+ML-KEM-768 mode actually took effect --
+   * `false` if `algorithm: 'X25519'` was requested, or if hybrid was
+   * requested but the peer didn't support it (automatic fallback).
+   */
+  hybrid: boolean;
 }
 
 /**
@@ -1126,6 +1184,14 @@ export class WshClient {
    * Send a control message over the authenticated relay connection.
    */
   sendRelayControl(msg: WshMessage): Promise<void>;
+
+  /**
+   * Initiate end-to-end encryption for a session: `'X25519'` (default,
+   * classical ECDH) or `'X25519+ML-KEM-768'` (hybrid, with automatic
+   * fallback to classical if the peer doesn't support it). Experimental
+   * -- the derived key is not yet wired to any actual encryption.
+   */
+  initiateE2E(sessionId: string, algorithm?: 'X25519' | 'X25519+ML-KEM-768', timeout?: number): Promise<WshE2EResult>;
 
   /**
    * Mark a peer fingerprint as an accepted reverse-connect bridge partner.
