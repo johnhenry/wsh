@@ -264,6 +264,8 @@ Category: **channel**
 | `stream_ids` | `u32[]` | no | `[]` |
 | `data_mode` | `SessionDataMode` | no | `"stream"` |
 | `capabilities` | `string[]` | no | `[]` |
+| `session_id` | `string` | no | — |
+| `token` | `bytes` | no | — |
 
 ### OpenFail (`0x12`)
 
@@ -370,7 +372,7 @@ Category: **session**
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
 | `session_id` | `string` | yes | — |
-| `token` | `bytes` | yes | — |
+| `token` | `bytes` | no | — |
 | `mode` | `string` | no | `"control"` |
 | `device_label` | `string` | no | — |
 

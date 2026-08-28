@@ -45,6 +45,23 @@ export class WshSession {
   #capabilities = [];
 
   /**
+   * The server-assigned session_id this channel belongs to, from OPEN_OK
+   * (clawser #48). `undefined` for channel kinds with no Attach/Resume-able
+   * session (e.g. file channels).
+   * @type {string|undefined}
+   */
+  #sessionId;
+
+  /**
+   * The session-scoped HMAC token minted by the server at Open time
+   * (clawser #48), also from OPEN_OK. Pass it to `WshClient.resumeSession`
+   * (or optionally `attachSession`) from a later connection to reclaim
+   * this exact session. `undefined` alongside `#sessionId`.
+   * @type {Uint8Array|undefined}
+   */
+  #resumeToken;
+
+  /**
    * Stream IDs returned by the server in OPEN_OK.
    * Typically { stdin: number, stdout: number } or a single bidirectional ID.
    * @type {object}
@@ -151,8 +168,13 @@ export class WshSession {
    * @param {object} [opts]
    * @param {'stream'|'virtual'} [opts.dataMode='stream']
    * @param {string[]} [opts.capabilities=[]]
+   * @param {string} [opts.sessionId] - Server session_id from OPEN_OK (clawser #48; pty/exec only)
+   * @param {Uint8Array} [opts.resumeToken] - Session-scoped resume token from OPEN_OK (clawser #48)
    */
-  constructor(transport, channelId, streamIds, kind, { dataMode = 'stream', capabilities = [] } = {}) {
+  constructor(
+    transport, channelId, streamIds, kind,
+    { dataMode = 'stream', capabilities = [], sessionId, resumeToken } = {}
+  ) {
     this.#transport = transport;
     this.channelId = channelId;
     this.#streamIds = streamIds;
@@ -160,6 +182,28 @@ export class WshSession {
     this.id = String(channelId);
     this.#dataMode = dataMode === 'virtual' ? 'virtual' : 'stream';
     this.#capabilities = Array.isArray(capabilities) ? [...capabilities] : [];
+    this.#sessionId = sessionId;
+    this.#resumeToken = resumeToken;
+  }
+
+  /**
+   * The server-assigned session_id this channel belongs to, if any
+   * (clawser #48; `undefined` for channel kinds with no Attach/Resume-able
+   * session, e.g. file channels). Pass to `WshClient.attachSession`/
+   * `resumeSession` from another connection.
+   */
+  get sessionId() {
+    return this.#sessionId;
+  }
+
+  /**
+   * The session-scoped resume token minted at Open time, if any (clawser
+   * #48). Pass it to `WshClient.resumeSession` from a later connection to
+   * reclaim this exact session, proving you're the same credentialed
+   * opener rather than merely an authorized principal.
+   */
+  get resumeToken() {
+    return this.#resumeToken;
   }
 
   /** Current session state. */

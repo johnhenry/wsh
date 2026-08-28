@@ -134,8 +134,18 @@ export class WshClient {
   /** @type {string|null} Session ID assigned by the server after authentication. */
   #sessionId = null;
 
-  /** @type {string|null} Resume token from AUTH_OK. */
-  #resumeToken = null;
+  /**
+   * @type {string|null} Connection-level token from AUTH_OK, bound to
+   * this connection's own auth session_id (from CHALLENGE/SERVER_HELLO) --
+   * NOT a PTY/exec session's token. Renamed from `#resumeToken` (clawser
+   * #48): the old name invited exactly the bug this fix addresses --
+   * attachSession() used to send this as if it were a valid token for the
+   * *target* session_id, which it can never be (it's scoped to a
+   * different session_id entirely). Not used for anything else currently;
+   * kept and exposed via `authToken` for potential future connection-level
+   * resume use, mirroring the Rust client's `WshClient::token()`.
+   */
+  #authToken = null;
 
   /** @type {import('./transport.mjs').WshTransport|null} Active transport. */
   #transport = null;
@@ -282,6 +292,16 @@ export class WshClient {
     return this.#sessionId;
   }
 
+  /**
+   * This connection's own AUTH-level token (from AUTH_OK), scoped to this
+   * connection's auth session_id -- NOT a PTY/exec session token. See
+   * `WshSession.resumeToken` for the per-session credential used by
+   * `resumeSession`.
+   */
+  get authToken() {
+    return this.#authToken;
+  }
+
   /** Read-only view of active sessions. */
   get sessions() {
     return new Map(this.#sessions);
@@ -341,7 +361,7 @@ export class WshClient {
     this.#channelCounter = 0;
     this.#waiters.clear();
     this.#sessionId = null;
-    this.#resumeToken = null;
+    this.#authToken = null;
 
     try {
       // ── Select and connect transport ──────────────────────────────
@@ -384,7 +404,7 @@ export class WshClient {
           if (challengeMsg.type === MSG.AUTH_OK) {
             // Server accepted without challenge (e.g. trusted key).
             this.#sessionId = challengeMsg.session_id || tempSessionId;
-            this.#resumeToken = challengeMsg.token || null;
+            this.#authToken = challengeMsg.token || null;
             this.#state = STATE_AUTHENTICATED;
             this.#startPing();
             return this.#sessionId;
@@ -460,7 +480,7 @@ export class WshClient {
       }
 
       this.#sessionId = authResult.session_id || tempSessionId;
-      this.#resumeToken = authResult.token || null;
+      this.#authToken = authResult.token || null;
       this.#state = STATE_AUTHENTICATED;
       this.#startPing();
 
@@ -538,37 +558,48 @@ export class WshClient {
   /**
    * Attach to an existing remote session (collaborative or read-only).
    *
+   * Authorization is satisfied by EITHER `token` OR the caller already
+   * owning/being ACL-granted access to `targetSessionId` server-side (see
+   * wsh-server's `check_session_access`) -- `token` is optional and, for
+   * the common case of attaching via ownership or a `grantSessionAccess`
+   * grant, should simply be omitted (a granted principal never receives
+   * the session's token to begin with -- only the opener does, via
+   * `WshSession.resumeToken`). Pass one explicitly only if you have it
+   * (e.g. this same process opened the session earlier, or the owner
+   * shared it with you out of band).
+   *
+   * Previously (clawser #48) this always sent this connection's own
+   * AUTH-level token, which can never verify against a *different*
+   * session_id -- making attachSession() unreachable for everyone,
+   * including the session's own owner from a fresh connection. Also fixed
+   * alongside that: the server actually replies with PRESENCE (success)
+   * or ERROR (failure), not OPEN_OK/OPEN_FAIL -- this used to wait on the
+   * wrong response stream entirely and would have hung even once the
+   * token bug was fixed.
+   *
    * @param {string} targetSessionId - Remote session ID to attach to
    * @param {object} [opts]
    * @param {boolean} [opts.readOnly=false] - Attach in read-only mode
+   * @param {Uint8Array} [opts.token] - Session-scoped token (optional; see above)
    * @param {number} [opts.timeout] - Timeout in ms
-   * @returns {Promise<object>} Server's response
+   * @returns {Promise<object>} Server's PRESENCE response
    */
-  async attachSession(targetSessionId, { readOnly = false, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
+  async attachSession(targetSessionId, { readOnly = false, token, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
     this.#assertAuthenticated('attachSession');
 
     const attachMode = readOnly ? 'readonly' : 'control';
     await this.#transport.sendControl(
-      attachMsg({ sessionId: targetSessionId, token: this.#resumeToken, mode: attachMode })
+      attachMsg({ sessionId: targetSessionId, token, mode: attachMode })
     );
 
-    // Shares #pendingOpens with openSession() -- both wait on the same
-    // OPEN_OK/OPEN_FAIL response stream, in the order their requests were
-    // sent (see #pendingOpens's doc comment). Unlike openSession(),
-    // attachSession() doesn't construct a WshSession, so it just wants
-    // the raw response either way.
-    const response = await new Promise((resolve, reject) => {
-      const entry = { mode: 'raw', resolve, reject };
-      entry.timer = setTimeout(() => {
-        const idx = this.#pendingOpens.indexOf(entry);
-        if (idx !== -1) this.#pendingOpens.splice(idx, 1);
-        reject(new Error('Timed out waiting for attach response'));
-      }, timeout);
-      this.#pendingOpens.push(entry);
-    });
+    const response = await this.#waitForMessage(
+      [MSG.PRESENCE, MSG.ERROR],
+      timeout,
+      'Timed out waiting for attach response'
+    );
 
-    if (response.type === MSG.OPEN_FAIL) {
-      throw new Error(`Failed to attach: ${response.reason || 'rejected'}`);
+    if (response.type === MSG.ERROR) {
+      throw new Error(`Failed to attach: ${response.message || 'rejected'}`);
     }
 
     return response;
@@ -577,26 +608,35 @@ export class WshClient {
   /**
    * Resume a previously disconnected session.
    *
+   * Unlike attachSession(), `token` is required and verified
+   * unconditionally server-side -- Resume is specifically for the
+   * connection that was handed this exact token (via
+   * `WshSession.resumeToken`, when it originally opened the session)
+   * coming back. A principal who only has ACL/ownership access but never
+   * held the token should use attachSession() instead.
+   *
    * @param {string} targetSessionId - Session ID to resume
-   * @param {string} token - Resume token from original AUTH_OK
-   * @param {number} [opts.timeout] - Timeout in ms
-   * @returns {Promise<object>} Server's response
+   * @param {Uint8Array} token - Session-scoped resume token (see `WshSession.resumeToken`)
+   * @param {object} [opts]
+   * @param {number} [opts.lastSeq=0] - Last sequence number this client already has (currently advisory -- the ring buffer replays its full contents regardless)
+   * @param {number} [opts.timeout=10000] - Timeout in ms
+   * @returns {Promise<object>} Server's PRESENCE response
    */
-  async resumeSession(targetSessionId, token, { timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
+  async resumeSession(targetSessionId, token, { lastSeq = 0, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
     this.#assertAuthenticated('resumeSession');
 
     await this.#transport.sendControl(
-      resumeMsg({ sessionId: targetSessionId, token })
+      resumeMsg({ sessionId: targetSessionId, token, lastSeq })
     );
 
     const response = await this.#waitForMessage(
-      [MSG.AUTH_OK, MSG.AUTH_FAIL],
+      [MSG.PRESENCE, MSG.ERROR],
       timeout,
       'Timed out waiting for resume response'
     );
 
-    if (response.type === MSG.AUTH_FAIL) {
-      throw new Error(`Failed to resume: ${response.reason || 'rejected'}`);
+    if (response.type === MSG.ERROR) {
+      throw new Error(`Failed to resume: ${response.message || 'rejected'}`);
     }
 
     return response;
@@ -1667,7 +1707,7 @@ export class WshClient {
 
           if (challengeMsg.type === MSG.AUTH_OK) {
             this.#sessionId = challengeMsg.session_id || tempSessionId;
-            this.#resumeToken = challengeMsg.token || null;
+            this.#authToken = challengeMsg.token || null;
             this.#state = STATE_AUTHENTICATED;
             this.#startPing();
             return this.#sessionId;
@@ -1713,7 +1753,7 @@ export class WshClient {
       }
 
       this.#sessionId = authResult.session_id || tempSessionId;
-      this.#resumeToken = authResult.token || null;
+      this.#authToken = authResult.token || null;
       this.#state = STATE_AUTHENTICATED;
       this.#startPing();
 
@@ -1773,14 +1813,6 @@ export class WshClient {
       if (!pending) return;
       clearTimeout(pending.timer);
 
-      // attachSession() wants the raw response either way and never
-      // constructs a session -- it has no #sessions-registration race to
-      // protect against.
-      if (pending.mode === 'raw') {
-        pending.resolve(msg);
-        return;
-      }
-
       if (type === MSG.OPEN_FAIL) {
         pending.reject(new Error(`Failed to open session: ${msg.reason || 'rejected'}`));
         return;
@@ -1796,7 +1828,18 @@ export class WshClient {
         serverChannelId,
         streamIds,
         pending.kind,
-        { dataMode, capabilities }
+        {
+          dataMode,
+          capabilities,
+          // clawser #48: OpenOk now carries the session_id/token this
+          // channel belongs to (pty/exec only -- undefined for e.g. file
+          // channels, which have no Attach/Resume-able session). Exposed
+          // via WshSession.sessionId/resumeToken for a later
+          // attachSession()/resumeSession() call, possibly from a
+          // different connection.
+          sessionId: msg.session_id,
+          resumeToken: msg.token,
+        }
       );
       this.#sessions.set(serverChannelId, session);
 

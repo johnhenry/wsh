@@ -205,6 +205,126 @@ describe('WshClient session management', { skip: !hasEd25519 && 'Ed25519 not ava
     assert.equal(sent.principal, 'bob');
     assert.equal(sent.reason, 'no longer needed');
   });
+
+  // ── clawser #48: OpenOk.session_id/token, attachSession/resumeSession ──
+  //
+  // Regression coverage for the actual bug: attachSession() used to send
+  // this connection's own AUTH-level token (bound to a different
+  // session_id) and wait on OPEN_OK/OPEN_FAIL, which the server's Attach
+  // handler never sends on success (it replies with PRESENCE) -- so it
+  // would have hung even once the token itself was fixed. Both are fixed
+  // together here.
+
+  it('openSession() exposes the server-provided session_id/token from OPEN_OK on the returned WshSession', async () => {
+    const transport = new SessionManagementMockTransport('sess-open-creds');
+    const token = new Uint8Array(40).fill(7);
+    transport.queueReply(MSG.OPEN, {
+      type: MSG.OPEN_OK,
+      channel_id: 1,
+      data_mode: 'virtual',
+      session_id: 'pty-sess-1',
+      token,
+    });
+    const client = await connectedClient(transport);
+
+    const session = await client.openSession({ type: 'pty' });
+
+    assert.equal(session.sessionId, 'pty-sess-1');
+    assert.deepEqual(session.resumeToken, token);
+  });
+
+  it('openSession() leaves sessionId/resumeToken undefined when OPEN_OK omits them (e.g. file channels)', async () => {
+    const transport = new SessionManagementMockTransport('sess-open-no-creds');
+    transport.queueReply(MSG.OPEN, { type: MSG.OPEN_OK, channel_id: 1, data_mode: 'virtual' });
+    const client = await connectedClient(transport);
+
+    const session = await client.openSession({ type: 'pty' });
+
+    assert.equal(session.sessionId, undefined);
+    assert.equal(session.resumeToken, undefined);
+  });
+
+  it('attachSession() sends no token by default (ACL/ownership-only attach) and resolves on PRESENCE', async () => {
+    const transport = new SessionManagementMockTransport('sess-attach-no-token');
+    transport.queueReply(MSG.ATTACH, {
+      type: MSG.PRESENCE,
+      attachments: [{ session_id: 'target-1', mode: 'control', username: 'alice' }],
+    });
+    const client = await connectedClient(transport);
+
+    const response = await client.attachSession('target-1');
+
+    const sent = transport.sentMessages.find((m) => m.type === MSG.ATTACH);
+    assert.ok(sent);
+    assert.equal(sent.session_id, 'target-1');
+    assert.equal(sent.token, undefined);
+    assert.equal(response.type, MSG.PRESENCE);
+  });
+
+  it('attachSession() forwards an explicit token when the caller provides one', async () => {
+    const transport = new SessionManagementMockTransport('sess-attach-token');
+    const token = new Uint8Array(40).fill(3);
+    transport.queueReply(MSG.ATTACH, {
+      type: MSG.PRESENCE,
+      attachments: [{ session_id: 'target-2', mode: 'control', username: 'alice' }],
+    });
+    const client = await connectedClient(transport);
+
+    await client.attachSession('target-2', { token });
+
+    const sent = transport.sentMessages.find((m) => m.type === MSG.ATTACH);
+    assert.deepEqual(sent.token, token);
+  });
+
+  it('attachSession() throws with the server-provided message on ERROR', async () => {
+    const transport = new SessionManagementMockTransport('sess-attach-fail');
+    transport.queueReply(MSG.ATTACH, {
+      type: MSG.ERROR,
+      code: 2,
+      message: 'not authorized to attach to this session',
+    });
+    const client = await connectedClient(transport);
+
+    await assert.rejects(
+      () => client.attachSession('target-3'),
+      /not authorized to attach to this session/
+    );
+  });
+
+  it('resumeSession() sends the required token and resolves on PRESENCE', async () => {
+    const transport = new SessionManagementMockTransport('sess-resume-ok');
+    const token = new Uint8Array(40).fill(4);
+    transport.queueReply(MSG.RESUME, {
+      type: MSG.PRESENCE,
+      attachments: [{ session_id: 'target-4', mode: 'control', username: 'alice' }],
+    });
+    const client = await connectedClient(transport);
+
+    const response = await client.resumeSession('target-4', token);
+
+    const sent = transport.sentMessages.find((m) => m.type === MSG.RESUME);
+    assert.ok(sent);
+    assert.equal(sent.session_id, 'target-4');
+    assert.deepEqual(sent.token, token);
+    assert.equal(sent.last_seq, 0);
+    assert.equal(response.type, MSG.PRESENCE);
+  });
+
+  it('resumeSession() throws with the server-provided message on ERROR (e.g. invalid/expired token)', async () => {
+    const transport = new SessionManagementMockTransport('sess-resume-fail');
+    const token = new Uint8Array(40).fill(4);
+    transport.queueReply(MSG.RESUME, {
+      type: MSG.ERROR,
+      code: 2,
+      message: 'invalid token: token error: invalid token signature',
+    });
+    const client = await connectedClient(transport);
+
+    await assert.rejects(
+      () => client.resumeSession('target-5', token),
+      /invalid token signature/
+    );
+  });
 });
 
 /**

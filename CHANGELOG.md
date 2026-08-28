@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.14.0
+
+- **Fix: `attachSession()`/`resumeSession()` were both unreachable** (clawser
+  #48). Two independent bugs, found together while wiring a real two-party
+  Attach test against the Rust `wsh-server`:
+  - `attachSession()` sent this connection's own AUTH-level token (from
+    AUTH_OK, bound to *this connection's* auth session_id) as if it were a
+    credential for the *target* PTY/exec session_id -- it never could be,
+    since those are different session_ids entirely, and no code path ever
+    minted a token scoped to a PTY/exec session_id in the first place.
+  - Independent of the token: `attachSession()`/`resumeSession()` waited on
+    `OPEN_OK`/`OPEN_FAIL` (`resumeSession()` even waited on `AUTH_OK`/
+    `AUTH_FAIL`), but the server actually replies to `Attach`/`Resume` with
+    `PRESENCE` (success) or `ERROR` (failure) -- both calls would have hung
+    until timeout even with a valid token.
+  - `OpenOk` gained optional `session_id`/`token` fields: the server now
+    mints a session-scoped token when a pty/exec session is created and
+    returns both alongside the channel_id, so the opener has a real
+    credential to hand to a later `resumeSession()` call. Exposed on
+    `WshSession` as `sessionId`/`resumeToken`. Both are `undefined` for
+    channel kinds with no Attach/Resume-able session (e.g. file channels).
+  - `Attach.token` is now optional on the wire: the server accepts EITHER a
+    valid token OR the caller already owning/being ACL-granted access to
+    the session (`grantSessionAccess`) -- a principal who was only granted
+    access via ACL never receives the session's token to begin with (only
+    the opener does), so requiring it would leave that case permanently
+    unreachable. `attachSession()`'s `token` option is now optional to
+    match; omit it for the common ACL/ownership case, or pass one
+    explicitly (e.g. `session.resumeToken`) if you have it. `Resume` keeps
+    requiring its token unconditionally -- it's specifically for the
+    original credentialed connection coming back, where proving that exact
+    credential is the point; use `attachSession()` instead for an
+    ACL-granted principal who never held it. `resumeSession()` also gained
+    a `lastSeq` option (previously always sent as `undefined`, which the
+    wire's `required: true` field never tolerated -- so `resumeSession()`
+    could never have produced a valid `Resume` message before this fix
+    either).
+  - `WshClient`'s previously-private, misleadingly-named `#resumeToken`
+    field (the AUTH-level token -- the actual root cause of the first bug
+    above, since its name invited using it as if it were a session-resume
+    credential) is renamed to `#authToken` and exposed read-only via the
+    new `authToken` getter, mirroring the Rust client's `WshClient::token()`.
+
 ## 0.13.0
 
 - **Hybrid X25519+ML-KEM-768 E2E key exchange**: `initiateE2E(sessionId,

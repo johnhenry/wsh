@@ -1484,4 +1484,31 @@ describe('optional field coverage', () => {
     const msg = fileResult({ channelId: 1, success: true });
     assert.equal(msg.error_message, undefined);
   });
+
+  // ── clawser #48: OpenOk.session_id/token, Attach.token optional ─────
+
+  it('openOk.session_id/token present (pty/exec channels)', () => {
+    const token = new Uint8Array(40).fill(5);
+    const msg = openOk({ channelId: 1, sessionId: 'sess-1', token });
+    assert.equal(msg.session_id, 'sess-1');
+    assert.deepEqual(msg.token, token);
+  });
+
+  it('openOk.session_id/token absent (e.g. file channels)', () => {
+    const msg = openOk({ channelId: 1 });
+    assert.equal(msg.session_id, undefined);
+    assert.equal(msg.token, undefined);
+  });
+
+  it('attach.token absent (ACL/ownership-only attach, clawser #48)', () => {
+    const msg = attach({ sessionId: 's1' });
+    assert.equal(msg.type, MSG.ATTACH);
+    assert.equal(msg.token, undefined);
+  });
+
+  it('attach.token present (token-based attach still supported)', () => {
+    const token = new Uint8Array(40).fill(9);
+    const msg = attach({ sessionId: 's1', token });
+    assert.deepEqual(msg.token, token);
+  });
 });

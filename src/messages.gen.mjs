@@ -247,14 +247,11 @@ export function open({ kind, command, cols, rows, env } = {}) {
   return msg;
 }
 
-export function openOk({ channelId, streamIds = [], dataMode = "stream", capabilities = [] } = {}) {
-  return {
-    type: MSG.OPEN_OK,
-    channel_id: channelId,
-    stream_ids: streamIds,
-    data_mode: dataMode,
-    capabilities,
-  };
+export function openOk({ channelId, streamIds = [], dataMode = "stream", capabilities = [], sessionId, token } = {}) {
+  const msg = { type: MSG.OPEN_OK, channel_id: channelId, stream_ids: streamIds, data_mode: dataMode, capabilities };
+  if (sessionId !== undefined) msg.session_id = sessionId;
+  if (token !== undefined) msg.token = token;
+  return msg;
 }
 
 export function openFail({ reason } = {}) {
@@ -327,7 +324,8 @@ export function pong({ id } = {}) {
 }
 
 export function attach({ sessionId, token, mode = "control", deviceLabel } = {}) {
-  const msg = { type: MSG.ATTACH, session_id: sessionId, token, mode };
+  const msg = { type: MSG.ATTACH, session_id: sessionId, mode };
+  if (token !== undefined) msg.token = token;
   if (deviceLabel !== undefined) msg.device_label = deviceLabel;
   return msg;
 }

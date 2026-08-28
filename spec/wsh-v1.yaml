@@ -181,6 +181,25 @@ messages:
         capabilities:
           type: "string[]"
           default: "[]"
+        session_id:
+          type: string
+          required: false
+          description: >
+            Present only for pty/exec channels (session-bearing kinds; omitted
+            for file channels, which have no Attach/Resume-able session).
+            The server-assigned session_id this channel belongs to -- pass it
+            to Attach/Resume from another connection, or discover it later via
+            SessionList.
+        token:
+          type: bytes
+          required: false
+          description: >
+            Present only alongside session_id. An HMAC-SHA256 credential
+            (see wsh-core's token module) scoped to this specific session_id,
+            minted at Open time. Resume requires presenting this exact token
+            back; Attach accepts it as an alternative to (not a replacement
+            for) ownership/ACL-grant authorization -- see Attach's
+            description for the reasoning.
 
     OpenFail:
       code: 0x12
@@ -290,15 +309,31 @@ messages:
     Attach:
       code: 0x30
       description: >
-        Attach to an existing session.  Requires a valid session token.
-        The server replays the ring buffer and broadcasts Presence.
+        Attach to an existing session. The server replays the ring buffer
+        and broadcasts Presence.
+
+        Authorization is satisfied by EITHER a valid session token OR the
+        caller already owning/having been granted access to the session
+        (see the server's check_session_access) -- token is optional and,
+        if present but invalid, does not by itself cause rejection as long
+        as ownership/ACL access checks out. This lets a principal who was
+        granted access via SessionGrant (and so never received the
+        session's token -- only its owner does, from OpenOk) attach without
+        one, while still letting a token holder attach even without an
+        explicit ACL grant (e.g. the owner reconnecting from a fresh
+        connection that hasn't otherwise proven ownership yet). Compare
+        Resume, which requires the token unconditionally -- Resume is for
+        the specific case of the original credentialed connection coming
+        back, where demanding proof of that exact credential is meaningful;
+        Attach is the general "some authorized principal wants in" case,
+        where check_session_access is already the authoritative check.
       fields:
         session_id:
           type: string
           required: true
         token:
           type: bytes
-          required: true
+          required: false
         mode:
           type: string
           default: '"control"'
@@ -312,6 +347,14 @@ messages:
       description: >
         Resume a session from a specific sequence number.  Like Attach
         but replays only output after last_seq for efficient reconnection.
+
+        Unlike Attach, token is required and unconditionally verified --
+        Resume is specifically the "the credentialed connection that
+        received this exact token (from OpenOk, when it opened the
+        session) is coming back" case, so demanding proof of that
+        credential is the whole point. A principal who only has
+        ACL/ownership access but never held the token should use Attach
+        instead.
       fields:
         session_id:
           type: string

@@ -833,6 +833,21 @@ export class WshSession {
   /** Session capabilities advertised by OPEN_OK. */
   readonly capabilities: string[];
 
+  /**
+   * The server-assigned session_id this channel belongs to, from OPEN_OK
+   * (clawser #48). `undefined` for channel kinds with no Attach/Resume-able
+   * session (e.g. file channels). Pass to `WshClient.attachSession`/
+   * `resumeSession` from another connection.
+   */
+  readonly sessionId: string | undefined;
+
+  /**
+   * The session-scoped resume token minted at Open time, if any (clawser
+   * #48). Pass to `WshClient.resumeSession` from a later connection to
+   * reclaim this exact session.
+   */
+  readonly resumeToken: Uint8Array | undefined;
+
   /** Called when stdout/stderr data arrives. */
   onData: ((data: Uint8Array) => void) | null;
 
@@ -874,6 +889,8 @@ export class WshSession {
     opts?: {
       dataMode?: 'stream' | 'virtual';
       capabilities?: string[];
+      sessionId?: string;
+      resumeToken?: Uint8Array;
     },
   );
 
@@ -958,6 +975,21 @@ export interface WshOpenSessionOptions {
 /** Options for WshClient.attachSession(). */
 export interface WshAttachSessionOptions {
   readOnly?: boolean;
+  /**
+   * Session-scoped token (clawser #48; optional). Omit for the common
+   * case of attaching via ownership or a `grantSessionAccess` grant --
+   * the server accepts EITHER a valid token OR the caller already
+   * owning/being ACL-granted access. Pass one (e.g. from
+   * `WshSession.resumeToken`) only if you have it.
+   */
+  token?: Uint8Array;
+  timeout?: number;
+}
+
+/** Options for WshClient.resumeSession(). */
+export interface WshResumeSessionOptions {
+  /** Last sequence number this client already has (currently advisory). */
+  lastSeq?: number;
   timeout?: number;
 }
 
@@ -1060,6 +1092,14 @@ export class WshClient {
   /** Server-assigned session ID. */
   readonly sessionId: string | null;
 
+  /**
+   * This connection's own AUTH-level token (from AUTH_OK), scoped to this
+   * connection's auth session_id -- NOT a PTY/exec session token. See
+   * `WshSession.resumeToken` for the per-session credential used by
+   * `resumeSession`.
+   */
+  readonly authToken: Uint8Array | null;
+
   /** Read-only view of active sessions. */
   readonly sessions: Map<number, WshSession>;
 
@@ -1118,13 +1158,17 @@ export class WshClient {
 
   /**
    * Attach to an existing remote session (collaborative or read-only).
+   * Authorization is satisfied by EITHER `opts.token` OR the caller
+   * already owning/being ACL-granted access to `targetSessionId`
+   * server-side -- see `WshAttachSessionOptions.token`.
    */
   attachSession(targetSessionId: string, opts?: WshAttachSessionOptions): Promise<WshMessage>;
 
   /**
-   * Resume a previously disconnected session.
+   * Resume a previously disconnected session. Unlike `attachSession()`,
+   * `token` is required and verified unconditionally server-side.
    */
-  resumeSession(targetSessionId: string, token: string, opts?: { timeout?: number }): Promise<WshMessage>;
+  resumeSession(targetSessionId: string, token: Uint8Array, opts?: WshResumeSessionOptions): Promise<WshMessage>;
 
   /**
    * Detach from a remote session, leaving it running server-side.
