@@ -21,9 +21,6 @@ impl<T> WsIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub(crate) type BoxedWsIo = Box<dyn WsIo>;
 
-const FRAME_CONTROL: u8 = 0x01;
-const HEADER_SIZE: usize = 5;
-
 /// A handle to an accepted WebSocket connection.
 pub struct WebSocketConnection {
     /// The WebSocket stream (split into sink + stream in usage).
@@ -90,53 +87,12 @@ pub async fn start_listener(
     Ok(rx)
 }
 
-fn build_frame(frame_type: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
-    frame.push(frame_type);
-    frame.extend_from_slice(&stream_id.to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame
-}
-
-fn parse_frame(data: &[u8]) -> WshResult<(u8, u32, &[u8])> {
-    if data.len() < HEADER_SIZE {
-        return Err(WshError::InvalidMessage(format!(
-            "WS frame too short: {} bytes",
-            data.len()
-        )));
-    }
-
-    let frame_type = data[0];
-    let stream_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-    Ok((frame_type, stream_id, &data[HEADER_SIZE..]))
-}
-
-fn decode_control_payload(data: &[u8]) -> WshResult<&[u8]> {
-    if data.len() < 4 {
-        return Err(WshError::InvalidMessage(format!(
-            "WS control payload too short: {} bytes",
-            data.len()
-        )));
-    }
-
-    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() != 4 + len {
-        return Err(WshError::InvalidMessage(format!(
-            "WS control payload length mismatch: declared {len}, got {} bytes",
-            data.len().saturating_sub(4)
-        )));
-    }
-
-    Ok(&data[4..])
-}
-
-/// Helper: send a control frame over a WebSocket.
-pub async fn ws_send_control(
-    ws: &mut WebSocketStream<BoxedWsIo>,
-    data: &[u8],
-) -> WshResult<()> {
-    let frame = build_frame(FRAME_CONTROL, 0, data);
-    ws.send(Message::Binary(frame.into()))
+/// Send a raw binary WebSocket message. The bytes are handed to us
+/// already-framed by the QMux layer (a QMux record) — this is a plain
+/// pass-through, unlike the old `FRAME_CONTROL`-wrapping `ws_send_control`
+/// it replaces.
+pub async fn ws_send_raw(ws: &mut WebSocketStream<BoxedWsIo>, data: &[u8]) -> WshResult<()> {
+    ws.send(Message::Binary(data.to_vec().into()))
         .await
         .map_err(|e| WshError::Transport(format!("WS send failed: {e}")))
 }
@@ -144,13 +100,12 @@ pub async fn ws_send_control(
 /// Maximum frame size for WebSocket messages (1 MiB, consistent with QUIC limit).
 const MAX_WS_FRAME_SIZE: usize = 1_048_576;
 
-/// Helper: receive the next control frame from a WebSocket.
+/// Receive the next raw binary WebSocket message, to be fed to
+/// `QMuxConnection::receive_bytes`.
 ///
 /// Returns `None` if the connection is closed. Text messages are ignored.
 /// Rejects frames larger than 1 MiB (consistent with QUIC transport limit).
-pub async fn ws_recv_control(
-    ws: &mut WebSocketStream<BoxedWsIo>,
-) -> WshResult<Option<Vec<u8>>> {
+pub async fn ws_recv_raw(ws: &mut WebSocketStream<BoxedWsIo>) -> WshResult<Option<Vec<u8>>> {
     loop {
         match ws.next().await {
             Some(Ok(Message::Binary(data))) => {
@@ -161,14 +116,7 @@ pub async fn ws_recv_control(
                         MAX_WS_FRAME_SIZE
                     )));
                 }
-                let (frame_type, _stream_id, payload) = parse_frame(&data)?;
-                if frame_type != FRAME_CONTROL {
-                    return Err(WshError::InvalidMessage(format!(
-                        "expected WS control frame, got type 0x{frame_type:02x}"
-                    )));
-                }
-                let payload = decode_control_payload(payload)?;
-                return Ok(Some(payload.to_vec()));
+                return Ok(Some(data.to_vec()));
             }
             Some(Ok(Message::Close(_))) => return Ok(None),
             Some(Ok(Message::Ping(payload))) => {
@@ -184,31 +132,5 @@ pub async fn ws_recv_control(
             }
             None => return Ok(None),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{build_frame, decode_control_payload, parse_frame, FRAME_CONTROL};
-
-    #[test]
-    fn build_and_parse_control_frame_round_trip() {
-        let frame = build_frame(FRAME_CONTROL, 0, b"hello");
-        let (frame_type, stream_id, payload) = parse_frame(&frame).unwrap();
-
-        assert_eq!(frame_type, FRAME_CONTROL);
-        assert_eq!(stream_id, 0);
-        assert_eq!(payload, b"hello");
-    }
-
-    #[test]
-    fn parse_frame_rejects_short_payload() {
-        assert!(parse_frame(&[FRAME_CONTROL, 0, 0, 0]).is_err());
-    }
-
-    #[test]
-    fn decode_control_payload_unwraps_inner_frame() {
-        let payload = decode_control_payload(&[0, 0, 0, 5, b'h', b'e', b'l', b'l', b'o']).unwrap();
-        assert_eq!(payload, b"hello");
     }
 }

@@ -23,7 +23,9 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 use wsh_core::keys::{load_authorized_keys, AuthorizedKey};
 use wsh_core::messages::*;
-use wsh_core::{decode_envelope, fingerprint, frame_encode, verify_token, WshError, WshResult};
+use wsh_core::qmux::ErrorCode;
+use wsh_core::qmux_connection::{QMuxConnection, QMuxConnectionConfig, QMuxEvent};
+use wsh_core::{decode_envelope, fingerprint, frame_encode, verify_token, FrameDecoder, WshError, WshResult};
 
 /// Per-connection context threaded through the session loop.
 struct ConnectionContext {
@@ -936,174 +938,434 @@ impl WshServer {
         });
     }
 
-    /// Handle a WebSocket connection through the auth handshake.
+    /// Handle a WebSocket connection.
+    ///
+    /// The transport now speaks QMux (draft-ietf-quic-qmux-02) rather than
+    /// the old hand-rolled `FRAME_CONTROL` framing: every control message
+    /// (HELLO/CHALLENGE/AUTH/AUTH_OK and everything post-auth) travels as a
+    /// CBOR envelope, length-prefix-framed (`FrameDecoder`/`frame_encode`),
+    /// inside QMux STREAM frames on the client's control stream — always
+    /// QMux stream ID 0, since the client always opens it first
+    /// (`first_bidi_stream_id(Client) == 0`).
+    ///
+    /// Because HELLO/AUTH now arrive as QMux events rather than sequential
+    /// awaits on raw WS reads, the handshake and the post-auth session loop
+    /// (formerly a separate `session_loop_ws`) are unified into one
+    /// `tokio::select!` loop driven by a small `ConnState` state machine —
+    /// both consume the same QMux control-stream event source.
     async fn handle_websocket(&self, mut conn: websocket::WebSocketConnection) -> WshResult<()> {
         let remote = conn.remote_addr;
         info!(remote = %remote, "handling WebSocket connection");
 
-        // Read HELLO
-        let hello_bytes = websocket::ws_recv_control(&mut conn.ws_stream)
-            .await?
-            .ok_or_else(|| WshError::Transport("connection closed before HELLO".into()))?;
-        let envelope = decode_envelope(&hello_bytes)?;
+        /// The client's control stream is always its first locally-opened
+        /// bidirectional stream.
+        const CONTROL_STREAM_ID: u64 = 0;
 
-        let hello = match (&envelope.msg_type, &envelope.payload) {
-            (MsgType::Hello, Payload::Hello(h)) => h.clone(),
-            _ => {
-                return Err(WshError::InvalidMessage(
-                    "expected HELLO as first message".into(),
-                ));
-            }
-        };
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QMuxEvent>();
+        let qmux = QMuxConnection::new(
+            QMuxConnectionConfig {
+                is_client: false,
+                ..Default::default()
+            },
+            move |bytes: &[u8]| {
+                let _ = outbound_tx.send(bytes.to_vec());
+            },
+            event_tx,
+        );
+        qmux.send_handshake()?;
 
-        // Send SERVER_HELLO + CHALLENGE
-        let server_fingerprints: Vec<String> = self
-            .authorized_keys
-            .iter()
-            .map(|k| k.fingerprint.clone())
-            .collect();
-        let features = self.build_feature_list();
-        let hello_result = handshake::handle_hello(&hello, &server_fingerprints, Some(&features))?;
+        // Frames a single WS binary message can map to 0..N QMux records
+        // can map to 0..N of these — a layer entirely separate from QMux's
+        // own record framing.
+        let mut control_decoder = FrameDecoder::new();
 
-        let sh_frame = frame_encode(&hello_result.server_hello)?;
-        websocket::ws_send_control(&mut conn.ws_stream, &sh_frame).await?;
-
-        let challenge_frame = frame_encode(&hello_result.challenge)?;
-        websocket::ws_send_control(&mut conn.ws_stream, &challenge_frame).await?;
-
-        // Read AUTH
-        let auth_bytes = websocket::ws_recv_control(&mut conn.ws_stream)
-            .await?
-            .ok_or_else(|| WshError::Transport("connection closed before AUTH".into()))?;
-        let auth_envelope = decode_envelope(&auth_bytes)?;
-
-        let auth = match (&auth_envelope.msg_type, &auth_envelope.payload) {
-            (MsgType::Auth, Payload::Auth(a)) => a.clone(),
-            _ => {
-                let fail = handshake::build_auth_fail("expected AUTH message");
-                let fail_frame = frame_encode(&fail)?;
-                let _ = websocket::ws_send_control(&mut conn.ws_stream, &fail_frame).await;
-                return Err(WshError::InvalidMessage("expected AUTH message".into()));
-            }
-        };
-
-        // Rate limit check (WebSocket)
-        {
-            let ip = remote.ip();
-            let rate_limited = {
-                let mut limits = self.rate_limits.lock().await;
-                !limits.check_auth(&ip)
-            };
-            if rate_limited {
-                let fail = handshake::build_auth_fail("rate limited: too many auth attempts");
-                let fail_frame = frame_encode(&fail)?;
-                let _ = websocket::ws_send_control(&mut conn.ws_stream, &fail_frame).await;
-                return Err(WshError::AuthFailed("rate limited".into()));
-            }
+        /// Handshake/session state threaded through the unified select loop.
+        enum ConnState {
+            AwaitingHello,
+            AwaitingAuth {
+                hello: HelloPayload,
+                hello_result: handshake::HelloResult,
+            },
+            Authenticated,
         }
+        let mut state = ConnState::AwaitingHello;
+        let mut ctx: Option<ConnectionContext> = None;
 
-        // Pre-check password auth against config hashes
-        if auth.method == AuthMethod::Password {
-            match auth.password {
-                Some(ref password) => {
-                    if let Some(expected_hash) = self.config.password_hashes.get(&hello.username) {
-                        if !handshake::verify_password_hash(password, expected_hash) {
-                            let fail = handshake::build_auth_fail("invalid password");
-                            let fail_frame = frame_encode(&fail)?;
-                            let _ =
-                                websocket::ws_send_control(&mut conn.ws_stream, &fail_frame).await;
-                            return Err(WshError::AuthFailed("invalid password".into()));
+        // Created eagerly (mirroring `inbound_tx`/`data_tx` below) so it can
+        // be a plain, unconditional `select!` arm: nothing holds a clone of
+        // `peer_tx` until auth succeeds and it's registered in
+        // `peer_senders`, so this simply never fires before then.
+        let (peer_tx, mut peer_rx) = mpsc::channel::<Envelope>(64);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
+        let (data_tx, mut data_rx) = mpsc::channel::<GatewayEvent>(256);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        let loop_result: WshResult<()> = 'session: loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    debug!("shutdown signal received, notifying WebSocket client");
+                    if matches!(state, ConnState::Authenticated) {
+                        let shutdown_msg = Envelope {
+                            msg_type: MsgType::Shutdown,
+                            payload: Payload::Shutdown(ShutdownPayload {
+                                reason: "server shutdown".into(),
+                                retry_after: None,
+                            }),
+                        };
+                        if let Ok(frame) = frame_encode(&shutdown_msg) {
+                            let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
                         }
-                    } else {
-                        let fail = handshake::build_auth_fail("unknown user");
-                        let fail_frame = frame_encode(&fail)?;
-                        let _ = websocket::ws_send_control(&mut conn.ws_stream, &fail_frame).await;
-                        return Err(WshError::AuthFailed(
-                            "unknown user for password auth".into(),
-                        ));
+                    }
+                    break 'session Ok(());
+                }
+
+                Some(event) = inbound_rx.recv() => {
+                    let msg = build_inbound_open(&event);
+                    match frame_encode(&msg) {
+                        Ok(frame) => {
+                            if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
+                                break 'session Err(e.into());
+                            }
+                        }
+                        Err(e) => break 'session Err(e),
                     }
                 }
-                None => {
-                    let fail = handshake::build_auth_fail("password required");
-                    let fail_frame = frame_encode(&fail)?;
-                    let _ = websocket::ws_send_control(&mut conn.ws_stream, &fail_frame).await;
-                    return Err(WshError::AuthFailed(
-                        "password auth without password".into(),
-                    ));
+
+                Some(event) = data_rx.recv() => {
+                    let msg = match &event {
+                        GatewayEvent::Data { gateway_id, data } => {
+                            build_gateway_data(*gateway_id, data.clone())
+                        }
+                        GatewayEvent::Closed { gateway_id } => {
+                            self.gateway_forwarder.close(*gateway_id).await;
+                            build_gateway_close_msg(*gateway_id)
+                        }
+                    };
+                    match frame_encode(&msg) {
+                        Ok(frame) => {
+                            if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
+                                break 'session Err(e.into());
+                            }
+                        }
+                        Err(e) => break 'session Err(e),
+                    }
+                }
+
+                // Peer push messages (e.g. forwarded ReverseConnect)
+                Some(envelope) = peer_rx.recv() => {
+                    match frame_encode(&envelope) {
+                        Ok(frame) => {
+                            if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
+                                break 'session Err(e.into());
+                            }
+                        }
+                        Err(e) => break 'session Err(e),
+                    }
+                }
+
+                // Outbound QMux record bytes (handshake/window-update/data
+                // frames the connection wants to send) -- pump them to the
+                // real WebSocket.
+                Some(bytes) = outbound_rx.recv() => {
+                    if let Err(e) = websocket::ws_send_raw(&mut conn.ws_stream, &bytes).await {
+                        break 'session Err(e);
+                    }
+                }
+
+                // Raw bytes off the wire -- sync feed into the QMux state
+                // machine, which may itself synchronously enqueue outbound
+                // bytes and/or push QMuxEvents.
+                ws_result = websocket::ws_recv_raw(&mut conn.ws_stream) => {
+                    match ws_result {
+                        Ok(Some(data)) => {
+                            qmux.receive_bytes(&data);
+                        }
+                        Ok(None) => {
+                            debug!("WebSocket session ended (peer closed)");
+                            break 'session Ok(());
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "WebSocket session ended");
+                            break 'session Err(e);
+                        }
+                    }
+                }
+
+                Some(event) = event_rx.recv() => {
+                    match event {
+                        QMuxEvent::StreamOpen { stream_id } => {
+                            debug!(stream_id, "QMux stream opened");
+                        }
+
+                        QMuxEvent::StreamData { stream_id, data } => {
+                            if stream_id != CONTROL_STREAM_ID {
+                                // Session data (PTY/exec output) doesn't
+                                // migrate onto real QMux streams in this
+                                // phase -- it still flows over the control
+                                // channel as `SessionData` envelopes.
+                                warn!(stream_id, "ignoring StreamData on non-control QMux stream");
+                                continue;
+                            }
+
+                            for raw in control_decoder.feed_raw(&data) {
+                                let envelope = match decode_envelope(&raw) {
+                                    Ok(e) => e,
+                                    Err(e) => break 'session Err(e),
+                                };
+
+                                match &mut state {
+                                    ConnState::AwaitingHello => {
+                                        let hello = match (&envelope.msg_type, &envelope.payload) {
+                                            (MsgType::Hello, Payload::Hello(h)) => h.clone(),
+                                            _ => break 'session Err(WshError::InvalidMessage(
+                                                "expected HELLO as first message".into(),
+                                            )),
+                                        };
+
+                                        let server_fingerprints: Vec<String> = self
+                                            .authorized_keys
+                                            .iter()
+                                            .map(|k| k.fingerprint.clone())
+                                            .collect();
+                                        let features = self.build_feature_list();
+                                        let hello_result = match handshake::handle_hello(
+                                            &hello,
+                                            &server_fingerprints,
+                                            Some(&features),
+                                        ) {
+                                            Ok(r) => r,
+                                            Err(e) => break 'session Err(e),
+                                        };
+
+                                        let sh_frame = match frame_encode(&hello_result.server_hello) {
+                                            Ok(f) => f,
+                                            Err(e) => break 'session Err(e),
+                                        };
+                                        if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &sh_frame).await {
+                                            break 'session Err(e.into());
+                                        }
+                                        let challenge_frame = match frame_encode(&hello_result.challenge) {
+                                            Ok(f) => f,
+                                            Err(e) => break 'session Err(e),
+                                        };
+                                        if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &challenge_frame).await {
+                                            break 'session Err(e.into());
+                                        }
+
+                                        state = ConnState::AwaitingAuth { hello, hello_result };
+                                    }
+
+                                    ConnState::AwaitingAuth { hello, hello_result } => {
+                                        let auth = match (&envelope.msg_type, &envelope.payload) {
+                                            (MsgType::Auth, Payload::Auth(a)) => a.clone(),
+                                            _ => {
+                                                let fail = handshake::build_auth_fail("expected AUTH message");
+                                                if let Ok(fail_frame) = frame_encode(&fail) {
+                                                    let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                }
+                                                break 'session Err(WshError::InvalidMessage("expected AUTH message".into()));
+                                            }
+                                        };
+
+                                        // Rate limit check (WebSocket)
+                                        {
+                                            let ip = remote.ip();
+                                            let rate_limited = {
+                                                let mut limits = self.rate_limits.lock().await;
+                                                !limits.check_auth(&ip)
+                                            };
+                                            if rate_limited {
+                                                let fail = handshake::build_auth_fail("rate limited: too many auth attempts");
+                                                if let Ok(fail_frame) = frame_encode(&fail) {
+                                                    let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                }
+                                                break 'session Err(WshError::AuthFailed("rate limited".into()));
+                                            }
+                                        }
+
+                                        // Pre-check password auth against config hashes
+                                        if auth.method == AuthMethod::Password {
+                                            match auth.password {
+                                                Some(ref password) => {
+                                                    if let Some(expected_hash) = self.config.password_hashes.get(&hello.username) {
+                                                        if !handshake::verify_password_hash(password, expected_hash) {
+                                                            let fail = handshake::build_auth_fail("invalid password");
+                                                            if let Ok(fail_frame) = frame_encode(&fail) {
+                                                                let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                            }
+                                                            break 'session Err(WshError::AuthFailed("invalid password".into()));
+                                                        }
+                                                    } else {
+                                                        let fail = handshake::build_auth_fail("unknown user");
+                                                        if let Ok(fail_frame) = frame_encode(&fail) {
+                                                            let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                        }
+                                                        break 'session Err(WshError::AuthFailed(
+                                                            "unknown user for password auth".into(),
+                                                        ));
+                                                    }
+                                                }
+                                                None => {
+                                                    let fail = handshake::build_auth_fail("password required");
+                                                    if let Ok(fail_frame) = frame_encode(&fail) {
+                                                        let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                    }
+                                                    break 'session Err(WshError::AuthFailed(
+                                                        "password auth without password".into(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+
+                                        match handshake::verify_auth(
+                                            &auth,
+                                            &hello_result.nonce,
+                                            &hello_result.session_id,
+                                            &hello.username,
+                                            &self.authorized_keys,
+                                            &self.secret,
+                                            self.config.session_ttl,
+                                            self.config.allow_pubkey,
+                                            self.config.allow_password,
+                                        ) {
+                                            Ok(mut result) => {
+                                                result.username = hello.username.clone();
+                                                let ok = handshake::build_auth_ok(
+                                                    &result.session_id,
+                                                    &result.token,
+                                                    self.config.session_ttl,
+                                                );
+                                                let ok_frame = match frame_encode(&ok) {
+                                                    Ok(f) => f,
+                                                    Err(e) => break 'session Err(e),
+                                                };
+                                                if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &ok_frame).await {
+                                                    break 'session Err(e.into());
+                                                }
+
+                                                info!(
+                                                    remote = %remote,
+                                                    username = %result.username,
+                                                    session_id = %result.session_id,
+                                                    "WebSocket auth OK"
+                                                );
+
+                                                // Assign a unique conn_id and register in
+                                                // peer_senders/conn_session_map so E2E relay,
+                                                // CopilotSuggest, and idle warnings are
+                                                // session-scoped.
+                                                let conn_id = self.alloc_conn_id();
+                                                self.peer_senders
+                                                    .write()
+                                                    .await
+                                                    .insert(conn_id, peer_tx.clone());
+                                                self.conn_session_map
+                                                    .write()
+                                                    .await
+                                                    .insert(conn_id, result.session_id.clone());
+                                                ctx = Some(ConnectionContext {
+                                                    username: result.username.clone(),
+                                                    fingerprint: result.fingerprint.clone(),
+                                                    session_id: result.session_id.clone(),
+                                                    token: result.token.clone(),
+                                                    peer_tx: peer_tx.clone(),
+                                                    conn_id: Some(conn_id),
+                                                });
+                                                state = ConnState::Authenticated;
+                                            }
+                                            Err(e) => {
+                                                let fail = handshake::build_auth_fail(&e.to_string());
+                                                if let Ok(fail_frame) = frame_encode(&fail) {
+                                                    let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                }
+                                                break 'session Err(e);
+                                            }
+                                        }
+                                    }
+
+                                    ConnState::Authenticated => {
+                                        let ctx_ref = ctx.as_mut().expect("ctx set once Authenticated");
+                                        match self
+                                            .dispatch_message(envelope, ctx_ref, inbound_tx.clone(), data_tx.clone())
+                                            .await
+                                        {
+                                            Ok(Some(response)) => {
+                                                let frame = match frame_encode(&response) {
+                                                    Ok(f) => f,
+                                                    Err(e) => break 'session Err(e),
+                                                };
+                                                if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
+                                                    break 'session Err(e.into());
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => break 'session Err(e),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        QMuxEvent::StreamEnd { stream_id } => {
+                            if stream_id == CONTROL_STREAM_ID {
+                                debug!("WebSocket control stream ended (peer closed)");
+                                break 'session Ok(());
+                            }
+                        }
+
+                        QMuxEvent::StreamReset { stream_id, error_code } => {
+                            if stream_id == CONTROL_STREAM_ID {
+                                debug!(?error_code, "WebSocket control stream reset by peer");
+                                break 'session Ok(());
+                            }
+                        }
+
+                        QMuxEvent::StreamDestroyed { stream_id } => {
+                            if stream_id == CONTROL_STREAM_ID {
+                                break 'session Ok(());
+                            }
+                        }
+
+                        QMuxEvent::Datagram { .. } => {
+                            debug!("ignoring QMux datagram (unused by wsh)");
+                        }
+
+                        QMuxEvent::ConnectionClosed { error_code, reason } => {
+                            debug!(?error_code, %reason, "QMux connection closed by peer");
+                            break 'session Ok(());
+                        }
+
+                        QMuxEvent::Error { message } => {
+                            break 'session Err(WshError::Transport(format!("QMux error: {message}")));
+                        }
+                    }
                 }
             }
+        };
+
+        // Flush any outbound QMux bytes still sitting in the channel --
+        // e.g. an AUTH_FAIL or Shutdown frame `write_stream`'d just before
+        // breaking out of the loop above only reaches `outbound_tx`
+        // (the synchronous `send` callback), not the wire; nothing drains
+        // it once the loop has already exited, so do that explicitly here
+        // before the WebSocket is dropped.
+        while let Ok(bytes) = outbound_rx.try_recv() {
+            let _ = websocket::ws_send_raw(&mut conn.ws_stream, &bytes).await;
         }
 
-        // Verify
-        match handshake::verify_auth(
-            &auth,
-            &hello_result.nonce,
-            &hello_result.session_id,
-            &hello.username,
-            &self.authorized_keys,
-            &self.secret,
-            self.config.session_ttl,
-            self.config.allow_pubkey,
-            self.config.allow_password,
-        ) {
-            Ok(mut result) => {
-                result.username = hello.username.clone();
-                let ok = handshake::build_auth_ok(
-                    &result.session_id,
-                    &result.token,
-                    self.config.session_ttl,
-                );
-                let ok_frame = frame_encode(&ok)?;
-                websocket::ws_send_control(&mut conn.ws_stream, &ok_frame).await?;
-
-                info!(
-                    remote = %remote,
-                    username = %result.username,
-                    session_id = %result.session_id,
-                    "WebSocket auth OK"
-                );
-
-                let (peer_tx, peer_rx) = mpsc::channel::<Envelope>(64);
-                // Assign a unique conn_id and register in peer_senders/conn_session_map
-                // so E2E relay, CopilotSuggest, and idle warnings are session-scoped.
-                let conn_id = self.alloc_conn_id();
-                self.peer_senders
-                    .write()
-                    .await
-                    .insert(conn_id, peer_tx.clone());
-                self.conn_session_map
-                    .write()
-                    .await
-                    .insert(conn_id, result.session_id.clone());
-                let mut ctx = ConnectionContext {
-                    username: result.username.clone(),
-                    fingerprint: result.fingerprint.clone(),
-                    session_id: result.session_id.clone(),
-                    token: result.token.clone(),
-                    peer_tx,
-                    conn_id: Some(conn_id),
-                };
-
-                // Session message loop
-                self.session_loop_ws(&mut conn, &mut ctx, peer_rx).await?;
-
-                // Cleanup: unregister peer if registered
-                if let Some(cid) = ctx.conn_id {
-                    self.peer_senders.write().await.remove(&cid);
-                    self.conn_session_map.write().await.remove(&cid);
-                    self.clear_relay_links(cid).await;
-                }
-                self.peer_registry.unregister(&ctx.fingerprint).await;
+        // Cleanup: unregister peer if it ever got registered, regardless of
+        // whether the loop above ended cleanly or with an error.
+        if let Some(ctx) = ctx.take() {
+            if let Some(cid) = ctx.conn_id {
+                self.peer_senders.write().await.remove(&cid);
+                self.conn_session_map.write().await.remove(&cid);
+                self.clear_relay_links(cid).await;
             }
-            Err(e) => {
-                let fail = handshake::build_auth_fail(&e.to_string());
-                let fail_frame = frame_encode(&fail)?;
-                let _ = websocket::ws_send_control(&mut conn.ws_stream, &fail_frame).await;
-                return Err(e);
-            }
+            self.peer_registry.unregister(&ctx.fingerprint).await;
         }
 
-        Ok(())
+        loop_result
     }
 
     /// Access the session manager.
@@ -1202,85 +1464,6 @@ impl WshServer {
                         }
                         Err(e) => {
                             debug!(error = %e, "WebTransport session ended");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Post-auth message loop over WebSocket.
-    async fn session_loop_ws(
-        &self,
-        conn: &mut websocket::WebSocketConnection,
-        ctx: &mut ConnectionContext,
-        mut peer_rx: mpsc::Receiver<Envelope>,
-    ) -> WshResult<()> {
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
-        let (data_tx, mut data_rx) = mpsc::channel::<GatewayEvent>(256);
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    debug!("shutdown signal received, notifying WebSocket client");
-                    let shutdown_msg = Envelope {
-                        msg_type: MsgType::Shutdown,
-                        payload: Payload::Shutdown(ShutdownPayload {
-                            reason: "server shutdown".into(),
-                            retry_after: None,
-                        }),
-                    };
-                    if let Ok(frame) = frame_encode(&shutdown_msg) {
-                        let _ = websocket::ws_send_control(&mut conn.ws_stream, &frame).await;
-                    }
-                    break;
-                }
-
-                Some(event) = inbound_rx.recv() => {
-                    let msg = build_inbound_open(&event);
-                    let frame = frame_encode(&msg)?;
-                    websocket::ws_send_control(&mut conn.ws_stream, &frame).await?;
-                }
-
-                Some(event) = data_rx.recv() => {
-                    let msg = match &event {
-                        GatewayEvent::Data { gateway_id, data } => {
-                            build_gateway_data(*gateway_id, data.clone())
-                        }
-                        GatewayEvent::Closed { gateway_id } => {
-                            self.gateway_forwarder.close(*gateway_id).await;
-                            build_gateway_close_msg(*gateway_id)
-                        }
-                    };
-                    let frame = frame_encode(&msg)?;
-                    websocket::ws_send_control(&mut conn.ws_stream, &frame).await?;
-                }
-
-                // Peer push messages (e.g. forwarded ReverseConnect)
-                Some(envelope) = peer_rx.recv() => {
-                    let frame = frame_encode(&envelope)?;
-                    websocket::ws_send_control(&mut conn.ws_stream, &frame).await?;
-                }
-
-                ws_result = websocket::ws_recv_control(&mut conn.ws_stream) => {
-                    match ws_result {
-                        Ok(Some(data)) => {
-                            let envelope = decode_envelope(&data)?;
-                            if let Some(response) = self.dispatch_message(envelope, ctx, inbound_tx.clone(), data_tx.clone()).await? {
-                                let frame = frame_encode(&response)?;
-                                websocket::ws_send_control(&mut conn.ws_stream, &frame).await?;
-                            }
-                        }
-                        Ok(None) => {
-                            debug!("WebSocket session ended (peer closed)");
-                            break;
-                        }
-                        Err(e) => {
-                            debug!(error = %e, "WebSocket session ended");
                             break;
                         }
                     }

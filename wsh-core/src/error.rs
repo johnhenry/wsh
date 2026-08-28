@@ -52,4 +52,10 @@ impl From<ciborium::ser::Error<std::io::Error>> for WshError {
     }
 }
 
+impl From<crate::qmux::QMuxError> for WshError {
+    fn from(e: crate::qmux::QMuxError) -> Self {
+        WshError::Transport(e.to_string())
+    }
+}
+
 pub type WshResult<T> = Result<T, WshError>;
