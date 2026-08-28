@@ -205,3 +205,105 @@ describe('WshClient session management', { skip: !hasEd25519 && 'Ed25519 not ava
     assert.equal(sent.reason, 'no longer needed');
   });
 });
+
+/**
+ * A mock transport that walks the *standard* handshake path (SERVER_HELLO
+ * -> CHALLENGE -> AUTH -> AUTH_OK), as opposed to ChallengeFirstMockTransport's
+ * deliberately-nonstandard CHALLENGE-first path. Doesn't perform real
+ * signature verification -- it's exercising the client's state machine,
+ * not the crypto (that's auth.test.mjs's job).
+ */
+class StandardHandshakeMockTransport extends WshTransport {
+  sentMessages = [];
+  #sessionId;
+  #rejectAuth;
+
+  constructor(sessionId, { rejectAuth = false } = {}) {
+    super();
+    this.#sessionId = sessionId;
+    this.#rejectAuth = rejectAuth;
+  }
+
+  async _doConnect() {}
+  async _doClose() {}
+  async _doOpenStream() { throw new Error('not needed for this test'); }
+
+  async _doSendControl(msg) {
+    this.sentMessages.push(msg);
+    if (msg.type === MSG.HELLO) {
+      setTimeout(() => {
+        this._emitControl({
+          type: MSG.SERVER_HELLO,
+          session_id: this.#sessionId,
+          features: ['reverse'],
+        });
+      }, 0);
+    } else if (msg.type === MSG.AUTH) {
+      setTimeout(() => {
+        if (this.#rejectAuth) {
+          this._emitControl({ type: MSG.AUTH_FAIL, reason: 'signature verification failed' });
+        } else {
+          this._emitControl({ type: MSG.AUTH_OK, session_id: this.#sessionId, token: 'resume-token-xyz' });
+        }
+      }, 0);
+    }
+  }
+
+  /** Server sends CHALLENGE after SERVER_HELLO, once the client asks (i.e. after HELLO). Triggered manually via emitChallenge() below since the base HELLO handler already replies with SERVER_HELLO. */
+  emitChallenge(nonce = new Uint8Array(32).fill(3)) {
+    this._emitControl({ type: MSG.CHALLENGE, session_id: this.#sessionId, nonce });
+  }
+}
+
+describe('WshClient auth handshake (standard SERVER_HELLO-first path)', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
+  it('walks SERVER_HELLO -> CHALLENGE -> AUTH -> AUTH_OK and authenticates', async () => {
+    const keyPair = await auth.generateKeyPair(true);
+    const transport = new StandardHandshakeMockTransport('server-session-std');
+
+    // Intercept HELLO to also schedule a CHALLENGE right after SERVER_HELLO,
+    // matching a real server's normal pubkey-auth flow.
+    const originalSend = transport._doSendControl.bind(transport);
+    transport._doSendControl = async (msg) => {
+      await originalSend(msg);
+      if (msg.type === MSG.HELLO) {
+        setTimeout(() => transport.emitChallenge(), 1);
+      }
+    };
+
+    const client = new clientMod.WshClient({
+      transportFactories: { ws: () => transport },
+    });
+
+    const sessionId = await client.connect('ws://test.invalid', {
+      username: 'carol',
+      keyPair,
+      transport: 'ws',
+    });
+
+    assert.equal(sessionId, 'server-session-std');
+    const authSent = transport.sentMessages.find((m) => m.type === MSG.AUTH);
+    assert.ok(authSent, 'client should have sent an AUTH message after CHALLENGE');
+    assert.equal(authSent.method, 'pubkey');
+  });
+
+  it('rejects with a clear error when the server sends AUTH_FAIL', async () => {
+    const keyPair = await auth.generateKeyPair(true);
+    const transport = new StandardHandshakeMockTransport('server-session-reject', { rejectAuth: true });
+    const originalSend = transport._doSendControl.bind(transport);
+    transport._doSendControl = async (msg) => {
+      await originalSend(msg);
+      if (msg.type === MSG.HELLO) {
+        setTimeout(() => transport.emitChallenge(), 1);
+      }
+    };
+
+    const client = new clientMod.WshClient({
+      transportFactories: { ws: () => transport },
+    });
+
+    await assert.rejects(
+      () => client.connect('ws://test.invalid', { username: 'carol', keyPair, transport: 'ws' }),
+      /signature verification failed/
+    );
+  });
+});
