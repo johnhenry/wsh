@@ -214,6 +214,112 @@ export async function verifyChallenge(publicKey, signature, sessionId, nonce, op
   return verify(publicKey, signature, transcript);
 }
 
+// ── Signed peer records (reverse-mode registration) ────────────────────
+//
+// libp2p RFC 0002/0003 signed-envelope pattern: a reverse peer signs its
+// own registration fields with its identity key, so `ReversePeers`
+// entries are verifiable by an operator independent of trusting the
+// relay server -- a relay could otherwise misreport (or a malicious one
+// forge) a peer's capabilities/type/backend, or replay a stale record
+// after a legitimate update. `PEER_RECORD_DOMAIN` intentionally differs
+// from the auth-challenge transcript's domain (`PROTOCOL_VERSION`
+// above) even though both are typically signed by the same Ed25519
+// identity key -- a signature produced for one context must never
+// verify in the other.
+
+const PEER_RECORD_DOMAIN = 'wsh-peer-record-v1\0';
+
+/**
+ * Build the signed transcript for a peer record.
+ *
+ * transcript = SHA-256(
+ *   "wsh-peer-record-v1\0" || lp(username) || lp(peerType) ||
+ *   lp(shellBackend) || lp(capabilities.join(',')) || flags(1 byte) ||
+ *   seq(8 BE bytes)
+ * )
+ *
+ * `capabilities` is joined and length-prefixed as a single field rather
+ * than iterated element-by-element -- simpler, and sufficient since the
+ * only thing that matters is that two different capability sets can't
+ * hash identically (true as long as no capability name itself contains
+ * the join separator in a way that creates ambiguity across the whole
+ * *list*, which none of wsh's fixed capability strings do).
+ *
+ * @param {object} record
+ * @param {string} record.username
+ * @param {string} [record.peerType]
+ * @param {string} [record.shellBackend]
+ * @param {string[]} [record.capabilities]
+ * @param {boolean} [record.supportsAttach]
+ * @param {boolean} [record.supportsReplay]
+ * @param {boolean} [record.supportsEcho]
+ * @param {boolean} [record.supportsTermSync]
+ * @param {number|bigint} record.seq - the signing peer's own monotonic
+ *   counter (in practice, current-time-millis); a verifier must reject a
+ *   record whose seq doesn't exceed the last one it accepted for that
+ *   fingerprint.
+ * @returns {Promise<Uint8Array>} 32-byte SHA-256 hash
+ */
+export async function buildPeerRecordTranscript(record) {
+  const enc = new TextEncoder();
+  const domainBytes = enc.encode(PEER_RECORD_DOMAIN);
+  const usernameField = lengthPrefixed(enc.encode(record.username ?? ''));
+  const peerTypeField = lengthPrefixed(enc.encode(record.peerType ?? 'host'));
+  const shellBackendField = lengthPrefixed(enc.encode(record.shellBackend ?? 'pty'));
+  const capsField = lengthPrefixed(enc.encode((record.capabilities ?? []).join(',')));
+  const flags = new Uint8Array([
+    (record.supportsAttach ? 1 : 0) |
+    (record.supportsReplay ? 2 : 0) |
+    (record.supportsEcho ? 4 : 0) |
+    (record.supportsTermSync ? 8 : 0),
+  ]);
+  const seqBytes = new Uint8Array(8);
+  new DataView(seqBytes.buffer).setBigUint64(0, BigInt(record.seq));
+
+  const total = domainBytes.length + usernameField.length + peerTypeField.length
+    + shellBackendField.length + capsField.length + flags.length + seqBytes.length;
+  const data = new Uint8Array(total);
+  let offset = 0;
+  data.set(domainBytes, offset); offset += domainBytes.length;
+  data.set(usernameField, offset); offset += usernameField.length;
+  data.set(peerTypeField, offset); offset += peerTypeField.length;
+  data.set(shellBackendField, offset); offset += shellBackendField.length;
+  data.set(capsField, offset); offset += capsField.length;
+  data.set(flags, offset); offset += flags.length;
+  data.set(seqBytes, offset);
+
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return new Uint8Array(hash);
+}
+
+/**
+ * Client-side: sign a peer record with the identity key pair.
+ * @param {CryptoKey} privateKey
+ * @param {CryptoKey} publicKey
+ * @param {object} record - see `buildPeerRecordTranscript`
+ * @returns {Promise<{ signature: Uint8Array, publicKeyRaw: Uint8Array }>}
+ */
+export async function signPeerRecord(privateKey, publicKey, record) {
+  const transcript = await buildPeerRecordTranscript(record);
+  const [signature, publicKeyRaw] = await Promise.all([
+    sign(privateKey, transcript),
+    exportPublicKeyRaw(publicKey),
+  ]);
+  return { signature, publicKeyRaw };
+}
+
+/**
+ * Verify a peer record's signature against the claimed record fields.
+ * @param {CryptoKey} publicKey
+ * @param {Uint8Array} signature
+ * @param {object} record - see `buildPeerRecordTranscript`
+ * @returns {Promise<boolean>}
+ */
+export async function verifyPeerRecord(publicKey, signature, record) {
+  const transcript = await buildPeerRecordTranscript(record);
+  return verify(publicKey, signature, transcript);
+}
+
 // ── Fingerprint ───────────────────────────────────────────────────────
 
 /**

@@ -35,7 +35,7 @@ import {
   sessionGrant as sessionGrantMsg, sessionRevoke as sessionRevokeMsg,
   isRelayForwardable,
 } from './messages.mjs';
-import { signChallenge, exportPublicKeyRaw } from './auth.mjs';
+import { signChallenge, exportPublicKeyRaw, signPeerRecord, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
 import { WshSession } from './session.mjs';
 import { cborDecode } from './cbor.mjs';
 
@@ -54,6 +54,36 @@ const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
 const DEFAULT_PING_INTERVAL  = 30_000;  // ms
 const DEFAULT_EXEC_TIMEOUT   = 60_000;  // ms
 const FILE_CHUNK_SIZE        = 65_536;
+
+/**
+ * Verify a `PeerInfo` entry's self-signed record (see `listPeers`).
+ * Defensive by design: any missing field, malformed key, or fingerprint
+ * mismatch resolves to `false` rather than throwing, so one bad entry
+ * from an untrusted relay can't break the whole `listPeers()` call.
+ * @param {object} peer - a raw `PeerInfo` wire entry
+ * @returns {Promise<boolean>}
+ */
+async function verifyPeerInfoRecord(peer) {
+  if (!peer.public_key || !peer.record_signature || peer.seq === undefined || peer.seq === null) return false;
+  try {
+    const claimedFingerprint = await computeFingerprint(peer.public_key);
+    if (claimedFingerprint !== peer.fingerprint) return false;
+    const publicKey = await importPublicKeyRaw(peer.public_key);
+    return await verifyPeerRecord(publicKey, peer.record_signature, {
+      username: peer.username,
+      peerType: peer.peer_type,
+      shellBackend: peer.shell_backend,
+      capabilities: peer.capabilities,
+      supportsAttach: peer.supports_attach,
+      supportsReplay: peer.supports_replay,
+      supportsEcho: peer.supports_echo,
+      supportsTermSync: peer.supports_term_sync,
+      seq: peer.seq,
+    });
+  } catch {
+    return false;
+  }
+}
 
 // ── Client class ──────────────────────────────────────────────────────
 
@@ -750,19 +780,37 @@ export class WshClient {
     }
 
     const effectiveShellBackend = shellBackend || (expose.shell ? 'virtual-shell' : 'exec-only');
+    const record = {
+      username,
+      capabilities,
+      peerType,
+      shellBackend: effectiveShellBackend,
+      supportsAttach: supportsAttach ?? effectiveShellBackend !== 'exec-only',
+      supportsReplay: supportsReplay ?? effectiveShellBackend !== 'exec-only',
+      supportsEcho: supportsEcho ?? effectiveShellBackend === 'virtual-shell',
+      supportsTermSync: supportsTermSync ?? effectiveShellBackend === 'virtual-shell',
+      // The peer's own monotonic counter for this signed record --
+      // current-time-millis in practice (see buildPeerRecordTranscript).
+      // A server/operator must reject a record whose seq doesn't exceed
+      // the last one accepted for this fingerprint.
+      seq: Date.now(),
+    };
+
+    // Self-sign the registration so ReversePeers entries built from it
+    // are verifiable by an operator independent of trusting the relay
+    // (see auth.mjs's "Signed peer records" section). Only possible with
+    // a real identity key, same precondition `publicKey` already had.
+    let recordSignature;
+    if (keyPair) {
+      ({ signature: recordSignature } = await signPeerRecord(keyPair.privateKey, keyPair.publicKey, record));
+    }
 
     // Register as a reverse peer.
     await this.#transport.sendControl(
       reverseRegisterMsg({
-        username,
-        capabilities,
-        peerType,
-        shellBackend: effectiveShellBackend,
-        supportsAttach: supportsAttach ?? effectiveShellBackend !== 'exec-only',
-        supportsReplay: supportsReplay ?? effectiveShellBackend !== 'exec-only',
-        supportsEcho: supportsEcho ?? effectiveShellBackend === 'virtual-shell',
-        supportsTermSync: supportsTermSync ?? effectiveShellBackend === 'virtual-shell',
+        ...record,
         publicKey,
+        recordSignature,
       })
     );
 
@@ -772,8 +820,19 @@ export class WshClient {
   /**
    * List peers registered on the relay server.
    *
+   * Each entry's `verified` field is computed here, client-side, from
+   * the peer's own signed record (`public_key`/`seq`/`record_signature`,
+   * present when the relay honestly forwards what the peer sent) --
+   * `true` only if the signature actually verifies against `public_key`
+   * AND that key's fingerprint matches the claimed `fingerprint` field.
+   * This is deliberately NOT trust-on-first-use of the relay's own
+   * claims: a relay that omits or tampers with these fields, or that
+   * substitutes a different key, produces `verified: false` rather than
+   * silently passing. `verified` is additive to the wire response, not
+   * a wire field itself.
+   *
    * @param {number} [timeout=10000] - Timeout in ms
-   * @returns {Promise<Array<{fingerprint_short: string, username: string, capabilities: string[], last_seen: number|null}>>}
+   * @returns {Promise<Array<{fingerprint_short: string, username: string, capabilities: string[], last_seen: number|null, verified: boolean}>>}
    */
   async listPeers(timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('listPeers');
@@ -786,7 +845,8 @@ export class WshClient {
       'Timed out waiting for peer list'
     );
 
-    return response.peers || [];
+    const peers = response.peers || [];
+    return Promise.all(peers.map(async (peer) => ({ ...peer, verified: await verifyPeerInfoRecord(peer) })));
   }
 
   /**

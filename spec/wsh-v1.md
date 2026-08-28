@@ -593,6 +593,8 @@ Category: **reverse**
 | `supports_echo` | `bool` | no | `false` |
 | `supports_term_sync` | `bool` | no | `false` |
 | `public_key` | `bytes` | yes | — |
+| `seq` | `u64` | yes | — |
+| `record_signature` | `bytes` | yes | — |
 
 ### ReverseList (`0x51`)
 
@@ -1279,6 +1281,9 @@ Category: **terminal**
 | `supports_echo` | `bool` | no | `false` |
 | `supports_term_sync` | `bool` | no | `false` |
 | `last_seen` | `u64` | no | — |
+| `public_key` | `bytes` | no | — |
+| `seq` | `u64` | no | — |
+| `record_signature` | `bytes` | no | — |
 
 ### McpToolSpec
 

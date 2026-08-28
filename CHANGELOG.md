@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.12.0
+
+- **Breaking: signed peer records for reverse-mode registration** (libp2p
+  RFC 0002/0003 pattern) — closes an impersonation surface where a relay
+  server had no way to distinguish a peer's honest `ReverseRegister`
+  fields from a forged or relay-tampered one. `ReverseRegister` gained
+  two required fields, `seq` (the peer's own monotonic counter --
+  `Date.now()` in practice) and `record_signature`: the peer signs a
+  domain-separated transcript of its own registration fields
+  (`buildPeerRecordTranscript`/`signPeerRecord` in `auth.mjs`, a
+  distinct signing domain from the auth-challenge transcript even
+  though both use the same Ed25519 identity key). `PeerInfo` gained
+  matching `public_key`/`seq`/`record_signature` fields so operators
+  can verify a peer's record themselves, independent of trusting the
+  relay. `WshClient.connectReverse()` signs automatically;
+  `WshClient.listPeers()` now verifies each returned entry and adds a
+  non-wire `verified: boolean` field. New exports:
+  `buildPeerRecordTranscript`, `signPeerRecord`, `verifyPeerRecord`.
+
 ## 0.11.0
 
 - **Breaking: replaced the hand-rolled 5-byte WebSocket mux with QMux**

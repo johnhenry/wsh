@@ -45,6 +45,7 @@ export {
   generateKeyPair, exportPublicKeyRaw, exportPublicKeySSH,
   importPublicKeyRaw, exportPrivateKeyPKCS8, importPrivateKeyPKCS8,
   sign, verify, buildTranscript, signChallenge, verifyChallenge,
+  buildPeerRecordTranscript, signPeerRecord, verifyPeerRecord,
   fingerprint, shortFingerprint, generateNonce,
   parseSSHPublicKey, extractRawFromSSHWire, base64Decode,
 } from './auth.mjs';

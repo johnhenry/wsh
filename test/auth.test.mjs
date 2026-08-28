@@ -90,6 +90,86 @@ describe('auth', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' 
     assert.ok(valid);
   });
 
+  it('buildPeerRecordTranscript returns 32-byte hash', async () => {
+    const transcript = await auth.buildPeerRecordTranscript({ username: 'peer', seq: 1 });
+    assert.equal(transcript.length, 32);
+  });
+
+  it('buildPeerRecordTranscript is deterministic for identical records', async () => {
+    const record = { username: 'peer', peerType: 'host', shellBackend: 'pty', capabilities: ['exec'], seq: 42 };
+    const t1 = await auth.buildPeerRecordTranscript(record);
+    const t2 = await auth.buildPeerRecordTranscript({ ...record });
+    assert.deepEqual([...t1], [...t2]);
+  });
+
+  it('buildPeerRecordTranscript differs when any field changes, including seq and each boolean flag', async () => {
+    const base = { username: 'peer', peerType: 'host', shellBackend: 'pty', capabilities: ['exec'], seq: 1 };
+    const baseline = await auth.buildPeerRecordTranscript(base);
+    const variants = [
+      { ...base, username: 'other' },
+      { ...base, peerType: 'vm-guest' },
+      { ...base, shellBackend: 'virtual-shell' },
+      { ...base, capabilities: ['shell'] },
+      { ...base, seq: 2 },
+      { ...base, supportsAttach: true },
+      { ...base, supportsReplay: true },
+      { ...base, supportsEcho: true },
+      { ...base, supportsTermSync: true },
+    ];
+    for (const variant of variants) {
+      const t = await auth.buildPeerRecordTranscript(variant);
+      assert.notDeepEqual([...t], [...baseline], `expected a different transcript for ${JSON.stringify(variant)}`);
+    }
+  });
+
+  it('signPeerRecord + verifyPeerRecord round-trip', async () => {
+    const keyPair = await auth.generateKeyPair(true);
+    const record = { username: 'browser-tab', capabilities: ['shell', 'exec'], peerType: 'browser-shell', shellBackend: 'virtual-shell', seq: Date.now() };
+
+    const { signature, publicKeyRaw } = await auth.signPeerRecord(keyPair.privateKey, keyPair.publicKey, record);
+    assert.equal(signature.length, 64);
+    assert.equal(publicKeyRaw.length, 32);
+
+    const imported = await auth.importPublicKeyRaw(publicKeyRaw);
+    assert.ok(await auth.verifyPeerRecord(imported, signature, record));
+  });
+
+  it('verifyPeerRecord rejects a signature for a different record (e.g. tampered capabilities)', async () => {
+    const keyPair = await auth.generateKeyPair(true);
+    const record = { username: 'browser-tab', capabilities: ['exec'], seq: 1 };
+    const { signature, publicKeyRaw } = await auth.signPeerRecord(keyPair.privateKey, keyPair.publicKey, record);
+    const imported = await auth.importPublicKeyRaw(publicKeyRaw);
+
+    assert.equal(await auth.verifyPeerRecord(imported, signature, { ...record, capabilities: ['exec', 'shell'] }), false);
+  });
+
+  it('verifyPeerRecord rejects a record signed by a different key', async () => {
+    const signer = await auth.generateKeyPair(true);
+    const impostor = await auth.generateKeyPair(true);
+    const record = { username: 'browser-tab', capabilities: ['exec'], seq: 1 };
+    const { signature } = await auth.signPeerRecord(signer.privateKey, signer.publicKey, record);
+
+    assert.equal(await auth.verifyPeerRecord(impostor.publicKey, signature, record), false);
+  });
+
+  it('a peer-record signature does not verify as an auth-challenge signature and vice versa (domain separation)', async () => {
+    const keyPair = await auth.generateKeyPair(true);
+    const nonce = auth.generateNonce();
+    const sessionId = 'session-1';
+
+    const { signature: challengeSig } = await auth.signChallenge(keyPair.privateKey, keyPair.publicKey, sessionId, nonce, { username: 'u' });
+    const record = { username: 'u', seq: 1 };
+    const { signature: recordSig } = await auth.signPeerRecord(keyPair.privateKey, keyPair.publicKey, record);
+
+    // Cross-domain: an auth-challenge signature must not verify as a peer
+    // record, even reusing the same identity key and even if a peer
+    // record happened to be constructed with matching fields.
+    assert.equal(await auth.verifyPeerRecord(keyPair.publicKey, challengeSig, record), false);
+    // And the reverse: a peer-record signature must not verify as an
+    // auth-challenge response.
+    assert.equal(await auth.verifyChallenge(keyPair.publicKey, recordSig, sessionId, nonce, { username: 'u' }), false);
+  });
+
   it('fingerprint returns 64-char hex', async () => {
     const keyPair = await auth.generateKeyPair(true);
     const raw = await auth.exportPublicKeyRaw(keyPair.publicKey);

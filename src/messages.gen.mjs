@@ -458,7 +458,7 @@ export function mcpResult({ result } = {}) {
   };
 }
 
-export function reverseRegister({ username, capabilities = [], peerType = "host", shellBackend = "pty", supportsAttach = false, supportsReplay = false, supportsEcho = false, supportsTermSync = false, publicKey } = {}) {
+export function reverseRegister({ username, capabilities = [], peerType = "host", shellBackend = "pty", supportsAttach = false, supportsReplay = false, supportsEcho = false, supportsTermSync = false, publicKey, seq, recordSignature } = {}) {
   return {
     type: MSG.REVERSE_REGISTER,
     username,
@@ -470,6 +470,8 @@ export function reverseRegister({ username, capabilities = [], peerType = "host"
     supports_echo: supportsEcho,
     supports_term_sync: supportsTermSync,
     public_key: publicKey,
+    seq,
+    record_signature: recordSignature,
   };
 }
 

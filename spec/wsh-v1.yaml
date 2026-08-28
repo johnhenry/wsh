@@ -596,6 +596,24 @@ messages:
         Register as a reverse peer so other clients can connect to
         this client through the server.  Includes the public key for
         fingerprint derivation and advertised capabilities.
+
+        seq/record_signature form a self-certifying signed peer record
+        (libp2p RFC 0002/0003 pattern): the peer signs a domain-separated
+        transcript of its own registration fields with its identity key
+        (buildPeerRecordTranscript/signPeerRecord in auth.mjs -- a
+        distinct signing domain from the auth challenge transcript, even
+        though both use the same Ed25519 key). The server verifies this
+        against the connection's own authenticated fingerprint (closing
+        the impersonation surface where a client could otherwise claim
+        someone else's public_key) before accepting registration, and
+        forwards the same signed fields in PeerInfo so operators can
+        verify a peer's record themselves -- independent of trusting the
+        relay -- rather than trusting server-computed fields blindly.
+        seq is the signing peer's own monotonic counter (in practice
+        current-time-millis); a server/operator MUST reject a record
+        whose seq is not greater than the last one accepted for that
+        fingerprint, so a compromised or malicious relay can't replay a
+        stale (e.g. revoked-capability) record over a newer one.
       fields:
         username:
           type: string
@@ -622,6 +640,12 @@ messages:
           type: bool
           default: false
         public_key:
+          type: bytes
+          required: true
+        seq:
+          type: u64
+          required: true
+        record_signature:
           type: bytes
           required: true
 
@@ -1676,6 +1700,15 @@ nested_types:
         default: false
       last_seen:
         type: u64
+        required: false
+      public_key:
+        type: bytes
+        required: false
+      seq:
+        type: u64
+        required: false
+      record_signature:
+        type: bytes
         required: false
 
   McpToolSpec:
