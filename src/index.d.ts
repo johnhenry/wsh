@@ -126,6 +126,7 @@ export const MSG: {
   readonly REVERSE_CONNECT: 0x53;
   readonly REVERSE_ACCEPT: 0x54;
   readonly REVERSE_REJECT: 0x55;
+  readonly RELAY_FORWARD: 0x56;
 
   // Gateway
   readonly OPEN_TCP: 0x70;
@@ -249,6 +250,7 @@ export function serverHello(opts?: {
 
 export function challenge(opts?: {
   nonce?: Uint8Array;
+  sessionId?: string;
 }): WshMessage;
 
 export function authMethods(opts?: {
@@ -264,7 +266,7 @@ export function auth(opts?: {
 
 export function authOk(opts?: {
   sessionId?: string;
-  token?: string;
+  token?: Uint8Array;
   ttl?: number;
 }): WshMessage;
 
@@ -287,6 +289,8 @@ export function openOk(opts?: {
   streamIds?: number[];
   dataMode?: string;
   capabilities?: string[];
+  sessionId?: string;
+  token?: Uint8Array;
 }): WshMessage;
 
 export function openFail(opts?: {
@@ -337,14 +341,14 @@ export function pong(opts?: {
 
 export function attach(opts?: {
   sessionId?: string;
-  token?: string;
+  token?: Uint8Array;
   mode?: string;
   deviceLabel?: string;
 }): WshMessage;
 
 export function resume(opts?: {
   sessionId?: string;
-  token?: string;
+  token?: Uint8Array;
   lastSeq?: number;
 }): WshMessage;
 
@@ -410,6 +414,10 @@ export function reverseRegister(opts?: {
   supportsEcho?: boolean;
   supportsTermSync?: boolean;
   publicKey?: Uint8Array | null;
+  /** The signing peer's own monotonic counter for its signed peer record. */
+  seq?: number;
+  /** Ed25519 signature over the peer record transcript (see signPeerRecord). */
+  recordSignature?: Uint8Array;
 }): WshMessage;
 
 export function reverseList(): WshMessage;
@@ -536,6 +544,262 @@ export function gatewayData(opts?: {
   data?: Uint8Array;
 }): WshMessage;
 
+// -- Message constructors (session extras) --
+
+export function clipboard(opts?: {
+  direction?: string;
+  data?: string;
+}): WshMessage;
+
+export function recordingExport(opts?: {
+  sessionId?: string;
+  format?: string;
+  data?: string;
+}): WshMessage;
+
+export function commandJournal(opts?: {
+  sessionId?: string;
+  command?: string;
+  exitCode?: number;
+  durationMs?: number;
+  cwd?: string;
+  timestamp?: number;
+}): WshMessage;
+
+export function metricsRequest(): WshMessage;
+
+export function suspendSession(opts?: {
+  sessionId?: string;
+  action?: string;
+}): WshMessage;
+
+export function restartPty(opts?: {
+  sessionId?: string;
+  command?: string;
+}): WshMessage;
+
+export function sessionListRequest(): WshMessage;
+
+export function sessionList(opts?: {
+  sessions?: unknown[];
+}): WshMessage;
+
+export function detach(opts?: {
+  sessionId?: string;
+}): WshMessage;
+
+export function detachOk(opts?: {
+  sessionId?: string;
+}): WshMessage;
+
+export function detachFail(opts?: {
+  reason?: string;
+}): WshMessage;
+
+// -- Message constructors (guest sharing) --
+
+export function guestInvite(opts?: {
+  sessionId?: string;
+  ttl?: number;
+  permissions?: string[];
+}): WshMessage;
+
+export function guestJoin(opts?: {
+  token?: string;
+  deviceLabel?: string;
+}): WshMessage;
+
+export function guestRevoke(opts?: {
+  token?: string;
+  reason?: string;
+}): WshMessage;
+
+export function shareSession(opts?: {
+  sessionId?: string;
+  mode?: string;
+  ttl?: number;
+}): WshMessage;
+
+export function shareRevoke(opts?: {
+  shareId?: string;
+  reason?: string;
+}): WshMessage;
+
+// -- Message constructors (compression / rate control / linking) --
+
+export function compressBegin(opts?: {
+  algorithm?: string;
+  level?: number;
+}): WshMessage;
+
+export function compressAck(opts?: {
+  algorithm?: string;
+  accepted?: boolean;
+}): WshMessage;
+
+export function rateControl(opts?: {
+  sessionId?: string;
+  maxBytesPerSec?: number;
+  policy?: string;
+}): WshMessage;
+
+export function rateWarning(opts?: {
+  sessionId?: string;
+  queuedBytes?: number;
+  action?: string;
+}): WshMessage;
+
+export function sessionLink(opts?: {
+  sourceSession?: string;
+  targetHost?: string;
+  targetPort?: number;
+  targetUser?: string;
+}): WshMessage;
+
+export function sessionUnlink(opts?: {
+  linkId?: string;
+  reason?: string;
+}): WshMessage;
+
+// -- Message constructors (copilot) --
+
+export function copilotAttach(opts?: {
+  sessionId?: string;
+  model?: string;
+  contextWindow?: number;
+}): WshMessage;
+
+export function copilotSuggest(opts?: {
+  sessionId?: string;
+  suggestion?: string;
+  confidence?: number;
+}): WshMessage;
+
+export function copilotDetach(opts?: {
+  sessionId?: string;
+  reason?: string;
+}): WshMessage;
+
+// -- Message constructors (e2e / echo / termsync) --
+
+export function keyExchange(opts?: {
+  algorithm?: string;
+  publicKey?: Uint8Array;
+  sessionId?: string;
+  kemPublicKey?: Uint8Array;
+  kemCiphertext?: Uint8Array;
+}): WshMessage;
+
+export function encryptedFrame(opts?: {
+  nonce?: Uint8Array;
+  ciphertext?: Uint8Array;
+  sessionId?: string;
+}): WshMessage;
+
+export function echoAck(opts?: {
+  channelId?: number;
+  echoSeq?: number;
+}): WshMessage;
+
+export function echoState(opts?: {
+  channelId?: number;
+  echoSeq?: number;
+  cursorX?: number;
+  cursorY?: number;
+  pending?: number;
+}): WshMessage;
+
+export function termSync(opts?: {
+  channelId?: number;
+  frameSeq?: number;
+  stateHash?: Uint8Array;
+}): WshMessage;
+
+export function termDiff(opts?: {
+  channelId?: number;
+  frameSeq?: number;
+  baseSeq?: number;
+  patch?: Uint8Array;
+}): WshMessage;
+
+// -- Message constructors (scaling / principals) --
+
+export function nodeAnnounce(opts?: {
+  nodeId?: string;
+  endpoint?: string;
+  load?: number;
+  capacity?: number;
+}): WshMessage;
+
+export function nodeRedirect(opts?: {
+  targetNode?: string;
+  targetEndpoint?: string;
+  sessionId?: string;
+  reason?: string;
+}): WshMessage;
+
+export function sessionGrant(opts?: {
+  sessionId?: string;
+  principal?: string;
+  permissions?: string[];
+}): WshMessage;
+
+export function sessionRevoke(opts?: {
+  sessionId?: string;
+  principal?: string;
+  reason?: string;
+}): WshMessage;
+
+// -- Message constructors (file channel / policy / terminal) --
+
+export function fileOp(opts?: {
+  channelId?: number;
+  op?: string;
+  path?: string;
+  offset?: number;
+  length?: number;
+}): WshMessage;
+
+export function fileResult(opts?: {
+  channelId?: number;
+  success?: boolean;
+  metadata?: Record<string, unknown>;
+  errorMessage?: string;
+}): WshMessage;
+
+export function fileChunk(opts?: {
+  channelId?: number;
+  offset?: number;
+  data?: Uint8Array;
+  isFinal?: boolean;
+  totalSize?: number;
+}): WshMessage;
+
+export function policyEval(opts?: {
+  requestId?: string;
+  action?: string;
+  principal?: string;
+  context?: Record<string, unknown>;
+}): WshMessage;
+
+export function policyResult(opts?: {
+  requestId?: string;
+  allowed?: boolean;
+  reason?: string;
+}): WshMessage;
+
+export function policyUpdate(opts?: {
+  policyId?: string;
+  rules?: Record<string, unknown>;
+  version?: number;
+}): WshMessage;
+
+export function terminalConfig(opts?: {
+  channelId?: number;
+  frontend?: string;
+  options?: Record<string, unknown>;
+}): WshMessage;
+
 // -- Utility --
 
 /**
@@ -595,17 +859,30 @@ export function sign(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Arra
  */
 export function verify(publicKey: CryptoKey, signature: Uint8Array, data: Uint8Array): Promise<boolean>;
 
+/** Options binding extra context into the auth transcript. */
+export interface WshTranscriptOptions {
+  /** Username this transcript is bound to (default ''). */
+  username?: string;
+  /** Reserved for a transport-layer identity binding; no caller populates it yet. */
+  channelBinding?: Uint8Array;
+}
+
 /**
  * Build the authentication transcript hash for challenge-response signing.
  *
- * transcript = SHA-256("wsh-v1\0" || session_id || nonce || channel_binding)
+ * transcript = SHA-256(
+ *   "wsh-v1\0" || lp(username) || lp(session_id) || nonce || channel_binding
+ * )
+ *
+ * where lp() is a 4-byte big-endian length prefix on the variable-length
+ * string fields.
  *
  * @returns 32-byte SHA-256 hash
  */
 export function buildTranscript(
   sessionId: string,
   nonce: Uint8Array,
-  channelBinding?: Uint8Array,
+  opts?: WshTranscriptOptions,
 ): Promise<Uint8Array>;
 
 /**
@@ -619,7 +896,7 @@ export function signChallenge(
   publicKey: CryptoKey,
   sessionId: string,
   nonce: Uint8Array,
-  channelBinding?: Uint8Array,
+  opts?: WshTranscriptOptions,
 ): Promise<{ signature: Uint8Array; publicKeyRaw: Uint8Array }>;
 
 /**
@@ -630,7 +907,7 @@ export function verifyChallenge(
   signature: Uint8Array,
   sessionId: string,
   nonce: Uint8Array,
-  channelBinding?: Uint8Array,
+  opts?: WshTranscriptOptions,
 ): Promise<boolean>;
 
 /** Fields of a signed peer record (reverse-mode registration). See `signPeerRecord`. */
@@ -789,17 +1066,193 @@ export class WshTransport {
  */
 export class WebTransportTransport extends WshTransport {}
 
+/**
+ * Dispatch a fixed, already-available batch of items one at a time,
+ * fully awaiting each handler call before dispatching the next. Use
+ * SerialQueue instead for items arriving incrementally via a push
+ * callback.
+ */
+export function dispatchSerially<T>(
+  items: Iterable<T>,
+  handler: (item: T) => void | Promise<void>,
+): Promise<void>;
+
+/**
+ * A queue drained one item at a time, awaiting each dispatch before
+ * starting the next. Use where items arrive incrementally over time via
+ * a push callback (e.g. a transport's raw `message` event).
+ */
+export class SerialQueue<T = unknown> {
+  constructor(handler: (item: T) => void | Promise<void>);
+  push(item: T): void;
+}
+
 // ============================================================================
 // transport-ws.mjs -- WebSocket transport
 // ============================================================================
 
 /**
- * wsh transport over a single WebSocket with multiplexed virtual streams.
+ * wsh transport over a single WebSocket, multiplexed with QMux
+ * (draft-ietf-quic-qmux-02). The control channel is QMux stream 0.
  *
  * Provides the same interface as WebTransportTransport so that upper
  * layers (session, client) work identically over either transport.
  */
 export class WebSocketTransport extends WshTransport {}
+
+/**
+ * @deprecated The old hand-rolled 5-byte mux's frame-type byte values.
+ * wsh now speaks QMux instead; this export is kept only for source
+ * compatibility and is no longer produced or consumed anywhere.
+ */
+export const WS_FRAME_TYPE: {
+  readonly CONTROL: 0x01;
+  readonly DATA: 0x02;
+  readonly OPEN_STREAM: 0x03;
+  readonly CLOSE_STREAM: 0x04;
+};
+
+// ============================================================================
+// qmux.mjs / qmux-connection.mjs -- QMux multiplexing layer
+// ============================================================================
+
+/** Default QMux flow-control parameters. */
+export const QMUX_DEFAULTS: {
+  /** Connection-wide receive window in bytes (8 MiB). */
+  readonly initialMaxData: number;
+  /** Per-stream receive window in bytes (1 MiB). */
+  readonly initialMaxStreamData: number;
+  /** Initial bidirectional stream credit. */
+  readonly initialMaxStreamsBidi: number;
+};
+
+/** QUIC transport error codes used by wsh (RFC 9000 Section 20.1 subset). */
+export const QMUX_ERROR_CODE: {
+  readonly NO_ERROR: 0x00;
+  readonly INTERNAL_ERROR: 0x01;
+  readonly FLOW_CONTROL_ERROR: 0x03;
+  readonly STREAM_LIMIT_ERROR: 0x04;
+  readonly STREAM_STATE_ERROR: 0x05;
+  readonly FINAL_SIZE_ERROR: 0x06;
+  readonly FRAME_ENCODING_ERROR: 0x07;
+  readonly TRANSPORT_PARAMETER_ERROR: 0x08;
+  readonly PROTOCOL_VIOLATION: 0x0a;
+  readonly APPLICATION_ERROR: 0x0c;
+};
+
+/** Stream-initiator bit values (QUIC stream-id low bit). */
+export const QMUX_STREAM_INITIATOR: {
+  readonly CLIENT: 0;
+  readonly SERVER: 1;
+};
+
+/** First bidirectional stream ID for the given initiator (0 or 1). */
+export function firstBidiStreamId(initiator: 0 | 1): number;
+
+/** Next bidirectional stream ID after `id` for the same initiator (+4). */
+export function nextBidiStreamId(id: number): number;
+
+/** Whether a stream ID was opened by the client side. */
+export function isClientInitiated(streamId: number): boolean;
+
+/** Whether a stream ID is bidirectional (wsh only uses bidi streams). */
+export function isBidirectional(streamId: number): boolean;
+
+/**
+ * One multiplexed QMux stream: a minimal push/pull data API (not DOM
+ * Streams -- WebSocketTransport wraps these in ReadableStream/
+ * WritableStream for the rest of wsh).
+ */
+export interface QMuxStream {
+  /** Stream ID. */
+  id: number;
+
+  /** In-order data delivery. */
+  onData: ((data: Uint8Array) => void) | null;
+
+  /** Clean FIN: all data delivered. */
+  onEnd: (() => void) | null;
+
+  /** Peer aborted (after any reliable prefix was delivered). */
+  onReset: ((errorCode: number) => void) | null;
+
+  /** The whole connection died (transport closed/errored). */
+  onDestroy: ((err: Error) => void) | null;
+
+  /** Send state: 'ready' | 'send' | 'reset_sent' | 'data_sent'. */
+  readonly sendState: string;
+
+  /** Receive state: 'recv' | 'size_known' | 'data_recvd' | 'reset_recvd'. */
+  readonly recvState: string;
+
+  /** Write bytes, awaiting flow-control window as needed. */
+  write(bytes: Uint8Array): Promise<void>;
+
+  /** Half-close the send side (send FIN). */
+  close(): Promise<void>;
+
+  /**
+   * Abort the send side. A non-zero `reliableSize` uses RESET_STREAM_AT
+   * (draft-ietf-quic-reliable-stream-reset) to guarantee that prefix is
+   * still delivered.
+   */
+  reset(errorCode?: number, reliableSize?: number): void;
+
+  /** Tell the peer to stop sending. */
+  stopSending(errorCode?: number): void;
+}
+
+/**
+ * QMux connection: stream state machine + windowed flow control over an
+ * ordered, reliable byte stream. Transport-agnostic -- it takes a
+ * `send(bytes)` callback for outbound record bytes and is fed inbound
+ * bytes via `receiveBytes()`. Exported so alternate server
+ * implementations can speak the same framing as WebSocketTransport.
+ */
+export class QMuxConnection {
+  constructor(opts: {
+    /** Whether this endpoint is the client (determines stream-id parity). */
+    isClient: boolean;
+    /** Callback receiving encoded QMux record bytes to transmit. */
+    send: (bytes: Uint8Array) => void;
+    initialMaxData?: number;
+    initialMaxStreamData?: number;
+    initialMaxStreamsBidi?: number;
+  });
+
+  /** Called for peer-initiated streams. */
+  onStreamOpen: ((stream: QMuxStream) => void) | null;
+
+  /** Called for DATAGRAM frames. */
+  onDatagram: ((data: Uint8Array) => void) | null;
+
+  /** Called on peer CONNECTION_CLOSE. */
+  onClose: ((errorCode: number, reason: string) => void) | null;
+
+  /** Called on protocol errors. */
+  onError: ((err: Error) => void) | null;
+
+  /** Send the QX_TRANSPORT_PARAMETERS handshake frame -- must be the first frame sent. */
+  sendHandshake(): void;
+
+  /** Open a new locally-initiated bidirectional stream. */
+  openStream(): Promise<QMuxStream>;
+
+  /** Look up an existing stream by ID. */
+  getStream(id: number): QMuxStream | undefined;
+
+  /** Send a DATAGRAM frame. */
+  sendDatagram(bytes: Uint8Array): void;
+
+  /** Feed inbound bytes from the underlying transport. */
+  receiveBytes(chunk: Uint8Array): void;
+
+  /** Send CONNECTION_CLOSE and shut down. */
+  close(errorCode?: number, reason?: string): void;
+
+  /** Forcibly tear down every stream (transport died; nothing is sent). */
+  destroy(err: Error): void;
+}
 
 // ============================================================================
 // session.mjs -- WshSession
@@ -1257,7 +1710,13 @@ export class WshClient {
   /**
    * Download a file from a remote path.
    */
-  download(remotePath: string): Promise<Uint8Array>;
+  download(
+    remotePath: string,
+    opts?: {
+      onProgress?: (progress: { received: number; total: number }) => void;
+      timeout?: number;
+    },
+  ): Promise<Uint8Array>;
 
   /**
    * Discover MCP tools available on the remote server.

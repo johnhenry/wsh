@@ -1,4 +1,4 @@
-# wsh-upon-star
+# @johnhenry/wsh
 
 Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.me/wsh/)
 
@@ -8,7 +8,7 @@ Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.m
 
 Browser-native remote command execution over WebTransport/WebSocket with Ed25519 authentication.
 
-wsh-upon-star is a pure-JS client library that connects browsers to remote shells. It implements its own binary protocol (CBOR over length-prefixed frames) with Ed25519 challenge-response auth, channel multiplexing, session management, and MCP tool bridging.
+wsh is a pure-JS client library that connects browsers to remote shells. It implements its own binary protocol — CBOR messages over QMux-multiplexed WebSocket or native WebTransport streams — with Ed25519 challenge-response auth, session management, and MCP tool bridging.
 
 ## Install
 
@@ -26,16 +26,28 @@ Or via CDN:
 
 ## Features
 
-- **Ed25519 authentication** -- challenge-response via Web Crypto API, SSH key format support
-- **Dual transport** -- WebTransport (native streams) and WebSocket (multiplexed virtual streams) with identical API
+- **Ed25519 authentication** -- challenge-response via Web Crypto API with a transcript binding username and session id, SSH key format support
+- **Dual transport** -- WebTransport (native streams) and WebSocket (QMux-multiplexed streams) with identical API
 - **CBOR encoding** -- compact binary wire format with length-prefixed framing
-- **Session management** -- open, attach, resume, detach, rename PTY/exec sessions
-- **Reverse mode** -- register as a peer and accept incoming connections through a relay
-- **File transfer** -- scp-like upload/download over dedicated streams in 64KB chunks
+- **Session management** -- open, attach, resume, detach, rename PTY/exec sessions, with session-scoped resume tokens and per-principal access grants
+- **Reverse mode** -- register as a peer (via a signed peer record) and accept incoming connections through a relay
+- **File transfer** -- scp-like upload/download as `FileChunk` control messages in 64KB chunks
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
 - **Session recording** -- asciicast v2 compatible recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
-- **80+ message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, and more
+- **95 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, and more
+
+## Wire Protocol: QMux
+
+Over WebSocket, wsh multiplexes streams with QMux (draft-ietf-quic-qmux-02):
+QUIC-v1 frames -- RFC 9000 varints, STREAM, RESET_STREAM, STOP_SENDING,
+MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS, CONNECTION_CLOSE, DATAGRAM, plus
+RESET_STREAM_AT from draft-ietf-quic-reliable-stream-reset -- carried in
+self-delimiting Records over the ordered, reliable WebSocket byte stream.
+The control channel is QMux stream 0, and every stream gets QUIC-style
+windowed flow control, so a slow consumer exerts real backpressure.
+`QMuxConnection` and the frame codec primitives are exported so alternate
+server implementations can speak the same framing.
 
 ## Quick Start
 
@@ -94,6 +106,27 @@ console.log(new TextDecoder().decode(stdout));
 console.log('Exit code:', exitCode);
 ```
 
+## Attach and Resume
+
+Opening a PTY/exec session returns a session-scoped credential alongside the channel:
+
+```js
+session.sessionId;   // server-assigned session id (undefined for e.g. file channels)
+session.resumeToken; // token minted at open time; only the opener receives it
+
+// The original opener, reclaiming its session from a fresh connection:
+await client.resumeSession(session.sessionId, session.resumeToken);
+
+// Any other authorized principal attaches without a token -- ownership
+// or an ACL grant is enough:
+await client.grantSessionAccess(session.sessionId, 'bob');  // by the owner
+await otherClient.attachSession(session.sessionId);         // by 'bob'
+
+// Other session-management round trips:
+await client.detach(session.sessionId);   // leave it running server-side
+await client.listRemoteSessions();        // sessions this key can see
+```
+
 ## API Overview
 
 ### Core Classes
@@ -117,17 +150,19 @@ console.log('Exit code:', exitCode);
 | `SessionPlayer` | Replay recordings with original timing |
 | `generateKeyPair()` | Create Ed25519 key pair via Web Crypto |
 | `signChallenge()` | Build transcript + sign for auth handshake |
+| `signPeerRecord()` / `verifyPeerRecord()` | Sign / verify reverse-mode peer records |
 | `fingerprint()` | SHA-256 hex fingerprint of a public key |
 
 ### Protocol
 
 | Export | Description |
 |--------|-------------|
-| `MSG` | 80+ message type constants (hex opcodes) |
+| `MSG` | 95 message type constants (hex opcodes) |
 | `CHANNEL_KIND` | Channel types: `pty`, `exec`, `meta`, `file`, `tcp`, `udp`, `job` |
 | `AUTH_METHOD` | Auth methods: `pubkey`, `password` |
 | `cborEncode` / `cborDecode` | CBOR codec (maps, arrays, strings, ints, bytes, bools, null, floats) |
 | `frameEncode` / `FrameDecoder` | 4-byte big-endian length-prefixed framing |
+| `QMuxConnection` + QMux primitives | QMux stream state machine, error codes, and stream-id helpers for building alternate servers |
 
 ## Protocol Specification
 
@@ -136,6 +171,25 @@ The `spec/` directory contains the protocol definition:
 - `wsh-v1.yaml` -- machine-readable protocol schema
 - `wsh-v1.md` -- human-readable protocol specification
 - `codegen.mjs` -- generates `messages.gen.mjs` from the YAML spec
+
+## Security
+
+- **Auth transcript binding** -- challenge signatures cover
+  `SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce || channel_binding)`,
+  so a signature can't be replayed against a different session or relabeled
+  to a different username.
+- **Signed peer records** -- reverse-mode registration is self-signed by the
+  peer's identity key (the libp2p RFC 0002/0003 pattern), in a signing
+  domain separate from the auth challenge. `listPeers()` verifies every
+  entry client-side and reports a `verified` boolean, independent of
+  trusting the relay.
+- **Hybrid post-quantum E2E (experimental)** --
+  `initiateE2E(sessionId, 'X25519+ML-KEM-768')` combines X25519 ECDH with
+  ML-KEM-768 via HKDF-SHA256, preferring native WebCrypto ML-KEM-768 (Node
+  24.7+) with the optional `@noble/post-quantum` pure-JS fallback, and
+  falling back to classical X25519 automatically when the peer can't do
+  hybrid (check the returned `hybrid` flag). The derived AES-256-GCM key is
+  not yet wired to actual frame encryption.
 
 ## Browser Compatibility
 
@@ -146,6 +200,10 @@ Requires a browser (or Node.js 24+) with:
 - WebTransport (Chrome 97+, Edge 97+, Firefox 114+)
 - TextEncoder/TextDecoder
 - ReadableStream/WritableStream
+
+Hybrid ML-KEM-768 key exchange prefers native WebCrypto ML-KEM (Node 24.7+,
+some browsers); elsewhere the optional `@noble/post-quantum` dependency is
+loaded dynamically.
 
 ## License
 

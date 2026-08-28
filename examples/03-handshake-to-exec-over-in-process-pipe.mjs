@@ -28,7 +28,7 @@ const log = (who, msg) => transcript.push(`${who} ${msgName(msg.type)}`);
 
 function makeServer(sendToClient, authorizedFingerprints) {
   const decoder = new FrameDecoder();
-  const state = { sessionId: 'sess-' + Math.random().toString(36).slice(2, 8), nonce: null, authed: false };
+  const state = { sessionId: 'sess-' + Math.random().toString(36).slice(2, 8), nonce: null, username: '', authed: false };
   const send = (msg) => { log('  server →', msg); sendToClient(frameEncode(msg)); };
 
   return async (chunk) => {
@@ -37,6 +37,7 @@ function makeServer(sendToClient, authorizedFingerprints) {
       switch (msg.type) {
         case MSG.HELLO: {
           state.nonce = generateNonce();
+          state.username = msg.username;
           send(serverHello({ sessionId: state.sessionId, features: ['exec'] }));
           send(challenge({ nonce: state.nonce, sessionId: state.sessionId }));
           break;
@@ -44,11 +45,14 @@ function makeServer(sendToClient, authorizedFingerprints) {
         case MSG.AUTH: {
           const fp = await fingerprint(msg.public_key);
           const key = await importPublicKeyRaw(msg.public_key);
+          // The transcript binds the username from HELLO as well as the
+          // session id and nonce (see example 02).
           const ok = authorizedFingerprints.has(fp) &&
-            await verifyChallenge(key, msg.signature, state.sessionId, state.nonce);
+            await verifyChallenge(key, msg.signature, state.sessionId, state.nonce,
+              { username: state.username });
           if (ok) {
             state.authed = true;
-            send(authOk({ sessionId: state.sessionId, token: 'resume-token', ttl: 3600 }));
+            send(authOk({ sessionId: state.sessionId, token: crypto.getRandomValues(new Uint8Array(32)), ttl: 3600 }));
           } else {
             send(authFail({ reason: 'signature or key rejected' }));
           }
@@ -100,16 +104,18 @@ console.log('pre-auth OPEN refused, as the spec requires');
 
 // 2. Handshake.
 await clientSend(hello({ username: 'demo', authMethod: AUTH_METHOD.PUBKEY }));
-const srvHello = await nextFromServer(MSG.SERVER_HELLO);
+await nextFromServer(MSG.SERVER_HELLO);
 const chal = await nextFromServer(MSG.CHALLENGE);
 
-// 3. Challenge-response auth (same crypto as example 02).
+// 3. Challenge-response auth (same crypto as example 02). CHALLENGE's own
+// session_id — not SERVER_HELLO's — is authoritative for the transcript,
+// so auth works even if SERVER_HELLO is reordered, dropped, or skipped.
 const { signature, publicKeyRaw } = await signChallenge(
-  privateKey, publicKey, srvHello.session_id, chal.nonce
+  privateKey, publicKey, chal.session_id, chal.nonce, { username: 'demo' }
 );
 await clientSend(auth({ method: AUTH_METHOD.PUBKEY, signature, publicKey: publicKeyRaw }));
 const ok = await nextFromServer(MSG.AUTH_OK);
-console.log(`authenticated: session ${ok.session_id}, resume token "${ok.token}"`);
+console.log(`authenticated: session ${ok.session_id}, ${ok.token.length}-byte auth token`);
 
 // 4. Exec a command over a channel.
 await clientSend(open({ kind: CHANNEL_KIND.EXEC, command: 'uname', cols: 80, rows: 24 }));
