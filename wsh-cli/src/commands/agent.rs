@@ -156,7 +156,7 @@ pub async fn run(
     let keystore = KeyStore::default_location()
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to initialize keystore")?;
-    let (_signing_key, verifying_key) = keystore
+    let (signing_key, verifying_key) = keystore
         .load(identity)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("failed to load key '{identity}'"))?;
@@ -217,6 +217,7 @@ pub async fn run(
             payload: Payload::ReverseRegister(options.reverse_register_payload(
                 resolved.user.clone(),
                 public_key.clone(),
+                &signing_key,
             )),
         };
 

@@ -255,7 +255,7 @@ pub async fn run_reverse(
     let keystore = wsh_client::KeyStore::default_location()
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to initialize keystore")?;
-    let (_signing_key, verifying_key) = keystore
+    let (signing_key, verifying_key) = keystore
         .load(identity)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("failed to load key '{identity}'"))?;
@@ -290,7 +290,7 @@ pub async fn run_reverse(
     let register = Envelope {
         msg_type: MsgType::ReverseRegister,
         payload: Payload::ReverseRegister(
-            reverse_options.reverse_register_payload(username, public_bytes),
+            reverse_options.reverse_register_payload(username, public_bytes, &signing_key),
         ),
     };
     client
@@ -608,6 +608,9 @@ mod tests {
                 supports_echo: false,
                 supports_term_sync: false,
                 last_seen: Some(1),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
             PeerInfo {
                 fingerprint: "browser".into(),
@@ -622,6 +625,9 @@ mod tests {
                 supports_echo: true,
                 supports_term_sync: true,
                 last_seen: Some(2),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
         ];
 
@@ -699,6 +705,9 @@ mod tests {
                 supports_echo: false,
                 supports_term_sync: false,
                 last_seen: Some(1),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
             PeerInfo {
                 fingerprint: "999999123456".into(),
@@ -713,6 +722,9 @@ mod tests {
                 supports_echo: true,
                 supports_term_sync: true,
                 last_seen: Some(2),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
         ];
 
@@ -738,6 +750,9 @@ mod tests {
                 supports_echo: false,
                 supports_term_sync: false,
                 last_seen: Some(1),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
             PeerInfo {
                 fingerprint: "abcdef654321".into(),
@@ -752,6 +767,9 @@ mod tests {
                 supports_echo: true,
                 supports_term_sync: true,
                 last_seen: Some(2),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
         ];
 
@@ -774,6 +792,9 @@ mod tests {
             supports_echo: false,
             supports_term_sync: false,
             last_seen: Some(1),
+            public_key: None,
+            seq: None,
+            record_signature: None,
         }];
 
         let peer = resolve_peer_selector(&peers, "only").unwrap();
@@ -796,6 +817,9 @@ mod tests {
                 supports_echo: false,
                 supports_term_sync: false,
                 last_seen: Some(1),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
             PeerInfo {
                 fingerprint: "999999123456".into(),
@@ -810,6 +834,9 @@ mod tests {
                 supports_echo: true,
                 supports_term_sync: true,
                 last_seen: Some(2),
+                public_key: None,
+                seq: None,
+                record_signature: None,
             },
         ];
 
@@ -834,6 +861,9 @@ mod tests {
             supports_echo: false,
             supports_term_sync: false,
             last_seen: Some(1),
+            public_key: None,
+            seq: None,
+            record_signature: None,
         }];
 
         let last = LastReversePeer {
@@ -863,6 +893,9 @@ mod tests {
             supports_echo: true,
             supports_term_sync: true,
             last_seen: Some(2),
+            public_key: None,
+            seq: None,
+            record_signature: None,
         }];
 
         let last = LastReversePeer {

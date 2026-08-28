@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
+use ed25519_dalek::{Signer, SigningKey};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,7 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
 use wsh_client::WshClient;
 use wsh_core::messages::*;
+use wsh_core::peer_record::{build_peer_record_transcript, PeerRecord};
 
 const DEFAULT_PTY_REPLAY_LIMIT: usize = 256 * 1024;
 
@@ -50,11 +52,46 @@ impl Default for ReverseHostOptions {
 }
 
 impl ReverseHostOptions {
+    /// Build a self-signed `ReverseRegister` payload (wsh #17: signed peer
+    /// records). `signing_key` is the caller's own identity key -- the
+    /// server verifies the resulting `record_signature` against the raw
+    /// `public_key` fingerprint of *this same connection's* authenticated
+    /// identity, so a mismatched or missing signature is rejected outright
+    /// (`crates/wsh-server/src/server.rs`'s `ReverseRegister` handler).
+    ///
+    /// `seq` is the signing peer's own monotonic counter -- current-time-
+    /// millis, matching `@johnhenry/wsh`'s `connectReverse()` (`src/
+    /// client.mjs`) and `wsh_core::peer_record`'s doc comment. The transcript
+    /// construction (`build_peer_record_transcript`) is crypto-library-
+    /// agnostic (just produces the bytes to sign), so signing directly with
+    /// this crate's `ed25519_dalek` key -- rather than going through
+    /// `wsh_core::peer_record::sign_peer_record`, which expects a `ring`
+    /// key pair -- still produces a byte-identical, correctly-verifiable
+    /// signature.
     pub fn reverse_register_payload(
         &self,
         username: String,
         public_key: Vec<u8>,
+        signing_key: &SigningKey,
     ) -> ReverseRegisterPayload {
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let record = PeerRecord {
+            username: username.clone(),
+            peer_type: self.peer_type.clone(),
+            shell_backend: self.shell_backend.clone(),
+            capabilities: self.capabilities.clone(),
+            supports_attach: self.supports_attach,
+            supports_replay: self.supports_replay,
+            supports_echo: self.supports_echo,
+            supports_term_sync: self.supports_term_sync,
+            seq,
+        };
+        let transcript = build_peer_record_transcript(&record);
+        let record_signature = signing_key.sign(&transcript).to_bytes().to_vec();
+
         ReverseRegisterPayload {
             username,
             capabilities: self.capabilities.clone(),
@@ -65,6 +102,8 @@ impl ReverseHostOptions {
             supports_echo: self.supports_echo,
             supports_term_sync: self.supports_term_sync,
             public_key,
+            seq,
+            record_signature,
         }
     }
 
