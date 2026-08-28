@@ -241,7 +241,7 @@ impl TryFrom<u8> for MsgType {
 pub fn is_relay_forwardable(t: MsgType) -> bool {
     matches!(
         t,
-        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff
+        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::FileResult | MsgType::FileChunk | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff
     )
 }
 
@@ -1315,6 +1315,7 @@ pub struct FileChunkPayload {
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     pub is_final: bool,
+    pub total_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

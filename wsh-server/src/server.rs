@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 use wsh_core::keys::{load_authorized_keys, AuthorizedKey};
@@ -203,6 +204,16 @@ pub struct WshServer {
     next_conn_id: Arc<AtomicU64>,
     /// Atomic counter for generating unique channel IDs (collision-free).
     next_channel_id: Arc<AtomicU32>,
+    /// In-progress file uploads: channel_id → open file handle + path.
+    /// Populated on Open{kind: File, command: "upload:<path>"}, written to
+    /// as FileChunk messages arrive, removed on the final chunk or Close.
+    file_uploads: Arc<RwLock<HashMap<u32, FileUploadState>>>,
+}
+
+/// State for an in-progress file upload (Open{kind: File, command: "upload:..."}).
+struct FileUploadState {
+    file: tokio::fs::File,
+    path: PathBuf,
 }
 
 impl WshServer {
@@ -291,6 +302,7 @@ impl WshServer {
             pending_relay_pairs: Arc::new(RwLock::new(HashMap::new())),
             next_conn_id: Arc::new(AtomicU64::new(1)),
             next_channel_id: Arc::new(AtomicU32::new(1)),
+            file_uploads: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -817,6 +829,110 @@ impl WshServer {
             if let Err(e) = sessions.remove(&session_id).await {
                 debug!(session_id = %session_id, error = %e, "PTY output pump: session already removed");
             }
+        });
+    }
+
+    /// Stream a file to the client as a sequence of FileChunk control
+    /// messages, ending with Exit + Close. FileChunk travels as an
+    /// ordinary control message (not raw stream bytes) so this works
+    /// identically over both transports, matching every other channel
+    /// kind's data_mode: virtual today.
+    fn spawn_file_download(
+        &self,
+        channel_id: u32,
+        path: String,
+        total_size: u64,
+        peer_tx: mpsc::Sender<Envelope>,
+    ) {
+        const CHUNK_SIZE: usize = 65_536;
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(channel_id, path = %path, error = %e, "file download: failed to open file");
+                    let _ = peer_tx
+                        .send(Envelope {
+                            msg_type: MsgType::Exit,
+                            payload: Payload::Exit(ExitPayload { channel_id, code: 1 }),
+                        })
+                        .await;
+                    let _ = peer_tx
+                        .send(Envelope {
+                            msg_type: MsgType::Close,
+                            payload: Payload::Close(ClosePayload { channel_id }),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let mut offset: u64 = 0;
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut read_error = false;
+
+            loop {
+                let n = match file.read(&mut buf).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(channel_id, path = %path, error = %e, "file download: read error");
+                        read_error = true;
+                        0
+                    }
+                };
+
+                // n == 0 or a read error both force a final chunk even if
+                // offset hasn't reached total_size yet (the file shrank or
+                // errored mid-transfer) -- total_size always stays what was
+                // captured at Open time, so the client's own
+                // offset + len(data) == total_size truncation check
+                // correctly flags that case as a truncated transfer rather
+                // than looping forever trying to read past real EOF.
+                let is_final = read_error || n == 0 || offset + n as u64 >= total_size;
+
+                let sent = peer_tx
+                    .send(Envelope {
+                        msg_type: MsgType::FileChunk,
+                        payload: Payload::FileChunk(FileChunkPayload {
+                            channel_id,
+                            offset,
+                            data: buf[..n].to_vec(),
+                            is_final,
+                            total_size,
+                        }),
+                    })
+                    .await;
+
+                if sent.is_err() {
+                    debug!(channel_id, "file download: peer channel closed, stopping");
+                    return;
+                }
+
+                offset += n as u64;
+                if is_final {
+                    break;
+                }
+            }
+
+            info!(channel_id, path = %path, bytes = offset, "file download complete");
+
+            let _ = peer_tx
+                .send(Envelope {
+                    msg_type: MsgType::Exit,
+                    payload: Payload::Exit(ExitPayload {
+                        channel_id,
+                        code: if read_error { 1 } else { 0 },
+                    }),
+                })
+                .await;
+            let _ = peer_tx
+                .send(Envelope {
+                    msg_type: MsgType::Close,
+                    payload: Payload::Close(ClosePayload { channel_id }),
+                })
+                .await;
         });
     }
 
@@ -1851,6 +1967,89 @@ impl WshServer {
                             })),
                         }
                     }
+                    ChannelKind::File => {
+                        let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
+                        let command = p.command.clone().unwrap_or_default();
+                        let Some((op, path)) = command.split_once(':') else {
+                            return Ok(Some(Envelope {
+                                msg_type: MsgType::OpenFail,
+                                payload: Payload::OpenFail(OpenFailPayload {
+                                    reason: format!(
+                                        "malformed file command {command:?} (expected \"upload:<path>\" or \"download:<path>\")"
+                                    ),
+                                }),
+                            }));
+                        };
+                        let path = path.to_string();
+
+                        match op {
+                            "upload" => match tokio::fs::File::create(&path).await {
+                                Ok(file) => {
+                                    self.file_uploads.write().await.insert(
+                                        channel_id,
+                                        FileUploadState {
+                                            file,
+                                            path: PathBuf::from(&path),
+                                        },
+                                    );
+                                    info!(channel_id, path = %path, "file upload channel opened");
+                                    Ok(Some(Envelope {
+                                        msg_type: MsgType::OpenOk,
+                                        payload: Payload::OpenOk(OpenOkPayload {
+                                            channel_id,
+                                            stream_ids: vec![],
+                                            data_mode: SessionDataMode::Virtual,
+                                            capabilities: vec![],
+                                        }),
+                                    }))
+                                }
+                                Err(e) => Ok(Some(Envelope {
+                                    msg_type: MsgType::OpenFail,
+                                    payload: Payload::OpenFail(OpenFailPayload {
+                                        reason: format!("cannot open {path:?} for writing: {e}"),
+                                    }),
+                                })),
+                            },
+                            "download" => match tokio::fs::metadata(&path).await {
+                                Ok(meta) if meta.is_file() => {
+                                    info!(channel_id, path = %path, size = meta.len(), "file download channel opened");
+                                    self.spawn_file_download(
+                                        channel_id,
+                                        path,
+                                        meta.len(),
+                                        ctx.peer_tx.clone(),
+                                    );
+                                    Ok(Some(Envelope {
+                                        msg_type: MsgType::OpenOk,
+                                        payload: Payload::OpenOk(OpenOkPayload {
+                                            channel_id,
+                                            stream_ids: vec![],
+                                            data_mode: SessionDataMode::Virtual,
+                                            capabilities: vec![],
+                                        }),
+                                    }))
+                                }
+                                Ok(_) => Ok(Some(Envelope {
+                                    msg_type: MsgType::OpenFail,
+                                    payload: Payload::OpenFail(OpenFailPayload {
+                                        reason: format!("{path:?} is not a regular file"),
+                                    }),
+                                })),
+                                Err(e) => Ok(Some(Envelope {
+                                    msg_type: MsgType::OpenFail,
+                                    payload: Payload::OpenFail(OpenFailPayload {
+                                        reason: format!("cannot open {path:?}: {e}"),
+                                    }),
+                                })),
+                            },
+                            _ => Ok(Some(Envelope {
+                                msg_type: MsgType::OpenFail,
+                                payload: Payload::OpenFail(OpenFailPayload {
+                                    reason: format!("unsupported file command: {op:?}"),
+                                }),
+                            })),
+                        }
+                    }
                     _ => Ok(Some(Envelope {
                         msg_type: MsgType::OpenFail,
                         payload: Payload::OpenFail(OpenFailPayload {
@@ -1900,6 +2099,16 @@ impl WshServer {
                 Ok(None)
             }
             (MsgType::Close, Payload::Close(p)) => {
+                // File-kind channels aren't PTY/exec sessions and never
+                // appear in channel_sessions, so without this check they'd
+                // fall through to the session-detach path below and
+                // (since target_session would be None) incorrectly detach
+                // ctx.session_id -- this connection's own top-level session.
+                if self.file_uploads.write().await.remove(&p.channel_id).is_some() {
+                    debug!(channel_id = p.channel_id, "file upload channel closed by client");
+                    return Ok(None);
+                }
+
                 // Look up the session for this channel_id
                 let target_session = {
                     let ch_map = self.channel_sessions.read().await;
@@ -3079,18 +3288,6 @@ impl WshServer {
             }
 
             (MsgType::FileChunk, Payload::FileChunk(p)) => {
-                if !self
-                    .check_session_access(&ctx.session_id, &ctx.username)
-                    .await
-                {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::Error,
-                        payload: Payload::Error(ErrorPayload {
-                            code: 2,
-                            message: "not authorized".into(),
-                        }),
-                    }));
-                }
                 debug!(
                     channel_id = p.channel_id,
                     offset = p.offset,
@@ -3098,6 +3295,57 @@ impl WshServer {
                     is_final = p.is_final,
                     "file chunk"
                 );
+
+                let mut uploads = self.file_uploads.write().await;
+                let Some(state) = uploads.get_mut(&p.channel_id) else {
+                    // Not an error worth surfacing: a chunk for an upload
+                    // that already finished/failed (or was never opened by
+                    // this connection) is simply stale/misdirected.
+                    return Ok(None);
+                };
+
+                let write_result = async {
+                    state.file.seek(std::io::SeekFrom::Start(p.offset)).await?;
+                    state.file.write_all(&p.data).await?;
+                    if p.is_final {
+                        state.file.flush().await?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                }
+                .await;
+
+                if write_result.is_err() || p.is_final {
+                    let channel_id = p.channel_id;
+                    let path = state.path.clone();
+                    let ok = write_result.is_ok();
+                    uploads.remove(&channel_id);
+                    drop(uploads);
+
+                    if let Err(e) = write_result {
+                        warn!(channel_id, path = ?path, error = %e, "file upload: write failed");
+                    } else {
+                        info!(channel_id, path = ?path, "file upload complete");
+                    }
+
+                    let _ = ctx
+                        .peer_tx
+                        .send(Envelope {
+                            msg_type: MsgType::Exit,
+                            payload: Payload::Exit(ExitPayload {
+                                channel_id,
+                                code: if ok { 0 } else { 1 },
+                            }),
+                        })
+                        .await;
+                    let _ = ctx
+                        .peer_tx
+                        .send(Envelope {
+                            msg_type: MsgType::Close,
+                            payload: Payload::Close(ClosePayload { channel_id }),
+                        })
+                        .await;
+                }
+
                 Ok(None)
             }
 
