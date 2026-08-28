@@ -828,6 +828,9 @@ pub struct ReverseRegisterPayload {
     pub supports_term_sync: bool,
     #[serde(with = "serde_bytes")]
     pub public_key: Vec<u8>,
+    pub seq: u64,
+    #[serde(with = "serde_bytes")]
+    pub record_signature: Vec<u8>,
 }
 
 fn default_reverse_register_peer_type() -> String {
@@ -1385,6 +1388,12 @@ pub struct PeerInfo {
     pub supports_term_sync: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
