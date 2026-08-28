@@ -802,6 +802,7 @@ function emitRust(schema) {
       const isRequired = fieldDef.required === true;
       const hasDefault = 'default' in fieldDef;
       const rType = rustType(fieldDef.type, isRequired, hasDefault);
+      const isBytes = isBytesField(fieldDef.type);
 
       const attrs = [];
       if (hasDefault) {
@@ -810,6 +811,27 @@ function emitRust(schema) {
       if (!isRequired && !hasDefault) {
         attrs.push('default');
         attrs.push('skip_serializing_if = "Option::is_none"');
+      }
+
+      // Bytes handling: without this, a `Vec<u8>`/`Option<Vec<u8>>` field
+      // serializes via serde's default derive as a CBOR array of per-byte
+      // integers instead of a CBOR byte string, which JS's `cborDecode`
+      // then hands back as a plain array (not a Uint8Array) -- silently
+      // breaking any consumer that feeds the value straight into
+      // `crypto.subtle.digest`/`verify` (see PeerInfo.public_key /
+      // .record_signature, added for the wsh #17 signed-peer-record work:
+      // this exact gap meant a legitimately-registered peer's
+      // `verified` flag came back `false` client-side even though the
+      // server-side registration check -- which never round-trips
+      // through this struct -- passed). Mirrors the identical handling
+      // already applied to top-level message payload fields above.
+      if (isBytes && isRequired) {
+        attrs.push('with = "serde_bytes"');
+      } else if (isBytes && !isRequired) {
+        attrs.length = 0; // rebuild
+        attrs.push('default');
+        attrs.push('skip_serializing_if = "Option::is_none"');
+        attrs.push('with = "option_bytes"');
       }
 
       if (attrs.length > 0) {
