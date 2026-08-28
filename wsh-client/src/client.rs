@@ -7,14 +7,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ml_kem::{Decapsulate, Encapsulate, EncapsulationKey, KeyExport, Kem, MlKem768, TryKeyInit};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time;
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 
 use wsh_core::codec::{decode_envelope, frame_encode};
 use wsh_core::error::{WshError, WshResult};
 use wsh_core::messages::*;
 
 use crate::auth;
+use crate::e2e::{combine_hybrid_secret, E2eKeyExchange, ALGORITHM_HYBRID};
 use crate::known_hosts::{HostStatus, KnownHosts};
 use crate::session::{ControlAction, SessionInfo, SessionOpts, WshSession};
 use crate::transport::{self, AnyTransport};
@@ -483,6 +486,162 @@ impl WshClient {
         }
     }
 
+    // ── E2E Encryption ───────────────────────────────────────────────
+
+    /// Initiate end-to-end encryption for a session (wsh #18).
+    ///
+    /// `algorithm: "X25519"` (default -- pass [`crate::e2e::ALGORITHM_X25519`]):
+    /// classical ECDH only, one round trip -- both sides send their
+    /// ephemeral public key, derive the shared secret directly.
+    ///
+    /// `algorithm: "X25519+ML-KEM-768"` (pass [`ALGORITHM_HYBRID`]): hybrid
+    /// classical+post-quantum. Round 1 is the same as classical, plus both
+    /// sides also send a fresh ML-KEM-768 public key. Each side then
+    /// deterministically derives the same "encapsulator"/"decapsulator"
+    /// role assignment by comparing the two exchanged X25519 public keys
+    /// byte-lexicographically (no extra round trip needed, since both
+    /// sides already have both values after round 1) -- the encapsulator
+    /// encapsulates against the decapsulator's ML-KEM-768 key and sends
+    /// the ciphertext in a second `KeyExchange` message; the decapsulator
+    /// decapsulates it. Both combine the X25519 and ML-KEM-768 outputs via
+    /// HKDF-SHA256 (see [`crate::e2e::combine_hybrid_secret`]). Falls back
+    /// to classical automatically if the peer's round-1 message doesn't
+    /// include a `kem_public_key` (it doesn't support hybrid mode) --
+    /// algorithm agility, not a hard cutover; check the returned `hybrid`
+    /// flag to see which actually happened.
+    ///
+    /// Mirrors `@johnhenry/wsh`'s `WshClient.initiateE2E` (`src/client.mjs`)
+    /// byte-for-byte for wire interop.
+    pub async fn initiate_e2e(
+        &self,
+        session_id: &str,
+        algorithm: &str,
+        timeout: Duration,
+    ) -> WshResult<E2eKeyExchange> {
+        let want_hybrid = algorithm == ALGORITHM_HYBRID;
+
+        // Generate an ephemeral X25519 key pair (and, for hybrid, a fresh
+        // ML-KEM-768 key pair too).
+        let ephemeral_secret = EphemeralSecret::random();
+        let local_public = X25519PublicKey::from(&ephemeral_secret);
+        let local_public_bytes = local_public.as_bytes().to_vec();
+
+        let local_kem = if want_hybrid {
+            Some(MlKem768::generate_keypair())
+        } else {
+            None
+        };
+        let local_kem_public_bytes = local_kem
+            .as_ref()
+            .map(|(_dk, ek)| ek.to_bytes().to_vec());
+
+        let round1 = Envelope {
+            msg_type: MsgType::KeyExchange,
+            payload: Payload::KeyExchange(KeyExchangePayload {
+                algorithm: algorithm.to_string(),
+                public_key: Some(local_public_bytes.clone()),
+                session_id: session_id.to_string(),
+                kem_public_key: local_kem_public_bytes,
+                kem_ciphertext: None,
+            }),
+        };
+
+        let peer_round1 = self
+            .send_and_wait_for(round1, MsgType::KeyExchange, timeout)
+            .await?;
+        let peer = match peer_round1.payload {
+            Payload::KeyExchange(p) => p,
+            _ => {
+                return Err(WshError::InvalidMessage(
+                    "unexpected response to round-1 KEY_EXCHANGE".into(),
+                ))
+            }
+        };
+
+        let peer_public_key = peer.public_key.clone().ok_or_else(|| {
+            WshError::InvalidMessage("peer KEY_EXCHANGE missing public_key".into())
+        })?;
+        let peer_public_array: [u8; 32] = peer_public_key.as_slice().try_into().map_err(|_| {
+            WshError::InvalidMessage(format!(
+                "peer public_key must be 32 bytes, got {}",
+                peer_public_key.len()
+            ))
+        })?;
+        let peer_x25519_public = X25519PublicKey::from(peer_public_array);
+        let x25519_shared = ephemeral_secret.diffie_hellman(&peer_x25519_public);
+        let x25519_secret_bytes = *x25519_shared.as_bytes();
+
+        let hybrid_active = want_hybrid && local_kem.is_some() && peer.kem_public_key.is_some();
+
+        let shared_secret = if hybrid_active {
+            let (local_dk, _local_ek) = local_kem.expect("checked by hybrid_active");
+            let peer_kem_public_key = peer
+                .kem_public_key
+                .expect("checked by hybrid_active");
+
+            // Lexicographic byte comparison: Rust's `Ord` on `&[u8]`
+            // already compares elementwise then by length, matching the
+            // JS `compareBytes` helper exactly, so no separate comparator
+            // is needed here.
+            let is_encapsulator = local_public_bytes < peer_public_key;
+
+            let kem_shared_secret: [u8; 32] = if is_encapsulator {
+                let peer_ek = EncapsulationKey::<MlKem768>::new_from_slice(&peer_kem_public_key)
+                    .map_err(|_| {
+                        WshError::InvalidMessage("invalid peer kem_public_key".into())
+                    })?;
+                let (ciphertext, shared) = peer_ek.encapsulate();
+
+                let round2 = Envelope {
+                    msg_type: MsgType::KeyExchange,
+                    payload: Payload::KeyExchange(KeyExchangePayload {
+                        algorithm: algorithm.to_string(),
+                        public_key: None,
+                        session_id: session_id.to_string(),
+                        kem_public_key: None,
+                        kem_ciphertext: Some(ciphertext.to_vec()),
+                    }),
+                };
+                self.send_fire_and_forget(round2).await?;
+
+                shared.as_slice().try_into().map_err(|_| {
+                    WshError::Other("ML-KEM-768 shared secret was not 32 bytes".into())
+                })?
+            } else {
+                let peer_round2 = self.wait_for(MsgType::KeyExchange, timeout).await?;
+                let ct_payload = match peer_round2.payload {
+                    Payload::KeyExchange(p) => p,
+                    _ => {
+                        return Err(WshError::InvalidMessage(
+                            "unexpected response to round-2 KEY_EXCHANGE".into(),
+                        ))
+                    }
+                };
+                let kem_ciphertext = ct_payload.kem_ciphertext.ok_or_else(|| {
+                    WshError::InvalidMessage(
+                        "round-2 KEY_EXCHANGE missing kem_ciphertext".into(),
+                    )
+                })?;
+                let shared = local_dk.decapsulate_slice(&kem_ciphertext).map_err(|_| {
+                    WshError::InvalidMessage("invalid peer kem_ciphertext".into())
+                })?;
+                shared.as_slice().try_into().map_err(|_| {
+                    WshError::Other("ML-KEM-768 shared secret was not 32 bytes".into())
+                })?
+            };
+
+            combine_hybrid_secret(&x25519_secret_bytes, &kem_shared_secret)?
+        } else {
+            x25519_secret_bytes
+        };
+
+        Ok(E2eKeyExchange {
+            peer_public_key,
+            shared_secret,
+            hybrid: hybrid_active,
+        })
+    }
+
     /// Disconnect from the server.
     pub async fn disconnect(&self) -> WshResult<()> {
         {
@@ -738,6 +897,60 @@ impl WshClient {
                 }
             }
         }
+    }
+
+    /// Register a one-shot waiter for the next incoming message of
+    /// `expected_type`, without sending anything. Used by `initiate_e2e`'s
+    /// "decapsulator" role, which only ever waits for the encapsulator's
+    /// round-2 `KeyExchange` (it doesn't send one itself).
+    async fn register_waiter(&self, expected_type: MsgType) -> oneshot::Receiver<Envelope> {
+        let (tx, rx) = oneshot::channel();
+        let mut responses = self.response_tx.lock().await;
+        responses
+            .entry(expected_type.into())
+            .or_insert_with(Vec::new)
+            .push(tx);
+        rx
+    }
+
+    /// Await a previously-registered waiter, subject to `timeout_duration`.
+    async fn await_waiter(
+        rx: oneshot::Receiver<Envelope>,
+        timeout_duration: Duration,
+    ) -> WshResult<Envelope> {
+        tokio::select! {
+            result = rx => {
+                result.map_err(|_| WshError::Transport("response channel dropped".into()))
+            }
+            _ = time::sleep(timeout_duration) => {
+                Err(WshError::Timeout)
+            }
+        }
+    }
+
+    /// Wait for the next incoming message of `expected_type`, without
+    /// sending anything first.
+    async fn wait_for(&self, expected_type: MsgType, timeout_duration: Duration) -> WshResult<Envelope> {
+        let rx = self.register_waiter(expected_type).await;
+        Self::await_waiter(rx, timeout_duration).await
+    }
+
+    /// Send a control message and wait for a specific response type, with
+    /// a caller-provided timeout. Like `send_and_wait`, but lets the
+    /// caller pick the timeout instead of the fixed 30s default -- used by
+    /// `initiate_e2e`, whose timeout is a parameter mirroring the JS
+    /// `initiateE2E(sessionId, algorithm, timeout)` signature. Unlike
+    /// `send_and_wait`, this doesn't register a companion "fail type"
+    /// waiter, since `KeyExchange` has no failure-reply counterpart.
+    async fn send_and_wait_for(
+        &self,
+        envelope: Envelope,
+        expected_type: MsgType,
+        timeout_duration: Duration,
+    ) -> WshResult<Envelope> {
+        let rx = self.register_waiter(expected_type).await;
+        self.send_control_message(envelope).await?;
+        Self::await_waiter(rx, timeout_duration).await
     }
 
     /// The control message dispatch loop.
@@ -1103,14 +1316,17 @@ impl Drop for WshClient {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use tokio::sync::{mpsc, Mutex};
+    use tokio::sync::{mpsc, oneshot, Mutex};
+    use wsh_core::codec::decode_envelope;
     use wsh_core::messages::{
-        ChannelKind, ClosePayload, Envelope, MsgType, OpenOkPayload, Payload, SessionDataMode,
-        SessionDataPayload,
+        ChannelKind, ClosePayload, Envelope, KeyExchangePayload, MsgType, OpenOkPayload, Payload,
+        SessionDataMode, SessionDataPayload,
     };
 
     use super::{known_host_label, SessionOpts, WshClient};
+    use crate::e2e::{ALGORITHM_HYBRID, ALGORITHM_X25519};
     use crate::session::WshSession;
 
     #[test]
@@ -1325,5 +1541,302 @@ mod tests {
             &["resize".to_string(), "signal".to_string()]
         );
         response_task.await.unwrap();
+    }
+
+    // ── initiate_e2e (wsh #18) ──────────────────────────────────────
+    //
+    // No integration test goes through the real wsh-server relay here:
+    // that relay currently requires two different connections to share a
+    // session_id via Attach/Resume, which (as of this writing) has no
+    // working token-minting path for PTY/exec sessions server-side -- see
+    // the GitHub issue filed alongside this change. Instead, these tests
+    // build two independent `WshClient`s over `AnyTransport::Test` and
+    // wire each one's outgoing control frames directly into the other's
+    // `handle_incoming`, i.e. a loopback transport pair fully under test
+    // control, exercising the exact same `initiate_e2e` code path real
+    // peers would use.
+
+    /// Bundle of handles needed both to construct a `WshClient` for
+    /// testing and to build a loopback relay *targeting* it (since the
+    /// relevant fields aren't otherwise reachable once moved into the
+    /// struct).
+    struct TestClientRig {
+        client: WshClient,
+        outgoing_rx: mpsc::Receiver<Vec<u8>>,
+        response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
+        outgoing_tx: mpsc::Sender<Vec<u8>>,
+        accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
+    }
+
+    fn build_test_client(session_id: &str) -> TestClientRig {
+        let response_tx = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (control_action_tx, _control_action_rx) = mpsc::channel(4);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(64);
+        let accepted_relay_peers = Arc::new(Mutex::new(HashSet::new()));
+
+        let client = WshClient {
+            transport: Arc::new(Mutex::new(crate::transport::AnyTransport::Test(
+                crate::transport::TestTransport,
+            ))),
+            session_id: Some(session_id.to_string()),
+            token: None,
+            sessions: sessions.clone(),
+            control_action_tx,
+            dispatch_handle: None,
+            keepalive_handle: None,
+            outgoing_tx: outgoing_tx.clone(),
+            response_tx: response_tx.clone(),
+            connected: Arc::new(Mutex::new(true)),
+            reverse_connect_rx: Arc::new(Mutex::new(None)),
+            relay_message_rx: Arc::new(Mutex::new(None)),
+            accepted_relay_peers: accepted_relay_peers.clone(),
+        };
+
+        TestClientRig {
+            client,
+            outgoing_rx,
+            response_tx,
+            sessions,
+            outgoing_tx,
+            accepted_relay_peers,
+        }
+    }
+
+    /// Pump every frame received on `rx` into `handle_incoming` for
+    /// whichever client owns the given `response_tx`/`sessions`/
+    /// `outgoing_tx`/`accepted_relay_peers`, as if it arrived over the
+    /// wire from a real peer. Runs until the sender end of `rx` is
+    /// dropped or the task is aborted.
+    ///
+    /// Frames on `rx` are `frame_encode`'s length-prefixed CBOR (the same
+    /// bytes a real transport's `send_control` would write to the wire),
+    /// so the 4-byte length prefix is stripped before `decode_envelope`,
+    /// matching what a real transport's `recv_control` already does for
+    /// the dispatch loop (see e.g. `transport::websocket::decode_control_payload`).
+    async fn relay_forever(
+        mut rx: mpsc::Receiver<Vec<u8>>,
+        response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
+        outgoing_tx: mpsc::Sender<Vec<u8>>,
+        accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
+    ) {
+        while let Some(frame) = rx.recv().await {
+            if frame.len() < 4 {
+                continue;
+            }
+            if let Ok(envelope) = decode_envelope(&frame[4..]) {
+                WshClient::handle_incoming(
+                    envelope,
+                    &response_tx,
+                    &sessions,
+                    &outgoing_tx,
+                    &None,
+                    &None,
+                    &accepted_relay_peers,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Wire up a bidirectional loopback relay between two rigs and return
+    /// the join handles so the caller can abort them once the exchange
+    /// under test has completed.
+    fn wire_loopback(
+        rig_a: &mut TestClientRig,
+        rig_b: &mut TestClientRig,
+    ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        let a_to_b_rx = std::mem::replace(&mut rig_a.outgoing_rx, mpsc::channel(1).1);
+        let b_to_a_rx = std::mem::replace(&mut rig_b.outgoing_rx, mpsc::channel(1).1);
+
+        let a_to_b = tokio::spawn(relay_forever(
+            a_to_b_rx,
+            rig_b.response_tx.clone(),
+            rig_b.sessions.clone(),
+            rig_b.outgoing_tx.clone(),
+            rig_b.accepted_relay_peers.clone(),
+        ));
+        let b_to_a = tokio::spawn(relay_forever(
+            b_to_a_rx,
+            rig_a.response_tx.clone(),
+            rig_a.sessions.clone(),
+            rig_a.outgoing_tx.clone(),
+            rig_a.accepted_relay_peers.clone(),
+        ));
+        (a_to_b, b_to_a)
+    }
+
+    #[tokio::test]
+    async fn initiate_e2e_classical_round_trip_matches_between_both_sides() {
+        let mut rig_a = build_test_client("sess-e2e-classical");
+        let mut rig_b = build_test_client("sess-e2e-classical");
+        let (a_to_b, b_to_a) = wire_loopback(&mut rig_a, &mut rig_b);
+
+        let (result_a, result_b) = tokio::join!(
+            rig_a
+                .client
+                .initiate_e2e("sess-e2e-classical", ALGORITHM_X25519, Duration::from_secs(5)),
+            rig_b
+                .client
+                .initiate_e2e("sess-e2e-classical", ALGORITHM_X25519, Duration::from_secs(5)),
+        );
+
+        let result_a = result_a.expect("client A initiate_e2e failed");
+        let result_b = result_b.expect("client B initiate_e2e failed");
+
+        assert!(!result_a.hybrid, "classical mode should not report hybrid");
+        assert!(!result_b.hybrid, "classical mode should not report hybrid");
+        assert_eq!(
+            result_a.shared_secret, result_b.shared_secret,
+            "both sides must derive the same AES-256-GCM key"
+        );
+
+        a_to_b.abort();
+        b_to_a.abort();
+    }
+
+    #[tokio::test]
+    async fn initiate_e2e_hybrid_round_trip_matches_and_uses_hybrid() {
+        // Loop for probabilistic coverage of both ML-KEM-768
+        // encapsulator/decapsulator role assignments (the role is chosen
+        // by comparing two randomly generated ephemeral X25519 public
+        // keys, so a single run only exercises one side of that branch),
+        // mirroring @johnhenry/wsh's test/client.test.mjs hybrid-mode test
+        // loop.
+        let mut previous_secret: Option<[u8; 32]> = None;
+
+        for i in 0..10 {
+            let session_id = format!("sess-e2e-hybrid-{i}");
+            let mut rig_a = build_test_client(&session_id);
+            let mut rig_b = build_test_client(&session_id);
+            let (a_to_b, b_to_a) = wire_loopback(&mut rig_a, &mut rig_b);
+
+            let (result_a, result_b) = tokio::join!(
+                rig_a
+                    .client
+                    .initiate_e2e(&session_id, ALGORITHM_HYBRID, Duration::from_secs(5)),
+                rig_b
+                    .client
+                    .initiate_e2e(&session_id, ALGORITHM_HYBRID, Duration::from_secs(5)),
+            );
+
+            let result_a = result_a.expect("client A initiate_e2e failed");
+            let result_b = result_b.expect("client B initiate_e2e failed");
+
+            assert!(result_a.hybrid, "iteration {i}: client A should report hybrid active");
+            assert!(result_b.hybrid, "iteration {i}: client B should report hybrid active");
+            assert_eq!(
+                result_a.shared_secret, result_b.shared_secret,
+                "iteration {i}: both sides must derive the same hybrid-combined key"
+            );
+
+            // Sanity check mirroring the JS suite's "different final keys"
+            // test: successive runs (fresh ephemeral keys each time) must
+            // not collide.
+            if let Some(prev) = previous_secret {
+                assert_ne!(
+                    prev, result_a.shared_secret,
+                    "iteration {i}: fresh ephemeral keys must not reproduce the previous key"
+                );
+            }
+            previous_secret = Some(result_a.shared_secret);
+
+            a_to_b.abort();
+            b_to_a.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn initiate_e2e_falls_back_to_classical_when_peer_lacks_hybrid_support() {
+        // Client A asks for hybrid; client B only speaks classical (as a
+        // pre-#18 peer would). Algorithm agility, not a hard cutover: both
+        // sides must still agree on a classical-only key.
+        let mut rig_a = build_test_client("sess-e2e-fallback");
+        let mut rig_b = build_test_client("sess-e2e-fallback");
+        let (a_to_b, b_to_a) = wire_loopback(&mut rig_a, &mut rig_b);
+
+        let (result_a, result_b) = tokio::join!(
+            rig_a
+                .client
+                .initiate_e2e("sess-e2e-fallback", ALGORITHM_HYBRID, Duration::from_secs(5)),
+            rig_b
+                .client
+                .initiate_e2e("sess-e2e-fallback", ALGORITHM_X25519, Duration::from_secs(5)),
+        );
+
+        let result_a = result_a.expect("client A initiate_e2e failed");
+        let result_b = result_b.expect("client B initiate_e2e failed");
+
+        assert!(
+            !result_a.hybrid,
+            "client A requested hybrid but must fall back since peer didn't support it"
+        );
+        assert!(!result_b.hybrid);
+        assert_eq!(
+            result_a.shared_secret, result_b.shared_secret,
+            "fallback must still agree on the classical X25519 key"
+        );
+
+        a_to_b.abort();
+        b_to_a.abort();
+    }
+
+    #[test]
+    fn key_exchange_payload_round_trips_all_hybrid_fields() {
+        // Cross-language interop guard: proves the Rust `KeyExchangePayload`
+        // CBOR encoding preserves every field a JS peer's round-1 hybrid
+        // message would send (algorithm, public_key, session_id,
+        // kem_public_key), and that a round-2 ciphertext-only message
+        // (kem_ciphertext only, no public_key/kem_public_key) round-trips
+        // too -- field presence/absence here is exactly what
+        // `@johnhenry/wsh`'s `messages.gen.mjs` `keyExchange()` produces
+        // (only sets `public_key`/`kem_public_key`/`kem_ciphertext` when
+        // not `undefined`), so a wrong `#[serde(skip_serializing_if)]`
+        // here would silently desync from real JS peers.
+        let round1 = Envelope {
+            msg_type: MsgType::KeyExchange,
+            payload: Payload::KeyExchange(KeyExchangePayload {
+                algorithm: ALGORITHM_HYBRID.to_string(),
+                public_key: Some(vec![0xAB; 32]),
+                session_id: "sess-interop".to_string(),
+                kem_public_key: Some(vec![0xCD; 1184]),
+                kem_ciphertext: None,
+            }),
+        };
+        let encoded = wsh_core::codec::frame_encode(&round1).unwrap();
+        let decoded = decode_envelope(&encoded[4..]).unwrap();
+        match decoded.payload {
+            Payload::KeyExchange(p) => {
+                assert_eq!(p.algorithm, ALGORITHM_HYBRID);
+                assert_eq!(p.public_key, Some(vec![0xAB; 32]));
+                assert_eq!(p.session_id, "sess-interop");
+                assert_eq!(p.kem_public_key, Some(vec![0xCD; 1184]));
+                assert_eq!(p.kem_ciphertext, None);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        let round2 = Envelope {
+            msg_type: MsgType::KeyExchange,
+            payload: Payload::KeyExchange(KeyExchangePayload {
+                algorithm: ALGORITHM_HYBRID.to_string(),
+                public_key: None,
+                session_id: "sess-interop".to_string(),
+                kem_public_key: None,
+                kem_ciphertext: Some(vec![0xEF; 1088]),
+            }),
+        };
+        let encoded = wsh_core::codec::frame_encode(&round2).unwrap();
+        let decoded = decode_envelope(&encoded[4..]).unwrap();
+        match decoded.payload {
+            Payload::KeyExchange(p) => {
+                assert_eq!(p.public_key, None);
+                assert_eq!(p.kem_public_key, None);
+                assert_eq!(p.kem_ciphertext, Some(vec![0xEF; 1088]));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
     }
 }

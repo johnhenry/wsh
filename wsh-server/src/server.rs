@@ -3251,13 +3251,18 @@ impl WshServer {
                 debug!(session_id = %p.session_id, algorithm = %p.algorithm, "key exchange");
                 // Relay the key exchange ONLY to other clients attached to the SAME session,
                 // excluding the sender. Previously broadcast to ALL peers (cross-session leak).
+                //
+                // Forward the whole payload verbatim (not field-by-field) so this
+                // opaque relay doesn't silently drop fields it doesn't know about
+                // -- it previously reconstructed KeyExchangePayload by hand with
+                // only {session_id, algorithm, public_key}, which meant the hybrid
+                // X25519+ML-KEM-768 fields (kem_public_key/kem_ciphertext, wsh #18)
+                // got silently dropped in transit, degrading two JS clients'
+                // relayed hybrid E2E exchange to classical-only without either
+                // side knowing.
                 let fwd = Envelope {
                     msg_type: MsgType::KeyExchange,
-                    payload: Payload::KeyExchange(KeyExchangePayload {
-                        session_id: p.session_id.clone(),
-                        algorithm: p.algorithm.clone(),
-                        public_key: p.public_key.clone(),
-                    }),
+                    payload: Payload::KeyExchange(p.clone()),
                 };
                 let conn_map = self.conn_session_map.read().await;
                 let senders = self.peer_senders.read().await;
