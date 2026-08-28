@@ -1,101 +1,52 @@
 /**
  * wsh transport — WebSocket fallback with multiplexed virtual streams.
  *
- * Wire format per frame:
- *   [1-byte type][4-byte stream_id (big-endian)][payload]
+ * Wire format: QMux (draft-ietf-quic-qmux-02) framing directly over the
+ * WebSocket's binary message stream -- see qmux.mjs for the wire codec
+ * and qmux-connection.mjs for the stream state machine and flow control
+ * this module wires into the DOM Streams API (ReadableStream/
+ * WritableStream) the rest of wsh expects from a transport.
  *
- * Frame types:
- *   0x01 = CONTROL   — CBOR-framed message on stream 0
- *   0x02 = DATA       — raw bytes on a numbered stream
- *   0x03 = OPEN_STREAM — request to open a new stream (payload = empty)
- *   0x04 = CLOSE_STREAM — notify stream closure (payload = empty)
- *
- * Stream 0 is reserved for control messages and uses length-prefixed
- * CBOR framing (frameEncode / FrameDecoder) inside the payload.
- * Data streams carry raw bytes with no additional framing.
+ * Stream 0 (the first client-initiated bidirectional QMux stream) is
+ * always opened on connect and carries CBOR control messages using the
+ * same length-prefixed framing as before (frameEncode/FrameDecoder) --
+ * QMux streams are raw byte pipes with no message-boundary framing of
+ * their own, so that inner framing is still needed to know where one
+ * control message ends and the next begins. Every other stream (opened
+ * via openStream(), or peer-initiated for reverse-mode/server-pushed
+ * channels) carries a session's raw data with no extra framing, exactly
+ * as before.
  */
 
 import { frameEncode, FrameDecoder, FrameSizeError } from './cbor.mjs';
 import { WshTransport, dispatchSerially, SerialQueue } from './transport.mjs';
+import { QMuxConnection } from './qmux-connection.mjs';
 
-// ── Frame type constants ─────────────────────────────────────────────
+// ── Frame type constants (kept for backward-compat callers) ──────────
 //
-// Unrelated to the CBOR-layer MSG opcodes (messages.gen.mjs) -- these are
-// the outer envelope's frame-type byte. See spec/wsh-v1.yaml's
-// `transport.websocket` section for the authoritative framing docs.
-
-const FRAME_CONTROL      = 0x01;
-const FRAME_DATA         = 0x02;
-const FRAME_OPEN_STREAM  = 0x03;
-const FRAME_CLOSE_STREAM = 0x04;
-
-/**
- * The mux frame-type byte values, exported for anything outside this
- * module that needs to name or inspect them correctly — tooling,
- * logging, or an alternative from-scratch implementation of this
- * transport in another runtime, which needs these exact wire values to
- * interoperate. Not related to `MSG` (messages.gen.mjs): that's the
- * CBOR-layer protocol-message opcode space carried *inside* a
- * FRAME_CONTROL payload, a separate numbering space at a different
- * layer of the stack. (An earlier, since-removed `MSG.WS_DATA` conflated
- * the two and collided with a real MSG opcode — see CHANGELOG 0.6.0.)
- */
+// The old hand-rolled 5-byte mux's frame-type byte values. wsh now
+// speaks QMux instead (see the file doc comment) -- this export is kept
+// so nothing importing WS_FRAME_TYPE breaks, but nothing in this module
+// produces or consumes these values anymore. Mirrors QMux's own frame
+// type space where it lines up (STREAM/RESET_STREAM), for whatever
+// documentation value that has; DATA/OPEN_STREAM/CLOSE_STREAM have no
+// QMux equivalent (QMux streams are implicitly opened by reference, and
+// "data" is just STREAM frame payload).
 export const WS_FRAME_TYPE = Object.freeze({
-  CONTROL: FRAME_CONTROL,
-  DATA: FRAME_DATA,
-  OPEN_STREAM: FRAME_OPEN_STREAM,
-  CLOSE_STREAM: FRAME_CLOSE_STREAM,
+  CONTROL: 0x01,
+  DATA: 0x02,
+  OPEN_STREAM: 0x03,
+  CLOSE_STREAM: 0x04,
 });
 
-// ── Header helpers ───────────────────────────────────────────────────
-
-const HEADER_SIZE = 5; // 1 byte type + 4 bytes stream ID
+// ── DOM Streams adapter over a QMuxStream ───────────────────────────
 
 /**
- * Build a multiplexing frame.
- * @param {number} type     Frame type byte.
- * @param {number} streamId 32-bit stream ID.
- * @param {Uint8Array} [payload] Optional payload bytes.
- * @returns {Uint8Array}
+ * Wraps a qmux-connection.mjs `QMuxStream` (a push/pull data API with
+ * no DOM dependency) in the ReadableStream/WritableStream pair the rest
+ * of wsh expects from a transport stream.
  */
-function buildFrame(type, streamId, payload) {
-  const payloadLen = payload ? payload.byteLength : 0;
-  const frame = new Uint8Array(HEADER_SIZE + payloadLen);
-  const view = new DataView(frame.buffer);
-  view.setUint8(0, type);
-  view.setUint32(1, streamId);
-  if (payload) {
-    frame.set(payload, HEADER_SIZE);
-  }
-  return frame;
-}
-
-/**
- * Parse a multiplexing frame header + payload.
- * @param {Uint8Array} data
- * @returns {{ type: number, streamId: number, payload: Uint8Array }}
- */
-function parseFrame(data) {
-  if (data.byteLength < HEADER_SIZE) {
-    throw new Error(`Frame too short: ${data.byteLength} bytes`);
-  }
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  return {
-    type: view.getUint8(0),
-    streamId: view.getUint32(1),
-    payload: data.subarray(HEADER_SIZE),
-  };
-}
-
-// ── Virtual stream ───────────────────────────────────────────────────
-
-/**
- * A virtual bidirectional stream multiplexed over a single WebSocket.
- *
- * Exposes standard ReadableStream / WritableStream interfaces so that
- * consumers see the same API as native WebTransport streams.
- */
-class VirtualStream {
+class QMuxStreamAdapter {
   /** @type {number} */
   id;
 
@@ -105,98 +56,52 @@ class VirtualStream {
   /** @type {WritableStream<Uint8Array>} */
   writable;
 
-  /** @type {ReadableStreamDefaultController} */
-  #readController = null;
-
-  /** @type {boolean} */
-  #readClosed = false;
-
-  /** @type {boolean} */
-  #writeClosed = false;
-
   /**
-   * @param {number} id
-   * @param {function(number, Uint8Array): void} sendData  Send data frame callback.
-   * @param {function(number): void} sendClose              Send close frame callback.
+   * @param {import('./qmux-connection.mjs').QMuxConnection} qs
    */
-  constructor(id, sendData, sendClose) {
-    this.id = id;
+  constructor(qs) {
+    this.id = qs.id;
 
     this.readable = new ReadableStream({
       start: (controller) => {
-        this.#readController = controller;
+        qs.onData = (data) => {
+          try { controller.enqueue(data); } catch { /* controller already closed/errored */ }
+        };
+        qs.onEnd = () => {
+          try { controller.close(); } catch { /* already closed */ }
+        };
+        qs.onReset = (errorCode) => {
+          try { controller.error(new Error(`Stream ${qs.id} was reset by peer (error code ${errorCode})`)); } catch { /* already settled */ }
+        };
+        qs.onDestroy = (err) => {
+          try { controller.error(err); } catch { /* already settled */ }
+        };
       },
       cancel: () => {
-        this.#readClosed = true;
+        qs.stopSending();
       },
     });
 
     this.writable = new WritableStream({
-      write: (chunk) => {
-        if (this.#writeClosed) {
-          throw new Error(`Stream ${id} writable is closed`);
-        }
-        const bytes = chunk instanceof Uint8Array
-          ? chunk
-          : new Uint8Array(chunk);
-        sendData(id, bytes);
+      write: async (chunk) => {
+        const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        await qs.write(bytes);
       },
-      close: () => {
-        this.#writeClosed = true;
-        sendClose(id);
+      close: async () => {
+        await qs.close();
       },
       abort: () => {
-        this.#writeClosed = true;
-        sendClose(id);
+        qs.reset();
       },
     });
-  }
-
-  /**
-   * Push inbound data into the readable side.
-   * @param {Uint8Array} data
-   */
-  _pushData(data) {
-    if (this.#readClosed || !this.#readController) return;
-    try {
-      this.#readController.enqueue(data);
-    } catch {
-      // Controller may already be closed; ignore.
-    }
-  }
-
-  /**
-   * Signal the remote closed this stream's readable side.
-   */
-  _closeRead() {
-    if (this.#readClosed) return;
-    this.#readClosed = true;
-    try {
-      this.#readController?.close();
-    } catch {
-      // Already closed.
-    }
-  }
-
-  /**
-   * Forcibly error both sides (used on transport close).
-   * @param {Error} err
-   */
-  _destroy(err) {
-    if (!this.#readClosed) {
-      this.#readClosed = true;
-      try {
-        this.#readController?.error(err);
-      } catch { /* ignore */ }
-    }
-    this.#writeClosed = true;
   }
 }
 
 // ── WebSocket transport ──────────────────────────────────────────────
 
 /**
- * wsh transport over a single WebSocket with multiplexed virtual streams.
+ * wsh transport over a single WebSocket with QMux-multiplexed virtual
+ * streams.
  *
  * Provides the same interface as WebTransportTransport so that upper
  * layers (session, client) work identically over either transport.
@@ -205,38 +110,37 @@ export class WebSocketTransport extends WshTransport {
   /** @type {WebSocket} */
   #ws = null;
 
-  /** @type {Map<number, VirtualStream>} Active virtual streams by ID. */
-  #streams = new Map();
+  /** @type {import('./qmux-connection.mjs').QMuxConnection} */
+  #qmux = null;
 
-  /** @type {FrameDecoder} Decoder for inbound control messages on stream 0. */
+  /** @type {import('./qmux-connection.mjs').QMuxConnection|null} The control channel (always QMux stream 0). */
+  #controlStream = null;
+
+  /** @type {FrameDecoder} Decoder for CBOR control messages carried inside the control stream's byte pipe. */
   #decoder = new FrameDecoder();
-
-  /** Next stream ID for locally-opened streams (odd = client, even = server). */
-  #nextLocalId = 1;
 
   /** Tracks whether we initiated the close. */
   #closedByUs = false;
 
   /**
-   * Serializes dispatch of raw inbound WebSocket messages. Needed because
-   * some `WebSocket` implementations (notably Node's `ws` package parsing
-   * several frames out of one TCP read) can fire multiple synchronous
-   * `message` events within a single JS task, all before any microtask
-   * gets to run — see `SerialQueue`'s doc comment in transport.mjs for
-   * why dispatching those inline would be unsafe.
+   * Serializes dispatch of inbound control-stream bytes. Needed because
+   * a single WebSocket 'message' event can decode into QMux STREAM
+   * frames for the control stream whose data callback fires
+   * synchronously and could otherwise interleave with — or race —
+   * whatever microtask continuation the *previous* chunk's dispatch
+   * triggers. See `SerialQueue`'s doc comment in transport.mjs.
    * @type {SerialQueue}
    */
-  #inbox = new SerialQueue((raw) => this.#handleMessage(raw));
+  #inbox = new SerialQueue((raw) => this.#handleControlBytes(raw));
 
   // ── Lifecycle ──────────────────────────────────────────────────────
 
   /** @override */
   async _doConnect(url) {
-    this.#streams.clear();
     this.#decoder.reset();
-    this.#nextLocalId = 1;
     this.#closedByUs = false;
     this.#inbox.clear();
+    this.#controlStream = null;
 
     return new Promise((resolve, reject) => {
       // Normalize URL scheme: wsh:// → wss://, http:// → ws://.
@@ -249,9 +153,39 @@ export class WebSocketTransport extends WshTransport {
       ws.binaryType = 'arraybuffer';
       this.#ws = ws;
 
-      ws.addEventListener('open', () => resolve(), { once: true });
+      const qmux = new QMuxConnection({
+        isClient: true,
+        send: (bytes) => this.#send(bytes),
+      });
+      this.#qmux = qmux;
 
-      ws.addEventListener('error', (ev) => {
+      qmux.onStreamOpen = (qs) => {
+        const adapter = new QMuxStreamAdapter(qs);
+        this._emitStreamOpen({ readable: adapter.readable, writable: adapter.writable, id: qs.id });
+      };
+      qmux.onError = (err) => this._emitError(err);
+      qmux.onClose = (errorCode, reason) => {
+        this.#handleClose(errorCode, reason || 'peer sent CONNECTION_CLOSE');
+      };
+
+      ws.addEventListener('open', async () => {
+        try {
+          qmux.sendHandshake();
+          // The control channel is always the first client-initiated
+          // QMux stream (ID 0) -- opened here, once, up front.
+          const controlQs = await qmux.openStream();
+          controlQs.onData = (data) => this.#inbox.push(data);
+          controlQs.onReset = (errorCode) => {
+            this._emitError(new Error(`control stream reset by peer (error code ${errorCode})`));
+          };
+          this.#controlStream = controlQs;
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      }, { once: true });
+
+      ws.addEventListener('error', () => {
         if (this.state === 'connecting') {
           reject(new Error('WebSocket connection failed'));
         } else {
@@ -260,11 +194,15 @@ export class WebSocketTransport extends WshTransport {
       });
 
       ws.addEventListener('close', (ev) => {
-        this.#handleClose(ev.code, ev.reason);
+        this.#handleClose(null, `WebSocket closed: ${ev.code} ${ev.reason}`);
       });
 
       ws.addEventListener('message', (ev) => {
-        this.#inbox.push(ev.data);
+        if (typeof ev.data === 'string') {
+          this._emitError(new Error('Received text WebSocket frame; expected binary'));
+          return;
+        }
+        qmux.receiveBytes(new Uint8Array(ev.data));
       });
     });
   }
@@ -272,7 +210,12 @@ export class WebSocketTransport extends WshTransport {
   /** @override */
   async _doClose() {
     this.#closedByUs = true;
-    this.#destroyAllStreams(new Error('Transport closed'));
+    // Tell the peer we're closing gracefully, then locally tear down our
+    // own stream objects -- without this, any reader still waiting on a
+    // stream's readable side would hang forever, since nothing else
+    // errors or closes it once the peer can no longer respond.
+    this.#qmux?.close();
+    this.#qmux?.destroy(new Error('Transport closed'));
 
     if (this.#ws) {
       try {
@@ -286,86 +229,34 @@ export class WebSocketTransport extends WshTransport {
 
   /** @override */
   async _doSendControl(msg) {
+    if (!this.#controlStream) {
+      throw new Error('Control stream is not open');
+    }
+    // Length-prefixed CBOR inside the raw QMux byte stream -- QMux
+    // streams carry bytes, not pre-delimited messages, same reason the
+    // old hand-rolled mux's control channel needed this framing too.
     const cbor = frameEncode(msg);
-    const frame = buildFrame(FRAME_CONTROL, 0, cbor);
-    this.#send(frame);
+    await this.#controlStream.write(cbor);
   }
 
   /** @override */
   async _doOpenStream() {
-    const id = this.#nextLocalId;
-    this.#nextLocalId += 2; // odd IDs for client
-
-    // Send open request.
-    this.#send(buildFrame(FRAME_OPEN_STREAM, id));
-
-    // Create the virtual stream.
-    const stream = new VirtualStream(
-      id,
-      (sid, data) => this.#sendData(sid, data),
-      (sid) => this.#sendCloseStream(sid),
-    );
-    this.#streams.set(id, stream);
-
-    return {
-      readable: stream.readable,
-      writable: stream.writable,
-      id,
-    };
+    const qs = await this.#qmux.openStream();
+    const adapter = new QMuxStreamAdapter(qs);
+    return { readable: adapter.readable, writable: adapter.writable, id: qs.id };
   }
 
-  // ── Inbound message dispatch ───────────────────────────────────────
+  // ── Inbound control-stream dispatch ─────────────────────────────────
 
   /**
-   * Handle a raw WebSocket message (ArrayBuffer). Called serially by
-   * `#inbox` — never invoked directly from the `message` event listener.
-   * Async (and awaited by `#inbox`'s SerialQueue) because the
-   * FRAME_CONTROL case can itself dispatch several decoded messages —
-   * see `#handleControlFrame`.
-   * @param {ArrayBuffer} raw
-   */
-  async #handleMessage(raw) {
-    if (typeof raw === 'string') {
-      this._emitError(new Error('Received text WebSocket frame; expected binary'));
-      return;
-    }
-    const data = new Uint8Array(raw);
-
-    let frame;
-    try {
-      frame = parseFrame(data);
-    } catch (err) {
-      this._emitError(new Error(`Malformed frame: ${err.message}`));
-      return;
-    }
-
-    switch (frame.type) {
-      case FRAME_CONTROL:
-        await this.#handleControlFrame(frame.payload);
-        break;
-      case FRAME_DATA:
-        this.#handleDataFrame(frame.streamId, frame.payload);
-        break;
-      case FRAME_OPEN_STREAM:
-        this.#handleOpenStream(frame.streamId);
-        break;
-      case FRAME_CLOSE_STREAM:
-        this.#handleCloseStream(frame.streamId);
-        break;
-      default:
-        this._emitError(new Error(`Unknown frame type: 0x${frame.type.toString(16)}`));
-    }
-  }
-
-  /**
-   * Decode CBOR-framed control messages from stream 0. A single mux
-   * frame's payload can decode into more than one protocol message (the
-   * CBOR decoder is stateful/streaming), so dispatch uses
+   * Decode CBOR-framed control messages from the control stream's byte
+   * pipe. A single chunk can decode into more than one protocol message
+   * (the CBOR decoder is stateful/streaming), so dispatch uses
    * `dispatchSerially` — see its doc comment for why a plain for-loop
    * here would be unsafe.
    * @param {Uint8Array} payload
    */
-  async #handleControlFrame(payload) {
+  async #handleControlBytes(payload) {
     let messages;
     try {
       messages = this.#decoder.feed(payload);
@@ -382,75 +273,28 @@ export class WebSocketTransport extends WshTransport {
   }
 
   /**
-   * Route data to the appropriate virtual stream.
-   * @param {number} streamId
-   * @param {Uint8Array} payload
-   */
-  #handleDataFrame(streamId, payload) {
-    const stream = this.#streams.get(streamId);
-    if (!stream) {
-      // Data for unknown stream; ignore silently (may arrive after close).
-      return;
-    }
-    stream._pushData(payload);
-  }
-
-  /**
-   * Server is opening a new stream (even IDs = server-initiated).
-   * @param {number} streamId
-   */
-  #handleOpenStream(streamId) {
-    if (this.#streams.has(streamId)) return; // already tracked
-
-    const stream = new VirtualStream(
-      streamId,
-      (sid, data) => this.#sendData(sid, data),
-      (sid) => this.#sendCloseStream(sid),
-    );
-    this.#streams.set(streamId, stream);
-
-    this._emitStreamOpen({
-      readable: stream.readable,
-      writable: stream.writable,
-      id: streamId,
-    });
-  }
-
-  /**
-   * Remote closed a stream.
-   * @param {number} streamId
-   */
-  #handleCloseStream(streamId) {
-    const stream = this.#streams.get(streamId);
-    if (!stream) return;
-    stream._closeRead();
-    this.#streams.delete(streamId);
-  }
-
-  /**
-   * WebSocket closed.
-   * @param {number} code
+   * Connection ended, either because the peer sent CONNECTION_CLOSE
+   * (QMux-graceful) or the underlying WebSocket itself closed (abrupt --
+   * QMux's own terms for a termination with no prior CONNECTION_CLOSE).
+   * @param {number|null} errorCode - QMux/QUIC error code, if this came from a CONNECTION_CLOSE frame
    * @param {string} reason
    */
-  #handleClose(code, reason) {
-    const err = new Error(`WebSocket closed: ${code} ${reason}`);
-    this.#destroyAllStreams(err);
-    this.#decoder.reset();
-    this.#ws = null;
-
-    if (this.state !== 'closed') {
-      this._setState('closed');
-      if (!this.#closedByUs) {
-        this._emitError(err);
-      }
-      this._emitClose();
+  #handleClose(errorCode, reason) {
+    if (this.state === 'closed') return;
+    const err = new Error(reason);
+    this.#qmux?.destroy(err);
+    this._setState('closed');
+    if (!this.#closedByUs) {
+      this._emitError(err);
     }
+    this._emitClose();
   }
 
-  // ── Outbound helpers ───────────────────────────────────────────────
+  // ── Outbound helper ──────────────────────────────────────────────
 
   /**
-   * Send raw bytes over the WebSocket.
+   * Send raw QMux record bytes over the WebSocket. Passed to
+   * QMuxConnection as its `send` callback.
    * @param {Uint8Array} data
    */
   #send(data) {
@@ -458,39 +302,5 @@ export class WebSocketTransport extends WshTransport {
       throw new Error('WebSocket is not open');
     }
     this.#ws.send(data);
-  }
-
-  /**
-   * Send a data frame for a virtual stream.
-   * @param {number} streamId
-   * @param {Uint8Array} payload
-   */
-  #sendData(streamId, payload) {
-    this.#send(buildFrame(FRAME_DATA, streamId, payload));
-  }
-
-  /**
-   * Send a close frame for a virtual stream.
-   * @param {number} streamId
-   */
-  #sendCloseStream(streamId) {
-    try {
-      this.#send(buildFrame(FRAME_CLOSE_STREAM, streamId));
-    } catch {
-      // WebSocket may already be closed.
-    }
-  }
-
-  // ── Cleanup ────────────────────────────────────────────────────────
-
-  /**
-   * Destroy all active virtual streams with an error.
-   * @param {Error} err
-   */
-  #destroyAllStreams(err) {
-    for (const stream of this.#streams.values()) {
-      stream._destroy(err);
-    }
-    this.#streams.clear();
   }
 }

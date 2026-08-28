@@ -81,6 +81,7 @@ class QMuxStream {
   onData = null;   // (Uint8Array) => void -- in-order delivery
   onEnd = null;     // () => void -- clean FIN, all data delivered
   onReset = null;  // (errorCode) => void -- peer aborted (after any reliable prefix delivered)
+  onDestroy = null; // (Error) => void -- the whole connection died (transport closed/errored), not a protocol-level reset
 
   constructor(conn, id, { sendWindow, recvWindow }) {
     this.#conn = conn;
@@ -171,6 +172,24 @@ class QMuxStream {
   /** Tell the peer to stop sending (we're no longer interested in their data). */
   stopSending(errorCode = ERROR_CODE.APPLICATION_ERROR) {
     this.#conn._sendFrame(encodeStopSending({ streamId: this.id, errorCode }), 0);
+  }
+
+  /**
+   * Forcibly tear down this stream because the whole connection died
+   * (transport closed/errored) -- not a protocol-level RESET_STREAM, so
+   * no frame is sent (there's nowhere to send it). No-ops if the stream
+   * already reached a terminal state on its own.
+   * @param {Error} err
+   */
+  _destroy(err) {
+    if (this.#sendState !== SEND_STATE.RESET_SENT && this.#sendState !== SEND_STATE.DATA_SENT) {
+      this.#sendState = SEND_STATE.RESET_SENT;
+    }
+    this.#failSendWaiters(err);
+    if (this.#recvState !== RECV_STATE.DATA_RECVD && this.#recvState !== RECV_STATE.RESET_RECVD) {
+      this.#recvState = RECV_STATE.RESET_RECVD;
+      try { this.onDestroy?.(err); } catch (handlerErr) { console.error('[qmux] onDestroy handler error:', handlerErr); }
+    }
   }
 
   // ── Flow control (send side) ────────────────────────────────────
@@ -588,6 +607,21 @@ export class QMuxConnection {
     if (this.#closed) return;
     this.#send(encodeRecord(encodeConnectionClose({ application: true, errorCode, reason })));
     this.#closed = true;
+  }
+
+  /**
+   * Forcibly tear down every stream because the underlying transport
+   * itself died (closed or errored below the QMux layer -- e.g. the
+   * WebSocket connection dropped) -- no CONNECTION_CLOSE is sent, since
+   * there's nowhere left to send it.
+   * @param {Error} err
+   */
+  destroy(err) {
+    this.#closed = true;
+    for (const stream of this.#streams.values()) {
+      stream._destroy(err);
+    }
+    this.#streams.clear();
   }
 
   #closeLocally(errorCode, reason) {
