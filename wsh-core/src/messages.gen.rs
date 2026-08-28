@@ -1195,9 +1195,13 @@ pub struct CopilotDetachPayload {
 #[serde(deny_unknown_fields)]
 pub struct KeyExchangePayload {
     pub algorithm: String,
-    #[serde(with = "serde_bytes")]
-    pub public_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub public_key: Option<Vec<u8>>,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub kem_public_key: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub kem_ciphertext: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
