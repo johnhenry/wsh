@@ -114,3 +114,94 @@ describe('WshClient auth handshake', { skip: !hasEd25519 && 'Ed25519 not availab
     assert.equal(id2, 'server-session-4');
   });
 });
+
+/**
+ * Extends the auth handshake with scriptable replies to the session-
+ * management messages this file's second describe block exercises:
+ * DETACH, SESSION_LIST_REQUEST, SESSION_GRANT, SESSION_REVOKE. Each
+ * reply is queued explicitly so a test can control success/failure.
+ */
+class SessionManagementMockTransport extends ChallengeFirstMockTransport {
+  #replies = new Map(); // request MSG.* -> reply message (or null to send nothing)
+
+  queueReply(requestType, reply) {
+    this.#replies.set(requestType, reply);
+  }
+
+  async _doSendControl(msg) {
+    await super._doSendControl(msg);
+    if (!this.#replies.has(msg.type)) return;
+    const reply = this.#replies.get(msg.type);
+    if (reply === null) return;
+    setTimeout(() => this._emitControl(reply), 0);
+  }
+}
+
+describe('WshClient session management', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
+  async function connectedClient(transport) {
+    const keyPair = await auth.generateKeyPair(true);
+    const client = new clientMod.WshClient({
+      transportFactories: { ws: () => transport },
+    });
+    await client.connect('ws://test.invalid', { username: 'alice', keyPair, transport: 'ws' });
+    return client;
+  }
+
+  it('detach() resolves on DETACH_OK', async () => {
+    const transport = new SessionManagementMockTransport('sess-detach-ok');
+    transport.queueReply(MSG.DETACH, { type: MSG.DETACH_OK, session_id: 'target-1' });
+    const client = await connectedClient(transport);
+
+    await client.detach('target-1');
+
+    const sent = transport.sentMessages.find((m) => m.type === MSG.DETACH);
+    assert.equal(sent.session_id, 'target-1');
+  });
+
+  it('detach() throws on DETACH_FAIL with the server-provided reason', async () => {
+    const transport = new SessionManagementMockTransport('sess-detach-fail');
+    transport.queueReply(MSG.DETACH, { type: MSG.DETACH_FAIL, reason: 'no such session' });
+    const client = await connectedClient(transport);
+
+    await assert.rejects(() => client.detach('missing'), /no such session/);
+  });
+
+  it('listRemoteSessions() returns the SESSION_LIST payload, distinct from the local listSessions()', async () => {
+    const transport = new SessionManagementMockTransport('sess-list');
+    const sessions = [{ session_id: 'a', username: 'alice' }, { session_id: 'b', username: 'alice' }];
+    transport.queueReply(MSG.SESSION_LIST_REQUEST, { type: MSG.SESSION_LIST, sessions });
+    const client = await connectedClient(transport);
+
+    const result = await client.listRemoteSessions();
+
+    assert.deepEqual(result, sessions);
+    // The purely-local method must stay unaffected -- no channels are open.
+    assert.deepEqual(client.listSessions(), []);
+  });
+
+  it('grantSessionAccess() sends SESSION_GRANT with the given principal and permissions', async () => {
+    const transport = new SessionManagementMockTransport('sess-grant');
+    const client = await connectedClient(transport);
+
+    await client.grantSessionAccess('sess-1', 'bob', ['read', 'write']);
+
+    const sent = transport.sentMessages.find((m) => m.type === MSG.SESSION_GRANT);
+    assert.ok(sent);
+    assert.equal(sent.session_id, 'sess-1');
+    assert.equal(sent.principal, 'bob');
+    assert.deepEqual(sent.permissions, ['read', 'write']);
+  });
+
+  it('revokeSessionAccess() sends SESSION_REVOKE with the given principal', async () => {
+    const transport = new SessionManagementMockTransport('sess-revoke');
+    const client = await connectedClient(transport);
+
+    await client.revokeSessionAccess('sess-1', 'bob', 'no longer needed');
+
+    const sent = transport.sentMessages.find((m) => m.type === MSG.SESSION_REVOKE);
+    assert.ok(sent);
+    assert.equal(sent.session_id, 'sess-1');
+    assert.equal(sent.principal, 'bob');
+    assert.equal(sent.reason, 'no longer needed');
+  });
+});

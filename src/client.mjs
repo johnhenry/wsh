@@ -30,6 +30,9 @@ import {
   fileOp as fileOpMsg,
   fileChunk as fileChunkMsg,
   policyEval as policyEvalMsg, policyUpdate as policyUpdateMsg,
+  detach as detachMsg,
+  sessionListRequest as sessionListRequestMsg,
+  sessionGrant as sessionGrantMsg, sessionRevoke as sessionRevokeMsg,
   isRelayForwardable,
 } from './messages.mjs';
 import { signChallenge, exportPublicKeyRaw } from './auth.mjs';
@@ -528,6 +531,86 @@ export class WshClient {
     }
 
     return response;
+  }
+
+  /**
+   * Detach from a remote session: release control (stop receiving its
+   * output) while leaving it running server-side, so it can be resumed
+   * later via resumeSession(). Mirrors the Rust client/CLI's `wsh detach`.
+   *
+   * @param {string} sessionId - Remote session ID to detach from
+   * @param {number} [timeout=10000]
+   */
+  async detach(sessionId, timeout = DEFAULT_OPEN_TIMEOUT) {
+    this.#assertAuthenticated('detach');
+
+    await this.#transport.sendControl(detachMsg({ sessionId }));
+
+    const response = await this.#waitForMessage(
+      [MSG.DETACH_OK, MSG.DETACH_FAIL],
+      timeout,
+      'Timed out waiting for detach response'
+    );
+
+    if (response.type === MSG.DETACH_FAIL) {
+      throw new Error(`Failed to detach: ${response.reason || 'rejected'}`);
+    }
+  }
+
+  /**
+   * List sessions on the server that this connection's key owns or has
+   * been granted access to (a server round trip — distinct from the
+   * purely local listSessions(), which only reports channels open on
+   * this connection). Mirrors the Rust client's list_remote_sessions().
+   *
+   * @param {number} [timeout=10000]
+   * @returns {Promise<Array<object>>} Server-reported session summaries
+   */
+  async listRemoteSessions(timeout = DEFAULT_OPEN_TIMEOUT) {
+    this.#assertAuthenticated('listRemoteSessions');
+
+    await this.#transport.sendControl(sessionListRequestMsg());
+
+    const response = await this.#waitForMessage(
+      [MSG.SESSION_LIST],
+      timeout,
+      'Timed out waiting for session list response'
+    );
+
+    return response.sessions || [];
+  }
+
+  /**
+   * Grant another authenticated principal (username or fingerprint)
+   * access to a session this connection owns. Server-enforced (only the
+   * session owner may grant); fire-and-forget like updatePolicy() — the
+   * server sends no response on success, only an Error envelope on
+   * rejection (surfaced via onError, not this call).
+   *
+   * @param {string} sessionId
+   * @param {string} principal - Username or fingerprint of the grantee
+   * @param {string[]} [permissions=['read']]
+   */
+  async grantSessionAccess(sessionId, principal, permissions = ['read']) {
+    this.#assertAuthenticated('grantSessionAccess');
+    await this.#transport.sendControl(
+      sessionGrantMsg({ sessionId, principal, permissions })
+    );
+  }
+
+  /**
+   * Revoke a previously granted principal's access to a session this
+   * connection owns. Same fire-and-forget shape as grantSessionAccess().
+   *
+   * @param {string} sessionId
+   * @param {string} principal
+   * @param {string} [reason]
+   */
+  async revokeSessionAccess(sessionId, principal, reason) {
+    this.#assertAuthenticated('revokeSessionAccess');
+    await this.#transport.sendControl(
+      sessionRevokeMsg({ sessionId, principal, reason })
+    );
   }
 
   // ── Disconnect ──────────────────────────────────────────────────────

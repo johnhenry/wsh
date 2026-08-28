@@ -1069,6 +1069,27 @@ export class WshClient {
   resumeSession(targetSessionId: string, token: string, opts?: { timeout?: number }): Promise<WshMessage>;
 
   /**
+   * Detach from a remote session, leaving it running server-side.
+   */
+  detach(sessionId: string, timeout?: number): Promise<void>;
+
+  /**
+   * List sessions on the server this connection's key can see (a server
+   * round trip — distinct from the purely local listSessions()).
+   */
+  listRemoteSessions(timeout?: number): Promise<object[]>;
+
+  /**
+   * Grant another principal access to a session this connection owns.
+   */
+  grantSessionAccess(sessionId: string, principal: string, permissions?: string[]): Promise<void>;
+
+  /**
+   * Revoke a previously granted principal's access to a session.
+   */
+  revokeSessionAccess(sessionId: string, principal: string, reason?: string): Promise<void>;
+
+  /**
    * Gracefully disconnect: close all sessions and the transport.
    */
   disconnect(): Promise<void>;

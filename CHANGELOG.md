@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.0
+
+- **New `WshClient` methods closing a JS/Rust parity gap**:
+  `detach(sessionId)`, `listRemoteSessions()`, `grantSessionAccess(sessionId,
+  principal, permissions)`, `revokeSessionAccess(sessionId, principal,
+  reason)`. These wrap `Detach`/`SessionListRequest`/`SessionGrant`/
+  `SessionRevoke`, which the Rust client/CLI (`wsh detach`, `wsh
+  sessions`) has supported for a while but the JS client had no
+  equivalent for. `listRemoteSessions()` is a server round trip and is
+  distinct from the existing purely-local `listSessions()`. Verified
+  against both a mock transport and the real Rust `wsh-server`.
+- **Spec accuracy fixes, no functional change**: the `EncryptedFrame`
+  message's description said ChaCha20-Poly1305, but the only real
+  implementation (`WshClient.initiateE2E()`) derives an AES-256-GCM key
+  — the spec now says AES-256-GCM, matching the code and clawser's own
+  prior design docs, and chosen because it's natively supported by
+  `SubtleCrypto` in every shipping browser (ChaCha20-Poly1305 isn't, and
+  this library has zero runtime dependencies by design). The `e2e` and
+  `scaling` (`NodeAnnounce`/`NodeRedirect`) message families, and
+  `Snapshot`, are now explicitly documented as experimental/incomplete
+  in the spec — they're declared and partially plumbed (KeyExchange
+  performs a real handshake; NodeAnnounce/Snapshot are received and
+  logged server-side) but don't actually do the thing their names
+  imply (no frame is ever encrypted, no routing decision ever made, no
+  recording event ever written). Nothing to fix in code for these three
+  yet — this just stops the spec from overclaiming what's implemented.
+- **Removed dead code**: `#openResolvers`/`#rejectAllOpens` in
+  `transport-ws.mjs` — vestigial from an earlier open-stream-ack design
+  that `_doOpenStream` (which has resolved synchronously for a while)
+  no longer uses; the map was always empty.
+
 ## 0.9.0
 
 - **Unify file transfer onto FileChunk control messages (breaking).**

@@ -362,7 +362,13 @@ messages:
     Snapshot:
       code: 0x35
       description: >
-        Mark a named position in the session recording for time-travel.
+        EXPERIMENTAL, not yet functional: intended to mark a named
+        position in the session recording for time-travel. The Rust
+        server currently accepts and authorizes this message but only
+        logs it -- RecordingEvent::Snapshot (and every other
+        RecordingEvent variant besides Start) is never actually
+        constructed, so nothing is written to the recording. No JS
+        client support exists.
       fields:
         label:
           type: string
@@ -1219,17 +1225,30 @@ messages:
           type: string
           required: false
 
-  # ── E2E encryption ──────────────────────────────────────────────────
-  # Inner encryption layer for end-to-end confidentiality.  After key
-  # exchange, all session data is wrapped in EncryptedFrame messages
-  # so the server cannot read session content.
+  # ── E2E encryption (EXPERIMENTAL, incomplete) ────────────────────────
+  # Inner encryption layer intended for end-to-end confidentiality: after
+  # key exchange, session data would be wrapped in EncryptedFrame messages
+  # so the server cannot read session content. Currently incomplete on
+  # both sides of the wire: WshClient.initiateE2E() performs a real X25519
+  # ECDH exchange and derives an AES-256-GCM key (src/client.mjs), but
+  # nothing constructs or consumes an EncryptedFrame with it -- the
+  # derived key is never actually used to seal/open anything. The Rust
+  # client has no KeyExchange/EncryptedFrame support at all; the Rust
+  # server only relays both message types opaquely between session
+  # participants (correct for true E2E, but doesn't imply either side
+  # actually encrypts). Do not rely on this for confidentiality today.
+  # Completing it (real AEAD sealing on both languages) is tracked
+  # alongside the hybrid PQ handshake work (X25519 + ML-KEM-768) rather
+  # than as a standalone fix, since that work revisits this same
+  # KeyExchange path anyway.
   e2e:
     KeyExchange:
       code: 0x8e
       description: >
         X25519 key exchange for establishing a shared secret.
         Both sides send their ephemeral public key; the shared
-        secret is derived via ECDH.
+        secret is derived via ECDH. See the e2e section note above --
+        the derived secret is not yet wired to any actual encryption.
       fields:
         algorithm:
           type: string
@@ -1245,9 +1264,17 @@ messages:
     EncryptedFrame:
       code: 0x8f
       description: >
-        An encrypted payload.  After key exchange, all session
-        data is sent inside EncryptedFrame messages using
-        ChaCha20-Poly1305 AEAD.
+        An encrypted payload. Once KeyExchange's derived secret is
+        actually wired to real encryption (see the e2e section note
+        above -- not yet true today), session data would be sent inside
+        EncryptedFrame messages using AES-256-GCM AEAD, matching the
+        cipher WshClient.initiateE2E() already derives a key for
+        (src/client.mjs) -- picked over the ChaCha20-Poly1305 this field
+        previously described because it's natively supported by
+        SubtleCrypto in every shipping browser, matching this library's
+        zero-runtime-dependency, Web-Crypto-native design; ChaCha20-
+        Poly1305 has no native browser support and would require
+        bundling a JS implementation.
       fields:
         nonce:
           type: bytes
@@ -1345,10 +1372,15 @@ messages:
           required: true
           description: "Binary diff patch (run-length encoded cell changes)"
 
-  # ── Horizontal scaling ───────────────────────────────────────────────
+  # ── Horizontal scaling (EXPERIMENTAL, incomplete) ────────────────────
   # Multi-node cluster support.  Nodes announce themselves and can
   # redirect clients to less-loaded peers.  Stateless session tokens
   # (HMAC-based) allow any node to validate without shared state.
+  # Currently: the Rust server records NodeAnnounce into a registry
+  # (garbage-collected on a timer) but never reads it back for any
+  # routing decision, and nothing anywhere ever constructs a
+  # NodeRedirect -- there is no load-aware routing today, only inert
+  # bookkeeping. No JS client support exists at all.
   scaling:
     NodeAnnounce:
       code: 0x94

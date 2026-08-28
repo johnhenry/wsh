@@ -214,9 +214,6 @@ export class WebSocketTransport extends WshTransport {
   /** Next stream ID for locally-opened streams (odd = client, even = server). */
   #nextLocalId = 1;
 
-  /** Resolvers for pending open-stream requests. */
-  #openResolvers = new Map();
-
   /** Tracks whether we initiated the close. */
   #closedByUs = false;
 
@@ -238,7 +235,6 @@ export class WebSocketTransport extends WshTransport {
     this.#streams.clear();
     this.#decoder.reset();
     this.#nextLocalId = 1;
-    this.#openResolvers.clear();
     this.#closedByUs = false;
     this.#inbox.clear();
 
@@ -277,7 +273,6 @@ export class WebSocketTransport extends WshTransport {
   async _doClose() {
     this.#closedByUs = true;
     this.#destroyAllStreams(new Error('Transport closed'));
-    this.#rejectAllOpens(new Error('Transport closed'));
 
     if (this.#ws) {
       try {
@@ -440,7 +435,6 @@ export class WebSocketTransport extends WshTransport {
   #handleClose(code, reason) {
     const err = new Error(`WebSocket closed: ${code} ${reason}`);
     this.#destroyAllStreams(err);
-    this.#rejectAllOpens(err);
     this.#decoder.reset();
     this.#ws = null;
 
@@ -498,16 +492,5 @@ export class WebSocketTransport extends WshTransport {
       stream._destroy(err);
     }
     this.#streams.clear();
-  }
-
-  /**
-   * Reject all pending open-stream promises.
-   * @param {Error} err
-   */
-  #rejectAllOpens(err) {
-    for (const { reject } of this.#openResolvers.values()) {
-      reject(err);
-    }
-    this.#openResolvers.clear();
   }
 }
