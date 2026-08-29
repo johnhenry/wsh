@@ -1,7 +1,7 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.14.0",
-  "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
+  "version": "0.15.0",
+  "description": "Web Shell — browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
   "exports": {
