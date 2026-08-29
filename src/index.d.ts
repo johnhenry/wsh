@@ -1334,6 +1334,9 @@ export class WshSession {
   /** Last terminal diff received for the session. */
   readonly lastTermDiff: Record<string, unknown> | null;
 
+  /** Whether `enableE2E()` has been called and E2E sealing is active for this session. */
+  readonly e2eEnabled: boolean;
+
   constructor(
     transport: WshTransport,
     channelId: number,
@@ -1350,8 +1353,20 @@ export class WshSession {
   /**
    * Write data to the session's stdin stream.
    * Accepts a Uint8Array for raw bytes or a string (UTF-8 encoded).
+   * Sealed into an EncryptedFrame instead of plaintext SessionData when
+   * `enableE2E()` has been called (virtual-mode sessions only).
    */
   write(data: Uint8Array | string): Promise<void>;
+
+  /**
+   * Opt in to end-to-end encryption for this session's data plane
+   * (virtual-mode sessions only). `sharedSecret` must come from a fresh
+   * `WshClient.initiateE2E()` call on the *current* connection --
+   * E2E state is connection-scoped, not session-scoped, so a session
+   * Resumed/Attached on a new connection must run `initiateE2E()` and
+   * `enableE2E()` again rather than reusing a prior key.
+   */
+  enableE2E(sharedSecret: CryptoKey, opts: { role: 'initiator' | 'responder' }): void;
 
   /**
    * Request the remote PTY to resize.

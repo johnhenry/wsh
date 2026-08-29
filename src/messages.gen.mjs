@@ -777,9 +777,10 @@ export function keyExchange({ algorithm, publicKey, sessionId, kemPublicKey, kem
   return msg;
 }
 
-export function encryptedFrame({ nonce, ciphertext, sessionId } = {}) {
+export function encryptedFrame({ channelId, nonce, ciphertext, sessionId } = {}) {
   return {
     type: MSG.ENCRYPTED_FRAME,
+    channel_id: channelId,
     nonce,
     ciphertext,
     session_id: sessionId,

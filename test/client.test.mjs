@@ -661,3 +661,184 @@ describe('WshClient initiateE2E', { skip: !hasEd25519 && 'Ed25519 not available 
     await assert.rejects(() => assertSameAesKey(hybridResult.sharedSecret, classicalTransport.peerCombinedSecret));
   });
 });
+
+// ── EncryptedFrame end-to-end integration (wsh #19) ───────────────────
+//
+// Wires two *real* WshClient instances together (not one under test
+// against a scripted mock, unlike E2EMockTransport above) so both sides
+// of initiateE2E()'s KeyExchange are the actual production code path,
+// then activates two real WshSession instances in virtual mode and
+// exercises the actual enableE2E()/write()/_handleControlMessage()
+// plumbing this PR adds. An "eavesdropper" observes every control
+// message exchanged between the two sides and asserts the plaintext
+// never appears on the wire.
+
+/**
+ * A transport whose KeyExchange (and, once linked, EncryptedFrame)
+ * control messages are delivered directly to a paired transport's
+ * onControl, simulating a relay that only shuttles opaque control
+ * messages between two peers -- exactly the role a real wsh server
+ * plays for E2E traffic (it relays KeyExchange/EncryptedFrame without
+ * being able to read session content). `wireLog` records every message
+ * that crosses the link, standing in for what an eavesdropping relay
+ * would see on the wire.
+ */
+class E2ELinkedTransport extends WshTransport {
+  #sessionId;
+  #peer = null;
+  wireLog = [];
+
+  constructor(sessionId) {
+    super();
+    this.#sessionId = sessionId;
+  }
+
+  link(peer) {
+    this.#peer = peer;
+  }
+
+  async _doConnect() {}
+  async _doClose() {}
+
+  async _doSendControl(msg) {
+    if (msg.type === MSG.HELLO) {
+      setTimeout(() => this._emitControl({ type: MSG.CHALLENGE, nonce: new Uint8Array(32).fill(7), session_id: this.#sessionId }), 0);
+      return;
+    }
+    if (msg.type === MSG.AUTH) {
+      setTimeout(() => this._emitControl({ type: MSG.AUTH_OK }), 0);
+      return;
+    }
+    if (msg.type === MSG.KEY_EXCHANGE || msg.type === MSG.ENCRYPTED_FRAME) {
+      this.wireLog.push(msg);
+      setTimeout(() => this.#peer?._emitControl(msg), 0);
+    }
+  }
+
+  async _doOpenStream() {
+    throw new Error('not needed for this test');
+  }
+}
+
+describe('EncryptedFrame end-to-end integration', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
+  it('two real WshClient/WshSession pairs exchange sealed data that an eavesdropper on the raw wire cannot read', async () => {
+    const keyPairA = await auth.generateKeyPair(true);
+    const keyPairB = await auth.generateKeyPair(true);
+
+    const transportA = new E2ELinkedTransport('sess-e2e-integ');
+    const transportB = new E2ELinkedTransport('sess-e2e-integ');
+    transportA.link(transportB);
+    transportB.link(transportA);
+
+    const clientA = new clientMod.WshClient({ transportFactories: { ws: () => transportA } });
+    const clientB = new clientMod.WshClient({ transportFactories: { ws: () => transportB } });
+    await clientA.connect('ws://test.invalid', { username: 'alice', keyPair: keyPairA, transport: 'ws' });
+    await clientB.connect('ws://test.invalid', { username: 'bob', keyPair: keyPairB, transport: 'ws' });
+
+    // Real, production initiateE2E() calls on both sides, linked directly
+    // to each other via the transports above -- not a scripted mock peer.
+    const [resultA, resultB] = await Promise.all([
+      clientA.initiateE2E('sess-e2e-integ', 'X25519', 30_000),
+      clientB.initiateE2E('sess-e2e-integ', 'X25519', 30_000),
+    ]);
+    assert.equal(resultA.hybrid, false);
+    assert.equal(resultB.hybrid, false);
+
+    // Build two WshSession instances directly in virtual mode, wired to
+    // each other exactly like transportA/transportB above -- standing in
+    // for the relay a real server would provide between two session
+    // participants without being able to read the content.
+    const sessionModule = await import('../src/session.mjs');
+    const { WshSession } = sessionModule;
+
+    const dummyTransport = { sendControl: async () => {} };
+    const sessionA = new WshSession(dummyTransport, 1, {}, 'pty', { dataMode: 'virtual', sessionId: 'sess-e2e-integ' });
+    const sessionB = new WshSession(dummyTransport, 1, {}, 'pty', { dataMode: 'virtual', sessionId: 'sess-e2e-integ' });
+
+    const wireLog = [];
+    sessionA._activateVirtual(async (msg) => {
+      wireLog.push(msg);
+      sessionB._handleControlMessage(msg);
+    });
+    sessionB._activateVirtual(async (msg) => {
+      wireLog.push(msg);
+      sessionA._handleControlMessage(msg);
+    });
+
+    sessionA.enableE2E(resultA.sharedSecret, { role: 'initiator' });
+    sessionB.enableE2E(resultB.sharedSecret, { role: 'responder' });
+
+    const plaintext = 'this is a secret message from A to B';
+    const received = new Promise((resolve) => {
+      sessionB.onData = (data) => resolve(new TextDecoder().decode(data));
+    });
+
+    await sessionA.write(plaintext);
+    const receivedText = await received;
+
+    assert.equal(receivedText, plaintext);
+
+    // The eavesdropper (wireLog, standing in for a relay/server reading
+    // raw control-message bytes) must never see the plaintext, or any
+    // substring of it, in the frame it observed.
+    assert.equal(wireLog.length, 1);
+    const frame = wireLog[0];
+    assert.equal(frame.type, MSG.ENCRYPTED_FRAME);
+    const ciphertextAsLatin1 = Buffer.from(frame.ciphertext).toString('latin1');
+    assert.equal(ciphertextAsLatin1.includes(plaintext), false);
+    // Also confirm the raw nonce+ciphertext bytes, concatenated, don't
+    // contain the plaintext -- belt-and-suspenders over the ciphertext-
+    // only check above.
+    const wireBytes = Buffer.concat([Buffer.from(frame.nonce), Buffer.from(frame.ciphertext)]).toString('latin1');
+    assert.equal(wireBytes.includes(plaintext), false);
+  });
+
+  it('a tampered EncryptedFrame on the wire is silently dropped, not delivered as corrupted plaintext', async () => {
+    const keyPairA = await auth.generateKeyPair(true);
+    const keyPairB = await auth.generateKeyPair(true);
+
+    const transportA = new E2ELinkedTransport('sess-e2e-tamper');
+    const transportB = new E2ELinkedTransport('sess-e2e-tamper');
+    transportA.link(transportB);
+    transportB.link(transportA);
+
+    const clientA = new clientMod.WshClient({ transportFactories: { ws: () => transportA } });
+    const clientB = new clientMod.WshClient({ transportFactories: { ws: () => transportB } });
+    await clientA.connect('ws://test.invalid', { username: 'alice', keyPair: keyPairA, transport: 'ws' });
+    await clientB.connect('ws://test.invalid', { username: 'bob', keyPair: keyPairB, transport: 'ws' });
+
+    const [resultA, resultB] = await Promise.all([
+      clientA.initiateE2E('sess-e2e-tamper', 'X25519', 30_000),
+      clientB.initiateE2E('sess-e2e-tamper', 'X25519', 30_000),
+    ]);
+
+    const sessionModule = await import('../src/session.mjs');
+    const { WshSession } = sessionModule;
+    const dummyTransport = { sendControl: async () => {} };
+    const sessionA = new WshSession(dummyTransport, 1, {}, 'pty', { dataMode: 'virtual', sessionId: 'sess-e2e-tamper' });
+    const sessionB = new WshSession(dummyTransport, 1, {}, 'pty', { dataMode: 'virtual', sessionId: 'sess-e2e-tamper' });
+
+    sessionA._activateVirtual(async (msg) => {
+      // Flip a ciphertext byte before delivery, simulating an active
+      // tamperer on the wire.
+      if (msg.type === MSG.ENCRYPTED_FRAME) {
+        msg.ciphertext = msg.ciphertext.slice();
+        msg.ciphertext[0] ^= 0xff;
+      }
+      sessionB._handleControlMessage(msg);
+    });
+    sessionB._activateVirtual(async (msg) => sessionA._handleControlMessage(msg));
+
+    sessionA.enableE2E(resultA.sharedSecret, { role: 'initiator' });
+    sessionB.enableE2E(resultB.sharedSecret, { role: 'responder' });
+
+    let delivered = false;
+    sessionB.onData = () => { delivered = true; };
+
+    await sessionA.write('will be tampered with');
+    // Give the async openFrame()/catch() a turn to run.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.equal(delivered, false);
+  });
+});
