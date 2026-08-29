@@ -1211,6 +1211,7 @@ pub struct KeyExchangePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptedFramePayload {
+    pub channel_id: u32,
     #[serde(with = "serde_bytes")]
     pub nonce: Vec<u8>,
     #[serde(with = "serde_bytes")]
