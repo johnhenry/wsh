@@ -3358,6 +3358,7 @@ impl WshServer {
                 let fwd = Envelope {
                     msg_type: MsgType::EncryptedFrame,
                     payload: Payload::EncryptedFrame(EncryptedFramePayload {
+                        channel_id: p.channel_id,
                         session_id: p.session_id.clone(),
                         nonce: p.nonce.clone(),
                         ciphertext: p.ciphertext.clone(),

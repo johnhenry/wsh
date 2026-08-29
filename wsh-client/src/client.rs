@@ -1051,6 +1051,15 @@ impl WshClient {
                             msg_type: MsgType::SessionData,
                             payload: Payload::SessionData(SessionDataPayload { channel_id, data }),
                         },
+                        ControlAction::EncryptedData { channel_id, session_id, nonce, ciphertext } => Envelope {
+                            msg_type: MsgType::EncryptedFrame,
+                            payload: Payload::EncryptedFrame(EncryptedFramePayload {
+                                channel_id,
+                                nonce,
+                                ciphertext,
+                                session_id,
+                            }),
+                        },
                         ControlAction::Resize { channel_id, cols, rows } => Envelope {
                             msg_type: MsgType::Resize,
                             payload: Payload::Resize(ResizePayload { channel_id, cols, rows }),
@@ -1193,6 +1202,7 @@ impl WshClient {
             MsgType::Exit
             | MsgType::Close
             | MsgType::SessionData
+            | MsgType::EncryptedFrame
             | MsgType::EchoAck
             | MsgType::EchoState
             | MsgType::TermSync
@@ -1312,6 +1322,7 @@ fn envelope_channel_id(envelope: &Envelope) -> Option<u32> {
         Payload::Exit(payload) => Some(payload.channel_id),
         Payload::Close(payload) => Some(payload.channel_id),
         Payload::SessionData(payload) => Some(payload.channel_id),
+        Payload::EncryptedFrame(payload) => Some(payload.channel_id),
         Payload::EchoAck(payload) => Some(payload.channel_id),
         Payload::EchoState(payload) => Some(payload.channel_id),
         Payload::TermSync(payload) => Some(payload.channel_id),
@@ -1378,12 +1389,13 @@ mod tests {
     use tokio::sync::{mpsc, oneshot, Mutex};
     use wsh_core::codec::decode_envelope;
     use wsh_core::messages::{
-        ChannelKind, ClosePayload, Envelope, KeyExchangePayload, MsgType, OpenOkPayload, Payload,
-        SessionDataMode, SessionDataPayload,
+        ChannelKind, ClosePayload, EncryptedFramePayload, Envelope, KeyExchangePayload, MsgType,
+        OpenOkPayload, Payload, ResizePayload, SessionDataMode, SessionDataPayload, SignalPayload,
     };
 
     use super::{known_host_label, SessionOpts, WshClient};
     use crate::e2e::{ALGORITHM_HYBRID, ALGORITHM_X25519};
+    use crate::session::ControlAction;
     use crate::session::WshSession;
 
     #[test]
@@ -1632,12 +1644,19 @@ mod tests {
         sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
         outgoing_tx: mpsc::Sender<Vec<u8>>,
         accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
+        /// Receiver for this client's `WshSession`s' `ControlAction`s
+        /// (resize/signal/close/data/encrypted-data). A real connection's
+        /// `dispatch_loop` drains this; these tests instead pump it via
+        /// `wire_action_loopback` so `WshSession::write` (and the E2E
+        /// sealing it does when enabled) exercises the exact same
+        /// production code path.
+        control_action_rx: mpsc::Receiver<ControlAction>,
     }
 
     fn build_test_client(session_id: &str) -> TestClientRig {
         let response_tx = Arc::new(Mutex::new(HashMap::new()));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let (control_action_tx, _control_action_rx) = mpsc::channel(4);
+        let (control_action_tx, control_action_rx) = mpsc::channel(4);
         let (outgoing_tx, outgoing_rx) = mpsc::channel(64);
         let accepted_relay_peers = Arc::new(Mutex::new(HashSet::new()));
 
@@ -1666,6 +1685,7 @@ mod tests {
             sessions,
             outgoing_tx,
             accepted_relay_peers,
+            control_action_rx,
         }
     }
 
@@ -1731,6 +1751,169 @@ mod tests {
             rig_a.accepted_relay_peers.clone(),
         ));
         (a_to_b, b_to_a)
+    }
+
+    /// Pump every `ControlAction` a `WshSession` sends (via `write`,
+    /// `resize`, `signal`, `close`) into the peer's `handle_incoming`, the
+    /// same conversion `dispatch_loop`'s `action_rx` arm performs for a
+    /// real connection (see the `ControlAction::Data`/`EncryptedData`/...
+    /// match in `dispatch_loop` above) -- this is what lets
+    /// `e2e_frame_round_trip_through_two_in_process_sessions` exercise
+    /// `WshSession::write`'s real E2E-sealing branch end-to-end instead of
+    /// calling `e2e_frame::seal_frame` directly.
+    async fn action_relay_forever(
+        mut rx: mpsc::Receiver<ControlAction>,
+        response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
+        outgoing_tx: mpsc::Sender<Vec<u8>>,
+        accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
+    ) {
+        while let Some(action) = rx.recv().await {
+            let envelope = match action {
+                ControlAction::Data { channel_id, data } => Envelope {
+                    msg_type: MsgType::SessionData,
+                    payload: Payload::SessionData(SessionDataPayload { channel_id, data }),
+                },
+                ControlAction::EncryptedData {
+                    channel_id,
+                    session_id,
+                    nonce,
+                    ciphertext,
+                } => Envelope {
+                    msg_type: MsgType::EncryptedFrame,
+                    payload: Payload::EncryptedFrame(EncryptedFramePayload {
+                        channel_id,
+                        nonce,
+                        ciphertext,
+                        session_id,
+                    }),
+                },
+                ControlAction::Resize { channel_id, cols, rows } => Envelope {
+                    msg_type: MsgType::Resize,
+                    payload: Payload::Resize(ResizePayload { channel_id, cols, rows }),
+                },
+                ControlAction::Signal { channel_id, signal } => Envelope {
+                    msg_type: MsgType::Signal,
+                    payload: Payload::Signal(SignalPayload { channel_id, signal }),
+                },
+                ControlAction::Close { channel_id } => Envelope {
+                    msg_type: MsgType::Close,
+                    payload: Payload::Close(ClosePayload { channel_id }),
+                },
+            };
+
+            WshClient::handle_incoming(
+                envelope,
+                &response_tx,
+                &sessions,
+                &outgoing_tx,
+                &None,
+                &None,
+                &accepted_relay_peers,
+            )
+            .await;
+        }
+    }
+
+    /// Wire up a bidirectional `ControlAction` relay between two rigs'
+    /// sessions, so writes on one rig's `WshSession` are delivered to the
+    /// peer rig's matching-channel_id session. Returns join handles to
+    /// abort once the exchange under test is done.
+    fn wire_action_loopback(
+        rig_a: &mut TestClientRig,
+        rig_b: &mut TestClientRig,
+    ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        let a_to_b_rx = std::mem::replace(&mut rig_a.control_action_rx, mpsc::channel(1).1);
+        let b_to_a_rx = std::mem::replace(&mut rig_b.control_action_rx, mpsc::channel(1).1);
+
+        let a_to_b = tokio::spawn(action_relay_forever(
+            a_to_b_rx,
+            rig_b.response_tx.clone(),
+            rig_b.sessions.clone(),
+            rig_b.outgoing_tx.clone(),
+            rig_b.accepted_relay_peers.clone(),
+        ));
+        let b_to_a = tokio::spawn(action_relay_forever(
+            b_to_a_rx,
+            rig_a.response_tx.clone(),
+            rig_a.sessions.clone(),
+            rig_a.outgoing_tx.clone(),
+            rig_a.accepted_relay_peers.clone(),
+        ));
+        (a_to_b, b_to_a)
+    }
+
+    #[tokio::test]
+    async fn e2e_frame_round_trip_through_two_in_process_sessions_over_the_control_action_path() {
+        // Extends the initiate_e2e coverage below: after two clients agree
+        // on a shared secret via the real initiate_e2e handshake, wire two
+        // WshSessions (one per client, opposite E2E roles) over the same
+        // ControlAction -> dispatch-loop-equivalent -> handle_incoming path
+        // a real connection uses, and prove WshSession::write/handle_control
+        // seal/open real SessionData-equivalent traffic end-to-end --
+        // exercising the exact production code added for clawser's E2E PR 2
+        // (wsh #19), not just e2e_frame's unit-level primitives.
+        let session_id = "sess-e2e-frame-roundtrip";
+        let mut rig_a = build_test_client(session_id);
+        let mut rig_b = build_test_client(session_id);
+        let (a_to_b, b_to_a) = wire_loopback(&mut rig_a, &mut rig_b);
+
+        let (result_a, result_b) = tokio::join!(
+            rig_a
+                .client
+                .initiate_e2e(session_id, ALGORITHM_X25519, Duration::from_secs(5)),
+            rig_b
+                .client
+                .initiate_e2e(session_id, ALGORITHM_X25519, Duration::from_secs(5)),
+        );
+        let result_a = result_a.expect("client A initiate_e2e failed");
+        let result_b = result_b.expect("client B initiate_e2e failed");
+        assert_eq!(result_a.shared_secret, result_b.shared_secret);
+
+        // Build two in-process virtual sessions, one per client, sharing
+        // channel_id=1 and this test's session_id -- as a real OpenOk
+        // would establish on each connection.
+        let session_a = Arc::new(
+            WshSession::new_virtual(1, ChannelKind::Pty, rig_a.client.control_action_tx.clone(), vec![])
+                .with_session_credentials(Some(session_id.to_string()), None),
+        );
+        let session_b = Arc::new(
+            WshSession::new_virtual(1, ChannelKind::Pty, rig_b.client.control_action_tx.clone(), vec![])
+                .with_session_credentials(Some(session_id.to_string()), None),
+        );
+        rig_a.sessions.lock().await.insert(1, session_a.clone());
+        rig_b.sessions.lock().await.insert(1, session_b.clone());
+
+        session_a
+            .enable_e2e(result_a.shared_secret, crate::e2e_frame::RoleTag::Initiator)
+            .await
+            .expect("enable_e2e on session A failed");
+        session_b
+            .enable_e2e(result_b.shared_secret, crate::e2e_frame::RoleTag::Responder)
+            .await
+            .expect("enable_e2e on session B failed");
+
+        let (action_a_to_b, action_b_to_a) = wire_action_loopback(&mut rig_a, &mut rig_b);
+
+        session_a.write(b"hello from A, sealed").await.unwrap();
+        let mut buf = [0_u8; 64];
+        let n = session_b.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello from A, sealed");
+
+        session_b.write(b"hello from B, sealed").await.unwrap();
+        let n = session_a.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello from B, sealed");
+
+        // A second frame each direction proves the monotonic counters keep
+        // advancing correctly across multiple writes, not just the first.
+        session_a.write(b"second message from A").await.unwrap();
+        let n = session_b.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"second message from A");
+
+        a_to_b.abort();
+        b_to_a.abort();
+        action_a_to_b.abort();
+        action_b_to_a.abort();
     }
 
     #[tokio::test]

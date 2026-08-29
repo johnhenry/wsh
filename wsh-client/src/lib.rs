@@ -31,6 +31,7 @@
 pub mod auth;
 pub mod client;
 pub mod e2e;
+pub mod e2e_frame;
 pub mod file_transfer;
 pub mod keystore;
 pub mod known_hosts;
@@ -42,6 +43,7 @@ pub mod virtual_session;
 // Re-export primary public types.
 pub use client::{ConnectConfig, RemoteSessionInfo, WshClient};
 pub use e2e::{E2eKeyExchange, ALGORITHM_HYBRID, ALGORITHM_X25519};
+pub use e2e_frame::RoleTag;
 pub use keystore::{KeyInfo, KeyStore};
 pub use known_hosts::{HostStatus, KnownHosts};
 pub use session::{SessionInfo, SessionOpts, SessionState, WshSession};
