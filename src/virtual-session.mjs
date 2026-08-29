@@ -1,4 +1,4 @@
-import { sessionData as sessionDataMsg } from './messages.mjs';
+import { sessionData as sessionDataMsg, encryptedFrame as encryptedFrameMsg } from './messages.mjs';
 
 const textEncoder = new TextEncoder();
 
@@ -61,6 +61,25 @@ export class WshVirtualSessionBackend {
       sessionDataMsg({
         channelId: this.#channelId,
         data: normalizeSessionData(data),
+      })
+    );
+  }
+
+  /**
+   * Send a pre-sealed EncryptedFrame instead of plaintext SessionData.
+   * Used by `WshSession.write()` when E2E is enabled for this session
+   * (see `session.mjs`'s `enableE2E`).
+   *
+   * @param {{nonce: Uint8Array, ciphertext: Uint8Array, sessionId: string}} frame
+   * @returns {Promise<void>}
+   */
+  async writeEncrypted({ nonce, ciphertext, sessionId }) {
+    await this.#sendControl(
+      encryptedFrameMsg({
+        channelId: this.#channelId,
+        nonce,
+        ciphertext,
+        sessionId,
       })
     );
   }

@@ -1292,28 +1292,32 @@ messages:
           type: string
           required: false
 
-  # ── E2E encryption (EXPERIMENTAL, incomplete) ────────────────────────
+  # ── E2E encryption (EXPERIMENTAL) ─────────────────────────────────────
   # Inner encryption layer intended for end-to-end confidentiality: after
-  # key exchange, session data would be wrapped in EncryptedFrame messages
-  # so the server cannot read session content. Currently incomplete on
-  # both sides of the wire: WshClient.initiateE2E() performs a real X25519
-  # ECDH exchange (optionally hybrid with ML-KEM-768, see below) and
-  # derives an AES-256-GCM key (src/client.mjs), but nothing constructs or
-  # consumes an EncryptedFrame with it -- the derived key is never
-  # actually used to seal/open anything. The Rust client has no
-  # KeyExchange/EncryptedFrame support at all; the Rust server only
-  # relays both message types opaquely between session participants
-  # (correct for true E2E, but doesn't imply either side actually
-  # encrypts). Do not rely on this for confidentiality today. Completing
-  # it (real AEAD sealing on both languages) is tracked as a follow-up,
-  # separate from the hybrid PQ handshake work this section now covers.
+  # key exchange, session data is wrapped in EncryptedFrame messages so
+  # the server cannot read session content. Status per side of the wire:
+  # WshClient.initiateE2E() performs a real X25519 ECDH exchange
+  # (optionally hybrid with ML-KEM-768, see below) and derives an
+  # AES-256-GCM key (src/client.mjs); as of this JS library's
+  # EncryptedFrame support (wsh #19), that key is now actually used to
+  # seal/open virtual-mode session data via WshSession.enableE2E()
+  # (src/session.mjs, src/e2e-frame.mjs) -- stream-mode sessions (raw
+  # byte streams, no message boundaries) aren't wired up yet. The Rust
+  # client (clawser's wsh-client crate) does have KeyExchange/
+  # initiate_e2e support, but does not yet construct or consume
+  # EncryptedFrame -- that AEAD sealing is tracked as a separate
+  # follow-up in that repo. The Rust server only relays both message
+  # types opaquely between session participants (correct for true E2E,
+  # but doesn't imply either side actually encrypts). Do not rely on
+  # this for confidentiality against a peer that hasn't actually called
+  # enableE2E()/opened an EncryptedFrame-sealing equivalent.
   e2e:
     KeyExchange:
       code: 0x8e
       description: >
         Key exchange for establishing a shared secret, X25519 or hybrid
-        X25519+ML-KEM-768. See the e2e section note above -- the derived
-        secret is not yet wired to any actual encryption.
+        X25519+ML-KEM-768. See the e2e section note above for which
+        peers currently wire the derived secret to actual encryption.
 
         Classical mode ("X25519"): both sides send only public_key
         (their ephemeral X25519 public key); the shared secret is
@@ -1359,18 +1363,26 @@ messages:
     EncryptedFrame:
       code: 0x8f
       description: >
-        An encrypted payload. Once KeyExchange's derived secret is
-        actually wired to real encryption (see the e2e section note
-        above -- not yet true today), session data would be sent inside
-        EncryptedFrame messages using AES-256-GCM AEAD, matching the
-        cipher WshClient.initiateE2E() already derives a key for
-        (src/client.mjs) -- picked over the ChaCha20-Poly1305 this field
-        previously described because it's natively supported by
-        SubtleCrypto in every shipping browser, matching this library's
-        zero-runtime-dependency, Web-Crypto-native design; ChaCha20-
-        Poly1305 has no native browser support and would require
-        bundling a JS implementation.
+        An encrypted payload carrying virtual-mode session data, once
+        KeyExchange's derived secret is wired to real encryption via
+        WshSession.enableE2E() (see the e2e section note above). Sent
+        using AES-256-GCM AEAD, matching the cipher
+        WshClient.initiateE2E() derives a key for (src/client.mjs) --
+        picked over the ChaCha20-Poly1305 this field previously
+        described because it's natively supported by SubtleCrypto in
+        every shipping browser, matching this library's zero-runtime-
+        dependency, Web-Crypto-native design; ChaCha20-Poly1305 has no
+        native browser support and would require bundling a JS
+        implementation. The nonce is 8 bytes of big-endian monotonic
+        send counter followed by a 4-byte fixed per-sender role tag
+        (see src/e2e-frame.mjs); session_id is bound as AEAD additional
+        authenticated data so a relay can't splice ciphertext across
+        sessions.
       fields:
+        channel_id:
+          type: u32
+          required: true
+          description: "Which channel (session) this frame belongs to -- same routing role as SessionData.channel_id."
         nonce:
           type: bytes
           required: true

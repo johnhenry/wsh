@@ -1065,6 +1065,7 @@ Category: **e2e**
 
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
+| `channel_id` | `u32` | yes | — |
 | `nonce` | `bytes` | yes | — |
 | `ciphertext` | `bytes` | yes | — |
 | `session_id` | `string` | yes | — |

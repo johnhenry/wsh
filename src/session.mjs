@@ -9,6 +9,7 @@ import {
   MSG, resize as resizeMsg, signal as signalMsg, close as closeMsg,
 } from './messages.mjs';
 import { WshVirtualSessionBackend } from './virtual-session.mjs';
+import { sealFrame, openFrame, ROLE_TAGS } from './e2e-frame.mjs';
 
 // ── Session states ────────────────────────────────────────────────────
 
@@ -76,6 +77,27 @@ export class WshSession {
 
   /** @type {WshVirtualSessionBackend|null} */
   #virtualBackend = null;
+
+  /**
+   * Non-extractable AES-256-GCM CryptoKey set by `enableE2E()`, or `null`
+   * if E2E is not enabled for this session. Connection-scoped -- see
+   * `enableE2E`'s doc comment for why this must never be reused across a
+   * Resume/Attach.
+   * @type {CryptoKey|null}
+   */
+  #e2eKey = null;
+
+  /** @type {Uint8Array|null} This side's 4-byte nonce role tag, set by `enableE2E()`. */
+  #e2eSendRoleTag = null;
+
+  /** @type {Uint8Array|null} The peer's 4-byte nonce role tag, set by `enableE2E()`. */
+  #e2eRecvRoleTag = null;
+
+  /** @type {number} Next outgoing frame counter for this side. */
+  #e2eSendCounter = 0;
+
+  /** @type {number} Next expected incoming frame counter from the peer. */
+  #e2eRecvCounter = 0;
 
   /**
    * The readable side of the stdout data stream.
@@ -292,6 +314,60 @@ export class WshSession {
     this.#state = STATE_ACTIVE;
   }
 
+  /** Whether `enableE2E()` has been called and E2E sealing is active for this session. */
+  get e2eEnabled() {
+    return this.#e2eKey !== null;
+  }
+
+  /**
+   * Opt in to end-to-end encryption for this session's data plane
+   * (virtual-mode sessions only in this PR; stream-mode is out of
+   * scope -- see `e2e-frame.mjs`'s doc comment). After this call,
+   * `write()` seals outgoing data into `EncryptedFrame` messages instead
+   * of plaintext `SessionData`, and incoming `EncryptedFrame` messages
+   * are opened and delivered via `onData` exactly like `SessionData` is
+   * today; plaintext `SessionData` from a peer is no longer expected
+   * once this side has opted in (it's simply passed through unchanged,
+   * as before -- this method doesn't add any negotiation-failure
+   * handling; that's a later PR).
+   *
+   * IMPORTANT -- key lifetime: `sharedSecret` must come from a *fresh*
+   * `WshClient.initiateE2E()` call on the *current* connection. E2E
+   * state here is connection-scoped, not session-scoped: if this
+   * session is later detached and Resumed/Attached on a new connection,
+   * callers MUST run `initiateE2E()` again and call `enableE2E()` again
+   * with the new key -- never persist or reuse a `sharedSecret` (or its
+   * counters) across a resume. Calling `enableE2E()` again on an
+   * already-enabled session is fine and resets counters cleanly (a
+   * fresh key naturally means fresh counters), but the caller is
+   * responsible for actually supplying a fresh key when doing so.
+   *
+   * @param {CryptoKey} sharedSecret - AES-256-GCM CryptoKey from `WshClient.initiateE2E()`
+   * @param {object} opts
+   * @param {'initiator'|'responder'} opts.role - which side of the KeyExchange this session was;
+   *   determines this side's nonce role tag (see `e2e-frame.mjs`'s `ROLE_TAGS`). The two peers of
+   *   one session MUST pick opposite roles, or their nonces can collide.
+   */
+  enableE2E(sharedSecret, { role } = {}) {
+    if (!sharedSecret || typeof sharedSecret !== 'object') {
+      throw new Error('enableE2E: sharedSecret must be a CryptoKey (see WshClient.initiateE2E)');
+    }
+    if (role !== 'initiator' && role !== 'responder') {
+      throw new Error("enableE2E: opts.role must be 'initiator' or 'responder'");
+    }
+    if (this.#dataMode !== 'virtual') {
+      throw new Error('enableE2E: only virtual-mode sessions are supported in this version (stream-mode is out of scope)');
+    }
+    if (!this.#sessionId) {
+      throw new Error('enableE2E: session has no server-assigned session_id to bind as AAD -- was OPEN_OK missing session_id?');
+    }
+    this.#e2eKey = sharedSecret;
+    this.#e2eSendRoleTag = ROLE_TAGS[role];
+    this.#e2eRecvRoleTag = role === 'initiator' ? ROLE_TAGS.responder : ROLE_TAGS.initiator;
+    this.#e2eSendCounter = 0;
+    this.#e2eRecvCounter = 0;
+  }
+
   // ── Public API ──────────────────────────────────────────────────────
 
   /**
@@ -307,6 +383,15 @@ export class WshSession {
     if (this.#dataMode === 'virtual') {
       if (this.#virtualBackend === null) {
         throw new Error('Session not yet activated — virtual backend unavailable');
+      }
+      if (this.#e2eKey !== null) {
+        const bytes = typeof data === 'string' ? textEncoder.encode(data) : data;
+        const counter = this.#e2eSendCounter++;
+        const { nonce, ciphertext } = await sealFrame(
+          this.#e2eKey, this.#sessionId, this.#e2eSendRoleTag, counter, bytes
+        );
+        await this.#virtualBackend.writeEncrypted({ nonce, ciphertext, sessionId: this.#sessionId });
+        return;
       }
       await this.#virtualBackend.write(data);
       return;
@@ -434,6 +519,40 @@ export class WshSession {
             console.error('[wsh:session] onData handler error:', err);
           }
         }
+        break;
+      }
+
+      case MSG.ENCRYPTED_FRAME: {
+        if (this.#e2eKey === null) {
+          console.error('[wsh:session] received EncryptedFrame but E2E is not enabled on this session — dropping');
+          break;
+        }
+        if (msg.session_id !== this.#sessionId) {
+          console.error('[wsh:session] EncryptedFrame session_id mismatch — dropping (possible splice attempt)');
+          break;
+        }
+        // openFrame is async; _handleControlMessage is a synchronous
+        // dispatch entry point (see the SESSION_DATA case above and its
+        // callers), so this fires the decrypt-and-deliver as a
+        // background task rather than awaiting it here. Per-channel
+        // control messages are already dispatched serially by the
+        // caller (see transport.mjs's dispatchSerially/SerialQueue), so
+        // frames still arrive at openFrame() in wire order; only the
+        // delivery of *this* frame's plaintext to onData is deferred by
+        // one microtask/macrotask relative to synchronous cases.
+        const counter = this.#e2eRecvCounter++;
+        openFrame(this.#e2eKey, this.#sessionId, counter, { nonce: msg.nonce, ciphertext: msg.ciphertext })
+          .then((plaintext) => {
+            this.#virtualBackend?.pushData(plaintext);
+            try {
+              this.onData?.(plaintext);
+            } catch (err) {
+              console.error('[wsh:session] onData handler error:', err);
+            }
+          })
+          .catch((err) => {
+            console.error('[wsh:session] failed to open EncryptedFrame:', err);
+          });
         break;
       }
 
