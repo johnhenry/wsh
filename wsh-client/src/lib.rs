@@ -37,6 +37,7 @@ pub mod keystore;
 pub mod known_hosts;
 pub mod mcp;
 pub mod session;
+pub mod stream_frame;
 pub mod transport;
 pub mod virtual_session;
 
@@ -47,6 +48,7 @@ pub use e2e_frame::RoleTag;
 pub use keystore::{KeyInfo, KeyStore};
 pub use known_hosts::{HostStatus, KnownHosts};
 pub use session::{SessionInfo, SessionOpts, SessionState, WshSession};
+pub use stream_frame::{CoalesceOptions, CoalesceOverride};
 pub use transport::{AnyTransport, TransportKind, WebSocketSession, WebTransportSession};
 pub use virtual_session::VirtualSessionBackend;
 

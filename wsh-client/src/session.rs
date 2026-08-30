@@ -4,6 +4,9 @@
 //! message queue and provides read/write/resize/signal/close operations on a
 //! single channel.
 
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -16,7 +19,16 @@ use wsh_core::messages::{
 use wsh_core::transport::ByteStream;
 
 use crate::e2e_frame::{self, RoleTag};
+use crate::stream_frame::{self, ChunkAccumulator, CoalesceOverride, WriteCoalescer};
 use crate::virtual_session::VirtualSessionBackend;
+
+/// Boxed flush callback for a stream-mode session's [`WriteCoalescer`] --
+/// seals + frames the merged bytes and writes them to the underlying
+/// `ByteStream`. Boxed (rather than a bare generic) so `WshSession` can
+/// name a concrete field type without threading a type parameter through
+/// the whole struct.
+type StreamFlushFn =
+    Box<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = WshResult<()>> + Send>> + Send + Sync>;
 
 /// The state of a session channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +118,21 @@ pub struct WshSession {
     /// `enable_e2e`. `None` means E2E is not active and `write()`/
     /// `handle_control` use plaintext `SessionData` as before.
     e2e: Mutex<Option<E2eState>>,
+    /// Stream-mode E2E chunk reassembly buffer (wsh #22 / clawser E2E PR
+    /// 3): reassembles the raw stdout byte stream into complete sealed
+    /// chunks. `Some` only while E2E is enabled on a stream-mode session;
+    /// reset to a fresh accumulator on every `enable_e2e` call.
+    stream_accumulator: Mutex<Option<ChunkAccumulator>>,
+    /// Decrypted plaintext bytes queued for delivery via `read()`, drained
+    /// FIFO. Mirrors `VirtualSessionBackend`'s "pending" byte-queue pattern
+    /// for the "queue decrypted plaintext, deliver into a possibly-smaller
+    /// caller buffer" problem.
+    stream_read_pending: Mutex<VecDeque<u8>>,
+    /// Write coalescer for a stream-mode E2E session (wsh #22). `None`
+    /// while E2E is disabled, or while enabled with coalescing turned off
+    /// (`CoalesceOverride::Disabled`) -- either way `write()` seals+frames
+    /// each call immediately in that case.
+    stream_coalescer: Mutex<Option<Arc<WriteCoalescer<StreamFlushFn>>>>,
 }
 
 /// Per-session E2E state set by `WshSession::enable_e2e`. Connection-scoped,
@@ -128,8 +155,12 @@ struct E2eState {
     #[allow(dead_code)]
     recv_role: RoleTag,
     /// Next monotonic send counter (0, 1, 2, ...). Incremented by
-    /// `write()` on every seal.
-    send_counter: AtomicU64,
+    /// `write()` on every seal. `Arc`-wrapped (rather than a bare
+    /// `AtomicU64`) so a stream-mode session's `WriteCoalescer` flush
+    /// closure -- which can't borrow `&self` (see `StreamFlushFn`) -- can
+    /// share the exact same counter instance the direct/non-coalesced path
+    /// uses.
+    send_counter: Arc<AtomicU64>,
     /// Next monotonic receive counter this side expects from the peer.
     /// Incremented by `handle_control` on every `EncryptedFrame` regardless
     /// of whether it successfully opens, mirroring the JS side's
@@ -174,6 +205,28 @@ pub enum ControlAction {
     },
 }
 
+/// Seal one stream-mode chunk and write it to the underlying `ByteStream`.
+/// Used directly by `WshSession::write` when coalescing is disabled, and as
+/// the flush callback for a session's `stream_coalescer` otherwise. A free
+/// function (not a `WshSession` method) so the `WriteCoalescer` flush
+/// closure can capture only the specific `Arc`s it needs rather than a
+/// whole `Arc<WshSession>` -- avoids a reference cycle between the session
+/// (which owns the coalescer) and the coalescer's flush closure.
+async fn seal_and_write_stream_chunk(
+    stream: &Arc<Mutex<Box<dyn ByteStream>>>,
+    key: &[u8; 32],
+    session_id: &str,
+    role: RoleTag,
+    counter: &AtomicU64,
+    bytes: &[u8],
+) -> WshResult<()> {
+    let counter_value = counter.fetch_add(1, Ordering::SeqCst);
+    let (nonce, ciphertext) = e2e_frame::seal_frame(key, session_id, role, counter_value, bytes)?;
+    let wire = stream_frame::encode_chunk(&nonce, &ciphertext)?;
+    let mut stream = stream.lock().await;
+    stream.write_all(&wire).await
+}
+
 impl WshSession {
     /// Create a new stream-backed session.
     pub(crate) fn new_stream(
@@ -195,6 +248,9 @@ impl WshSession {
             backend: SessionBackend::Stream(Arc::new(Mutex::new(stream))),
             control_tx,
             e2e: Mutex::new(None),
+            stream_accumulator: Mutex::new(None),
+            stream_read_pending: Mutex::new(VecDeque::new()),
+            stream_coalescer: Mutex::new(None),
         }
     }
 
@@ -217,6 +273,9 @@ impl WshSession {
             backend: SessionBackend::Virtual(Arc::new(VirtualSessionBackend::new())),
             control_tx,
             e2e: Mutex::new(None),
+            stream_accumulator: Mutex::new(None),
+            stream_read_pending: Mutex::new(VecDeque::new()),
+            stream_coalescer: Mutex::new(None),
         }
     }
 
@@ -319,12 +378,25 @@ impl WshSession {
         self.e2e.lock().await.is_some()
     }
 
-    /// Opt in to end-to-end encryption for this session's data plane
-    /// (virtual-mode sessions only in this PR; stream-mode is out of scope
-    /// -- see `crate::e2e_frame`'s doc comment). After this call, `write()`
-    /// seals outgoing data into `EncryptedFrame` messages instead of
-    /// plaintext `SessionData`, and incoming `EncryptedFrame` messages are
-    /// opened and delivered via the same path `SessionData` uses today.
+    /// Opt in to end-to-end encryption for this session's data plane.
+    /// Works for both virtual-mode and stream-mode sessions (wsh #22
+    /// generalized this from virtual-mode-only, #19).
+    ///
+    /// Virtual-mode: after this call, `write()` seals outgoing data into
+    /// `EncryptedFrame` messages instead of plaintext `SessionData`, and
+    /// incoming `EncryptedFrame` messages are opened and delivered via the
+    /// same path `SessionData` uses today.
+    ///
+    /// Stream-mode: outgoing bytes are sealed and framed inline in the raw
+    /// byte stream (`crate::stream_frame`'s `[len][nonce][ciphertext]`
+    /// chunk format, reusing the same `seal_frame`/`open_frame`
+    /// primitives) -- invisible to the control-message spec, no new
+    /// message type. Small writes are batched before sealing per
+    /// `coalesce` (see [`crate::stream_frame::CoalesceOverride`]);
+    /// incoming bytes are reassembled via a `ChunkAccumulator` and opened
+    /// per-chunk before reaching `read()`. `coalesce` is ignored for
+    /// virtual-mode sessions (each `write()` is already one
+    /// `EncryptedFrame`).
     ///
     /// Mirrors `@johnhenry/wsh`'s `WshSession.enableE2E` (`src/session.mjs`)
     /// API shape and semantics exactly.
@@ -337,19 +409,19 @@ impl WshSession {
     /// new key -- never persist or reuse a `shared_secret` (or its
     /// counters) across a resume. Calling `enable_e2e` again on an
     /// already-enabled session is fine and resets counters cleanly (a fresh
-    /// key naturally means fresh counters), but the caller is responsible
-    /// for actually supplying a fresh key when doing so.
+    /// key naturally means fresh counters, and a fresh `ChunkAccumulator`
+    /// for stream-mode), but the caller is responsible for actually
+    /// supplying a fresh key when doing so.
     ///
     /// `role` is which side of the `KeyExchange` this session was; it
     /// determines this side's nonce role tag. The two peers of one session
     /// MUST pick opposite roles, or their nonces can collide.
-    pub async fn enable_e2e(&self, shared_secret: [u8; 32], role: RoleTag) -> WshResult<()> {
-        if !matches!(self.data_mode, SessionDataMode::Virtual) {
-            return Err(WshError::Channel(
-                "enable_e2e: only virtual-mode sessions are supported in this version (stream-mode is out of scope)"
-                    .into(),
-            ));
-        }
+    pub async fn enable_e2e(
+        &self,
+        shared_secret: [u8; 32],
+        role: RoleTag,
+        coalesce: CoalesceOverride,
+    ) -> WshResult<()> {
         let session_id = self.session_id.clone().ok_or_else(|| {
             WshError::Channel(
                 "enable_e2e: session has no server-assigned session_id to bind as AAD -- was OpenOk missing session_id?"
@@ -357,15 +429,57 @@ impl WshSession {
             )
         })?;
 
-        let mut e2e = self.e2e.lock().await;
-        *e2e = Some(E2eState {
-            key: shared_secret,
-            session_id,
-            send_role: role,
-            recv_role: role.peer(),
-            send_counter: AtomicU64::new(0),
-            recv_counter: AtomicU64::new(0),
-        });
+        let send_counter = Arc::new(AtomicU64::new(0));
+        {
+            let mut e2e = self.e2e.lock().await;
+            *e2e = Some(E2eState {
+                key: shared_secret,
+                session_id: session_id.clone(),
+                send_role: role,
+                recv_role: role.peer(),
+                send_counter: send_counter.clone(),
+                recv_counter: AtomicU64::new(0),
+            });
+        }
+
+        if matches!(self.data_mode, SessionDataMode::Stream) {
+            let SessionBackend::Stream(stream) = &self.backend else {
+                unreachable!("data_mode Stream implies a Stream backend");
+            };
+            *self.stream_accumulator.lock().await = Some(ChunkAccumulator::new());
+            self.stream_read_pending.lock().await.clear();
+
+            let coalescer = stream_frame::resolve_coalesce_options(&self.kind, coalesce).map(
+                |options| {
+                    let stream = stream.clone();
+                    let key = shared_secret;
+                    let sealed_session_id = session_id.clone();
+                    let counter = send_counter.clone();
+                    let flush: StreamFlushFn = Box::new(move |bytes: Vec<u8>| {
+                        let stream = stream.clone();
+                        let sealed_session_id = sealed_session_id.clone();
+                        let counter = counter.clone();
+                        Box::pin(async move {
+                            seal_and_write_stream_chunk(
+                                &stream,
+                                &key,
+                                &sealed_session_id,
+                                role,
+                                &counter,
+                                &bytes,
+                            )
+                            .await
+                        })
+                    });
+                    Arc::new(WriteCoalescer::new(options, flush))
+                },
+            );
+            *self.stream_coalescer.lock().await = coalescer;
+        } else {
+            *self.stream_accumulator.lock().await = None;
+            *self.stream_coalescer.lock().await = None;
+        }
+
         Ok(())
     }
 
@@ -382,8 +496,28 @@ impl WshSession {
 
         match &self.backend {
             SessionBackend::Stream(stream) => {
-                let mut stream = stream.lock().await;
-                stream.write_all(data).await
+                let e2e_guard = self.e2e.lock().await;
+                let Some(e2e) = e2e_guard.as_ref() else {
+                    drop(e2e_guard);
+                    let mut s = stream.lock().await;
+                    return s.write_all(data).await;
+                };
+                let key = e2e.key;
+                let session_id = e2e.session_id.clone();
+                let role = e2e.send_role;
+                let counter = e2e.send_counter.clone();
+                drop(e2e_guard);
+
+                let coalescer_guard = self.stream_coalescer.lock().await;
+                if let Some(coalescer) = coalescer_guard.as_ref() {
+                    let coalescer = coalescer.clone();
+                    drop(coalescer_guard);
+                    coalescer.write(data).await
+                } else {
+                    drop(coalescer_guard);
+                    seal_and_write_stream_chunk(stream, &key, &session_id, role, &counter, data)
+                        .await
+                }
             }
             SessionBackend::Virtual(_) => {
                 let e2e_guard = self.e2e.lock().await;
@@ -427,10 +561,100 @@ impl WshSession {
     pub async fn read(&self, buf: &mut [u8]) -> WshResult<usize> {
         match &self.backend {
             SessionBackend::Stream(stream) => {
-                let mut stream = stream.lock().await;
-                stream.read(buf).await
+                let e2e_enabled = self.e2e.lock().await.is_some();
+                if e2e_enabled {
+                    self.read_stream_e2e(stream, buf).await
+                } else {
+                    let mut stream = stream.lock().await;
+                    stream.read(buf).await
+                }
             }
             SessionBackend::Virtual(backend) => backend.read(buf).await,
+        }
+    }
+
+    /// Stream-mode E2E read path: pull decrypted plaintext already queued
+    /// from a previous call, or -- if none is queued -- read more raw bytes
+    /// from the underlying stream, feed them through the `ChunkAccumulator`,
+    /// open every complete chunk it yields, and queue the results before
+    /// looping back to serve `buf`. Mirrors `session.mjs`'s
+    /// `_pumpDataStream`/`#openStreamChunks`, adapted from a push-driven
+    /// background pump to a pull-driven `read()` (this crate has no
+    /// standing read-loop task per session).
+    async fn read_stream_e2e(
+        &self,
+        stream: &Arc<Mutex<Box<dyn ByteStream>>>,
+        buf: &mut [u8],
+    ) -> WshResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            {
+                let mut pending = self.stream_read_pending.lock().await;
+                if !pending.is_empty() {
+                    let to_copy = pending.len().min(buf.len());
+                    for slot in buf.iter_mut().take(to_copy) {
+                        *slot = pending.pop_front().expect("checked non-empty above");
+                    }
+                    return Ok(to_copy);
+                }
+            }
+
+            let mut raw = vec![0_u8; stream_frame::CHUNK_HARD_CAP_BYTES];
+            let n = {
+                let mut s = stream.lock().await;
+                s.read(&mut raw).await?
+            };
+
+            if n == 0 {
+                // Clean EOF: catch a torn (truncated) chunk left in the E2E
+                // accumulator, if any -- per the design, no partial-chunk
+                // plaintext is ever released, so this is purely
+                // diagnostic (the stream is ending either way).
+                if let Some(accumulator) = self.stream_accumulator.lock().await.as_ref() {
+                    if let Err(err) = accumulator.finish() {
+                        tracing::error!(
+                            "[wsh:session] stream E2E torn chunk at stream end: {err}"
+                        );
+                    }
+                }
+                return Ok(0);
+            }
+            raw.truncate(n);
+
+            let wire_chunks = {
+                let mut accumulator_guard = self.stream_accumulator.lock().await;
+                let accumulator = accumulator_guard
+                    .as_mut()
+                    .expect("stream_accumulator set while E2E is enabled on a stream session");
+                accumulator.feed(&raw)?
+            };
+            if wire_chunks.is_empty() {
+                continue;
+            }
+
+            let mut opened_chunks = Vec::with_capacity(wire_chunks.len());
+            {
+                let e2e_guard = self.e2e.lock().await;
+                let e2e = e2e_guard.as_ref().ok_or_else(|| {
+                    WshError::Channel(
+                        "stream E2E chunk arrived but E2E was disabled mid-read".into(),
+                    )
+                })?;
+                for (nonce, ciphertext) in wire_chunks {
+                    let counter = e2e.recv_counter.fetch_add(1, Ordering::SeqCst);
+                    let plaintext =
+                        e2e_frame::open_frame(&e2e.key, &e2e.session_id, counter, &nonce, &ciphertext)?;
+                    opened_chunks.push(plaintext);
+                }
+            }
+
+            let mut pending = self.stream_read_pending.lock().await;
+            for plaintext in opened_chunks {
+                pending.extend(plaintext);
+            }
         }
     }
 
@@ -476,6 +700,18 @@ impl WshSession {
 
         match &self.backend {
             SessionBackend::Stream(stream) => {
+                // Flush any bytes still buffered by the write coalescer
+                // before closing the stream, mirroring `session.mjs`'s
+                // close(): coalescing must not silently drop trailing
+                // bytes that never hit the byte/timer threshold.
+                let coalescer = self.stream_coalescer.lock().await.clone();
+                if let Some(coalescer) = coalescer {
+                    if let Err(err) = coalescer.flush().await {
+                        tracing::error!(
+                            "[wsh:session] failed to flush coalesced stream E2E writes on close: {err}"
+                        );
+                    }
+                }
                 let mut stream = stream.lock().await;
                 stream.close().await?;
             }

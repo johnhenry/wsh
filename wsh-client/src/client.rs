@@ -1397,6 +1397,9 @@ mod tests {
     use crate::e2e::{ALGORITHM_HYBRID, ALGORITHM_X25519};
     use crate::session::ControlAction;
     use crate::session::WshSession;
+    use crate::stream_frame::CoalesceOverride;
+    use wsh_core::transport::ByteStream;
+    use wsh_core::WshResult;
 
     #[test]
     fn known_host_label_preserves_explicit_websocket_port() {
@@ -1885,11 +1888,19 @@ mod tests {
         rig_b.sessions.lock().await.insert(1, session_b.clone());
 
         session_a
-            .enable_e2e(result_a.shared_secret, crate::e2e_frame::RoleTag::Initiator)
+            .enable_e2e(
+                result_a.shared_secret,
+                crate::e2e_frame::RoleTag::Initiator,
+                crate::stream_frame::CoalesceOverride::Default,
+            )
             .await
             .expect("enable_e2e on session A failed");
         session_b
-            .enable_e2e(result_b.shared_secret, crate::e2e_frame::RoleTag::Responder)
+            .enable_e2e(
+                result_b.shared_secret,
+                crate::e2e_frame::RoleTag::Responder,
+                crate::stream_frame::CoalesceOverride::Default,
+            )
             .await
             .expect("enable_e2e on session B failed");
 
@@ -1914,6 +1925,172 @@ mod tests {
         b_to_a.abort();
         action_a_to_b.abort();
         action_b_to_a.abort();
+    }
+
+    /// A `ByteStream` wrapping one end of a `tokio::io::duplex` pipe --
+    /// stands in for a real WebTransport/WebSocket stream-mode data
+    /// stream, giving two in-process `WshSession`s a real raw byte pipe
+    /// between them (as opposed to the mpsc-based `ControlAction` relay
+    /// the virtual-mode tests above use).
+    struct DuplexByteStream {
+        inner: tokio::io::DuplexStream,
+        /// If set, every byte slice passed to `write_all` is appended here
+        /// before being written to `inner` -- lets a test assert on the
+        /// exact bytes that crossed the "wire" (e.g. that plaintext never
+        /// appears in it), independent of what the peer decodes.
+        recorded: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+    }
+
+    impl ByteStream for DuplexByteStream {
+        fn read<'a>(
+            &'a mut self,
+            buf: &'a mut [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WshResult<usize>> + Send + 'a>>
+        {
+            use tokio::io::AsyncReadExt;
+            Box::pin(async move { Ok(self.inner.read(buf).await?) })
+        }
+
+        fn write_all<'a>(
+            &'a mut self,
+            data: &'a [u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WshResult<()>> + Send + 'a>>
+        {
+            use tokio::io::AsyncWriteExt;
+            Box::pin(async move {
+                if let Some(recorded) = &self.recorded {
+                    recorded.lock().unwrap().extend_from_slice(data);
+                }
+                self.inner.write_all(data).await?;
+                self.inner.flush().await?;
+                Ok(())
+            })
+        }
+
+        fn close(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WshResult<()>> + Send + '_>>
+        {
+            use tokio::io::AsyncWriteExt;
+            Box::pin(async move {
+                let _ = self.inner.shutdown().await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_mode_e2e_round_trip_through_real_write_and_read_path() {
+        // Extends the virtual-mode coverage above (wsh #19 / clawser E2E PR
+        // 2) to stream-mode sessions (wsh #22 / clawser E2E PR 2): after a
+        // real initiate_e2e handshake between two in-process clients, wire
+        // two stream-backed WshSessions over a real raw byte pipe
+        // (tokio::io::duplex, standing in for a WebTransport/WebSocket data
+        // stream) and prove WshSession::write/read seal+frame/reassemble+
+        // open real chunk-framed traffic end-to-end -- exercising the
+        // production stream_frame::ChunkAccumulator/encode_chunk plus
+        // session.rs's generalized enable_e2e, not just unit-level
+        // primitives. Also asserts the raw wire bytes never contain the
+        // plaintext, proving the data is actually encrypted in transit and
+        // not merely framed.
+        let session_id = "sess-stream-e2e-roundtrip";
+        let mut rig_a = build_test_client(session_id);
+        let mut rig_b = build_test_client(session_id);
+        let (a_to_b, b_to_a) = wire_loopback(&mut rig_a, &mut rig_b);
+
+        let (result_a, result_b) = tokio::join!(
+            rig_a
+                .client
+                .initiate_e2e(session_id, ALGORITHM_X25519, Duration::from_secs(5)),
+            rig_b
+                .client
+                .initiate_e2e(session_id, ALGORITHM_X25519, Duration::from_secs(5)),
+        );
+        let result_a = result_a.expect("client A initiate_e2e failed");
+        let result_b = result_b.expect("client B initiate_e2e failed");
+        assert_eq!(result_a.shared_secret, result_b.shared_secret);
+
+        a_to_b.abort();
+        b_to_a.abort();
+
+        let (dup_a, dup_b) = tokio::io::duplex(64 * 1024);
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream_a: Box<dyn ByteStream> = Box::new(DuplexByteStream {
+            inner: dup_a,
+            recorded: Some(recorded.clone()),
+        });
+        let stream_b: Box<dyn ByteStream> = Box::new(DuplexByteStream {
+            inner: dup_b,
+            recorded: None,
+        });
+
+        let session_a = Arc::new(
+            WshSession::new_stream(
+                1,
+                ChannelKind::Exec,
+                stream_a,
+                rig_a.client.control_action_tx.clone(),
+                vec![],
+            )
+            .with_session_credentials(Some(session_id.to_string()), None),
+        );
+        let session_b = Arc::new(
+            WshSession::new_stream(
+                1,
+                ChannelKind::Exec,
+                stream_b,
+                rig_b.client.control_action_tx.clone(),
+                vec![],
+            )
+            .with_session_credentials(Some(session_id.to_string()), None),
+        );
+
+        session_a
+            .enable_e2e(
+                result_a.shared_secret,
+                crate::e2e_frame::RoleTag::Initiator,
+                CoalesceOverride::Disabled,
+            )
+            .await
+            .expect("enable_e2e on stream session A failed");
+        session_b
+            .enable_e2e(
+                result_b.shared_secret,
+                crate::e2e_frame::RoleTag::Responder,
+                CoalesceOverride::Disabled,
+            )
+            .await
+            .expect("enable_e2e on stream session B failed");
+
+        let plaintext = b"secret exec output that must never appear on the wire in cleartext";
+        session_a.write(plaintext).await.unwrap();
+
+        let mut buf = [0_u8; 256];
+        let n = session_b.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], plaintext, "session B must recover A's exact plaintext");
+
+        let recorded_bytes = recorded.lock().unwrap().clone();
+        assert!(
+            !recorded_bytes
+                .windows(plaintext.len())
+                .any(|window| window == plaintext.as_slice()),
+            "plaintext must never appear verbatim in the raw wire bytes"
+        );
+
+        // A second write/read in the same direction proves the monotonic
+        // send/recv counters (and the chunk accumulator's cursor) keep
+        // working correctly across multiple chunks, not just the first.
+        let second = b"a second exec chunk";
+        session_a.write(second).await.unwrap();
+        let n = session_b.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], second);
+
+        // And the reverse direction, proving the two sides' opposite role
+        // tags keep nonces from colliding on a real duplex pipe.
+        let reply = b"reply from B";
+        session_b.write(reply).await.unwrap();
+        let n = session_a.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], reply);
     }
 
     #[tokio::test]
