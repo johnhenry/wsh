@@ -1243,11 +1243,25 @@ impl WshClient {
                 if let Some(session) = session {
                     if matches!(envelope.msg_type, MsgType::Exit) {
                         if let Payload::Exit(exit) = &envelope.payload {
-                            tracing::info!(
-                                "channel {} exited with code {}",
-                                exit.channel_id,
-                                exit.code
-                            );
+                            // `eprintln!`, not `tracing::info!`, is
+                            // deliberate here: a `tracing::info!` call at
+                            // exactly this point -- the dispatch loop
+                            // processing an `Exit` envelope for a Virtual
+                            // session, right after that same loop already
+                            // logged at least one other event on this
+                            // connection -- was found to hang forever
+                            // (confirmed by bisecting with manual
+                            // `eprintln!` markers immediately before/after
+                            // the call; execution stops inside the macro
+                            // and never returns). Root cause not
+                            // identified (suspected interaction between
+                            // this i686-unknown-linux-musl cross-compiled
+                            // binary and `tracing-subscriber`'s global
+                            // writer lock, but unconfirmed) -- tracked as
+                            // a known issue on #38. `eprintln!` sidesteps
+                            // the tracing subscriber entirely and is not
+                            // known to hang.
+                            eprintln!("channel {} exited with code {}", exit.channel_id, exit.code);
                         }
                     }
 
