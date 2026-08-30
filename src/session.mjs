@@ -20,6 +20,17 @@ const STATE_OPENING = 'opening';
 const STATE_ACTIVE  = 'active';
 const STATE_CLOSED  = 'closed';
 
+/**
+ * Stream-mode data and control streams are independently-multiplexed
+ * transport streams (QUIC/QMux) with no guaranteed relative delivery
+ * order (wsh #24). When the data stream reaches EOF, the server-sent
+ * `CLOSE` control message -- not the data-stream FIN -- is the
+ * authoritative close signal, so `_pumpDataStream()` waits up to this
+ * long for `CLOSE` to arrive before falling back to closing on data-EOF
+ * alone (a safety net for servers that never send `CLOSE`).
+ */
+const DATA_EOF_CLOSE_GRACE_MS = 300;
+
 // ── Text encoding ─────────────────────────────────────────────────────
 
 const textEncoder = new TextEncoder();
@@ -132,6 +143,16 @@ export class WshSession {
 
   /** @type {number|null} Exit code received from the server. */
   #exitCode = null;
+
+  /**
+   * Pending fallback timer scheduled when the data stream hits EOF
+   * before a `CLOSE` control message has arrived (wsh #24). Cleared
+   * as soon as `CLOSE` arrives (or the session is otherwise closed) so
+   * a prompt `CLOSE` short-circuits the wait instead of idling out the
+   * full grace period.
+   * @type {ReturnType<typeof setTimeout>|null}
+   */
+  #closeGraceTimer = null;
 
   // ── Callbacks ───────────────────────────────────────────────────────
 
@@ -580,6 +601,7 @@ export class WshSession {
     // Optimistically mark closed so no further writes are accepted.
     this.#state = STATE_CLOSED;
     this.#abort.abort();
+    this.#clearCloseGraceTimer();
 
     // Send CLOSE to the server (best-effort).
     try {
@@ -697,7 +719,11 @@ export class WshSession {
       }
 
       case MSG.CLOSE: {
-        // Server-initiated close.
+        // Server-initiated close. This is the authoritative close signal
+        // for stream-mode sessions (wsh #24) -- it always short-circuits
+        // any pending data-EOF grace timer, regardless of which arrived
+        // first.
+        this.#clearCloseGraceTimer();
         if (this.#state !== STATE_CLOSED) {
           this.#state = STATE_CLOSED;
           this.#abort.abort();
@@ -879,16 +905,42 @@ export class WshSession {
       reader.releaseLock();
     }
 
-    // If the data stream ended but we haven't received a CLOSE message,
-    // transition to closed state.
-    if (this.#state !== STATE_CLOSED) {
-      this.#state = STATE_CLOSED;
-      this.#releaseStreams();
-      this.#emitClose();
+    // The data stream ended, but its FIN carries no ordering guarantee
+    // relative to the control stream (wsh #24): a server that closes the
+    // data stream and sends EXIT/CLOSE around the same time can have
+    // this EOF arrive before those control messages. Closing the session
+    // here unconditionally would resolve onClose without onExit ever
+    // having fired. Instead, give the (expected) CLOSE control message a
+    // bounded grace period to arrive -- its handler clears this timer and
+    // performs the real transition -- and only self-close on timeout as a
+    // fallback for servers that never send CLOSE after ending the data
+    // stream.
+    if (this.#state !== STATE_CLOSED && this.#closeGraceTimer === null) {
+      this.#closeGraceTimer = setTimeout(() => {
+        this.#closeGraceTimer = null;
+        if (this.#state !== STATE_CLOSED) {
+          this.#state = STATE_CLOSED;
+          this.#releaseStreams();
+          this.#emitClose();
+        }
+      }, DATA_EOF_CLOSE_GRACE_MS);
+      this.#closeGraceTimer?.unref?.();
     }
   }
 
   // ── Private helpers ─────────────────────────────────────────────────
+
+  /**
+   * Cancel any pending data-EOF close-grace timer (wsh #24). Safe to call
+   * whether or not a timer is currently scheduled.
+   * @private
+   */
+  #clearCloseGraceTimer() {
+    if (this.#closeGraceTimer !== null) {
+      clearTimeout(this.#closeGraceTimer);
+      this.#closeGraceTimer = null;
+    }
+  }
 
   /**
    * Release stream resources without sending a CLOSE message.
