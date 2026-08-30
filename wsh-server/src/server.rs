@@ -2220,13 +2220,40 @@ impl WshServer {
                                 }
                                 info!(session_id = %session_id, channel_id, kind = ?p.kind, "channel opened");
 
-                                // Neither the WebSocket nor the WebTransport transport
-                                // layer implements a second multiplexed data stream for
-                                // session I/O (WS only ever reads/writes FRAME_CONTROL
-                                // frames; WebTransport's handle_webtransport() only
-                                // accepts a single bidirectional stream for control).
-                                // So session data must flow as SessionData/Exit control
-                                // messages ("virtual" mode), not raw stream bytes.
+                                // wsh #22 PR 3 of 3's decision (recorded on the
+                                // issue) is to switch `exec` channels to
+                                // `data_mode: Stream` in *both* of clawser's wsh
+                                // servers. This server intentionally still declares
+                                // `Virtual` for every kind, including `exec` --
+                                // tried the literal flip first and reverted it after
+                                // the real end-to-end test suite (tools/test/
+                                // wsh-rust-server.test.mjs) caught a genuine hang:
+                                // `WshSession.close()` (dataMode: 'stream') awaits
+                                // its background read pump finishing, which only
+                                // happens once the *server* sends data or a FIN on
+                                // the client-initiated data stream -- but neither
+                                // this server's WebSocket transport (only ever
+                                // reads/writes FRAME_CONTROL frames) nor its
+                                // WebTransport transport (handle_webtransport()
+                                // only accepts a single bidirectional stream, for
+                                // control) ever touches that stream. Every test that
+                                // closes a still-running exec session (e.g.
+                                // session management / Attach-Resume, which call
+                                // `session.close()` on a `sleep 5` session instead
+                                // of waiting for natural exit) hung forever. Output
+                                // delivery for `exec` still works fine as SessionData
+                                // control messages below (@johnhenry/wsh's WshSession
+                                // delivers those to onData regardless of the
+                                // session's declared data_mode) -- it's specifically
+                                // *declaring* `Stream` without a real second
+                                // multiplexed stream behind it that's unsafe here.
+                                // Standing up a real per-transport data stream (the
+                                // way tools/wsh-server.mjs's #bindDataStream does)
+                                // is necessary follow-up work before this server can
+                                // make the same switch -- tracked separately, out of
+                                // scope for wsh #22 PR 3, whose actual live caller
+                                // is tools/wsh-server.mjs.
+                                let data_mode = SessionDataMode::Virtual;
                                 self.spawn_pty_output_pump(
                                     session_id.clone(),
                                     channel_id,
@@ -2252,7 +2279,7 @@ impl WshServer {
                                     payload: Payload::OpenOk(OpenOkPayload {
                                         channel_id,
                                         stream_ids: vec![],
-                                        data_mode: SessionDataMode::Virtual,
+                                        data_mode,
                                         capabilities: vec![],
                                         session_id: Some(session_id.clone()),
                                         token: Some(session_token),
