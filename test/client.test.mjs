@@ -994,3 +994,143 @@ describe('Stream-mode EncryptedFrame chunk framing end-to-end integration', { sk
     assert.equal(delivered, false);
   });
 });
+
+// ── Data-stream EOF vs EXIT/CLOSE control-message race (wsh #24) ──────
+//
+// Stream-mode sessions carry data and control on two independently-
+// multiplexed transport streams with no guaranteed relative delivery
+// order. A server that ends the data stream and sends EXIT+CLOSE around
+// the same time (as on process exit) can have the data-stream FIN reach
+// the client first. Before the wsh #24 fix, _pumpDataStream() treated
+// that FIN alone as sufficient to close the session, so callers waiting
+// on onClose could resolve before onExit ever fired -- silently losing
+// the exit code. These tests deliberately control the delivery order
+// (something a naive "everything arrives in the expected order" test
+// would never exercise) via the real dispatch entry points --
+// `_bind()`'s pump loop for the data stream and `_handleControlMessage()`
+// for control messages -- rather than poking at session internals.
+
+/**
+ * A stream-mode WshSession bound to a controllable ReadableStream, so
+ * the test can decide exactly when the data stream reaches EOF
+ * independently of when control messages are delivered via
+ * `_handleControlMessage()`.
+ */
+async function makeControllableStreamSession() {
+  const sessionModule = await import('../src/session.mjs');
+  const { WshSession } = sessionModule;
+  const dummyTransport = { sendControl: async () => {} };
+
+  let controller;
+  const readable = new ReadableStream({
+    start(c) {
+      controller = c;
+    },
+  });
+  const session = new WshSession(dummyTransport, 1, {}, 'exec', { dataMode: 'stream' });
+  session._bind(readable, new WritableStream());
+
+  return { session, closeDataStream: () => controller.close() };
+}
+
+describe('WshSession data-stream EOF vs EXIT/CLOSE control-message race (wsh #24)', () => {
+  it('data-stream EOF arriving before EXIT/CLOSE does not lose the exit code (adversarial ordering)', async () => {
+    const { session, closeDataStream } = await makeControllableStreamSession();
+
+    const events = [];
+    const closed = new Promise((resolve) => {
+      session.onClose = () => {
+        events.push('close');
+        resolve();
+      };
+    });
+    session.onExit = (code) => {
+      events.push(`exit:${code}`);
+    };
+
+    // Unlucky delivery order: the data stream's FIN reaches the client
+    // first...
+    closeDataStream();
+    // ...give the pump loop a turn to observe EOF and schedule its grace
+    // timer before the control messages "arrive" (simulating them
+    // actually being in flight on a separate stream at data-EOF time).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // ...and only afterwards do EXIT and CLOSE land, via the real
+    // control-message dispatch path.
+    session._handleControlMessage({ type: MSG.EXIT, code: 42 });
+    session._handleControlMessage({ type: MSG.CLOSE });
+
+    await closed;
+
+    assert.deepEqual(events, ['exit:42', 'close']);
+    assert.equal(session.exitCode, 42);
+  });
+
+  it('CLOSE arriving promptly short-circuits the grace period instead of waiting it out', async () => {
+    const { session, closeDataStream } = await makeControllableStreamSession();
+
+    const closed = new Promise((resolve) => {
+      session.onClose = resolve;
+    });
+
+    closeDataStream();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const start = Date.now();
+    session._handleControlMessage({ type: MSG.EXIT, code: 0 });
+    session._handleControlMessage({ type: MSG.CLOSE });
+    await closed;
+    const elapsed = Date.now() - start;
+
+    // The session-level DATA_EOF_CLOSE_GRACE_MS fallback is 300ms; a
+    // prompt CLOSE must resolve onClose well before that, not idle out
+    // the timer.
+    assert.ok(elapsed < 150, `expected CLOSE to short-circuit the wait, took ${elapsed}ms`);
+  });
+
+  it('control messages arriving before data-stream EOF close normally (non-adversarial ordering)', async () => {
+    const { session, closeDataStream } = await makeControllableStreamSession();
+
+    const events = [];
+    const closed = new Promise((resolve) => {
+      session.onClose = () => {
+        events.push('close');
+        resolve();
+      };
+    });
+    session.onExit = (code) => {
+      events.push(`exit:${code}`);
+    };
+
+    session._handleControlMessage({ type: MSG.EXIT, code: 7 });
+    session._handleControlMessage({ type: MSG.CLOSE });
+    closeDataStream();
+
+    await closed;
+
+    assert.deepEqual(events, ['exit:7', 'close']);
+    assert.equal(session.state, 'closed');
+  });
+
+  it('falls back to closing after the grace period if CLOSE never arrives (no hang)', async () => {
+    const { session, closeDataStream } = await makeControllableStreamSession();
+
+    const closed = new Promise((resolve) => {
+      session.onClose = resolve;
+    });
+
+    const start = Date.now();
+    closeDataStream();
+    // Deliberately never send CLOSE.
+    await closed;
+    const elapsed = Date.now() - start;
+
+    assert.equal(session.state, 'closed');
+    // Must have waited out (approximately) the grace period, not closed
+    // instantly on data-EOF alone...
+    assert.ok(elapsed >= 250, `expected the grace-period fallback (~300ms), closed after only ${elapsed}ms`);
+    // ...but also must not hang indefinitely.
+    assert.ok(elapsed < 2000, `grace-period fallback took far too long: ${elapsed}ms`);
+  });
+});
