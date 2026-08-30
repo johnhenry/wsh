@@ -4,11 +4,15 @@
  * `CryptoKey` this module seals/opens with, and `spec/wsh-v1.yaml`'s
  * `EncryptedFrame` message).
  *
- * This is PR 1 of a multi-PR E2E rollout: it implements the AEAD
- * primitives and wires them into virtual-mode sessions only (see
- * `session.mjs`'s `enableE2E`). Stream-mode sessions (raw WebTransport
- * byte streams with no message boundaries) are explicitly out of scope
- * here -- they need separate ad hoc chunk-framing design.
+ * This module's AEAD primitives were introduced in wsh #19 (virtual-mode
+ * only) and, as of wsh #22 (PR 1 of 3), are reused unchanged by
+ * stream-mode sessions too: `stream-frame.mjs` wraps `sealFrame`/
+ * `openFrame` in inline length-prefixed chunk framing for raw
+ * WebTransport byte streams (no message boundaries), while
+ * `session.mjs`'s `enableE2E` now dispatches to either transport based
+ * on the session's `dataMode`. This module itself needed no changes for
+ * that -- see `stream-frame.mjs`'s doc comment for the chunk-framing
+ * design.
  *
  * ── Nonce construction ─────────────────────────────────────────────
  * Nonces are the AES-GCM-mandated 96 bits (12 bytes), built as:

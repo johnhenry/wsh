@@ -10,6 +10,9 @@ import {
 } from './messages.mjs';
 import { WshVirtualSessionBackend } from './virtual-session.mjs';
 import { sealFrame, openFrame, ROLE_TAGS } from './e2e-frame.mjs';
+import {
+  ChunkAccumulator, encodeChunk, resolveCoalesceOptions, WriteCoalescer, StreamAuthenticationError,
+} from './stream-frame.mjs';
 
 // ── Session states ────────────────────────────────────────────────────
 
@@ -98,6 +101,22 @@ export class WshSession {
 
   /** @type {number} Next expected incoming frame counter from the peer. */
   #e2eRecvCounter = 0;
+
+  /**
+   * Reassembles the raw stdout byte stream into complete sealed chunks
+   * when E2E is enabled on a stream-mode session. `null` for virtual-mode
+   * sessions or when E2E is not enabled.
+   * @type {import('./stream-frame.mjs').ChunkAccumulator|null}
+   */
+  #streamAccumulator = null;
+
+  /**
+   * Batches outgoing stream-mode writes before sealing, per the
+   * write-coalescing design (wsh #22). `null` means coalescing is
+   * disabled (`coalesce: false`) -- every write() seals immediately.
+   * @type {WriteCoalescer|null}
+   */
+  #streamCoalescer = null;
 
   /**
    * The readable side of the stdout data stream.
@@ -320,16 +339,26 @@ export class WshSession {
   }
 
   /**
-   * Opt in to end-to-end encryption for this session's data plane
-   * (virtual-mode sessions only in this PR; stream-mode is out of
-   * scope -- see `e2e-frame.mjs`'s doc comment). After this call,
-   * `write()` seals outgoing data into `EncryptedFrame` messages instead
-   * of plaintext `SessionData`, and incoming `EncryptedFrame` messages
-   * are opened and delivered via `onData` exactly like `SessionData` is
-   * today; plaintext `SessionData` from a peer is no longer expected
-   * once this side has opted in (it's simply passed through unchanged,
-   * as before -- this method doesn't add any negotiation-failure
-   * handling; that's a later PR).
+   * Opt in to end-to-end encryption for this session's data plane.
+   * Works for both virtual-mode and stream-mode sessions (wsh #22
+   * generalized this from virtual-mode-only, #19).
+   *
+   * Virtual-mode: after this call, `write()` seals outgoing data into
+   * `EncryptedFrame` control messages instead of plaintext
+   * `SessionData`, and incoming `EncryptedFrame` messages are opened and
+   * delivered via `onData` exactly like `SessionData` is today;
+   * plaintext `SessionData` from a peer is no longer expected once this
+   * side has opted in (it's simply passed through unchanged, as before
+   * -- this method doesn't add any negotiation-failure handling; that's
+   * a later PR).
+   *
+   * Stream-mode: outgoing bytes are sealed and framed inline in the raw
+   * byte stream (`stream-frame.mjs`'s `[len][nonce][ciphertext]` chunk
+   * format, reusing the same `sealFrame`/`openFrame` primitives) --
+   * invisible to the control-message spec, no new CBOR message type.
+   * Small writes are batched before sealing per `opts.coalesce` (see
+   * below); incoming bytes are reassembled via a `ChunkAccumulator` and
+   * opened per-chunk before reaching `onData`.
    *
    * IMPORTANT -- key lifetime: `sharedSecret` must come from a *fresh*
    * `WshClient.initiateE2E()` call on the *current* connection. E2E
@@ -347,16 +376,17 @@ export class WshSession {
    * @param {'initiator'|'responder'} opts.role - which side of the KeyExchange this session was;
    *   determines this side's nonce role tag (see `e2e-frame.mjs`'s `ROLE_TAGS`). The two peers of
    *   one session MUST pick opposite roles, or their nonces can collide.
+   * @param {false|{maxBytes?: number, maxDelayMs?: number}} [opts.coalesce] - stream-mode only:
+   *   override the default write-coalescing profile derived from this session's `kind`
+   *   ('pty'|'exec'), or pass `false` to seal every write() immediately with no batching.
+   *   Ignored for virtual-mode sessions (each write() is already one EncryptedFrame).
    */
-  enableE2E(sharedSecret, { role } = {}) {
+  enableE2E(sharedSecret, { role, coalesce } = {}) {
     if (!sharedSecret || typeof sharedSecret !== 'object') {
       throw new Error('enableE2E: sharedSecret must be a CryptoKey (see WshClient.initiateE2E)');
     }
     if (role !== 'initiator' && role !== 'responder') {
       throw new Error("enableE2E: opts.role must be 'initiator' or 'responder'");
-    }
-    if (this.#dataMode !== 'virtual') {
-      throw new Error('enableE2E: only virtual-mode sessions are supported in this version (stream-mode is out of scope)');
     }
     if (!this.#sessionId) {
       throw new Error('enableE2E: session has no server-assigned session_id to bind as AAD -- was OPEN_OK missing session_id?');
@@ -366,6 +396,75 @@ export class WshSession {
     this.#e2eRecvRoleTag = role === 'initiator' ? ROLE_TAGS.responder : ROLE_TAGS.initiator;
     this.#e2eSendCounter = 0;
     this.#e2eRecvCounter = 0;
+
+    if (this.#dataMode === 'stream') {
+      // Two-data-plane counter isolation note: send/recv counters above
+      // are per-session (this instance), not shared with any other data
+      // plane -- a session is always exactly one of stream/virtual today,
+      // so there's nothing to cross-wire, but a future refactor that let
+      // one session span both planes simultaneously would need separate
+      // counters per plane.
+      this.#streamAccumulator = new ChunkAccumulator();
+      const profile = resolveCoalesceOptions(this.kind, coalesce);
+      this.#streamCoalescer = profile
+        ? new WriteCoalescer(profile, (bytes) => this.#sealAndWriteStreamChunk(bytes))
+        : null;
+    } else {
+      this.#streamAccumulator = null;
+      this.#streamCoalescer = null;
+    }
+  }
+
+  /**
+   * Seal one stream-mode chunk and write it to the stdin stream. Used
+   * directly by write() when coalescing is disabled, and as the flush
+   * callback for `#streamCoalescer` otherwise.
+   * @private
+   */
+  async #sealAndWriteStreamChunk(bytes) {
+    if (this.#stdinWriter === null) {
+      throw new Error('Session not yet bound — stdin writer unavailable');
+    }
+    const counter = this.#e2eSendCounter++;
+    const { nonce, ciphertext } = await sealFrame(
+      this.#e2eKey, this.#sessionId, this.#e2eSendRoleTag, counter, bytes
+    );
+    await this.#stdinWriter.write(encodeChunk(nonce, ciphertext));
+  }
+
+  /**
+   * Feed newly-read bytes through the stream E2E accumulator and open
+   * every complete chunk it yields.
+   *
+   * @param {Uint8Array} bytes
+   * @returns {Promise<Uint8Array[]|null>} the opened plaintext chunks, in order,
+   *   or `null` if framing was corrupt or a chunk failed authentication
+   *   (already logged; caller should tear the pump down).
+   * @private
+   */
+  async #openStreamChunks(bytes) {
+    let wireChunks;
+    try {
+      wireChunks = this.#streamAccumulator.feed(bytes);
+    } catch (err) {
+      console.error('[wsh:session] stream E2E framing error:', err);
+      return null;
+    }
+    const plaintexts = [];
+    for (const { nonce, ciphertext } of wireChunks) {
+      const counter = this.#e2eRecvCounter++;
+      try {
+        const plaintext = await openFrame(this.#e2eKey, this.#sessionId, counter, { nonce, ciphertext });
+        plaintexts.push(plaintext);
+      } catch (err) {
+        console.error(
+          '[wsh:session] stream E2E chunk failed authentication:',
+          new StreamAuthenticationError(err.message)
+        );
+        return null;
+      }
+    }
+    return plaintexts;
   }
 
   // ── Public API ──────────────────────────────────────────────────────
@@ -401,6 +500,16 @@ export class WshSession {
     }
 
     const bytes = typeof data === 'string' ? textEncoder.encode(data) : data;
+
+    if (this.#e2eKey !== null) {
+      if (this.#streamCoalescer) {
+        await this.#streamCoalescer.write(bytes);
+      } else {
+        await this.#sealAndWriteStreamChunk(bytes);
+      }
+      return;
+    }
+
     await this.#stdinWriter.write(bytes);
   }
 
@@ -482,6 +591,16 @@ export class WshSession {
     }
 
     if (this.#dataMode === 'stream') {
+      // Flush any bytes still batched by write-coalescing before closing
+      // the writer, so a pending buffer isn't silently dropped.
+      if (this.#streamCoalescer) {
+        try {
+          await this.#streamCoalescer.flush();
+        } catch (err) {
+          console.error('[wsh:session] failed to flush coalesced stream E2E writes on close:', err);
+        }
+      }
+
       // Release the stdin writer.
       try {
         await this.#stdinWriter?.close();
@@ -710,13 +829,44 @@ export class WshSession {
         if (this.#abort.signal.aborted) break;
 
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          // Clean EOF: catch a torn (truncated) chunk left in the E2E
+          // accumulator, if any -- per the design, no partial-chunk
+          // plaintext is ever released, so this is purely a diagnostic
+          // (the stream is ending either way).
+          if (this.#e2eKey !== null && this.#streamAccumulator) {
+            try {
+              this.#streamAccumulator.finish();
+            } catch (err) {
+              console.error('[wsh:session] stream E2E torn chunk at stream end:', err);
+            }
+          }
+          break;
+        }
 
         if (value && value.byteLength > 0) {
-          try {
-            this.onData?.(value);
-          } catch (err) {
-            console.error('[wsh:session] onData handler error:', err);
+          if (this.#e2eKey !== null && this.#streamAccumulator) {
+            const deliverable = await this.#openStreamChunks(value);
+            if (deliverable === null) {
+              // Authentication failure (or corrupt framing) -- matches
+              // the strict "no skip-and-continue" philosophy of
+              // virtual-mode's counter check: tear the session down
+              // rather than deliver anything from this point on.
+              break;
+            }
+            for (const plaintext of deliverable) {
+              try {
+                this.onData?.(plaintext);
+              } catch (err) {
+                console.error('[wsh:session] onData handler error:', err);
+              }
+            }
+          } else {
+            try {
+              this.onData?.(value);
+            } catch (err) {
+              console.error('[wsh:session] onData handler error:', err);
+            }
           }
         }
       }

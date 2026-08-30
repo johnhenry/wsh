@@ -842,3 +842,155 @@ describe('EncryptedFrame end-to-end integration', { skip: !hasEd25519 && 'Ed2551
     assert.equal(delivered, false);
   });
 });
+
+// ── Stream-mode chunk-framed EncryptedFrame end-to-end integration (wsh #22) ──
+//
+// Mirrors the virtual-mode integration tests above, but wires two real
+// WshSession instances in stream mode (`_bind()` with actual
+// ReadableStream/WritableStream pairs, like a real WebTransport data
+// stream) instead of `_activateVirtual()`. Confirms the whole PR-1 path
+// end to end: enableE2E() on a stream-mode session, write()'s chunk
+// sealing + framing (src/stream-frame.mjs's encodeChunk), and
+// _pumpDataStream()'s ChunkAccumulator + openFrame reassembly, all using
+// real production initiateE2E() key exchange.
+
+/**
+ * Builds a linked ReadableStream/WritableStream pair standing in for one
+ * direction of a raw WebTransport data stream: bytes written to
+ * `writable` are recorded in `wireLog` (standing in for what an
+ * eavesdropping relay/server would see) and then delivered to
+ * `readable`, optionally mutated by `mutate` first (to simulate an
+ * active tamperer).
+ */
+function makeLinkedStreamPair(wireLog, mutate) {
+  let controller;
+  const readable = new ReadableStream({
+    start(c) {
+      controller = c;
+    },
+  });
+  const writable = new WritableStream({
+    write(chunk) {
+      wireLog.push(chunk);
+      controller.enqueue(mutate ? mutate(chunk) : chunk);
+    },
+    close() {
+      controller.close();
+    },
+    abort(reason) {
+      controller.error(reason);
+    },
+  });
+  return { readable, writable };
+}
+
+describe('Stream-mode EncryptedFrame chunk framing end-to-end integration', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
+  it('two real WshClient/WshSession pairs exchange chunk-framed sealed data over a raw stream that an eavesdropper cannot read', async () => {
+    const keyPairA = await auth.generateKeyPair(true);
+    const keyPairB = await auth.generateKeyPair(true);
+
+    const transportA = new E2ELinkedTransport('sess-e2e-stream');
+    const transportB = new E2ELinkedTransport('sess-e2e-stream');
+    transportA.link(transportB);
+    transportB.link(transportA);
+
+    const clientA = new clientMod.WshClient({ transportFactories: { ws: () => transportA } });
+    const clientB = new clientMod.WshClient({ transportFactories: { ws: () => transportB } });
+    await clientA.connect('ws://test.invalid', { username: 'alice', keyPair: keyPairA, transport: 'ws' });
+    await clientB.connect('ws://test.invalid', { username: 'bob', keyPair: keyPairB, transport: 'ws' });
+
+    const [resultA, resultB] = await Promise.all([
+      clientA.initiateE2E('sess-e2e-stream', 'X25519', 30_000),
+      clientB.initiateE2E('sess-e2e-stream', 'X25519', 30_000),
+    ]);
+
+    const sessionModule = await import('../src/session.mjs');
+    const { WshSession } = sessionModule;
+
+    const dummyTransport = { sendControl: async () => {} };
+    // 'exec' kind, matching the design's revised PR-3 plan to switch
+    // exec-type sessions to stream-mode data planes.
+    const sessionA = new WshSession(dummyTransport, 1, {}, 'exec', { dataMode: 'stream', sessionId: 'sess-e2e-stream' });
+    const sessionB = new WshSession(dummyTransport, 1, {}, 'exec', { dataMode: 'stream', sessionId: 'sess-e2e-stream' });
+
+    const wireLog = [];
+    const pipeAtoB = makeLinkedStreamPair(wireLog);
+    // sessionA never receives; sessionB never sends -- only the A -> B
+    // direction is exercised here, so the other halves are unused stubs.
+    sessionA._bind(new ReadableStream(), pipeAtoB.writable);
+    sessionB._bind(pipeAtoB.readable, new WritableStream());
+
+    // coalesce: false so this single write() seals and sends immediately
+    // (no timer/threshold to wait out in the test).
+    sessionA.enableE2E(resultA.sharedSecret, { role: 'initiator', coalesce: false });
+    sessionB.enableE2E(resultB.sharedSecret, { role: 'responder', coalesce: false });
+
+    const plaintext = 'this is a secret message sent over the raw chunk-framed stream';
+    const received = new Promise((resolve) => {
+      sessionB.onData = (data) => resolve(new TextDecoder().decode(data));
+    });
+
+    await sessionA.write(plaintext);
+    const receivedText = await received;
+
+    assert.equal(receivedText, plaintext);
+
+    // The eavesdropper must never see the plaintext, or any substring of
+    // it, anywhere in the raw bytes that crossed the "wire".
+    assert.equal(wireLog.length, 1);
+    const wireBytes = Buffer.concat(wireLog.map((chunk) => Buffer.from(chunk))).toString('latin1');
+    assert.equal(wireBytes.includes(plaintext), false);
+  });
+
+  it('a tampered chunk on the raw stream is not delivered as corrupted plaintext', async () => {
+    const keyPairA = await auth.generateKeyPair(true);
+    const keyPairB = await auth.generateKeyPair(true);
+
+    const transportA = new E2ELinkedTransport('sess-e2e-stream-tamper');
+    const transportB = new E2ELinkedTransport('sess-e2e-stream-tamper');
+    transportA.link(transportB);
+    transportB.link(transportA);
+
+    const clientA = new clientMod.WshClient({ transportFactories: { ws: () => transportA } });
+    const clientB = new clientMod.WshClient({ transportFactories: { ws: () => transportB } });
+    await clientA.connect('ws://test.invalid', { username: 'alice', keyPair: keyPairA, transport: 'ws' });
+    await clientB.connect('ws://test.invalid', { username: 'bob', keyPair: keyPairB, transport: 'ws' });
+
+    const [resultA, resultB] = await Promise.all([
+      clientA.initiateE2E('sess-e2e-stream-tamper', 'X25519', 30_000),
+      clientB.initiateE2E('sess-e2e-stream-tamper', 'X25519', 30_000),
+    ]);
+
+    const sessionModule = await import('../src/session.mjs');
+    const { WshSession } = sessionModule;
+    const dummyTransport = { sendControl: async () => {} };
+    const sessionA = new WshSession(dummyTransport, 1, {}, 'exec', { dataMode: 'stream', sessionId: 'sess-e2e-stream-tamper' });
+    const sessionB = new WshSession(dummyTransport, 1, {}, 'exec', { dataMode: 'stream', sessionId: 'sess-e2e-stream-tamper' });
+
+    const wireLog = [];
+    // Flip a byte inside the ciphertext region of the wire-format chunk
+    // ([4-byte len][12-byte nonce][ciphertext+tag]), simulating an
+    // active tamperer on the raw stream.
+    const pipeAtoB = makeLinkedStreamPair(wireLog, (chunk) => {
+      const tampered = chunk.slice();
+      tampered[4 + 12] ^= 0xff;
+      return tampered;
+    });
+    sessionA._bind(new ReadableStream(), pipeAtoB.writable);
+    sessionB._bind(pipeAtoB.readable, new WritableStream());
+
+    sessionA.enableE2E(resultA.sharedSecret, { role: 'initiator', coalesce: false });
+    sessionB.enableE2E(resultB.sharedSecret, { role: 'responder', coalesce: false });
+
+    let delivered = false;
+    sessionB.onData = () => {
+      delivered = true;
+    };
+
+    await sessionA.write('will be tampered with on the raw stream');
+    // Give the async openFrame()/pump loop a turn to run.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(delivered, false);
+  });
+});
