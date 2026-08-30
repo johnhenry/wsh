@@ -755,6 +755,7 @@ impl WshSession {
 
     /// Handle a session-specific control message from the server.
     pub(crate) async fn handle_control(&self, envelope: &Envelope) -> WshResult<()> {
+        eprintln!("DEBUGTRACE session.handle_control payload={:?}", envelope.payload);
         match &envelope.payload {
             Payload::SessionData(data) => match &self.backend {
                 SessionBackend::Virtual(backend) => backend.push_data(data.data.clone()).await,

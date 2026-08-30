@@ -40,11 +40,13 @@ pub async fn run(
     let mut stdout = std::io::stdout().lock();
     let mut buf = vec![0u8; 8192];
     loop {
+        eprintln!("DEBUGTRACE exec.rs calling session.read()");
         let n = session
             .read(&mut buf)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
             .context("failed reading exec output")?;
+        eprintln!("DEBUGTRACE exec.rs session.read() returned n={}", n);
         if n == 0 {
             break;
         }
@@ -54,9 +56,13 @@ pub async fn run(
         stdout.flush().context("failed flushing stdout")?;
     }
 
+    eprintln!("DEBUGTRACE exec.rs read loop done, getting exit_code");
     let exit_code = session.exit_code().await.unwrap_or(0);
+    eprintln!("DEBUGTRACE exec.rs exit_code={}, closing session", exit_code);
     let _ = session.close().await;
+    eprintln!("DEBUGTRACE exec.rs session closed, disconnecting client");
     let _ = client.disconnect().await;
+    eprintln!("DEBUGTRACE exec.rs client disconnected");
     if exit_code != 0 {
         eprintln!("wsh: remote command exited with code {exit_code}");
         std::process::exit(exit_code);

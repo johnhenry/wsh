@@ -1,302 +1,325 @@
 //! WebSocket transport implementation for wsh.
 //!
-//! Multiplexes multiple virtual streams over a single WebSocket connection.
+//! Speaks QMux (draft-ietf-quic-qmux-02) over the single WebSocket
+//! connection, mirroring the server's `handle_websocket`
+//! (`crates/wsh-server/src/server.rs`) and its `transport/websocket.rs`
+//! (`ws_send_raw`/`ws_recv_raw`): every WS binary message is a raw QMux
+//! record, fed straight into a `wsh_core::qmux_connection::QMuxConnection`.
+//! The client's first (and only) locally-initiated bidirectional QMux
+//! stream is always ID 0 (`first_bidi_stream_id(Client) == 0`), matching
+//! the server's `CONTROL_STREAM_ID` constant, and carries every control
+//! *and* session-data envelope -- length-prefix-framed via
+//! `wsh_core::codec::{frame_encode, FrameDecoder}` -- because this server
+//! always declares `SessionDataMode::Virtual` (see that constant's doc
+//! comment in `server.rs`: no per-session second QMux stream exists yet).
+//! `open_stream`/`accept_stream` are consequently never exercised against
+//! this server and return an error rather than pretending to support
+//! something nothing on the wire actually implements.
 //!
-//! Frame format: `[1-byte type][4-byte stream_id][payload]`
-//!
-//! Frame types:
-//! - `0x01` — control message
-//! - `0x02` — data (routed to stream by stream_id)
-//! - `0x03` — open_stream (request to open a new virtual stream)
-//! - `0x04` — close_stream (close a virtual stream)
+//! This replaces an earlier, unrelated hand-rolled `[type][stream_id]`
+//! framing that predated the server's QMux migration and was never
+//! actually compatible with it (issue #38's Phase 1 loopback proof is
+//! what first exercised a real `wss://` connection all the way through
+//! TLS to the protocol layer and caught the mismatch).
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, Connector, MaybeTlsStream, WebSocketStream};
 
+use wsh_core::codec::FrameDecoder;
 use wsh_core::error::{WshError, WshResult};
-use wsh_core::transport::{ByteStream, IdentifiedStream, TransportSession};
+use wsh_core::qmux::ErrorCode;
+use wsh_core::qmux_connection::{QMuxConnection, QMuxConnectionConfig, QMuxEvent};
+use wsh_core::transport::{IdentifiedStream, TransportSession};
 
-/// WebSocket frame type markers.
-const FRAME_CONTROL: u8 = 0x01;
-const FRAME_DATA: u8 = 0x02;
-const FRAME_OPEN_STREAM: u8 = 0x03;
-const FRAME_CLOSE_STREAM: u8 = 0x04;
+/// Environment variable that, when set to `1` or `true`, disables TLS
+/// certificate verification for the `wss://` connection this process
+/// makes.
+///
+/// **This exists solely for the Phase 1 loopback proof harness
+/// (`tools/guest-image/init.sh`, driven by
+/// `tools/guest-image/boot-test.mjs` — see issue #38) and MUST NOT be set
+/// for any real remote connection.** `wsh-server`'s dev cert is
+/// self-signed and there is currently no hash-pinning trust path for
+/// `wss://` in this codebase (unlike WebTransport, which pins on the
+/// server's certificate hash via `wtransport`'s
+/// `ClientConfig::with_no_cert_validation()` — see
+/// `transport/webtransport.rs`). Skipping verification is the only way to
+/// complete a loopback `wss://127.0.0.1` handshake against that cert
+/// without a CA-trusted certificate, which the minimal guest image used
+/// for the Phase 1 proof doesn't have anyway (no `/etc/ssl/certs`).
+///
+/// Nothing in this codebase sets this variable except the loopback test
+/// harness above — it is off by default, and turning it on for a real
+/// connection would allow a MITM to impersonate any server.
+const INSECURE_LOOPBACK_TLS_ENV: &str = "WSH_INSECURE_LOOPBACK_TLS";
 
-/// Build a multiplexed frame: `[type][stream_id BE][payload]`.
-fn build_frame(frame_type: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(1 + 4 + payload.len());
-    frame.push(frame_type);
-    frame.extend_from_slice(&stream_id.to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame
+fn insecure_loopback_tls_requested() -> bool {
+    matches!(
+        std::env::var(INSECURE_LOOPBACK_TLS_ENV).as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
-/// Parse a multiplexed frame header: `(type, stream_id, payload_offset)`.
-fn parse_frame_header(data: &[u8]) -> WshResult<(u8, u32, usize)> {
-    if data.len() < 5 {
-        return Err(WshError::Transport("frame too short".into()));
-    }
-    let frame_type = data[0];
-    let stream_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-    Ok((frame_type, stream_id, 5))
+/// A `rustls` certificate verifier that accepts any certificate chain,
+/// for any server name, unconditionally.
+///
+/// Only ever constructed when [`INSECURE_LOOPBACK_TLS_ENV`] is set — see
+/// that constant's doc comment for the full scoping rationale. This is
+/// the `wss://` analogue of `wtransport`'s built-in
+/// `with_no_cert_validation()`, which the WebTransport transport
+/// (`transport/webtransport.rs`) already uses unconditionally today.
+#[derive(Debug)]
+struct NoOpServerCertVerifier {
+    supported_schemes: Vec<rustls::SignatureScheme>,
 }
 
-fn decode_control_payload(data: &[u8]) -> WshResult<&[u8]> {
-    if data.len() < 4 {
-        return Err(WshError::Transport(format!(
-            "control payload too short: {} bytes",
-            data.len()
-        )));
+impl rustls::client::danger::ServerCertVerifier for NoOpServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
-    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() != 4 + len {
-        return Err(WshError::Transport(format!(
-            "control payload length mismatch: declared {len}, got {} bytes",
-            data.len().saturating_sub(4)
-        )));
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
-    Ok(&data[4..])
-}
-
-/// A virtual byte stream backed by mpsc channels.
-struct VirtualStream {
-    stream_id: u32,
-    rx: mpsc::Receiver<Vec<u8>>,
-    tx_ws: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
-    read_buf: Vec<u8>,
-    read_offset: usize,
-    closed: bool,
-}
-
-impl ByteStream for VirtualStream {
-    fn read<'a>(
-        &'a mut self,
-        buf: &'a mut [u8],
-    ) -> Pin<Box<dyn Future<Output = WshResult<usize>> + Send + 'a>> {
-        Box::pin(async move {
-            // Drain leftover bytes from previous read
-            if self.read_offset < self.read_buf.len() {
-                let available = self.read_buf.len() - self.read_offset;
-                let n = available.min(buf.len());
-                buf[..n].copy_from_slice(&self.read_buf[self.read_offset..self.read_offset + n]);
-                self.read_offset += n;
-                if self.read_offset >= self.read_buf.len() {
-                    self.read_buf.clear();
-                    self.read_offset = 0;
-                }
-                return Ok(n);
-            }
-
-            // Wait for next chunk
-            match self.rx.recv().await {
-                Some(data) => {
-                    let n = data.len().min(buf.len());
-                    buf[..n].copy_from_slice(&data[..n]);
-                    if n < data.len() {
-                        self.read_buf = data;
-                        self.read_offset = n;
-                    }
-                    Ok(n)
-                }
-                None => Ok(0), // Channel closed = EOF
-            }
-        })
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
-    fn write_all<'a>(
-        &'a mut self,
-        data: &'a [u8],
-    ) -> Pin<Box<dyn Future<Output = WshResult<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let frame = build_frame(FRAME_DATA, self.stream_id, data);
-            let mut sink = self.tx_ws.lock().await;
-            sink.send(Message::Binary(frame))
-                .await
-                .map_err(|e| WshError::Transport(format!("WS write error: {e}")))?;
-            Ok(())
-        })
-    }
-
-    fn close(&mut self) -> Pin<Box<dyn Future<Output = WshResult<()>> + Send + '_>> {
-        Box::pin(async move {
-            if !self.closed {
-                self.closed = true;
-                let frame = build_frame(FRAME_CLOSE_STREAM, self.stream_id, &[]);
-                let mut sink = self.tx_ws.lock().await;
-                let _ = sink.send(Message::Binary(frame)).await;
-            }
-            Ok(())
-        })
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_schemes.clone()
     }
 }
 
-/// WebSocket transport session with virtual stream multiplexing.
+/// Build a `tokio-tungstenite` connector that skips TLS certificate
+/// verification. Only called when [`insecure_loopback_tls_requested`]
+/// returns true.
+fn build_insecure_loopback_connector() -> Connector {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(NoOpServerCertVerifier {
+        supported_schemes: provider.signature_verification_algorithms.supported_schemes(),
+    });
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions are always valid")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Connector::Rustls(Arc::new(config))
+}
+
+/// Maximum frame size for WebSocket messages (1 MiB, matching the
+/// server's `MAX_WS_FRAME_SIZE`).
+const MAX_WS_FRAME_SIZE: usize = 1_048_576;
+
+type WsSink = futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
 pub struct WebSocketSession {
-    ws_sink: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+    qmux: Arc<QMuxConnection>,
+    control_stream_id: u64,
     control_rx: mpsc::Receiver<Vec<u8>>,
-    incoming_streams_rx: mpsc::Receiver<(u32, mpsc::Receiver<Vec<u8>>)>,
-    stream_registry: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
-    next_stream_id: Arc<Mutex<u32>>,
-    dispatch_handle: tokio::task::JoinHandle<()>,
+    io_handle: tokio::task::JoinHandle<()>,
+    event_handle: tokio::task::JoinHandle<()>,
     connected: Arc<Mutex<bool>>,
 }
 
 impl WebSocketSession {
     /// Connect to a wsh server over WebSocket.
     pub async fn connect(url: &str) -> WshResult<Self> {
-        let (ws_stream, _response) = connect_async(url)
-            .await
-            .map_err(|e| WshError::Transport(format!("WebSocket connect error: {e}")))?;
+        let (ws_stream, _response) = if insecure_loopback_tls_requested() {
+            // See INSECURE_LOOPBACK_TLS_ENV's doc comment: only reachable
+            // when the loopback test harness explicitly opts in.
+            tracing::warn!(
+                "{} is set — skipping wss:// certificate verification \
+                 (loopback test harness only, see issue #38)",
+                INSECURE_LOOPBACK_TLS_ENV
+            );
+            let connector = build_insecure_loopback_connector();
+            tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
+                .await
+                .map_err(|e| WshError::Transport(format!("WebSocket connect error: {e}")))?
+        } else {
+            connect_async(url)
+                .await
+                .map_err(|e| WshError::Transport(format!("WebSocket connect error: {e}")))?
+        };
 
         tracing::info!("WebSocket connected to {}", url);
 
-        let (ws_sink, ws_stream_read) = ws_stream.split();
+        let (ws_sink, ws_read) = ws_stream.split();
         let ws_sink = Arc::new(Mutex::new(ws_sink));
+        let alive = Arc::new(Mutex::new(true));
+
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<QMuxEvent>();
+
+        let qmux = Arc::new(QMuxConnection::new(
+            QMuxConnectionConfig {
+                is_client: true,
+                ..Default::default()
+            },
+            move |bytes: &[u8]| {
+                let _ = outbound_tx.send(bytes.to_vec());
+            },
+            event_tx,
+        ));
+        qmux.send_handshake()?;
+        let control_stream_id = qmux.open_stream().await?;
+        let ws_sink_for_io = ws_sink.clone();
+        let qmux_for_io = qmux.clone();
+        let alive_for_io = alive.clone();
+        let io_handle = tokio::spawn(async move {
+            Self::io_loop(ws_read, ws_sink_for_io, outbound_rx, qmux_for_io, alive_for_io).await;
+        });
 
         let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (incoming_tx, incoming_streams_rx) =
-            mpsc::channel::<(u32, mpsc::Receiver<Vec<u8>>)>(64);
-
-        let stream_registry: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let connected = Arc::new(Mutex::new(true));
-
-        // Spawn the dispatch loop
-        let dispatch_handle = {
-            let registry = stream_registry.clone();
-            let connected = connected.clone();
-            let ws_sink_clone = ws_sink.clone();
-
-            tokio::spawn(async move {
-                Self::dispatch_loop(
-                    ws_stream_read,
-                    control_tx,
-                    incoming_tx,
-                    registry,
-                    connected,
-                    ws_sink_clone,
-                )
-                .await;
-            })
-        };
+        let alive_for_events = alive.clone();
+        let event_handle = tokio::spawn(async move {
+            Self::event_loop(event_rx, control_stream_id, control_tx, alive_for_events).await;
+        });
 
         Ok(Self {
-            ws_sink,
+            qmux,
+            control_stream_id,
             control_rx,
-            incoming_streams_rx,
-            stream_registry,
-            next_stream_id: Arc::new(Mutex::new(1)), // Client uses odd IDs
-            dispatch_handle,
-            connected,
+            io_handle,
+            event_handle,
+            connected: alive,
         })
     }
 
-    /// Internal dispatch loop that routes incoming WebSocket frames.
-    async fn dispatch_loop(
+    async fn io_loop(
         mut ws_read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-        control_tx: mpsc::Sender<Vec<u8>>,
-        incoming_tx: mpsc::Sender<(u32, mpsc::Receiver<Vec<u8>>)>,
-        stream_registry: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
-        connected: Arc<Mutex<bool>>,
-        ws_sink: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+        ws_sink: Arc<Mutex<WsSink>>,
+        mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        qmux: Arc<QMuxConnection>,
+        alive: Arc<Mutex<bool>>,
     ) {
-        while let Some(msg) = ws_read.next().await {
-            let data = match msg {
-                Ok(Message::Binary(data)) => data,
-                Ok(Message::Close(_)) => {
-                    tracing::debug!("WebSocket close frame received");
-                    break;
-                }
-                Ok(Message::Ping(payload)) => {
-                    // Respond to pings
-                    let mut sink = ws_sink.lock().await;
-                    let _ = sink.send(Message::Pong(payload)).await;
-                    continue;
-                }
-                Ok(_) => continue, // Ignore text frames, pongs, etc.
-                Err(e) => {
-                    tracing::error!("WebSocket read error: {}", e);
-                    break;
-                }
-            };
-
-            let (frame_type, stream_id, offset) = match parse_frame_header(&data) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("invalid frame: {}", e);
-                    continue;
-                }
-            };
-
-            let payload = &data[offset..];
-
-            match frame_type {
-                FRAME_CONTROL => {
-                    let control_payload = match decode_control_payload(payload) {
-                        Ok(payload) => payload,
-                        Err(e) => {
-                            tracing::warn!("invalid control payload: {}", e);
-                            continue;
+        loop {
+            tokio::select! {
+                outbound = outbound_rx.recv() => {
+                    match outbound {
+                        Some(bytes) => {
+                            let mut sink = ws_sink.lock().await;
+                            if sink.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
                         }
-                    };
-
-                    if control_tx.send(control_payload.to_vec()).await.is_err() {
-                        tracing::debug!("control channel closed");
-                        break;
+                        None => break,
                     }
                 }
-                FRAME_DATA => {
-                    let registry = stream_registry.lock().await;
-                    if let Some(tx) = registry.get(&stream_id) {
-                        let _ = tx.send(payload.to_vec()).await;
-                    } else {
-                        tracing::warn!("data for unknown stream {}", stream_id);
+                msg = ws_read.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(data))) => {
+                            if data.len() > MAX_WS_FRAME_SIZE {
+                                tracing::warn!("WS frame too large: {} bytes", data.len());
+                                break;
+                            }
+                            qmux.receive_bytes(&data);
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            tracing::debug!("WebSocket close frame received");
+                            break;
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            let mut sink = ws_sink.lock().await;
+                            let _ = sink.send(Message::Pong(payload)).await;
+                        }
+                        Some(Ok(_)) => continue,
+                        Some(Err(e)) => {
+                            tracing::error!("WebSocket read error: {}", e);
+                            break;
+                        }
+                        None => break,
                     }
-                }
-                FRAME_OPEN_STREAM => {
-                    // Remote side wants to open a stream
-                    let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-                    {
-                        let mut registry = stream_registry.lock().await;
-                        registry.insert(stream_id, tx);
-                    }
-                    let _ = incoming_tx.send((stream_id, rx)).await;
-                }
-                FRAME_CLOSE_STREAM => {
-                    let mut registry = stream_registry.lock().await;
-                    registry.remove(&stream_id);
-                }
-                _ => {
-                    tracing::warn!("unknown frame type: 0x{:02x}", frame_type);
                 }
             }
         }
+        *alive.lock().await = false;
+    }
 
-        let mut c = connected.lock().await;
-        *c = false;
-        tracing::debug!("WebSocket dispatch loop ended");
+    async fn event_loop(
+        mut event_rx: mpsc::UnboundedReceiver<QMuxEvent>,
+        control_stream_id: u64,
+        control_tx: mpsc::Sender<Vec<u8>>,
+        alive: Arc<Mutex<bool>>,
+    ) {
+        let mut control_decoder = FrameDecoder::new();
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                QMuxEvent::StreamData { stream_id, data } if stream_id == control_stream_id => {
+                    for frame in control_decoder.feed_raw(&data) {
+                        if control_tx.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                QMuxEvent::StreamData { stream_id, .. } => {
+                    tracing::warn!(stream_id, "ignoring StreamData on non-control QMux stream");
+                }
+                QMuxEvent::StreamEnd { stream_id } | QMuxEvent::StreamReset { stream_id, .. }
+                    if stream_id == control_stream_id =>
+                {
+                    tracing::debug!("QMux control stream ended");
+                    break;
+                }
+                QMuxEvent::StreamDestroyed { stream_id } if stream_id == control_stream_id => {
+                    break;
+                }
+                QMuxEvent::ConnectionClosed { reason, .. } => {
+                    tracing::debug!(reason, "QMux connection closed");
+                    break;
+                }
+                QMuxEvent::Error { message } => {
+                    tracing::error!("QMux error: {}", message);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        *alive.lock().await = false;
+    }
+
+    /// This server always declares `SessionDataMode::Virtual` (see its
+    /// doc comment in server.rs), so no session ever asks a WebSocket
+    /// transport to open a real second QMux stream in practice. Fail
+    /// loudly instead of pretending to support it.
+    fn no_real_data_stream_error() -> WshResult<IdentifiedStream> {
+        Err(WshError::Transport(
+            "WebSocket transport does not support real data streams for this server".into(),
+        ))
     }
 }
 
 impl TransportSession for WebSocketSession {
     async fn send_control(&mut self, data: &[u8]) -> WshResult<()> {
-        let frame = build_frame(FRAME_CONTROL, 0, data);
-        let mut sink = self.ws_sink.lock().await;
-        sink.send(Message::Binary(frame))
+        self.qmux
+            .write_stream(self.control_stream_id, data)
             .await
-            .map_err(|e| WshError::Transport(format!("WS control send error: {e}")))?;
-        Ok(())
+            .map_err(WshError::from)
     }
 
     async fn recv_control(&mut self) -> WshResult<Vec<u8>> {
@@ -307,92 +330,29 @@ impl TransportSession for WebSocketSession {
     }
 
     async fn open_stream(&mut self) -> WshResult<IdentifiedStream> {
-        let stream_id = {
-            let mut id = self.next_stream_id.lock().await;
-            let current = *id;
-            *id += 2; // Client uses odd IDs, increment by 2
-            current
-        };
-
-        // Register the stream's receive channel
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-        {
-            let mut registry = self.stream_registry.lock().await;
-            registry.insert(stream_id, tx);
-        }
-
-        // Notify the remote side
-        let frame = build_frame(FRAME_OPEN_STREAM, stream_id, &[]);
-        {
-            let mut sink = self.ws_sink.lock().await;
-            sink.send(Message::Binary(frame))
-                .await
-                .map_err(|e| WshError::Transport(format!("WS open_stream error: {e}")))?;
-        }
-
-        Ok(IdentifiedStream {
-            id: stream_id,
-            stream: Box::new(VirtualStream {
-                stream_id,
-                rx,
-                tx_ws: self.ws_sink.clone(),
-                read_buf: Vec::new(),
-                read_offset: 0,
-                closed: false,
-            }),
-        })
+        Self::no_real_data_stream_error()
     }
 
     async fn accept_stream(&mut self) -> WshResult<IdentifiedStream> {
-        let (stream_id, rx) = self
-            .incoming_streams_rx
-            .recv()
-            .await
-            .ok_or_else(|| WshError::Transport("incoming stream channel closed".into()))?;
-
-        Ok(IdentifiedStream {
-            id: stream_id,
-            stream: Box::new(VirtualStream {
-                stream_id,
-                rx,
-                tx_ws: self.ws_sink.clone(),
-                read_buf: Vec::new(),
-                read_offset: 0,
-                closed: false,
-            }),
-        })
+        Self::no_real_data_stream_error()
     }
 
     async fn close(&mut self) -> WshResult<()> {
-        {
-            let mut c = self.connected.lock().await;
-            *c = false;
-        }
-        let mut sink = self.ws_sink.lock().await;
-        let _ = sink.send(Message::Close(None)).await;
-        self.dispatch_handle.abort();
+        *self.connected.lock().await = false;
+        let _ = self.qmux.close(ErrorCode::NoError, "client disconnect");
+        self.io_handle.abort();
+        self.event_handle.abort();
         Ok(())
     }
 
     fn is_connected(&self) -> bool {
-        // Non-blocking check — use try_lock to avoid blocking
         self.connected.try_lock().map(|c| *c).unwrap_or(false)
     }
 }
 
 impl Drop for WebSocketSession {
     fn drop(&mut self) {
-        self.dispatch_handle.abort();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::decode_control_payload;
-
-    #[test]
-    fn decode_control_payload_unwraps_inner_frame() {
-        let payload = decode_control_payload(&[0, 0, 0, 2, 0xa0, 0xf5]).unwrap();
-        assert_eq!(payload, &[0xa0, 0xf5]);
+        self.io_handle.abort();
+        self.event_handle.abort();
     }
 }

@@ -714,6 +714,24 @@ impl WshClient {
             }
         }
 
+        // Stop the dispatch/keepalive tasks *before* touching the
+        // transport lock below. The dispatch loop's "receive" select arm
+        // holds `self.transport`'s lock for the full duration of its
+        // `recv_control().await` call, which -- once there's no more
+        // traffic left to receive (as here, right after the last session
+        // closed) -- blocks forever. Without this abort, the
+        // `self.transport.lock().await` a few lines down would deadlock
+        // against that still-parked task instead of ever closing the
+        // transport. (First hit in practice by issue #38's Phase 1
+        // loopback proof: nothing had exercised a full connect ->
+        // exec -> disconnect cycle to completion before.)
+        if let Some(handle) = &self.dispatch_handle {
+            handle.abort();
+        }
+        if let Some(handle) = &self.keepalive_handle {
+            handle.abort();
+        }
+
         // Close the transport
         {
             let mut transport = self.transport.lock().await;
@@ -1096,6 +1114,7 @@ impl WshClient {
                         Ok(data) => {
                             match decode_envelope(&data) {
                                 Ok(envelope) => {
+                                    eprintln!("DEBUGTRACE dispatch_loop got envelope msg_type={:?}", envelope.msg_type);
                                     Self::handle_incoming(
                                         envelope,
                                         &response_tx,
@@ -1105,6 +1124,7 @@ impl WshClient {
                                         &relay_message_tx,
                                         &accepted_relay_peers,
                                     ).await;
+                                    eprintln!("DEBUGTRACE dispatch_loop handle_incoming returned");
                                 }
                                 Err(e) => {
                                     tracing::warn!("failed to decode control message: {}", e);
