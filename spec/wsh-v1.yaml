@@ -1294,23 +1294,35 @@ messages:
 
   # ── E2E encryption (EXPERIMENTAL) ─────────────────────────────────────
   # Inner encryption layer intended for end-to-end confidentiality: after
-  # key exchange, session data is wrapped in EncryptedFrame messages so
-  # the server cannot read session content. Status per side of the wire:
+  # key exchange, session data is protected so the server cannot read
+  # session content. Status per side of the wire:
   # WshClient.initiateE2E() performs a real X25519 ECDH exchange
   # (optionally hybrid with ML-KEM-768, see below) and derives an
   # AES-256-GCM key (src/client.mjs); as of this JS library's
-  # EncryptedFrame support (wsh #19), that key is now actually used to
-  # seal/open virtual-mode session data via WshSession.enableE2E()
-  # (src/session.mjs, src/e2e-frame.mjs) -- stream-mode sessions (raw
-  # byte streams, no message boundaries) aren't wired up yet. The Rust
-  # client (clawser's wsh-client crate) does have KeyExchange/
+  # EncryptedFrame support (wsh #19), that key is used to seal/open
+  # virtual-mode session data (discrete SessionData control messages
+  # swapped 1:1 for EncryptedFrame) via WshSession.enableE2E()
+  # (src/session.mjs, src/e2e-frame.mjs). As of wsh #22 (PR 1 of a
+  # 3-PR rollout), the same key/enableE2E() call also covers
+  # stream-mode sessions (raw byte streams, no message boundaries):
+  # sealed chunks are framed *inline in the raw stream itself* --
+  # [4-byte big-endian length][12-byte nonce][ciphertext + 16-byte GCM
+  # tag] -- reusing the exact same sealFrame/openFrame primitives and
+  # nonce scheme as EncryptedFrame, just without a CBOR envelope. This
+  # inline chunk framing is invisible to this control-message spec: it
+  # lives entirely inside the byte stream a session's data plane already
+  # carries, so it introduces no new message type here (see
+  # src/stream-frame.mjs for the framing/reassembly implementation).
+  # The Rust client (clawser's wsh-client crate) does have KeyExchange/
   # initiate_e2e support, but does not yet construct or consume
-  # EncryptedFrame -- that AEAD sealing is tracked as a separate
-  # follow-up in that repo. The Rust server only relays both message
-  # types opaquely between session participants (correct for true E2E,
+  # EncryptedFrame or stream-mode chunk framing -- that AEAD sealing is
+  # tracked as a separate follow-up in that repo (wsh #22's PR 2/PR 3).
+  # The Rust server only relays both message types (and raw stream
+  # bytes) opaquely between session participants (correct for true E2E,
   # but doesn't imply either side actually encrypts). Do not rely on
   # this for confidentiality against a peer that hasn't actually called
-  # enableE2E()/opened an EncryptedFrame-sealing equivalent.
+  # enableE2E()/opened an EncryptedFrame-sealing (or stream chunk
+  # framing) equivalent.
   e2e:
     KeyExchange:
       code: 0x8e
@@ -1365,7 +1377,13 @@ messages:
       description: >
         An encrypted payload carrying virtual-mode session data, once
         KeyExchange's derived secret is wired to real encryption via
-        WshSession.enableE2E() (see the e2e section note above). Sent
+        WshSession.enableE2E() (see the e2e section note above).
+        Virtual-mode only -- stream-mode sessions never send this
+        message type; their sealed data instead travels as inline
+        length-prefixed chunks inside the raw byte stream itself (see
+        the e2e section note above and src/stream-frame.mjs), since a
+        stream-mode session has no control-message channel to carry a
+        CBOR envelope like this one through. Sent
         using AES-256-GCM AEAD, matching the cipher
         WshClient.initiateE2E() derives a key for (src/client.mjs) --
         picked over the ChaCha20-Poly1305 this field previously
