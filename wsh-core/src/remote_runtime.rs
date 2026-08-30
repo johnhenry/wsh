@@ -38,6 +38,15 @@ pub enum ShellBackend {
     VirtualShell,
     VmConsole,
     ExecOnly,
+    /// A v86 guest's own `wsh-server` exposing a real PTY (clawser#38
+    /// Phases 1/2's loopback-exec + WISP reverse-connect proof),
+    /// distinct from `VmConsole` (a browser-mediated console
+    /// emulation with no real guest-side `wsh-server`). Reachable only
+    /// via the spawning browser tab's WISP reverse-connect bridge, not
+    /// independently — see `wsh-core::guest_linkage`-shaped tooling
+    /// (browser-side `clawser-guest-linkage.mjs`) for "hosted by"
+    /// provenance (clawser#38 Phase 4).
+    GuestNativePty,
 }
 
 impl ShellBackend {
@@ -48,6 +57,7 @@ impl ShellBackend {
             "virtual-shell" => Self::VirtualShell,
             "vm-console" => Self::VmConsole,
             "exec-only" => Self::ExecOnly,
+            "guest-native-pty" => Self::GuestNativePty,
             _ => Self::Pty,
         }
     }
@@ -207,6 +217,46 @@ mod tests {
             ShellBackend::VirtualShell
         );
         assert_eq!(ShellBackend::from_wire("bogus"), ShellBackend::Pty);
+    }
+
+    #[test]
+    fn shell_backend_from_wire_recognizes_guest_native_pty() {
+        assert_eq!(
+            ShellBackend::from_wire("guest-native-pty"),
+            ShellBackend::GuestNativePty
+        );
+        assert_ne!(ShellBackend::GuestNativePty, ShellBackend::VmConsole);
+    }
+
+    #[test]
+    fn shell_backend_serializes_guest_native_pty_as_kebab_case() {
+        let json = serde_json::to_string(&ShellBackend::GuestNativePty).unwrap();
+        assert_eq!(json, "\"guest-native-pty\"");
+    }
+
+    #[test]
+    fn converts_peer_info_with_guest_native_pty_backend() {
+        let peer = PeerInfo {
+            fingerprint: "guestfp123".into(),
+            fingerprint_short: "guestfp1".into(),
+            username: "guest".into(),
+            capabilities: vec!["shell".into(), "exec".into()],
+            peer_type: "vm-guest".into(),
+            shell_backend: "guest-native-pty".into(),
+            source: "wsh-relay".into(),
+            supports_attach: true,
+            supports_replay: true,
+            supports_echo: false,
+            supports_term_sync: false,
+            last_seen: Some(1),
+            public_key: None,
+            seq: None,
+            record_signature: None,
+        };
+
+        let descriptor = RemotePeerDescriptor::from_wsh_peer_info(&peer, "relay.example", 4422);
+        assert_eq!(descriptor.peer_type, PeerType::VmGuest);
+        assert_eq!(descriptor.shell_backend, ShellBackend::GuestNativePty);
     }
 
     #[test]
