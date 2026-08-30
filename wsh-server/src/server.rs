@@ -10,7 +10,7 @@ use crate::gateway::policy::{GatewayPolicy, GatewayPolicyEnforcer};
 use crate::gateway::GatewayEvent;
 use crate::handshake;
 use crate::mcp::{McpBridge, McpProxy};
-use crate::relay::{PeerMetadata, PeerRegistry, RelayBroker};
+use crate::relay::{wisp, PeerMetadata, PeerRegistry, RelayBroker, WispGuestSession, WispRegistry};
 use crate::session::SessionManager;
 use crate::transport::{websocket, webtransport};
 use std::collections::HashMap;
@@ -149,6 +149,10 @@ pub struct WshServer {
     peer_registry: Arc<PeerRegistry>,
     /// Relay broker.
     relay_broker: Arc<RelayBroker>,
+    /// #38 Phase 2: registry of connected guests' WISP tunnels
+    /// (`/wisp/<fingerprint>`), used to bridge external `wsh connect`
+    /// requests via `REVERSE_OPEN` (`/wisp-connect/<fingerprint>`).
+    wisp_registry: Arc<WispRegistry>,
     /// MCP CLI tool bridge.
     mcp_bridge: Arc<RwLock<McpBridge>>,
     /// MCP proxy to local servers.
@@ -247,6 +251,7 @@ impl WshServer {
         // Relay
         let peer_registry = Arc::new(PeerRegistry::new());
         let relay_broker = Arc::new(RelayBroker::new(peer_registry.clone()));
+        let wisp_registry = Arc::new(WispRegistry::new());
 
         // MCP
         let mcp_bridge = Arc::new(RwLock::new(McpBridge::new()));
@@ -278,6 +283,7 @@ impl WshServer {
             sessions,
             peer_registry,
             relay_broker,
+            wisp_registry,
             mcp_bridge,
             mcp_proxy,
             recording_dir,
@@ -328,7 +334,14 @@ impl WshServer {
         .await?;
 
         // Start WebSocket listener on the same configured port over TCP/TLS.
-        let mut ws_rx = websocket::start_listener(ws_addr, tls_config).await?;
+        // Also routes #38 Phase 2's WISP guest tunnels and reverse-connect
+        // bridge requests, which share the same TCP/TLS listener but are
+        // distinguished by request path (see `transport::websocket::parse_route`).
+        let websocket::ListenerChannels {
+            mut ws_rx,
+            mut wisp_guest_rx,
+            mut wisp_connect_rx,
+        } = websocket::start_listener(ws_addr, tls_config).await?;
 
         // Start session GC + idle warning task
         let gc_sessions = server.sessions.clone();
@@ -519,6 +532,18 @@ impl WshServer {
                         if let Err(e) = srv.handle_websocket(ws_conn).await {
                             warn!(error = %e, "WebSocket connection error");
                         }
+                    });
+                }
+                Some(guest_conn) = wisp_guest_rx.recv() => {
+                    let srv = server.clone();
+                    tokio::spawn(async move {
+                        srv.handle_wisp_guest(guest_conn).await;
+                    });
+                }
+                Some(connect_req) = wisp_connect_rx.recv() => {
+                    let srv = server.clone();
+                    tokio::spawn(async move {
+                        srv.handle_wisp_connect(connect_req).await;
                     });
                 }
                 else => {
@@ -1386,6 +1411,139 @@ impl WshServer {
     /// Access the relay broker.
     pub fn relay_broker(&self) -> &RelayBroker {
         &self.relay_broker
+    }
+
+    /// Access the #38 Phase 2 WISP guest registry.
+    pub fn wisp_registry(&self) -> &WispRegistry {
+        &self.wisp_registry
+    }
+
+    // ── #38 Phase 2: WISP reverse-connect bridge ─────────────────────────
+
+    /// Handle a guest's outbound `/wisp/<fingerprint>` WISP tunnel.
+    ///
+    /// Registers a [`WispGuestSession`] for the connection's lifetime so
+    /// `/wisp-connect/<fingerprint>` requests can find and bridge to it, then
+    /// pumps bytes in both directions: raw WISP frame bytes queued by the
+    /// session (`REVERSE_OPEN`/`DATA`/`CLOSE` destined for the guest) go out
+    /// over the WebSocket, and frames arriving from the guest are decoded
+    /// and handed to `WispGuestSession::handle_incoming`.
+    async fn handle_wisp_guest(&self, conn: websocket::WispGuestConnection) {
+        let websocket::WispGuestConnection {
+            mut ws_stream,
+            remote_addr,
+            fingerprint,
+        } = conn;
+
+        info!(remote = %remote_addr, %fingerprint, "WISP guest tunnel connected");
+
+        let (to_guest_tx, mut to_guest_rx) = mpsc::channel::<Vec<u8>>(64);
+        let session = WispGuestSession::new(fingerprint.clone(), to_guest_tx);
+        self.wisp_registry.register(session.clone()).await;
+
+        loop {
+            tokio::select! {
+                outbound = to_guest_rx.recv() => {
+                    match outbound {
+                        Some(bytes) => {
+                            if let Err(e) = websocket::ws_send_raw(&mut ws_stream, &bytes).await {
+                                warn!(%fingerprint, error = %e, "failed to send WISP frame to guest");
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                incoming = websocket::ws_recv_raw(&mut ws_stream) => {
+                    match incoming {
+                        Ok(Some(bytes)) => {
+                            if let Some(frame) = wisp::decode_frame(&bytes) {
+                                session.handle_incoming(frame).await;
+                            } else {
+                                debug!(%fingerprint, "malformed WISP frame from guest, dropping");
+                            }
+                        }
+                        Ok(None) => {
+                            debug!(%fingerprint, "WISP guest tunnel closed by guest");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(%fingerprint, error = %e, "WISP guest tunnel read error");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.wisp_registry.unregister(&fingerprint).await;
+        info!(%fingerprint, "WISP guest tunnel disconnected");
+    }
+
+    /// Handle an external `wsh connect <fingerprint>` client's reverse-bridge
+    /// request (`/wisp-connect/<fingerprint>`).
+    ///
+    /// Looks the fingerprint up in the WISP registry; if a guest tunnel is
+    /// live, opens a `REVERSE_OPEN` reverse stream against it and proxies raw
+    /// bytes bidirectionally between this external WebSocket and that
+    /// stream — a NAT-style byte pipe, not wsh's own Envelope/QMux relay
+    /// protocol (the guest's own `wsh-server` terminates its own independent
+    /// session with whatever ends up on the other end).
+    async fn handle_wisp_connect(&self, conn: websocket::WispConnectRequest) {
+        let websocket::WispConnectRequest {
+            mut ws_stream,
+            remote_addr,
+            fingerprint,
+            local_port,
+        } = conn;
+
+        let Some(session) = self.wisp_registry.get(&fingerprint).await else {
+            warn!(remote = %remote_addr, %fingerprint, "WISP reverse-connect: no guest tunnel registered for fingerprint");
+            let _ = ws_stream.close(None).await;
+            return;
+        };
+
+        let (stream_id, mut reverse_rx) = session.open_reverse(local_port).await;
+        info!(remote = %remote_addr, %fingerprint, stream_id, local_port, "WISP reverse-connect bridge established");
+
+        loop {
+            tokio::select! {
+                incoming = websocket::ws_recv_raw(&mut ws_stream) => {
+                    match incoming {
+                        Ok(Some(bytes)) => {
+                            if !session.send_reverse_data(stream_id, &bytes).await {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            session.close_reverse(stream_id, 0).await;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(%fingerprint, stream_id, error = %e, "WISP reverse-connect read error");
+                            session.close_reverse(stream_id, 5 /* CLOSE_REASON_ERROR */).await;
+                            break;
+                        }
+                    }
+                }
+                event = reverse_rx.recv() => {
+                    match event {
+                        Some(wisp::ReverseEvent::Data(bytes)) => {
+                            if let Err(e) = websocket::ws_send_raw(&mut ws_stream, &bytes).await {
+                                warn!(%fingerprint, stream_id, error = %e, "failed to forward reverse data to external client");
+                                break;
+                            }
+                        }
+                        Some(wisp::ReverseEvent::Closed) | None => {
+                            let _ = ws_stream.close(None).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(%fingerprint, stream_id, "WISP reverse-connect bridge closed");
     }
 
     // ── Session message loops ──────────────────────────────────────────
@@ -3884,4 +4042,321 @@ async fn read_webtransport_frame(recv: &mut wtransport::RecvStream) -> WshResult
         .map_err(|e| WshError::Transport(format!("WebTransport read payload failed: {e}")))?;
 
     Ok(buf)
+}
+
+// ── #38 Phase 2: WISP reverse-connect end-to-end proof ──────────────────
+//
+// Unlike the demux-only unit tests in `relay::wisp`, this spins up the
+// *real* `websocket::start_listener` (a live TCP/TLS socket) and the real
+// `WshServer::handle_wisp_guest`/`handle_wisp_connect` handlers, then drives
+// them with two independent `tokio-tungstenite` clients standing in for:
+//
+//   - a v86 guest's patched `wisp_network.js` (`FakeGuestWisp` below) —
+//     reacts to `REVERSE_OPEN` by opening a real loopback TCP connection to
+//     a stand-in "guest-local service" (mirroring what `fake_tcp_connect()`
+//     really does inside v86: synthesize an inbound connection into the
+//     guest's own TCP stack) and pumps bytes between that TCP connection
+//     and WISP `DATA` frames tagged with the relay-assigned stream_id.
+//   - an external `wsh connect <fingerprint>` client, dialing
+//     `/wisp-connect/<fingerprint>` directly.
+//
+// The "guest-local service" is a minimal scripted echo-with-transform
+// (not a full wsh-server) — reusing real wsh-server/QMux protocol code
+// here would just be re-proving Phase 1's already-proven loopback exec
+// path. What Phase 2 actually adds, and what this test exercises against
+// real sockets end to end, is everything between the external client and
+// that service: `/wisp-connect/` accept → `WispRegistry::get` →
+// `REVERSE_OPEN` → the guest's `/wisp/` tunnel → the fake_tcp_connect
+// stand-in → bytes flowing back the same path. A real v86 guest running
+// the real (patched) wsh-server as that "guest-local service" is exactly
+// what `tools/guest-image/boot-test.mjs` proves for Phase 1's loopback
+// case; wiring an actual v86-in-Node boot into this same test is tracked
+// as follow-up work (needs the Docker-built guest image + a self-hosted
+// patched v86 bundle, both outside this crate).
+#[cfg(test)]
+mod wisp_reverse_connect_e2e_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc as StdArc;
+    use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::{connect_async_tls_with_config, Connector};
+
+    /// Test-only cert verifier that accepts anything — mirrors
+    /// `wsh-client`'s `NoOpServerCertVerifier` (see
+    /// `crates/wsh-client/src/transport/websocket.rs`), duplicated here
+    /// rather than shared so this stays confined to `#[cfg(test)]` and
+    /// never touches a real connection path.
+    #[derive(Debug)]
+    struct NoOpVerifier {
+        schemes: Vec<rustls::SignatureScheme>,
+    }
+    impl rustls::client::danger::ServerCertVerifier for NoOpVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.schemes.clone()
+        }
+    }
+
+    fn insecure_test_connector() -> Connector {
+        let provider = StdArc::new(rustls::crypto::ring::default_provider());
+        let verifier = StdArc::new(NoOpVerifier {
+            schemes: provider.signature_verification_algorithms.supported_schemes(),
+        });
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("default protocol versions are valid")
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Connector::Rustls(StdArc::new(config))
+    }
+
+    fn self_signed_tls_config() -> Arc<rustls::ServerConfig> {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+                .unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        let cert_der = cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        );
+
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("valid self-signed cert/key");
+        Arc::new(config)
+    }
+
+    fn test_server_config(port: u16) -> ServerConfig {
+        ServerConfig {
+            port,
+            cert_path: PathBuf::from("/nonexistent/cert.pem"),
+            key_path: PathBuf::from("/nonexistent/key.pem"),
+            max_sessions: 10,
+            session_ttl: 3600,
+            idle_timeout: 3600,
+            enable_relay: true,
+            allow_pubkey: true,
+            allow_password: false,
+            gateway_enabled: false,
+            gateway_allowed_destinations: Vec::new(),
+            gateway_max_connections: 10,
+            gateway_enable_reverse_tunnels: false,
+            password_hashes: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Simulates a v86 guest's *already-patched* `wisp_network.js`: reacts
+    /// to `REVERSE_OPEN` by opening a real TCP connection to
+    /// `guest_service_port` (standing in for `fake_tcp_connect()`) and
+    /// bridges bytes between it and WISP `DATA`/`CLOSE` frames on the
+    /// relay-assigned stream_id.
+    async fn run_fake_guest(
+        mut ws: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<TcpStream>,
+        >,
+        guest_service_port: u16,
+    ) {
+        use crate::relay::wisp::{decode_frame, encode_frame, WISP_DATA, WISP_REVERSE_OPEN};
+
+        while let Some(msg) = ws.next().await {
+            let Ok(WsMessage::Binary(bytes)) = msg else {
+                continue;
+            };
+            let Some(frame) = decode_frame(&bytes) else {
+                continue;
+            };
+            if frame.frame_type == WISP_REVERSE_OPEN {
+                let stream_id = frame.stream_id;
+                // Emulate fake_tcp_connect(): open a real TCP connection to
+                // the "guest-local service".
+                let mut svc = TcpStream::connect(("127.0.0.1", guest_service_port))
+                    .await
+                    .expect("guest-local service reachable");
+                let (mut svc_rd, mut svc_wr) = svc.split();
+
+                // Pump: WS -> service, service -> WS, until either side closes.
+                let mut buf = [0u8; 4096];
+                loop {
+                    tokio::select! {
+                        ws_msg = ws.next() => {
+                            match ws_msg {
+                                Some(Ok(WsMessage::Binary(b))) => {
+                                    if let Some(f) = decode_frame(&b) {
+                                        if f.frame_type == WISP_DATA && f.stream_id == stream_id {
+                                            use tokio::io::AsyncWriteExt as _;
+                                            if svc_wr.write_all(&f.payload).await.is_err() { break; }
+                                        }
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        n = { use tokio::io::AsyncReadExt as _; svc_rd.read(&mut buf) } => {
+                            match n {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    let frame = encode_frame(WISP_DATA, stream_id, &buf[..n]);
+                                    if ws.send(WsMessage::Binary(frame.into())).await.is_err() { break; }
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = svc.shutdown().await;
+                return; // single reverse connection is enough to prove the path
+            }
+        }
+    }
+
+    /// A minimal scripted "guest-local service": reads one request, replies
+    /// with a deterministic transform, proving real bidirectional bytes
+    /// flowed through the whole REVERSE_OPEN bridge (not just one direction).
+    async fn run_fake_guest_service(listener: TokioTcpListener) {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4096];
+            if let Ok(n) = sock.read(&mut buf).await {
+                if n > 0 {
+                    let mut reply = b"EXEC-OK:".to_vec();
+                    reply.extend_from_slice(&buf[..n]);
+                    let _ = sock.write_all(&reply).await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_wsh_connect_reaches_guest_service_via_reverse_open() {
+        // Normally installed once in `main()`; tests bypass main, so install
+        // it here (harmless if another test in this binary already did).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // 1. Real listener: routes /wisp/<fp> and /wisp-connect/<fp> exactly
+        //    as production `WshServer::run` does.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let tls_config = self_signed_tls_config();
+        let tcp_probe = std::net::TcpListener::bind(addr).unwrap();
+        let bound_addr = tcp_probe.local_addr().unwrap();
+        drop(tcp_probe);
+
+        let websocket::ListenerChannels {
+            ws_rx: _ws_rx,
+            mut wisp_guest_rx,
+            mut wisp_connect_rx,
+        } = websocket::start_listener(bound_addr, tls_config).await.unwrap();
+
+        let server = Arc::new(WshServer::new(test_server_config(bound_addr.port())).unwrap());
+        {
+            let server = server.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(g) = wisp_guest_rx.recv() => {
+                            let srv = server.clone();
+                            tokio::spawn(async move { srv.handle_wisp_guest(g).await; });
+                        }
+                        Some(c) = wisp_connect_rx.recv() => {
+                            let srv = server.clone();
+                            tokio::spawn(async move { srv.handle_wisp_connect(c).await; });
+                        }
+                        else => break,
+                    }
+                }
+            });
+        }
+
+        // 2. The "guest-local service" this fake guest will fake_tcp_connect to.
+        let svc_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let svc_port = svc_listener.local_addr().unwrap().port();
+        tokio::spawn(run_fake_guest_service(svc_listener));
+
+        // 3. Fake guest dials its outbound WISP tunnel.
+        let fingerprint = "e2e-guest-fingerprint";
+        let (guest_ws, _) = connect_async_tls_with_config(
+            format!("wss://127.0.0.1:{}/wisp/{fingerprint}", bound_addr.port()),
+            None,
+            false,
+            Some(insecure_test_connector()),
+        )
+        .await
+        .expect("fake guest connects");
+        tokio::spawn(run_fake_guest(guest_ws, svc_port));
+
+        // Give the guest tunnel a moment to register in WispRegistry.
+        for _ in 0..50 {
+            if server.wisp_registry().get(fingerprint).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            server.wisp_registry().get(fingerprint).await.is_some(),
+            "guest tunnel never registered"
+        );
+
+        // 4. External `wsh connect <fingerprint>` client.
+        let (mut client_ws, _) = connect_async_tls_with_config(
+            format!(
+                "wss://127.0.0.1:{}/wisp-connect/{fingerprint}?port={svc_port}",
+                bound_addr.port()
+            ),
+            None,
+            false,
+            Some(insecure_test_connector()),
+        )
+        .await
+        .expect("external client connects");
+
+        client_ws
+            .send(WsMessage::Binary(b"hello guest".to_vec().into()))
+            .await
+            .unwrap();
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), client_ws.next())
+            .await
+            .expect("reply within timeout")
+            .expect("stream not closed")
+            .expect("no ws error");
+
+        let WsMessage::Binary(reply_bytes) = reply else {
+            panic!("expected binary reply, got {reply:?}");
+        };
+
+        // Proves real bidirectional bytes flowed: external client ->
+        // /wisp-connect -> REVERSE_OPEN -> guest's /wisp tunnel ->
+        // fake_tcp_connect stand-in -> guest-local service -> back the
+        // same path -> external client.
+        assert_eq!(reply_bytes, b"EXEC-OK:hello guest");
+    }
 }

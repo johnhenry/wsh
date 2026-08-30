@@ -37,3 +37,9 @@ time = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# #38 Phase 2 e2e test only: adds the rustls-backed client connector
+# (`Connector::Rustls`/`connect_async_tls_with_config`) so the WISP
+# reverse-connect end-to-end test can dial the real listener as both a
+# fake guest and a fake external `wsh connect` client over wss://, the
+# same feature wsh-client already enables for its own tests.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
