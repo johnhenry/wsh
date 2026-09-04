@@ -52,6 +52,34 @@ const STATE_CLOSED        = 'closed';
 
 const DEFAULT_AUTH_TIMEOUT   = 10_000;  // ms
 const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
+
+/**
+ * Reject a missing argument that maps to a `required: true` wire field.
+ *
+ * JavaScript will happily let an omitted argument through, and
+ * `cborEncode` turns the resulting `undefined` into CBOR null rather
+ * than dropping the key -- so the message goes out looking well-formed,
+ * gets rejected by a spec-conformant server for a reason that has
+ * nothing to do with what the caller did wrong, and the local stack
+ * trace is long gone by then. This is exactly how `resumeSession()`
+ * shipped broken for two releases (CHANGELOG 0.14.0: `last_seq`
+ * "previously always sent as `undefined`, which the wire's
+ * `required: true` field never tolerated"). Failing here instead names
+ * the argument at the call site.
+ *
+ * @param {string} method - Method name, for the message.
+ * @param {Record<string, *>} args - Argument name -> value.
+ */
+function requireArgs(method, args) {
+  for (const [name, value] of Object.entries(args)) {
+    if (value === undefined || value === null) {
+      throw new TypeError(
+        `${method}: "${name}" is required -- the corresponding wire field is not optional, ` +
+        'and omitting it produces a message a conformant server will reject'
+      );
+    }
+  }
+}
 const DEFAULT_PING_INTERVAL  = 30_000;  // ms
 const DEFAULT_EXEC_TIMEOUT   = 60_000;  // ms
 const FILE_CHUNK_SIZE        = 65_536;
@@ -1145,12 +1173,15 @@ export class WshClient {
    * Call an MCP tool on the remote server.
    *
    * @param {string} name - Tool name
-   * @param {object} args - Tool arguments
+   * @param {object} [args={}] - Tool arguments. Defaults to `{}` rather
+   *   than being omitted: `McpCall.arguments` is a required wire field,
+   *   and a tool that takes no arguments is an ordinary thing to call.
    * @param {number} [timeout=30000]
    * @returns {Promise<*>} Tool result
    */
-  async callTool(name, args, timeout = 30_000) {
+  async callTool(name, args = {}, timeout = 30_000) {
     this.#assertAuthenticated('callTool');
+    requireArgs('callTool', { name });
 
     await this.#transport.sendControl(
       mcpCallMsg({ tool: name, arguments: args })
@@ -1216,6 +1247,7 @@ export class WshClient {
    */
   async inviteGuest(sessionId, ttl, permissions = ['read'], timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('inviteGuest');
+    requireArgs('inviteGuest', { sessionId, ttl });
     await this.#transport.sendControl(guestInviteMsg({ sessionId, ttl, permissions }));
     return this.#waitForMessage(
       [MSG.GUEST_INVITE],
@@ -1257,12 +1289,17 @@ export class WshClient {
    * Share a session for multi-attach.
    * @param {string} sessionId - Session to share
    * @param {string} [mode='read'] - Share mode
-   * @param {number} [ttl] - Share TTL in seconds
+   * @param {number} ttl - Share lifetime in seconds. Not optional,
+   *   despite its position after a defaulted parameter:
+   *   `ShareSession.ttl` is a required wire field, and there is no
+   *   sensible default lifetime for a share link to invent on the
+   *   caller's behalf.
    * @param {number} [timeout=10000]
    * @returns {Promise<object>} Share response with share_id
    */
   async shareSession(sessionId, mode = 'read', ttl, timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('shareSession');
+    requireArgs('shareSession', { sessionId, ttl });
     await this.#transport.sendControl(shareSessionMsg({ sessionId, mode, ttl }));
     return this.#waitForMessage(
       [MSG.SHARE_SESSION],
@@ -1310,6 +1347,7 @@ export class WshClient {
    */
   async setRateControl(sessionId, maxBytesPerSec, policy = 'pause') {
     this.#assertAuthenticated('setRateControl');
+    requireArgs('setRateControl', { sessionId, maxBytesPerSec });
     await this.#transport.sendControl(rateControlMsg({ sessionId, maxBytesPerSec, policy }));
   }
 
@@ -1349,6 +1387,7 @@ export class WshClient {
    */
   async copilotAttach(sessionId, model, contextWindow) {
     this.#assertAuthenticated('copilotAttach');
+    requireArgs('copilotAttach', { sessionId, model });
     await this.#transport.sendControl(
       copilotAttachMsg({ sessionId, model, contextWindow })
     );
@@ -1551,6 +1590,7 @@ export class WshClient {
    */
   async updatePolicy(policyId, rules, version) {
     this.#assertAuthenticated('updatePolicy');
+    requireArgs('updatePolicy', { policyId, rules, version });
     await this.#transport.sendControl(
       policyUpdateMsg({ policyId, rules, version })
     );
