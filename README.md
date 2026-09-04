@@ -28,6 +28,7 @@ Or via CDN:
 
 - **Ed25519 authentication** -- challenge-response via Web Crypto API with a transcript binding username and session id, SSH key format support
 - **Dual transport** -- WebTransport (native streams) and WebSocket (QMux-multiplexed streams) with identical API
+- **Self-signed certificate pinning** -- `serverCertificateHashes` on the WebTransport path, so page JavaScript can reach a server whose certificate no certificate authority signed
 - **CBOR encoding** -- compact binary wire format with length-prefixed framing
 - **Session management** -- open, attach, resume, detach, rename PTY/exec sessions, with session-scoped resume tokens and per-principal access grants
 - **Reverse mode** -- register as a peer (via a signed peer record) and accept incoming connections through a relay
@@ -127,6 +128,67 @@ await client.detach(session.sessionId);   // leave it running server-side
 await client.listRemoteSessions();        // sessions this key can see
 ```
 
+## Pinning a Self-Signed Certificate
+
+Both transports normally need a certificate a public certificate authority
+signed. On a LAN -- a phone talking to a desktop on `192.168.x.x`, a
+browser talking to a device on the same Wi-Fi -- there is no such
+certificate to be had, and a plaintext `ws://` from an `https://` page is
+blocked as mixed content.
+
+WebTransport is the one place in the web platform with an answer:
+`serverCertificateHashes` lets the page pin a specific certificate by
+SHA-256 digest, no certificate authority involved.
+
+```js
+// The digest can be raw bytes, base64, plain hex, or the colon-separated
+// hex `openssl x509 -fingerprint -sha256 -noout -in cert.pem` prints --
+// the whole `SHA256 Fingerprint=AB:CD:...` line is accepted as-is.
+await client.connect('https://192.168.1.20:4433/wsh', {
+  username: 'alice',
+  keyPair,
+  transport: 'wt',
+  webTransport: {
+    serverCertificateHashes: [
+      'SHA256 Fingerprint=A1:B2:C3:...',
+    ],
+  },
+});
+```
+
+`WebTransportTransport` also takes the same options directly, for use with
+`connectWithTransport()`:
+
+```js
+const transport = new WebTransportTransport({
+  serverCertificateHashes: [certDigestBytes],
+});
+```
+
+A malformed digest throws locally (`RangeError` for the wrong length,
+`TypeError` for an unrecognised shape) before any connection is
+attempted -- a wrong hash otherwise surfaces only as an opaque
+`WebTransportError` from `wt.ready`.
+
+The constraints are the platform's, not wsh's:
+
+- The URL must be `https:`; pinning is HTTP/3 only, with no HTTP/2 fallback.
+- The certificate must use an **ECDSA P-256** key and be valid for **at most
+  14 days**, so it has to be reissued on a schedule.
+- Connection pooling is disabled for a pinned connection.
+- Only `sha-256` is accepted as the algorithm.
+
+The option applies to the WebTransport rung of the transport ladder only.
+If the WebTransport attempt fails and the client falls back to WebSocket,
+that `wss:` connection is subject to the ordinary certificate-authority
+check again -- there is no WebSocket equivalent of certificate pinning.
+Pass `transport: 'wt'` if you would rather fail than fall back.
+
+Any other key in `webTransport` is forwarded to the `WebTransport`
+constructor verbatim (`congestionControl`, `allowPooling`,
+`requireUnreliable`, the `anticipatedConcurrentIncoming*Streams` hints),
+so options the platform gains later need no change here.
+
 ## API Overview
 
 ### Core Classes
@@ -136,7 +198,7 @@ await client.listRemoteSessions();        // sessions this key can see
 | `WshClient` | Full lifecycle client: connect, auth, sessions, reverse mode, MCP |
 | `WshSession` | Single PTY or exec channel with read/write/resize/signal |
 | `WshTransport` | Abstract transport base class |
-| `WebTransportTransport` | WebTransport implementation (native streams) |
+| `WebTransportTransport` | WebTransport implementation (native streams); takes `serverCertificateHashes` and other `WebTransport` options |
 | `WebSocketTransport` | WebSocket implementation (multiplexed virtual streams) |
 
 ### Utilities
@@ -152,6 +214,8 @@ await client.listRemoteSessions();        // sessions this key can see
 | `signChallenge()` | Build transcript + sign for auth handshake |
 | `signPeerRecord()` / `verifyPeerRecord()` | Sign / verify reverse-mode peer records |
 | `fingerprint()` | SHA-256 hex fingerprint of a public key |
+| `parseCertificateHash()` | Decode a certificate digest from hex / base64 / bytes |
+| `normalizeWebTransportOptions()` | Build a `WebTransportOptions` dictionary from loose input |
 
 ### Protocol
 

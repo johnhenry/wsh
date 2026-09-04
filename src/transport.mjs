@@ -111,7 +111,7 @@ const STATE_CLOSED       = 'closed';
  * Abstract transport for the wsh protocol.
  *
  * Subclasses must implement:
- *   - _doConnect(url)
+ *   - _doConnect(url, options)
  *   - _doClose()
  *   - _doSendControl(msg)
  *   - _doOpenStream()
@@ -144,14 +144,18 @@ export class WshTransport {
   /**
    * Connect to a wsh server.
    * @param {string} url
+   * @param {object} [options] - Transport-specific connect options.
+   *   Ignored by transports that have none; `WebTransportTransport`
+   *   forwards them to the `WebTransport` constructor (see its docs for
+   *   `serverCertificateHashes`).
    */
-  async connect(url) {
+  async connect(url, options) {
     if (this.#state === STATE_CONNECTED || this.#state === STATE_CONNECTING) {
       throw new Error(`Transport already ${this.#state}`);
     }
     this.#state = STATE_CONNECTING;
     try {
-      await this._doConnect(url);
+      await this._doConnect(url, options);
       this.#state = STATE_CONNECTED;
     } catch (err) {
       this.#state = STATE_CLOSED;
@@ -235,7 +239,7 @@ export class WshTransport {
   // ── Abstract methods (must be overridden) ────────────────────────────
 
   /** @protected */
-  async _doConnect(_url) {
+  async _doConnect(_url, _options) {
     throw new Error('_doConnect not implemented');
   }
 
@@ -256,6 +260,140 @@ export class WshTransport {
 }
 
 // ── WebTransport implementation ──────────────────────────────────────
+
+// ── WebTransport options ─────────────────────────────────────────────
+
+/** Digest length in bytes, keyed by the algorithm name WebTransport accepts. */
+const CERT_HASH_LENGTHS = Object.freeze({ 'sha-256': 32 });
+
+/**
+ * Decode one `serverCertificateHashes` value into the `BufferSource` the
+ * WebTransport constructor requires.
+ *
+ * Accepts, in addition to a `BufferSource` passed straight through:
+ *
+ * - **Hex**, with or without separators — this is what
+ *   `openssl x509 -fingerprint -sha256` prints
+ *   (`SHA256 Fingerprint=AB:CD:...`), and pasting that string in is the
+ *   single most likely thing a caller will try.
+ * - **Base64** or **base64url**, which is how the same digest usually
+ *   arrives over a QR code or a pairing payload.
+ *
+ * Throws on anything else, and on a digest whose decoded length is wrong
+ * for the algorithm. Failing here is the whole point: a wrong hash
+ * otherwise surfaces as an opaque `WebTransportError` from `wt.ready`
+ * with no indication that the *input* was malformed rather than the
+ * certificate mismatched.
+ *
+ * @param {*} value
+ * @param {string} algorithm - Lower-cased algorithm name (e.g. 'sha-256').
+ * @returns {Uint8Array}
+ */
+export function parseCertificateHash(value, algorithm = 'sha-256') {
+  const expected = CERT_HASH_LENGTHS[algorithm];
+  let bytes;
+
+  if (value instanceof Uint8Array) {
+    bytes = value;
+  } else if (ArrayBuffer.isView(value)) {
+    bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  } else if (value instanceof ArrayBuffer) {
+    bytes = new Uint8Array(value);
+  } else if (typeof value === 'string') {
+    bytes = decodeHashString(value);
+  } else {
+    throw new TypeError(
+      'serverCertificateHashes value must be a BufferSource or a hex/base64 string, ' +
+      `got ${value === null ? 'null' : typeof value}`
+    );
+  }
+
+  if (expected !== undefined && bytes.length !== expected) {
+    throw new RangeError(
+      `serverCertificateHashes value for "${algorithm}" must be ${expected} bytes, got ${bytes.length}`
+    );
+  }
+  return bytes;
+}
+
+/**
+ * @param {string} str
+ * @returns {Uint8Array}
+ */
+function decodeHashString(str) {
+  // Strip the separators OpenSSL and friends emit, plus any surrounding
+  // whitespace: "SHA256 Fingerprint=" style output is colon-separated,
+  // and hand-copied values often carry spaces or dashes.
+  const compact = str.trim().replace(/^[^=]*fingerprint[^=]*=\s*/i, '');
+  const hexish = compact.replace(/[\s:-]/g, '');
+
+  if (/^[0-9a-fA-F]+$/.test(hexish) && hexish.length % 2 === 0) {
+    const out = new Uint8Array(hexish.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      out[i] = Number.parseInt(hexish.slice(i * 2, i * 2 + 2), 16);
+    }
+    return out;
+  }
+
+  // Not hex — try base64 / base64url.
+  const b64 = compact.replace(/-/g, '+').replace(/_/g, '/');
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) {
+    throw new TypeError(
+      `serverCertificateHashes value is neither hex nor base64: ${JSON.stringify(str)}`
+    );
+  }
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Normalise a caller-supplied options bag into a `WebTransportOptions`
+ * dictionary, or `undefined` when there is nothing to pass.
+ *
+ * Only `serverCertificateHashes` is transformed; every other key is
+ * forwarded verbatim, so options the platform gains later
+ * (`congestionControl`, `allowPooling`, `requireUnreliable`, the
+ * `anticipatedConcurrentIncoming*Streams` hints, …) work without a
+ * change here.
+ *
+ * @param {object} [options]
+ * @returns {object|undefined}
+ */
+export function normalizeWebTransportOptions(options) {
+  if (!options) return undefined;
+  const keys = Object.keys(options).filter((k) => options[k] !== undefined);
+  if (keys.length === 0) return undefined;
+
+  const out = {};
+  for (const key of keys) out[key] = options[key];
+
+  if (out.serverCertificateHashes !== undefined) {
+    const list = out.serverCertificateHashes;
+    if (!Array.isArray(list)) {
+      throw new TypeError('serverCertificateHashes must be an array');
+    }
+    if (list.length === 0) {
+      throw new TypeError(
+        'serverCertificateHashes must not be empty -- omit the option entirely to use the ' +
+        'normal certificate-authority path'
+      );
+    }
+    out.serverCertificateHashes = list.map((entry) => {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry) ||
+          ArrayBuffer.isView(entry) || entry instanceof ArrayBuffer) {
+        // A bare digest is a natural thing to write; accept it rather
+        // than making the caller wrap every value in { algorithm, value }.
+        return { algorithm: 'sha-256', value: parseCertificateHash(entry, 'sha-256') };
+      }
+      const algorithm = String(entry.algorithm ?? 'sha-256').toLowerCase();
+      return { algorithm, value: parseCertificateHash(entry.value, algorithm) };
+    });
+  }
+
+  return out;
+}
 
 /**
  * wsh transport over the WebTransport API.
@@ -287,16 +425,53 @@ export class WebTransportTransport extends WshTransport {
   /** @type {Promise<void>} Resolves when the incoming-stream acceptor finishes. */
   #incomingAcceptorDone = null;
 
+  /** @type {object|undefined} Default WebTransport options for every connect. */
+  #options;
+
+  /**
+   * @param {object} [options] - Forwarded to the `WebTransport`
+   *   constructor. Most usefully `serverCertificateHashes`, which lets
+   *   page JavaScript pin a specific short-lived self-signed certificate
+   *   by digest instead of requiring one a certificate authority signed:
+   *
+   *   ```js
+   *   new WebTransportTransport({
+   *     serverCertificateHashes: [
+   *       // hex (with or without colons), base64, or raw bytes
+   *       'a1:b2:c3:...',
+   *     ],
+   *   });
+   *   ```
+   *
+   *   The web platform imposes the rules, not wsh: the URL must be
+   *   `https:`, the connection is HTTP/3 only (there is no fallback to
+   *   HTTP/2 for a pinned certificate), the certificate must use an
+   *   ECDSA P-256 key and be valid for no more than 14 days, and
+   *   connection pooling is disabled. Options passed to `connect()`
+   *   override these per call.
+   */
+  constructor(options) {
+    super();
+    this.#options = options;
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────
 
   /** @override */
-  async _doConnect(url) {
+  async _doConnect(url, options) {
     this.#abort = new AbortController();
     this.#decoder.reset();
     this.#nextStreamId = 1;
 
-    // Create the WebTransport session.
-    const wt = new WebTransport(url);
+    // Create the WebTransport session. Pass the options dictionary only
+    // when there is something in it: `new WebTransport(url)` and
+    // `new WebTransport(url, {})` are equivalent per spec, but an empty
+    // second argument is noise in a stack trace and in any engine that
+    // predates the dictionary.
+    const wtOptions = normalizeWebTransportOptions(
+      (this.#options || options) && { ...this.#options, ...options }
+    );
+    const wt = wtOptions ? new WebTransport(url, wtOptions) : new WebTransport(url);
     this.#wt = wt;
 
     // Wait for the connection to be ready.

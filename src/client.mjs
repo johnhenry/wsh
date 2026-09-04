@@ -342,10 +342,18 @@ export class WshClient {
    * @param {CryptoKeyPair} [opts.keyPair] - Ed25519 key pair for pubkey auth
    * @param {string} [opts.password] - Password for password auth
    * @param {'wt'|'ws'|'auto'} [opts.transport] - Force a specific transport
+   * @param {object} [opts.webTransport] - Options forwarded to the
+   *   `WebTransport` constructor when the WebTransport rung of the ladder
+   *   is tried. Most usefully `serverCertificateHashes`, which pins a
+   *   specific self-signed certificate by SHA-256 digest -- the one way
+   *   page JavaScript can reach a server whose certificate no certificate
+   *   authority signed. Values may be raw bytes, hex (colon-separated is
+   *   fine), or base64. Ignored by the WebSocket rung, which has no
+   *   equivalent mechanism.
    * @param {number} [opts.timeout] - Auth handshake timeout in ms
    * @returns {Promise<string>} The server-assigned session ID
    */
-  async connect(url, { username, keyPair, password, transport: transportHint, timeout = DEFAULT_AUTH_TIMEOUT } = {}) {
+  async connect(url, { username, keyPair, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT } = {}) {
     if (this.#state !== STATE_DISCONNECTED && this.#state !== STATE_CLOSED) {
       throw new Error(`Client already ${this.#state}`);
     }
@@ -365,7 +373,7 @@ export class WshClient {
 
     try {
       // ── Select and connect transport ──────────────────────────────
-      const transport = await this.#connectTransport(url, transportHint);
+      const transport = await this.#connectTransport(url, transportHint, webTransport);
       this.#transport = transport;
       this.#state = STATE_CONNECTED;
 
@@ -834,6 +842,7 @@ export class WshClient {
     username,
     keyPair,
     password,
+    webTransport,
     expose = {},
     peerType = 'browser-shell',
     shellBackend,
@@ -843,7 +852,7 @@ export class WshClient {
     supportsTermSync,
   } = {}) {
     // Authenticate normally first.
-    const sessionId = await this.connect(url, { username, keyPair, password });
+    const sessionId = await this.connect(url, { username, keyPair, password, webTransport });
 
     // Build capabilities list from expose options.
     const capabilities = [];
@@ -1554,17 +1563,23 @@ export class WshClient {
    *
    * @param {string} url
    * @param {'wt'|'ws'|'auto'} [hint]
+   * @param {object} [webTransport] - Options for the `WebTransport`
+   *   constructor, applied only to a `wt` attempt (see
+   *   `WebTransportTransport`). The `ws` rung of the ladder ignores them:
+   *   a `serverCertificateHashes` pin has no WebSocket equivalent, so a
+   *   `wss:` fallback against that same self-signed certificate will
+   *   still fail the usual certificate-authority check.
    * @returns {Promise<import('./transport.mjs').WshTransport>}
    * @private
    */
-  async #connectTransport(url, hint) {
+  async #connectTransport(url, hint, webTransport) {
     const attempts = this.#buildTransportAttempts(url, hint);
     const errors = [];
 
     for (const attempt of attempts) {
       const transport = this.#createTransport(attempt.kind);
       try {
-        await transport.connect(attempt.url);
+        await transport.connect(attempt.url, attempt.kind === 'wt' ? webTransport : undefined);
         this.#attachTransportHandlers(transport);
         return transport;
       } catch (err) {

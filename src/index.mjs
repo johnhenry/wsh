@@ -51,7 +51,10 @@ export {
 } from './auth.mjs';
 
 // Transport
-export { WshTransport, WebTransportTransport, dispatchSerially, SerialQueue } from './transport.mjs';
+export {
+  WshTransport, WebTransportTransport, dispatchSerially, SerialQueue,
+  parseCertificateHash, normalizeWebTransportOptions,
+} from './transport.mjs';
 export { WebSocketTransport, WS_FRAME_TYPE } from './transport-ws.mjs';
 
 // QMux (QUIC-v1 frames over an ordered byte stream, draft-ietf-quic-qmux-02)
