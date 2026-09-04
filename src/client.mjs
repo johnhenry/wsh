@@ -1621,6 +1621,16 @@ export class WshClient {
     if (hint === 'ws') {
       return [{ kind: 'ws', url }];
     }
+    if (hint !== undefined && hint !== null && hint !== 'auto') {
+      // Anything else is a typo, and silently treating it as 'auto' is
+      // the worst available answer: `transport: 'webtransport'` would
+      // quietly fall back to WebSocket, dropping any
+      // `webTransport.serverCertificateHashes` pin along with it and
+      // connecting over a transport the caller explicitly tried to avoid.
+      throw new Error(
+        `Unknown transport hint: ${JSON.stringify(hint)} (expected 'wt', 'ws', or 'auto')`
+      );
+    }
     if (/^wss?:\/\//i.test(url)) {
       return [{ kind: 'ws', url }];
     }
