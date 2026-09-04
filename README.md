@@ -257,17 +257,80 @@ The `spec/` directory contains the protocol definition:
 
 ## Browser Compatibility
 
-Requires a browser (or Node.js 24+) with:
+Requires a browser (or Node.js 24+) with `TextEncoder`/`TextDecoder`,
+`ReadableStream`/`WritableStream`, `WebSocket` (universal), and:
 
-- Web Crypto API with Ed25519 support
-- WebSocket (all browsers)
-- WebTransport (Chrome 97+, Edge 97+, Firefox 114+)
-- TextEncoder/TextDecoder
-- ReadableStream/WritableStream
+### WebCrypto Ed25519 -- the real floor
 
-Hybrid ML-KEM-768 key exchange prefers native WebCrypto ML-KEM (Node 24.7+,
-some browsers); elsewhere the optional `@noble/post-quantum` dependency is
-loaded dynamically.
+This is what actually gates the library, because pubkey auth is not
+optional to the protocol. Roughly: **Safari 17+, Chrome/Edge 137+,
+Firefox 130+, Node 20+**.
+
+There is deliberately **no pure-JS fallback**. A JS Ed25519 needs the
+private scalar as ordinary bytes, which would give up the property
+`WshKeyStore` is built around -- keys are non-extractable `CryptoKey`
+objects by default, so a compromised page can *use* a key but cannot
+exfiltrate it. Trading that away on exactly the oldest, least-patched
+engines is the wrong direction, and doing it silently would be worse.
+
+Ask before you commit to pubkey auth:
+
+```js
+import { isEd25519Supported } from '@johnhenry/wsh';
+
+if (await isEd25519Supported()) {
+  await client.connect(url, { username, keyPair });
+} else {
+  await client.connect(url, { username, password });
+}
+```
+
+`isEd25519Supported()` measures by generating a key rather than sniffing a
+version string, and memoizes. `generateKeyPair()` throws with an
+actionable message where support is missing, rather than passing the
+platform's "Unrecognized name" straight through.
+
+### WebTransport
+
+WebTransport is optional -- the transport ladder falls back to WebSocket.
+It matters if you want `serverCertificateHashes` (see [Pinning a
+Self-Signed Certificate](#pinning-a-self-signed-certificate)), which has
+no WebSocket equivalent.
+
+**Safari supports WebTransport, and more of it than Chromium does.**
+That is the opposite of the usual assumption, and the earlier version of
+this section propagated the assumption by listing only Chrome, Edge and
+Firefox. Measured on 2026-09-04, both engines on a `localhost` secure
+context:
+
+| | `WebTransport.prototype` members | Ed25519 | X25519 | ML-KEM-768 |
+|---|---|---|---|---|
+| WebKit -- Safari 26.5, iOS 26.5 simulator | **17** | OK | OK | fails (`TypeError`) |
+| Chromium 148, macOS | 10 | OK | OK | fails (`NotSupportedError`) |
+
+WebKit's extra seven are `congestionControl`, `reliability`, `draining`,
+`getStats`, `createSendGroup`, and the two
+`anticipatedConcurrentIncoming*Streams` hints; both engines have
+`datagrams`, both bidirectional and unidirectional stream creation, and
+`ready`/`closed`.
+
+Approximate first-support versions, which are *not* measured here: Chrome
+and Edge 97, Firefox 114, Safari 26. Below Safari 26, the ladder falls
+back to WebSocket.
+
+Both engines accept a `serverCertificateHashes` entry without a
+synchronous throw, but that is weak evidence on its own -- unknown WebIDL
+dictionary members are silently ignored, so acceptance does not prove the
+option is honoured. Confirming it needs a real HTTP/3 server presenting a
+matching short-lived certificate.
+
+### ML-KEM-768
+
+The hybrid post-quantum path prefers native WebCrypto ML-KEM (Node 24.7+).
+**No browser tested has it** -- it failed on both engines above -- so in a
+browser the optional `@noble/post-quantum` dependency is what actually
+runs, loaded dynamically by `src/mlkem.mjs`. Treat it as required, not
+optional, if you want the hybrid handshake on the web today.
 
 ## License
 

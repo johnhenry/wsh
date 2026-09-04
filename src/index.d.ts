@@ -817,7 +817,19 @@ export function isValidMessage(msg: unknown): boolean;
 // ============================================================================
 
 /**
- * Generate a new Ed25519 key pair.
+ * Whether this runtime's WebCrypto implements Ed25519, measured by
+ * generating a key rather than sniffed from a version string.
+ *
+ * There is no pure-JS fallback: one would need the private scalar as
+ * ordinary bytes, giving up the non-extractable `CryptoKey` property
+ * `WshKeyStore` is built around. Check this before committing to pubkey
+ * auth and fall back to password auth where it returns false.
+ */
+export function isEd25519Supported(): Promise<boolean>;
+
+/**
+ * Generate a new Ed25519 key pair. Throws with an actionable message
+ * where WebCrypto has no Ed25519 -- see `isEd25519Supported()`.
  * @param extractable - Whether private key can be exported (default false)
  */
 export function generateKeyPair(extractable?: boolean): Promise<CryptoKeyPair>;

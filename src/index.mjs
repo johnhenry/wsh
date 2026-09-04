@@ -42,6 +42,7 @@ export {
 
 // Auth + crypto
 export {
+  isEd25519Supported,
   generateKeyPair, exportPublicKeyRaw, exportPublicKeySSH,
   importPublicKeyRaw, exportPrivateKeyPKCS8, importPrivateKeyPKCS8,
   sign, verify, buildTranscript, signChallenge, verifyChallenge,
