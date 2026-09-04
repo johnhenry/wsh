@@ -158,7 +158,26 @@ export class WshTransport {
       await this._doConnect(url, options);
       this.#state = STATE_CONNECTED;
     } catch (err) {
+      // A connect can fail *after* acquiring a real resource -- an open
+      // WebSocket whose QMux handshake then threw, a WebTransport whose
+      // session came up but whose control stream did not. Tear that down
+      // here, because a later `close()` cannot: it treats the `closed`
+      // state this line sets as "already torn down" and returns without
+      // calling `_doClose()`, so the socket would stay open for the life
+      // of the page. Every rung of WshClient's transport ladder that
+      // fails hits this path.
       this.#state = STATE_CLOSED;
+      try {
+        await this._doClose();
+      } catch {
+        // Best effort: the connect error is the one worth reporting, and
+        // tearing down a half-built transport can fail for its own
+        // uninteresting reasons.
+      }
+      // Deliberately no `_emitClose()`: a transport that never reached
+      // `connected` never announced itself, callers have not attached
+      // their handlers yet, and a close event for a connection that never
+      // opened is a lie.
       throw err;
     }
   }
