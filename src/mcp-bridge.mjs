@@ -7,6 +7,7 @@
  */
 
 import { MSG, mcpDiscover, mcpCall } from './messages.mjs';
+import { waitForControlMessage } from './control-listener.mjs';
 
 /** Default timeout for MCP operations (15 seconds). */
 const MCP_TIMEOUT_MS = 15_000;
@@ -19,13 +20,24 @@ export class WshMcpBridge {
   #tools = new Map();
 
   /**
-   * @param {object} client - A WshClient or transport exposing:
+   * @param {object} client - A `WshClient`, a `WshTransport`, or any object
+   *   exposing:
    *   - sendControl(msg): send a control message
    *   - addControlListener(fn) / removeControlListener(fn): message listeners
-   *     (or _controlListeners array, or onControl callback)
+   *     (or a `_controlListeners` array, or a settable `onControl` callback)
+   *
+   *   `sendControl` is checked here rather than at first use: without it
+   *   `discover()` failed with `TypeError: this.#client.sendControl is not
+   *   a function` from inside a promise, naming a private field and not
+   *   the argument that was actually wrong.
    */
   constructor(client) {
     if (!client) throw new Error('WshMcpBridge requires a client');
+    if (typeof client.sendControl !== 'function') {
+      throw new TypeError(
+        'WshMcpBridge requires a client exposing sendControl() — pass a WshClient or a WshTransport'
+      );
+    }
     this.#client = client;
   }
 
@@ -171,58 +183,17 @@ export class WshMcpBridge {
   /**
    * Wait for a control message matching a predicate.
    *
-   * Temporarily hooks into the client's control message flow and resolves
-   * when a matching message arrives (or rejects on timeout).
+   * Subscribes to the client's control message flow and resolves when a
+   * matching message arrives (or rejects on timeout). Deregistration is
+   * `control-listener.mjs`'s job — the version inlined here leaked one
+   * permanent `onControl` wrapper per operation against any client whose
+   * only hook is that property.
    *
    * @param {function(object): boolean} predicate
    * @param {number} timeoutMs
    * @returns {Promise<object>}
    */
   _waitForMessage(predicate, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      let timer = null;
-      let settled = false;
-
-      const cleanup = () => {
-        settled = true;
-        if (timer !== null) clearTimeout(timer);
-        // Remove listener
-        if (this.#client.removeControlListener) {
-          this.#client.removeControlListener(listener);
-        } else if (this.#client._controlListeners) {
-          const idx = this.#client._controlListeners.indexOf(listener);
-          if (idx !== -1) this.#client._controlListeners.splice(idx, 1);
-        }
-      };
-
-      const listener = (msg) => {
-        if (settled) return;
-        if (predicate(msg)) {
-          cleanup();
-          resolve(msg);
-        }
-      };
-
-      // Register listener on the client
-      if (this.#client.addControlListener) {
-        this.#client.addControlListener(listener);
-      } else if (this.#client._controlListeners) {
-        this.#client._controlListeners.push(listener);
-      } else {
-        // Fallback: wrap existing onControl
-        const prev = this.#client.onControl;
-        this.#client.onControl = (msg) => {
-          prev?.(msg);
-          listener(msg);
-        };
-      }
-
-      timer = setTimeout(() => {
-        if (!settled) {
-          cleanup();
-          reject(new Error(`MCP operation timed out after ${timeoutMs}ms`));
-        }
-      }, timeoutMs);
-    });
+    return waitForControlMessage(this.#client, predicate, timeoutMs, 'MCP operation');
   }
 }

@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+- **Fix: `WshMcpBridge` and `WshFileTransfer.list()` were unreachable from a
+  `WshClient`.** Both classes are exported from the package root and both
+  document their constructor argument as "a WshClient", and both drive the
+  connection through `sendControl()` plus `addControlListener()` /
+  `removeControlListener()` (`list()` also needs `openStream()`). `WshClient`
+  exposed none of those, so `discover()`, `call()` and `list()` all failed
+  immediately with
+
+  ```
+  TypeError: this.#client.sendControl is not a function
+  ```
+
+  the first time a real client reached them. Three public methods
+  unreachable while the suite was green — the same shape as 0.14.0's
+  `attachSession()`/`resumeSession()`, and for the same reason: every test
+  and both examples passed a hand-written stand-in, and a stand-in written
+  to satisfy the caller cannot disagree with it.
+
+  `WshClient` gains `sendControl()`, `openStream()`, `addControlListener()`
+  and `removeControlListener()` — thin delegations to the transport it
+  already owns and to `#handleControl`, which already sees every inbound
+  control message. Listeners are dispatched *after* the RelayForward trust
+  gate, so a relayed message from a peer this client has not accepted never
+  reaches one, and a trusted RelayForward arrives unwrapped.
+
+- **Fix: each bridge operation leaked a permanent `onControl` wrapper.** For
+  a client whose only hook is a settable `onControl` property — which is what
+  a bare `WshTransport` is — the subscription inlined in both helpers wrapped
+  that property and never unwrapped it; the matching `cleanup()` handled only
+  `removeControlListener` and `_controlListeners`. Measured against a real
+  `WshTransport`, the frames an inbound control message traversed to reach the
+  connection's own handler grew one per operation, with no ceiling: 1, 5, 20
+  and 50 operations gave 5, 9, 24 and 54. Subscription now lives in
+  `src/control-listener.mjs`, attaches once and detaches on cleanup, and
+  restores the displaced handler only while its own wrapper is still the
+  installed one — putting `prev` back unconditionally severs any subscription
+  that nested inside it.
+
+- **`WshMcpBridge`'s constructor and `WshFileTransfer.list()` now reject a
+  client that cannot work**, naming the missing member, instead of failing
+  later with a `TypeError` about a private field. `WshFileTransfer`'s
+  constructor is unchanged: `upload()`/`download()` need nothing from the
+  control channel.
+
+- `WshFileTransfer`'s control-message timeout text changed from
+  `Timeout waiting for response (30000ms)` to
+  `File transfer response timed out after 30000ms`.
+
+- New `test/helpers-against-real-client.test.mjs`: every case drives a real
+  `WshClient` over a real `WshTransport` subclass through the real handshake,
+  and asserts on what reached the wire. `npm test` goes 443 → 453.
+
 ## 0.14.0
 
 - **Fix: `attachSession()`/`resumeSession()` were both unreachable** (clawser

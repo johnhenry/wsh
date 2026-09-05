@@ -1776,6 +1776,31 @@ export class WshClient {
   sendRelayControl(msg: WshMessage): Promise<void>;
 
   /**
+   * Send a raw control message on the authenticated connection.
+   *
+   * Prefer the typed methods. This is the hook `WshMcpBridge` and
+   * `WshFileTransfer` compose their own messages through.
+   */
+  sendControl(msg: WshMessage): Promise<void>;
+
+  /**
+   * Open a raw bidirectional stream on the underlying transport.
+   */
+  openStream(): Promise<WshStream>;
+
+  /**
+   * Observe every inbound control message this client handles. Listeners
+   * are called past the RelayForward trust gate, so a message from an
+   * unaccepted peer never reaches one.
+   */
+  addControlListener(fn: (msg: WshMessage) => void): void;
+
+  /**
+   * Stop observing inbound control messages.
+   */
+  removeControlListener(fn: (msg: WshMessage) => void): void;
+
+  /**
    * Initiate end-to-end encryption for a session: `'X25519'` (default,
    * classical ECDH) or `'X25519+ML-KEM-768'` (hybrid, with automatic
    * fallback to classical if the peer doesn't support it). Experimental
