@@ -181,6 +181,13 @@ export class WshClient {
    */
   #acceptedRelayPeers = new Set();
 
+  /**
+   * Observers registered through addControlListener() — see that method
+   * and #dispatchControlListeners.
+   * @type {Set<function(object): void>}
+   */
+  #controlListeners = new Set();
+
   /** @type {number} Monotonically increasing channel ID counter. */
   #channelCounter = 0;
 
@@ -983,6 +990,71 @@ export class WshClient {
   async sendRelayControl(msg) {
     this.#assertAuthenticated('sendRelayControl');
     await this.#transport.sendControl(msg);
+  }
+
+  // ── Raw control channel (used by WshMcpBridge / WshFileTransfer) ─────
+  //
+  // `WshMcpBridge` and `WshFileTransfer` both document their constructor
+  // argument as "a WshClient", and both drive the connection through
+  // `sendControl()` + `addControlListener()`/`removeControlListener()`
+  // (`WshFileTransfer.list()` also needs `openStream()`). None of those
+  // existed on this class, so every one of those code paths failed with
+  // `TypeError: this.#client.sendControl is not a function` the moment a
+  // real client was passed instead of a hand-written stand-in — the same
+  // shape as the 0.14.0 `attachSession()`/`resumeSession()` bug, where a
+  // whole method was unreachable while the suite stayed green because
+  // every test spoke to a mock that answered whatever it was asked.
+  //
+  // These four members are thin, deliberate delegations rather than a new
+  // subsystem: the transport already owns the socket and the framing, and
+  // `#handleControl` already sees every inbound control message.
+
+  /**
+   * Send a raw control message on the authenticated connection.
+   *
+   * Prefer the typed methods (`openSession`, `callTool`, `upload`, …).
+   * This exists for the helper classes that compose their own messages —
+   * see `WshMcpBridge` and `WshFileTransfer`.
+   *
+   * @param {object} msg
+   * @returns {Promise<void>}
+   */
+  async sendControl(msg) {
+    this.#assertAuthenticated('sendControl');
+    await this.#transport.sendControl(msg);
+  }
+
+  /**
+   * Open a raw bidirectional stream on the underlying transport.
+   *
+   * @returns {Promise<{ readable: ReadableStream, writable: WritableStream }>}
+   */
+  async openStream() {
+    this.#assertAuthenticated('openStream');
+    return this.#transport.openStream();
+  }
+
+  /**
+   * Observe every inbound control message this client handles.
+   *
+   * Listeners are called after the RelayForward trust gate, so a relayed
+   * message from an untrusted peer is never handed to one, and a trusted
+   * RelayForward is delivered as its unwrapped inner message. A listener
+   * that throws is logged and does not stop the client's own dispatch.
+   *
+   * @param {function(object): void} fn
+   */
+  addControlListener(fn) {
+    if (typeof fn !== 'function') throw new TypeError('addControlListener requires a function');
+    this.#controlListeners.add(fn);
+  }
+
+  /**
+   * Stop observing inbound control messages.
+   * @param {function(object): void} fn
+   */
+  removeControlListener(fn) {
+    this.#controlListeners.delete(fn);
   }
 
   /**
@@ -1804,6 +1876,13 @@ export class WshClient {
       return;
     }
 
+    // Observers registered via addControlListener() see the message here —
+    // past the RelayForward trust gate above (so an untrusted peer's
+    // message never reaches one, and a trusted one arrives unwrapped) and
+    // before this client's own dispatch, so a helper waiting on a reply
+    // cannot miss it to an ordering accident.
+    this.#dispatchControlListeners(msg);
+
     // OPEN_OK/OPEN_FAIL: handled as a dedicated case (not the generic
     // waiter mechanism below) so the WshSession gets constructed and
     // registered in #sessions synchronously, in the same dispatch step as
@@ -2196,6 +2275,28 @@ export class WshClient {
   #assertAuthenticated(action) {
     if (this.#state !== STATE_AUTHENTICATED) {
       throw new Error(`Cannot ${action}: client is ${this.#state} (expected authenticated)`);
+    }
+  }
+
+  /**
+   * Hand a control message to every addControlListener() observer.
+   *
+   * Iterates a copy, so a listener that deregisters itself (the normal
+   * case — a one-shot reply waiter) does not perturb the iteration, and
+   * isolates throws so one bad observer cannot break the client's own
+   * dispatch of the same message.
+   *
+   * @param {object} msg
+   * @private
+   */
+  #dispatchControlListeners(msg) {
+    if (this.#controlListeners.size === 0) return;
+    for (const fn of [...this.#controlListeners]) {
+      try {
+        fn(msg);
+      } catch (err) {
+        console.error('[wsh:client] control listener error:', err);
+      }
     }
   }
 

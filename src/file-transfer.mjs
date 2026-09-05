@@ -8,6 +8,7 @@
  */
 
 import { MSG, open, CHANNEL_KIND } from './messages.mjs';
+import { waitForControlMessage } from './control-listener.mjs';
 
 /** Default timeout for waiting on control messages (30 seconds). */
 const RESPONSE_TIMEOUT_MS = 30_000;
@@ -30,6 +31,10 @@ export class WshFileTransfer {
    *   - openStream(): open a new bidirectional stream
    *   - onControl: settable callback for incoming control messages
    *     (or a method to add a listener — see _waitForMessage)
+   *
+   *   Only `list()` needs the control-channel members, so they are checked
+   *   there rather than here: uploading and downloading through a client
+   *   that has `upload()`/`download()` and nothing else stays valid.
    */
   constructor(client) {
     if (!client) throw new Error('WshFileTransfer requires a client');
@@ -104,6 +109,11 @@ export class WshFileTransfer {
     if (!remotePath || typeof remotePath !== 'string') {
       throw new Error('remotePath is required');
     }
+    if (typeof this.#client.sendControl !== 'function' || typeof this.#client.openStream !== 'function') {
+      throw new TypeError(
+        'WshFileTransfer.list() requires a client exposing sendControl() and openStream() (e.g. WshClient)'
+      );
+    }
 
     // Use an exec channel to run ls
     const openMsg = open({
@@ -154,51 +164,7 @@ export class WshFileTransfer {
    * @returns {Promise<object>}
    */
   _waitForMessage(predicate, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      let timer = null;
-      let settled = false;
-
-      const cleanup = () => {
-        settled = true;
-        if (timer !== null) clearTimeout(timer);
-        // Remove listener
-        if (this.#client.removeControlListener) {
-          this.#client.removeControlListener(listener);
-        } else if (this.#client._controlListeners) {
-          const idx = this.#client._controlListeners.indexOf(listener);
-          if (idx !== -1) this.#client._controlListeners.splice(idx, 1);
-        }
-      };
-
-      const listener = (msg) => {
-        if (settled) return;
-        if (predicate(msg)) {
-          cleanup();
-          resolve(msg);
-        }
-      };
-
-      // Register listener on the client
-      if (this.#client.addControlListener) {
-        this.#client.addControlListener(listener);
-      } else if (this.#client._controlListeners) {
-        this.#client._controlListeners.push(listener);
-      } else {
-        // Fallback: wrap existing onControl
-        const prev = this.#client.onControl;
-        this.#client.onControl = (msg) => {
-          prev?.(msg);
-          listener(msg);
-        };
-      }
-
-      timer = setTimeout(() => {
-        if (!settled) {
-          cleanup();
-          reject(new Error(`Timeout waiting for response (${timeoutMs}ms)`));
-        }
-      }, timeoutMs);
-    });
+    return waitForControlMessage(this.#client, predicate, timeoutMs, 'File transfer response');
   }
 
   /**
