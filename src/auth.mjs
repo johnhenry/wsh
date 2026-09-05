@@ -5,15 +5,77 @@
 
 import { PROTOCOL_VERSION } from './messages.mjs';
 
+// ── Capability detection ──────────────────────────────────────────────
+
+/** @type {Promise<boolean>|null} Memoized: the answer cannot change at runtime. */
+let ed25519Support = null;
+
+/**
+ * Whether this runtime's WebCrypto implements Ed25519.
+ *
+ * There is deliberately no pure-JS fallback behind this. A JS
+ * implementation needs the private scalar as ordinary bytes, which would
+ * quietly give up the property `WshKeyStore` is built around -- keys are
+ * non-extractable `CryptoKey` objects by default, so a compromised page
+ * can use a key but cannot exfiltrate it. Trading that away on exactly
+ * the oldest, least-patched engines is the wrong direction, and doing it
+ * silently is worse. So wsh's floor is WebCrypto Ed25519, and this is how
+ * an application asks about it before committing to pubkey auth:
+ *
+ * ```js
+ * if (await isEd25519Supported()) {
+ *   await client.connect(url, { username, keyPair });
+ * } else {
+ *   await client.connect(url, { username, password });   // AUTH_METHOD.PASSWORD
+ * }
+ * ```
+ *
+ * Measured directly rather than sniffed from a version string: `'Ed25519'`
+ * is accepted as an algorithm name by some engines that then fail at
+ * `generateKey`, so nothing short of generating a key is conclusive.
+ *
+ * @returns {Promise<boolean>}
+ */
+export async function isEd25519Supported() {
+  if (ed25519Support === null) {
+    ed25519Support = (async () => {
+      try {
+        await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify']);
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+  }
+  return ed25519Support;
+}
+
 // ── Key Generation ────────────────────────────────────────────────────
 
 /**
  * Generate a new Ed25519 key pair.
+ *
+ * Throws where WebCrypto has no Ed25519 -- see `isEd25519Supported()` for
+ * why there is no fallback, and for how to check before you get here.
+ *
  * @param {boolean} [extractable=false] - Whether private key can be exported
  * @returns {Promise<CryptoKeyPair>} { publicKey, privateKey }
  */
 export async function generateKeyPair(extractable = false) {
-  return crypto.subtle.generateKey('Ed25519', extractable, ['sign', 'verify']);
+  try {
+    return await crypto.subtle.generateKey('Ed25519', extractable, ['sign', 'verify']);
+  } catch (err) {
+    // The platform's own message is typically "Unrecognized name" or a
+    // bare "Type error", neither of which says which algorithm, which
+    // library wanted it, or what a caller might do instead.
+    throw new Error(
+      'wsh requires WebCrypto Ed25519, which this runtime does not implement ' +
+      '(Safari 17+, Chrome/Edge 137+, Firefox 130+, Node 20+). Check ' +
+      'isEd25519Supported() first and fall back to password auth, or supply ' +
+      `a CryptoKeyPair from elsewhere. (${err?.message || err})`,
+      { cause: err }
+    );
+  }
 }
 
 // ── Export / Import ───────────────────────────────────────────────────

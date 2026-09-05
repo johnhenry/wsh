@@ -238,3 +238,53 @@ describe('auth', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' 
     assert.ok(valid);
   });
 });
+
+describe('Ed25519 capability floor', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
+  // wsh has no pure-JS Ed25519 fallback -- deliberately, because one
+  // would need the private scalar as ordinary bytes and give up the
+  // non-extractable CryptoKey property WshKeyStore is built around. What
+  // it owes callers instead is a way to ask, and a comprehensible failure
+  // where the answer is no.
+
+  it('isEd25519Supported() reports true on a runtime that has it', async () => {
+    assert.equal(await auth.isEd25519Supported(), true);
+  });
+
+  it('isEd25519Supported() memoizes rather than re-probing', async () => {
+    const first = auth.isEd25519Supported();
+    const second = auth.isEd25519Supported();
+    assert.equal(await first, await second);
+  });
+
+  it('generateKeyPair() explains the floor instead of forwarding "Unrecognized name"', async () => {
+    const original = crypto.subtle.generateKey;
+    crypto.subtle.generateKey = async () => {
+      const err = new Error('Unrecognized name.');
+      err.name = 'NotSupportedError';
+      throw err;
+    };
+    try {
+      await assert.rejects(
+        () => auth.generateKeyPair(),
+        (err) => {
+          // The message must name the missing primitive, the versions
+          // that have it, and what a caller can do instead -- none of
+          // which the platform's own error says.
+          assert.match(err.message, /WebCrypto Ed25519/);
+          assert.match(err.message, /Safari 17\+/);
+          assert.match(err.message, /isEd25519Supported/);
+          assert.equal(err.cause?.name, 'NotSupportedError');
+          return true;
+        }
+      );
+    } finally {
+      crypto.subtle.generateKey = original;
+    }
+  });
+
+  it('a working runtime is unaffected by that wrapping', async () => {
+    const keyPair = await auth.generateKeyPair(true);
+    assert.ok(keyPair.publicKey);
+    assert.ok(keyPair.privateKey);
+  });
+});

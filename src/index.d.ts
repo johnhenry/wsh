@@ -817,7 +817,19 @@ export function isValidMessage(msg: unknown): boolean;
 // ============================================================================
 
 /**
- * Generate a new Ed25519 key pair.
+ * Whether this runtime's WebCrypto implements Ed25519, measured by
+ * generating a key rather than sniffed from a version string.
+ *
+ * There is no pure-JS fallback: one would need the private scalar as
+ * ordinary bytes, giving up the non-extractable `CryptoKey` property
+ * `WshKeyStore` is built around. Check this before committing to pubkey
+ * auth and fall back to password auth where it returns false.
+ */
+export function isEd25519Supported(): Promise<boolean>;
+
+/**
+ * Generate a new Ed25519 key pair. Throws with an actionable message
+ * where WebCrypto has no Ed25519 -- see `isEd25519Supported()`.
  * @param extractable - Whether private key can be exported (default false)
  */
 export function generateKeyPair(extractable?: boolean): Promise<CryptoKeyPair>;
@@ -1017,7 +1029,7 @@ export class WshTransport {
   readonly state: 'disconnected' | 'connecting' | 'connected' | 'closed';
 
   /** Connect to a wsh server. */
-  connect(url: string): Promise<void>;
+  connect(url: string, options?: object): Promise<void>;
 
   /** Gracefully close the transport. */
   close(): Promise<void>;
@@ -1044,7 +1056,7 @@ export class WshTransport {
   protected _emitError(err: Error): void;
 
   /** @protected Must be overridden by subclasses. */
-  protected _doConnect(url: string): Promise<void>;
+  protected _doConnect(url: string, options?: object): Promise<void>;
 
   /** @protected Must be overridden by subclasses. */
   protected _doClose(): Promise<void>;
@@ -1064,7 +1076,65 @@ export class WshTransport {
  * - Subsequent streams carry raw byte data (no framing).
  * - Server-initiated streams are surfaced via onStreamOpen.
  */
-export class WebTransportTransport extends WshTransport {}
+export class WebTransportTransport extends WshTransport {
+  /**
+   * @param options Forwarded to the `WebTransport` constructor. Options
+   *   passed to `connect()` override these per call.
+   */
+  constructor(options?: WshWebTransportOptions);
+
+  connect(url: string, options?: WshWebTransportOptions): Promise<void>;
+}
+
+/**
+ * One entry of `serverCertificateHashes`. The digest may be given as raw
+ * bytes, as hex (with or without `:` separators -- what
+ * `openssl x509 -fingerprint -sha256` prints), or as base64/base64url.
+ */
+export interface WshCertificateHash {
+  /** Defaults to `'sha-256'`, the only algorithm the platform accepts today. */
+  algorithm?: string;
+  value: BufferSource | string;
+}
+
+/**
+ * Options forwarded to the `WebTransport` constructor.
+ *
+ * `serverCertificateHashes` is the interesting one: it pins a specific
+ * self-signed certificate by digest, which is the only mechanism in the
+ * web platform that lets page JavaScript reach a server whose certificate
+ * no certificate authority signed. The platform's own constraints apply --
+ * `https:` URL, HTTP/3 only, ECDSA P-256 key, at most 14 days validity,
+ * no connection pooling.
+ *
+ * Every other key is forwarded verbatim, so platform options not listed
+ * here still work.
+ */
+export interface WshWebTransportOptions {
+  serverCertificateHashes?: Array<WshCertificateHash | BufferSource | string>;
+  allowPooling?: boolean;
+  requireUnreliable?: boolean;
+  congestionControl?: 'default' | 'throughput' | 'low-latency';
+  anticipatedConcurrentIncomingUnidirectionalStreams?: number | null;
+  anticipatedConcurrentIncomingBidirectionalStreams?: number | null;
+  protocols?: string[];
+  [key: string]: unknown;
+}
+
+/**
+ * Decode one `serverCertificateHashes` digest into bytes. Accepts a
+ * `BufferSource`, hex (separators and an `... Fingerprint=` prefix are
+ * stripped), or base64/base64url. Throws a `TypeError` on an
+ * unrecognised shape and a `RangeError` on a digest of the wrong length
+ * for the algorithm.
+ */
+export function parseCertificateHash(value: BufferSource | string, algorithm?: string): Uint8Array;
+
+/**
+ * Normalise a caller-supplied options bag into a `WebTransportOptions`
+ * dictionary, or `undefined` when there is nothing to pass.
+ */
+export function normalizeWebTransportOptions(options?: WshWebTransportOptions): object | undefined;
 
 /**
  * Dispatch a fixed, already-available batch of items one at a time,
@@ -1427,6 +1497,12 @@ export interface WshConnectOptions {
   keyPair?: CryptoKeyPair;
   password?: string;
   transport?: 'wt' | 'ws';
+  /**
+   * Forwarded to the `WebTransport` constructor when the WebTransport
+   * rung of the transport ladder is tried; ignored by the WebSocket rung,
+   * which has no `serverCertificateHashes` equivalent.
+   */
+  webTransport?: WshWebTransportOptions;
   timeout?: number;
 }
 
@@ -1466,6 +1542,8 @@ export interface WshConnectReverseOptions {
   username: string;
   keyPair?: CryptoKeyPair;
   password?: string;
+  /** Forwarded to the underlying `connect()` -- see `WshConnectOptions`. */
+  webTransport?: WshWebTransportOptions;
   expose?: {
     shell?: boolean;
     exec?: boolean;

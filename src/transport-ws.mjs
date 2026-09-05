@@ -214,8 +214,22 @@ export class WebSocketTransport extends WshTransport {
     // own stream objects -- without this, any reader still waiting on a
     // stream's readable side would hang forever, since nothing else
     // errors or closes it once the peer can no longer respond.
-    this.#qmux?.close();
-    this.#qmux?.destroy(new Error('Transport closed'));
+    //
+    // Each step is guarded separately. The courtesy CONNECTION_CLOSE is
+    // the one that can realistically throw -- it writes to the socket,
+    // and a socket that is already broken is the single most likely
+    // reason we are closing at all. Letting that throw would skip both
+    // the local `destroy()` (hanging every waiting reader, the exact
+    // thing above) and the socket close (leaking the connection), which
+    // makes the failure mode strictly worse than the failure that
+    // triggered it.
+    try {
+      this.#qmux?.close();
+    } catch { /* peer is unreachable; the local teardown below still matters */ }
+
+    try {
+      this.#qmux?.destroy(new Error('Transport closed'));
+    } catch { /* a stream's error callback threw; keep tearing down */ }
 
     if (this.#ws) {
       try {
