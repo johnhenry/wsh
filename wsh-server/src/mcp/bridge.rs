@@ -87,6 +87,7 @@ impl McpBridge {
             Some(t) => t,
             None => {
                 return McpResultPayload {
+                    call_id: call.call_id.clone(),
                     result: json!({
                         "error": format!("unknown tool: {}", call.tool),
                     }),
@@ -95,8 +96,9 @@ impl McpBridge {
         };
 
         match self.execute_tool(tool, &call.arguments).await {
-            Ok(output) => McpResultPayload { result: output },
+            Ok(output) => McpResultPayload { call_id: call.call_id.clone(), result: output },
             Err(e) => McpResultPayload {
+                call_id: call.call_id.clone(),
                 result: json!({
                     "error": e.to_string(),
                 }),

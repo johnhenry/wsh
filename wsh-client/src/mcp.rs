@@ -46,6 +46,11 @@ pub async fn call_tool(
         payload: Payload::McpCall(McpCallPayload {
             tool: name.to_string(),
             arguments: args,
+            // Left None deliberately: send_and_wait() matches on message type
+            // alone (and pops LIFO), so an id sent from here would be echoed
+            // back and still not correlated. Sending one without correlating
+            // on it would only look like a fix. Tracked separately.
+            call_id: None,
         }),
     };
 

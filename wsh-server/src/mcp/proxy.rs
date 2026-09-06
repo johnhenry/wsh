@@ -156,6 +156,7 @@ impl McpProxy {
             Some(parts) => parts,
             None => {
                 return McpResultPayload {
+                    call_id: call.call_id.clone(),
                     result: json!({
                         "error": format!(
                             "tool name must be prefixed with server name: {}",
@@ -170,6 +171,7 @@ impl McpProxy {
             Some(s) => s,
             None => {
                 return McpResultPayload {
+                    call_id: call.call_id.clone(),
                     result: json!({
                         "error": format!("unknown MCP server: {server_name}"),
                     }),
@@ -203,8 +205,9 @@ impl McpProxy {
         match req.send().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<serde_json::Value>().await {
-                    Ok(result) => McpResultPayload { result },
+                    Ok(result) => McpResultPayload { call_id: call.call_id.clone(), result },
                     Err(e) => McpResultPayload {
+                        call_id: call.call_id.clone(),
                         result: json!({
                             "error": format!("failed to parse MCP result: {e}"),
                         }),
@@ -215,6 +218,7 @@ impl McpProxy {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 McpResultPayload {
+                    call_id: call.call_id.clone(),
                     result: json!({
                         "error": format!("MCP call failed with status {status}"),
                         "body": body,
@@ -222,6 +226,7 @@ impl McpProxy {
                 }
             }
             Err(e) => McpResultPayload {
+                call_id: call.call_id.clone(),
                 result: json!({
                     "error": format!("MCP call request failed: {e}"),
                 }),

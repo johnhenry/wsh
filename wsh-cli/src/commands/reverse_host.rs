@@ -668,6 +668,7 @@ impl ReverseHostRuntime {
             self.mcp.call(&call).await
         } else {
             McpResultPayload {
+                call_id: call.call_id.clone(),
                 result: json!({
                     "error": "tool access not permitted for this reverse host",
                 }),
@@ -1381,8 +1382,9 @@ impl LocalMcpBridge {
         };
 
         match result {
-            Ok(result) => McpResultPayload { result },
+            Ok(result) => McpResultPayload { call_id: call.call_id.clone(), result },
             Err(err) => McpResultPayload {
+                call_id: call.call_id.clone(),
                 result: json!({ "error": err.to_string() }),
             },
         }
@@ -2110,9 +2112,41 @@ mod tests {
             .call(&wsh_core::messages::McpCallPayload {
                 tool: "shell.exec".to_string(),
                 arguments: json!({ "command": "printf hello" }),
+                call_id: Some("call-1".to_string()),
             })
             .await;
         assert_eq!(result.result["stdout"], "hello");
+        // The caller correlates concurrent calls on this; a responder that
+        // drops it forces them back on "first result wins".
+        assert_eq!(result.call_id.as_deref(), Some("call-1"));
+    }
+
+    #[tokio::test]
+    async fn local_mcp_bridge_echoes_call_id_on_failure_too() {
+        let bridge = LocalMcpBridge;
+        let result = bridge
+            .call(&wsh_core::messages::McpCallPayload {
+                tool: "no.such.tool".to_string(),
+                arguments: json!({}),
+                call_id: Some("call-2".to_string()),
+            })
+            .await;
+        assert!(result.result["error"].is_string());
+        // An error still answers one specific call.
+        assert_eq!(result.call_id.as_deref(), Some("call-2"));
+    }
+
+    #[tokio::test]
+    async fn local_mcp_bridge_omits_call_id_when_the_call_carried_none() {
+        let bridge = LocalMcpBridge;
+        let result = bridge
+            .call(&wsh_core::messages::McpCallPayload {
+                tool: "shell.exec".to_string(),
+                arguments: json!({ "command": "printf hello" }),
+                call_id: None,
+            })
+            .await;
+        assert_eq!(result.call_id, None);
     }
 
     #[test]

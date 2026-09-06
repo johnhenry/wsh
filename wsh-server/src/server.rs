@@ -1659,7 +1659,15 @@ impl WshServer {
 
     /// Build the list of features this server advertises based on configuration.
     fn build_feature_list(&self) -> Vec<String> {
-        let mut features = vec!["mcp".to_string(), "file-transfer".to_string()];
+        // "mcp-call-id": McpResult echoes McpCall's call_id, so a client may
+        // correlate concurrent tool calls. Advertised rather than assumed --
+        // McpCallPayload is deny_unknown_fields, so a client must not send
+        // call_id to a server that predates it.
+        let mut features = vec![
+            "mcp".to_string(),
+            "mcp-call-id".to_string(),
+            "file-transfer".to_string(),
+        ];
         if self.gateway_enabled {
             features.push("gateway".to_string());
         }
