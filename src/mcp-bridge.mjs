@@ -8,6 +8,7 @@
 
 import { MSG, mcpDiscover, mcpCall } from './messages.mjs';
 import { waitForControlMessage } from './control-listener.mjs';
+import { MCP_CALL_ID_FEATURE } from './client.mjs';
 
 /** Default timeout for MCP operations (15 seconds). */
 const MCP_TIMEOUT_MS = 15_000;
@@ -18,6 +19,16 @@ export class WshMcpBridge {
 
   /** @type {Map<string, object>} Cached tool specs: name -> { name, description, parameters } */
   #tools = new Map();
+
+  /** @type {number} Monotonically increasing counter for call_id. */
+  #callCounter = 0;
+
+  /**
+   * Tail of the serialised call chain, used only against servers that do not
+   * advertise `mcp-call-id`. Never rejects.
+   * @type {Promise<void>}
+   */
+  #queue = Promise.resolve();
 
   /**
    * @param {object} client - A `WshClient`, a `WshTransport`, or any object
@@ -85,6 +96,13 @@ export class WshMcpBridge {
    *
    * Sends an MCP_CALL message and waits for the MCP_RESULT response.
    *
+   * Safe to call concurrently. Against a server advertising `mcp-call-id`
+   * each call carries a correlation id and takes only its own reply;
+   * otherwise calls are queued one at a time, because without an id on the
+   * wire the replies are indistinguishable and `{ success, output }`
+   * normalisation strips whatever the payload might have identified itself
+   * by.
+   *
    * @param {string} toolName - Name of the tool to invoke
    * @param {object} [args={}] - Arguments to pass to the tool
    * @param {object} [opts]
@@ -103,10 +121,40 @@ export class WshMcpBridge {
       );
     }
 
-    await this.#client.sendControl(mcpCall({ tool: toolName, arguments: args }));
+    if (this.#correlates()) return this.#callOnce(toolName, args, timeout);
+
+    const run = this.#queue.then(
+      () => this.#callOnce(toolName, args, timeout),
+      () => this.#callOnce(toolName, args, timeout),
+    );
+    this.#queue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** True when the connected server echoes call_id. @private */
+  #correlates() {
+    return this.#client?.hasFeature?.(MCP_CALL_ID_FEATURE) === true;
+  }
+
+  /** @private */
+  async #callOnce(toolName, args, timeout) {
+    const callId = this.#correlates()
+      ? `bridge-${++this.#callCounter}-${Date.now()}`
+      : undefined;
+
+    await this.#client.sendControl(
+      mcpCall({ tool: toolName, arguments: args, callId })
+    );
 
     const response = await this._waitForMessage(
-      (msg) => msg.type === MSG.MCP_RESULT || msg.type === MSG.ERROR,
+      (msg) => {
+        // ERROR carries no call_id and cannot be attributed to one call;
+        // it is taken by whichever call is waiting.
+        if (msg.type === MSG.ERROR) return true;
+        if (msg.type !== MSG.MCP_RESULT) return false;
+        if (callId === undefined) return true;
+        return msg.call_id === undefined || msg.call_id === callId;
+      },
       timeout
     );
 

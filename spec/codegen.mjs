@@ -287,8 +287,10 @@ function emitJS(schema) {
 
     // ── Special case: McpCall (arguments is a reserved word) ─────────
     if (msg.name === 'McpCall') {
-      out.push('export function mcpCall({ tool, arguments: args } = {}) {');
-      out.push('  return { type: MSG.MCP_CALL, tool, arguments: args };');
+      out.push('export function mcpCall({ tool, arguments: args, callId } = {}) {');
+      out.push('  const m = { type: MSG.MCP_CALL, tool, arguments: args };');
+      out.push('  if (callId !== undefined) m.call_id = callId;');
+      out.push('  return m;');
       out.push('}');
       out.push('');
       continue;

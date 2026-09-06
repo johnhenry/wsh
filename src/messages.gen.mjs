@@ -445,15 +445,16 @@ export function mcpTools({ tools } = {}) {
   };
 }
 
-export function mcpCall({ tool, arguments: args } = {}) {
-  return { type: MSG.MCP_CALL, tool, arguments: args };
+export function mcpCall({ tool, arguments: args, callId } = {}) {
+  const m = { type: MSG.MCP_CALL, tool, arguments: args };
+  if (callId !== undefined) m.call_id = callId;
+  return m;
 }
 
-export function mcpResult({ result } = {}) {
-  return {
-    type: MSG.MCP_RESULT,
-    result,
-  };
+export function mcpResult({ result, callId } = {}) {
+  const msg = { type: MSG.MCP_RESULT, result };
+  if (callId !== undefined) msg.call_id = callId;
+  return msg;
 }
 
 export function reverseRegister({ username, capabilities = [], peerType = "host", shellBackend = "pty", supportsAttach = false, supportsReplay = false, supportsEcho = false, supportsTermSync = false, publicKey, seq, recordSignature } = {}) {

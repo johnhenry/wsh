@@ -72,7 +72,7 @@ export {
 // Session + Client
 export { WshSession } from './session.mjs';
 export { WshVirtualSessionBackend, normalizeSessionData } from './virtual-session.mjs';
-export { WshClient } from './client.mjs';
+export { WshClient, MCP_CALL_ID_FEATURE } from './client.mjs';
 
 // Key storage
 export { WshKeyStore } from './keystore.mjs';
