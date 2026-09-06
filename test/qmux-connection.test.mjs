@@ -297,6 +297,58 @@ describe('QMuxConnection: MAX_STREAMS', () => {
     const s2 = await client.openStream();
     assert.equal(s2.id, 4);
   });
+
+  it('actually parks the caller while the grant is exhausted', async () => {
+    /*
+     * The test above never reaches the limit. It closes s1 and waits for the
+     * server's MAX_STREAMS top-up BEFORE opening s2, so
+     * `#streamsOpened >= #peerMaxStreamsBidi` is never true on entry, and its
+     * one assertion -- `s2.id === 4` -- is decided by `#nextLocalStreamId`
+     * bookkeeping whether the limit is enforced or not.
+     *
+     * Deleting the admission check outright left it green, and the whole
+     * suite at 443 pass. Only the MAX_STREAMS regrant half was load-bearing:
+     * with the check present and the regrant gone the test would hang, which
+     * is why the pair read as covered.
+     *
+     * This holds s1 OPEN, so the second call has to park.
+     */
+    const sent = [];
+    let client, server;
+    client = new QMuxConnection({
+      isClient: true,
+      initialMaxStreamsBidi: 1,
+      send: (bytes) => { sent.push(bytes); setTimeout(() => server.receiveBytes(bytes), 0); },
+    });
+    server = new QMuxConnection({
+      isClient: false,
+      initialMaxStreamsBidi: 1,
+      send: (bytes) => setTimeout(() => client.receiveBytes(bytes), 0),
+    });
+    client.sendHandshake();
+    server.sendHandshake();
+    await nextTick(2);
+
+    server.onStreamOpen = (s) => { s.close(); };
+
+    const s1 = await client.openStream();
+    const framesBefore = sent.length;
+
+    // s1 stays open: this call must not resolve.
+    let secondResolved = false;
+    const pending = client.openStream().then((s) => { secondResolved = true; return s; });
+    await nextTick(4);
+
+    assert.equal(secondResolved, false, 'the second open parks while the grant is exhausted');
+    assert.ok(sent.length > framesBefore, 'and a STREAMS_BLOCKED frame went out');
+
+    // Releasing the first stream tops the grant back up and wakes the caller.
+    await s1.close();
+    await nextTick(4);
+    const s2 = await pending;
+    assert.equal(secondResolved, true, 'the parked caller resumes after MAX_STREAMS');
+    assert.ok(s2 && typeof s2.id === 'number');
+  });
 });
 
 describe('QMuxConnection: protocol violations', () => {
