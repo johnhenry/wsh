@@ -153,6 +153,8 @@ export class WshSession {
    * @type {ReturnType<typeof setTimeout>|null}
    */
   #closeGraceTimer = null;
+  /** Why the session closed, when it closed for a reason worth naming. */
+  #closeReason = null;
 
   // ── Callbacks ───────────────────────────────────────────────────────
 
@@ -724,14 +726,7 @@ export class WshSession {
         // any pending data-EOF grace timer, regardless of which arrived
         // first.
         this.#clearCloseGraceTimer();
-        if (this.#state !== STATE_CLOSED) {
-          this.#state = STATE_CLOSED;
-          this.#abort.abort();
-          this.#virtualBackend?.close();
-          this.#releaseStreams();
-          this.#resolvePendingFileChunk(null);
-          this.#emitClose();
-        }
+        this.#closeNow();
         break;
       }
 
@@ -874,11 +869,32 @@ export class WshSession {
           if (this.#e2eKey !== null && this.#streamAccumulator) {
             const deliverable = await this.#openStreamChunks(value);
             if (deliverable === null) {
-              // Authentication failure (or corrupt framing) -- matches
-              // the strict "no skip-and-continue" philosophy of
-              // virtual-mode's counter check: tear the session down
-              // rather than deliver anything from this point on.
-              break;
+              /*
+               * Authentication failure (or corrupt framing) -- the strict
+               * "no skip-and-continue" philosophy of virtual-mode's counter
+               * check: tear the session down rather than deliver anything
+               * from this point on.
+               *
+               * `break` alone did not tear anything down. It left the loop,
+               * and control fell through to the data-EOF grace timer, so the
+               * session stayed `active` and writable for the full 300ms and
+               * then closed as an ordinary EOF: onClose with no error,
+               * onExit never fired, exitCode still null. An application could
+               * not tell "the peer forged data at me" from "the process
+               * exited and the server forgot to send CLOSE" -- the two were
+               * byte-identical to observe.
+               *
+               * Closed immediately, and the reason recorded so the two are
+               * distinguishable. `StreamAuthenticationError` was already
+               * built here and handed only to console.error; it is now the
+               * close reason as well.
+               */
+              this.#closeReason = new StreamAuthenticationError(
+                'wsh: stream authentication failed -- session torn down'
+              );
+              this.#clearCloseGraceTimer();
+              this.#closeNow();
+              return;
             }
             for (const plaintext of deliverable) {
               try {
@@ -918,11 +934,7 @@ export class WshSession {
     if (this.#state !== STATE_CLOSED && this.#closeGraceTimer === null) {
       this.#closeGraceTimer = setTimeout(() => {
         this.#closeGraceTimer = null;
-        if (this.#state !== STATE_CLOSED) {
-          this.#state = STATE_CLOSED;
-          this.#releaseStreams();
-          this.#emitClose();
-        }
+        this.#closeNow();
       }, DATA_EOF_CLOSE_GRACE_MS);
       this.#closeGraceTimer?.unref?.();
     }
@@ -935,6 +947,36 @@ export class WshSession {
    * whether or not a timer is currently scheduled.
    * @private
    */
+  /**
+   * Close the session once, releasing everything a close has to release.
+   *
+   * There were two ways a stream-mode session reached `closed` and they did
+   * not agree. The CLOSE control handler aborted, closed the virtual backend,
+   * released the streams AND settled any parked file chunk. The data-EOF
+   * grace fallback -- the path taken when a server ends the data stream
+   * without sending CLOSE, which the comment above it says is real -- only
+   * released the streams and fired onClose.
+   *
+   * So `download()`, parked on `_readFileChunk()`, was never settled on that
+   * path. It documents returning `null` for a truncated transfer and
+   * `download()` turns that into a thrown error; via the fallback it returned
+   * nothing at all and the download hung forever, while `onClose` had already
+   * fired and the session read `closed`.
+   *
+   * One method rather than two call sites kept in step by hand: the drift is
+   * the bug, and the next field added to a close would have drifted the same
+   * way.
+   */
+  #closeNow() {
+    if (this.#state === STATE_CLOSED) return;
+    this.#state = STATE_CLOSED;
+    this.#abort.abort();
+    this.#virtualBackend?.close();
+    this.#releaseStreams();
+    this.#resolvePendingFileChunk(null);
+    this.#emitClose();
+  }
+
   #clearCloseGraceTimer() {
     if (this.#closeGraceTimer !== null) {
       clearTimeout(this.#closeGraceTimer);
@@ -961,9 +1003,19 @@ export class WshSession {
    * Emit the onClose callback exactly once.
    * @private
    */
+  /**
+   * Why the session closed, or null for an ordinary close.
+   *
+   * A torn-down session and a clean exit used to be indistinguishable from
+   * the outside; this is what tells them apart.
+   */
+  get closeReason() {
+    return this.#closeReason;
+  }
+
   #emitClose() {
     try {
-      this.onClose?.();
+      this.onClose?.(this.#closeReason);
     } catch (err) {
       console.error('[wsh:session] onClose handler error:', err);
     }
