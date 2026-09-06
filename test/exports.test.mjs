@@ -132,3 +132,36 @@ describe('wsh exports', () => {
     assert.equal(typeof SerialQueue, 'function');
   });
 });
+
+// ---------------------------------------------------------------------------
+// index.d.ts vs the runtime barrel
+//
+// src/index.d.ts is shipped in `files`, so it is the API as far as every
+// TypeScript consumer is concerned — and nothing was comparing the two. It
+// had drifted: MCP_CALL_ID_FEATURE was exported from index.mjs and absent
+// from the declarations, so the feature gate a caller needs before setting
+// `callId` was unreachable from TypeScript. The list above cannot catch this
+// class of drift because it is hand-maintained; this derives from the runtime.
+// ---------------------------------------------------------------------------
+
+describe('shipped type declarations', () => {
+  it('declares every runtime export', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const dts = readFileSync(
+      fileURLToPath(new URL('../src/index.d.ts', import.meta.url)),
+      'utf8',
+    );
+    const runtime = await import('../src/index.mjs');
+
+    const missing = Object.keys(runtime)
+      .filter(name => name !== 'default')
+      .filter(name => !new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(dts));
+
+    assert.deepEqual(
+      missing, [],
+      'these are exported at runtime but absent from src/index.d.ts, so a ' +
+      'TypeScript consumer cannot reach them',
+    );
+  });
+});
