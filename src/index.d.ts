@@ -228,6 +228,16 @@ export const AUTH_METHOD: {
 /** Protocol version string. */
 export const PROTOCOL_VERSION: 'wsh-v1';
 
+/**
+ * ServerHello feature advertising that McpResult echoes McpCall's call_id.
+ *
+ * Compare against `WshClient.hasFeature()` before setting `callId`:
+ * McpCallPayload is `deny_unknown_fields` server-side, so sending the field
+ * to a server predating it makes the server reject the call rather than
+ * ignore the field.
+ */
+export const MCP_CALL_ID_FEATURE: 'mcp-call-id';
+
 /** A wsh protocol control message (all messages have a numeric `type`). */
 export interface WshMessage {
   type: number;
@@ -396,10 +406,14 @@ export function mcpTools(opts?: {
 export function mcpCall(opts?: {
   tool?: string;
   arguments?: Record<string, unknown>;
+  /** Correlates this call with its McpResult. Omitted from the message entirely when undefined. */
+  callId?: string;
 }): WshMessage;
 
 export function mcpResult(opts?: {
   result?: unknown;
+  /** Echoed verbatim from the McpCall this answers. */
+  callId?: string;
 }): WshMessage;
 
 // -- Message constructors (reverse) --
@@ -1377,8 +1391,21 @@ export class WshSession {
   /** Called when the remote process exits. */
   onExit: ((code: number) => void) | null;
 
-  /** Called when the session is fully closed. */
-  onClose: (() => void) | null;
+  /**
+   * Called when the session is fully closed.
+   *
+   * Receives the same value as `closeReason`: an Error for a torn-down
+   * session, null for an ordinary close.
+   */
+  onClose: ((reason: Error | null) => void) | null;
+
+  /**
+   * Why the session closed, or null for an ordinary close.
+   *
+   * A torn-down session and a clean exit are otherwise indistinguishable
+   * from the outside.
+   */
+  readonly closeReason: Error | null;
 
   /** Called when the remote peer acknowledges speculative local echo. */
   onEchoAck: ((payload: Record<string, unknown>) => void) | null;
