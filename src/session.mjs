@@ -475,7 +475,7 @@ export class WshSession {
     for (const { nonce, ciphertext } of wireChunks) {
       const counter = this.#e2eRecvCounter++;
       try {
-        const plaintext = await openFrame(this.#e2eKey, this.#sessionId, counter, { nonce, ciphertext });
+        const plaintext = await openFrame(this.#e2eKey, this.#sessionId, counter, { nonce, ciphertext, expectedRoleTag: this.#e2eRecvRoleTag });
         plaintexts.push(plaintext);
       } catch (err) {
         console.error(
@@ -682,7 +682,7 @@ export class WshSession {
         // delivery of *this* frame's plaintext to onData is deferred by
         // one microtask/macrotask relative to synchronous cases.
         const counter = this.#e2eRecvCounter++;
-        openFrame(this.#e2eKey, this.#sessionId, counter, { nonce: msg.nonce, ciphertext: msg.ciphertext })
+        openFrame(this.#e2eKey, this.#sessionId, counter, { nonce: msg.nonce, ciphertext: msg.ciphertext, expectedRoleTag: this.#e2eRecvRoleTag })
           .then((plaintext) => {
             this.#virtualBackend?.pushData(plaintext);
             try {
