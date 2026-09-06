@@ -1134,3 +1134,72 @@ describe('WshSession data-stream EOF vs EXIT/CLOSE control-message race (wsh #24
     assert.ok(elapsed < 2000, `grace-period fallback took far too long: ${elapsed}ms`);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The session chooses the counter and the session_id (#40)
+// ---------------------------------------------------------------------------
+//
+// `openFrame` rejects a wrong counter or a wrong session_id, and
+// test/e2e-frame.test.mjs covers that. But those tests hand `openFrame` the
+// counter and session id as literals the test wrote, so they only prove the
+// function rejects what it is GIVEN. The production choice of both values
+// lives in WshSession._handleControlMessage -- the splice check at
+// `msg.session_id !== this.#sessionId` and the advance at
+// `this.#e2eRecvCounter++` -- and nothing exercised it. A session that passed
+// a constant 0 as the expected counter, or dropped the session_id comparison
+// entirely, satisfied every existing assertion.
+
+describe('WshSession E2E guards, at the level that chooses the arguments', () => {
+  async function linkedPair(sessionId = 'sess-guard') {
+    const { WshSession } = await import('../src/session.mjs');
+    // enableE2E wants a CryptoKey, not raw bytes -- the real one comes from
+    // initiateE2E's key exchange; an imported AES-GCM key is the same shape.
+    const raw = new Uint8Array(32).fill(7);
+    const secret = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const dummyTransport = { sendControl: async () => {} };
+    const a = new WshSession(dummyTransport, 1, {}, 'pty', { dataMode: 'virtual', sessionId });
+    const b = new WshSession(dummyTransport, 1, {}, 'pty', { dataMode: 'virtual', sessionId });
+    // Captured, not auto-delivered: these tests decide what B receives.
+    const wire = [];
+    a._activateVirtual(async (msg) => { wire.push(msg); });
+    b._activateVirtual(async () => {});
+    a.enableE2E(secret, { role: 'initiator' });
+    b.enableE2E(secret, { role: 'responder' });
+    return { a, b, wire };
+  }
+
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  it('drops a frame whose session_id belongs to another session', async () => {
+    const { a, b, wire } = await linkedPair();
+    const delivered = [];
+    b.onData = (data) => delivered.push(new TextDecoder().decode(data));
+
+    await a.write('spliced from another session');
+    assert.equal(wire.length, 1);
+
+    // A relay splices this frame into a different session. The ciphertext is
+    // untouched and would decrypt; only the envelope's session_id is wrong.
+    b._handleControlMessage({ ...wire[0], session_id: 'sess-somewhere-else' });
+    await settle();
+
+    assert.deepEqual(delivered, [], 'a spliced frame is not delivered');
+  });
+
+  it('rejects a replayed frame, because the expected counter advanced', async () => {
+    const { a, b, wire } = await linkedPair('sess-replay');
+    const delivered = [];
+    b.onData = (data) => delivered.push(new TextDecoder().decode(data));
+
+    await a.write('deliver me exactly once');
+    assert.equal(wire.length, 1);
+
+    // The same frame twice, as a relay replaying what it captured.
+    b._handleControlMessage(wire[0]);
+    await settle();
+    b._handleControlMessage(wire[0]);
+    await settle();
+
+    assert.deepEqual(delivered, ['deliver me exactly once'], 'the replay is refused');
+  });
+});
