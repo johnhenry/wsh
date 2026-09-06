@@ -17,6 +17,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+      # The package has no runtime dependencies, so this was omitted -- but
+      # @noble/post-quantum is an OPTIONAL one, and it is the only ML-KEM
+      # backend a browser can use. Without an install step the noble path
+      # cannot run here, which is why it had never been executed in CI. See
+      # #42.
+      - run: npm install --no-save --include=optional
       - run: npm test
       - name: Examples smoke test
         run: npm run examples

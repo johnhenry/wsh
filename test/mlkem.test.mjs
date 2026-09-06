@@ -82,3 +82,68 @@ describe('mlkem', { skip: !mlkem && 'ML-KEM-768 module failed to import' }, () =
     await assert.rejects(() => mlkem.mlKemDecapsulate(secretKeySeed, new Uint8Array(10)));
   });
 });
+
+// ---------------------------------------------------------------------------
+// The noble path, which is the only one a browser can take (#42)
+// ---------------------------------------------------------------------------
+//
+// `getBackend()` memoised a probe that always succeeds on this repo's target
+// runtime, so every assertion above ran against native and not one line of
+// the noble branch had ever executed -- `ml_kem768.keygen`, `.encapsulate`
+// and `.decapsulate` included. No browser implements the experimental
+// WebCrypto ML-KEM draft, so noble is what every browser consumer of
+// `initiateE2E(..., 'X25519+ML-KEM-768')` actually runs.
+//
+// The file's own header claimed it exercised "whichever backend this runtime
+// actually selects", and its skip guard claimed to catch a missing noble --
+// unreachable, since the import is lazy and there is no top-level probe.
+//
+// WSH_MLKEM_BACKEND forces the choice. The env var is read per call, not
+// memoised, which is what lets one process play both peers.
+
+const nobleAvailable = await import('@noble/post-quantum/ml-kem.js').then(() => true, () => false);
+
+describe('ML-KEM-768 noble backend', { skip: !nobleAvailable && '@noble/post-quantum is not installed' }, () => {
+  const withBackend = async (name, fn) => {
+    const previous = process.env.WSH_MLKEM_BACKEND;
+    process.env.WSH_MLKEM_BACKEND = name;
+    try { return await fn(); } finally {
+      if (previous === undefined) delete process.env.WSH_MLKEM_BACKEND;
+      else process.env.WSH_MLKEM_BACKEND = previous;
+    }
+  };
+
+  it('round-trips entirely on noble', async () => {
+    await withBackend('noble', async () => {
+      const kp = await mlkem.generateMlKemKeyPair();
+      assert.equal(kp.publicKey.length, mlkem.MLKEM768_PUBLIC_KEY_LENGTH);
+      const enc = await mlkem.mlKemEncapsulate(kp.publicKey);
+      assert.equal(enc.ciphertext.length, mlkem.MLKEM768_CIPHERTEXT_LENGTH);
+      const shared = await mlkem.mlKemDecapsulate(kp.secretKeySeed, enc.ciphertext);
+      assert.deepEqual([...shared], [...enc.sharedSecret]);
+    });
+  });
+
+  it('a browser peer and a Node peer derive the SAME secret', async () => {
+    /*
+     * The failure this guards against is not a crash. If noble's argument
+     * order or seed semantics drift from the native draft -- it is pinned
+     * only to ^0.7.0 and called through three positional APIs -- the two
+     * sides still complete, and derive DIFFERENT secrets. Every frame
+     * afterwards fails to open, far from the cause.
+     *
+     * Both directions, because either peer may be the browser.
+     */
+    const nativeKeys = await withBackend('native', () => mlkem.generateMlKemKeyPair());
+    const fromNoble = await withBackend('noble', () => mlkem.mlKemEncapsulate(nativeKeys.publicKey));
+    const atNative = await withBackend('native', () =>
+      mlkem.mlKemDecapsulate(nativeKeys.secretKeySeed, fromNoble.ciphertext));
+    assert.deepEqual([...atNative], [...fromNoble.sharedSecret], 'noble -> native');
+
+    const nobleKeys = await withBackend('noble', () => mlkem.generateMlKemKeyPair());
+    const fromNative = await withBackend('native', () => mlkem.mlKemEncapsulate(nobleKeys.publicKey));
+    const atNoble = await withBackend('noble', () =>
+      mlkem.mlKemDecapsulate(nobleKeys.secretKeySeed, fromNative.ciphertext));
+    assert.deepEqual([...atNoble], [...fromNative.sharedSecret], 'native -> noble');
+  });
+});
