@@ -54,6 +54,15 @@ const DEFAULT_AUTH_TIMEOUT   = 10_000;  // ms
 const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
 
 /**
+ * ServerHello feature advertising that McpResult echoes McpCall's call_id.
+ *
+ * Negotiated rather than assumed: McpCallPayload is `deny_unknown_fields` on
+ * the Rust side, so sending call_id to a server predating it does not
+ * degrade -- it makes the server reject the call.
+ */
+export const MCP_CALL_ID_FEATURE = 'mcp-call-id';
+
+/**
  * Reject a missing argument that maps to a `required: true` wire field.
  *
  * JavaScript will happily let an omitted argument through, and
@@ -224,6 +233,17 @@ export class WshClient {
 
   /** @type {number} Monotonically increasing channel ID counter. */
   #channelCounter = 0;
+
+  /** @type {number} Monotonically increasing MCP call counter for call_id. */
+  #mcpCallCounter = 0;
+
+  /**
+   * Tail of the serialised MCP call chain, used only against servers that do
+   * not advertise `mcp-call-id`. Never rejects: each link swallows so one
+   * failed call does not poison the queue.
+   * @type {Promise<void>}
+   */
+  #mcpQueue = Promise.resolve();
 
   /**
    * Pending message waiters: Map<messageType, Array<{resolve, reject, timer}>>
@@ -1259,6 +1279,12 @@ export class WshClient {
   /**
    * Call an MCP tool on the remote server.
    *
+   * Safe to call concurrently. Against a server advertising the
+   * `mcp-call-id` feature each call carries a correlation id and takes only
+   * its own reply. Against an older server there is no id on the wire and
+   * replies are indistinguishable, so calls are queued one at a time on this
+   * connection -- slower, but never the wrong tool's result.
+   *
    * @param {string} name - Tool name
    * @param {object} [args={}] - Tool arguments. Defaults to `{}` rather
    *   than being omitted: `McpCall.arguments` is a required wire field,
@@ -1270,14 +1296,43 @@ export class WshClient {
     this.#assertAuthenticated('callTool');
     requireArgs('callTool', { name });
 
+    if (this.hasFeature(MCP_CALL_ID_FEATURE)) {
+      return this.#callToolCorrelated(name, args, timeout);
+    }
+    // No correlation available: serialise so a concurrent caller cannot be
+    // handed someone else's result.
+    const run = this.#mcpQueue.then(
+      () => this.#callToolCorrelated(name, args, timeout),
+      () => this.#callToolCorrelated(name, args, timeout),
+    );
+    this.#mcpQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /**
+   * Send one McpCall and wait for the McpResult that answers it.
+   * @private
+   */
+  async #callToolCorrelated(name, args, timeout) {
+    const correlate = this.hasFeature(MCP_CALL_ID_FEATURE);
+    // Only sent when the peer understands it: McpCallPayload is
+    // deny_unknown_fields on the Rust side, so an unsolicited call_id would
+    // make an older server reject the call outright rather than ignore it.
+    const callId = correlate ? `mcp-${++this.#mcpCallCounter}-${Date.now()}` : undefined;
+
     await this.#transport.sendControl(
-      mcpCallMsg({ tool: name, arguments: args })
+      mcpCallMsg({ tool: name, arguments: args, callId })
     );
 
     const response = await this.#waitForMessage(
       [MSG.MCP_RESULT],
       timeout,
-      `Timed out waiting for MCP tool result (${name})`
+      `Timed out waiting for MCP tool result (${name})`,
+      // A responder that echoes no call_id gets matched on type, which is
+      // the pre-correlation behaviour and all an older peer can offer.
+      callId === undefined
+        ? undefined
+        : (msg) => msg.call_id === undefined || msg.call_id === callId,
     );
 
     return response.result;
@@ -2023,10 +2078,13 @@ export class WshClient {
     }
 
     // First, check if any waiters are listening for this message type.
+    // A waiter carrying a `match` predicate only takes messages it claims,
+    // so the queue is scanned rather than shifted blindly.
     if (this.#waiters.has(type)) {
       const queue = this.#waiters.get(type);
-      if (queue.length > 0) {
-        const waiter = queue.shift();
+      for (let i = 0; i < queue.length; i++) {
+        if (queue[i].match && !queue[i].match(msg)) continue;
+        const waiter = queue.splice(i, 1)[0];
         if (queue.length === 0) this.#waiters.delete(type);
         clearTimeout(waiter.timer);
         waiter.resolve(msg);
@@ -2038,13 +2096,13 @@ export class WshClient {
     for (const [key, queue] of this.#waiters) {
       if (typeof key === 'string' && key.startsWith('multi:')) {
         for (let i = 0; i < queue.length; i++) {
-          if (queue[i].types?.includes(type)) {
-            const waiter = queue.splice(i, 1)[0];
-            if (queue.length === 0) this.#waiters.delete(key);
-            clearTimeout(waiter.timer);
-            waiter.resolve(msg);
-            return;
-          }
+          if (!queue[i].types?.includes(type)) continue;
+          if (queue[i].match && !queue[i].match(msg)) continue;
+          const waiter = queue.splice(i, 1)[0];
+          if (queue.length === 0) this.#waiters.delete(key);
+          clearTimeout(waiter.timer);
+          waiter.resolve(msg);
+          return;
         }
       }
     }
@@ -2222,7 +2280,7 @@ export class WshClient {
    * @returns {Promise<object>}
    * @private
    */
-  #waitForMessage(types, timeout, timeoutMessage) {
+  #waitForMessage(types, timeout, timeoutMessage, match) {
     const typeArr = Array.isArray(types) ? types : [types];
 
     return new Promise((resolve, reject) => {
@@ -2232,7 +2290,10 @@ export class WshClient {
         reject(new Error(timeoutMessage));
       }, timeout);
 
-      const waiter = { resolve, reject, timer, types: typeArr };
+      // `match` lets a waiter claim only the reply that belongs to it --
+      // correlation, rather than "first waiter of this type wins". Waiters
+      // without one match on type alone, as before.
+      const waiter = { resolve, reject, timer, types: typeArr, match };
 
       // For multi-type waiting, use a synthetic key.
       const key = typeArr.length === 1

@@ -567,6 +567,7 @@ Category: **mcp**
 |-------|------|----------|---------|
 | `tool` | `string` | yes | — |
 | `arguments` | `json` | yes | — |
+| `call_id` | `string` | no | — |
 
 ### McpResult (`0x43`)
 
@@ -577,6 +578,7 @@ Category: **mcp**
 | Field | Type | Required | Default |
 |-------|------|----------|---------|
 | `result` | `json` | yes | — |
+| `call_id` | `string` | no | — |
 
 ### ReverseRegister (`0x50`)
 

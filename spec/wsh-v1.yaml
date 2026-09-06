@@ -613,7 +613,7 @@ messages:
       code: 0x42
       description: >
         Invoke an MCP tool by name with JSON arguments.
-        The server replies with McpResult.
+        The server replies with McpResult carrying the same call_id.
       fields:
         tool:
           type: string
@@ -621,6 +621,15 @@ messages:
         arguments:
           type: json
           required: true
+        call_id:
+          type: string
+          required: false
+          description: >
+            Correlates this call with its McpResult.  Optional for
+            backward compatibility with peers predating it: when absent,
+            a client with more than one call in flight cannot tell the
+            replies apart and may return one call's result to another.
+            Senders SHOULD always set it.
 
     McpResult:
       code: 0x43
@@ -631,6 +640,13 @@ messages:
         result:
           type: json
           required: true
+        call_id:
+          type: string
+          required: false
+          description: >
+            Echoed verbatim from the McpCall this answers.  Responders
+            MUST echo it when the call carried one; omitting it forces
+            the caller back on type-only matching.
 
   reverse:
     ReverseRegister:
