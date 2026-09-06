@@ -66,7 +66,34 @@ function bytesEqual(a, b) {
   return diff === 0;
 }
 
+/**
+ * Which implementation serves ML-KEM-768, with an override for testing.
+ *
+ * The noble branch is the ONLY path a browser can take -- no browser
+ * implements the experimental WebCrypto ML-KEM draft -- and until this
+ * override existed no test had ever executed a line of it. `getBackend()`
+ * memoised a probe that always succeeds on the repo's target runtime, so
+ * every assertion ran against native, and every noble call
+ * (`ml_kem768.keygen`, `.encapsulate`, `.decapsulate`) was untouched. A
+ * change in noble's argument order or seed semantics -- it is pinned only to
+ * `^0.7.0` and called through three positional APIs -- would break hybrid PQ
+ * key exchange for every browser consumer while this repo stayed green.
+ *
+ * `WSH_MLKEM_BACKEND=noble` forces it. Read defensively: this module runs in
+ * browsers, where `process` does not exist.
+ */
+function backendOverride() {
+  try {
+    const value = globalThis.process?.env?.WSH_MLKEM_BACKEND;
+    return value === 'noble' || value === 'native' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 async function getBackend() {
+  const forced = backendOverride();
+  if (forced) return forced;
   if (!backendPromise) {
     backendPromise = probeNativeSupport().then((supported) => (supported ? 'native' : 'noble'));
   }
