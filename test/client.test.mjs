@@ -1170,6 +1170,37 @@ describe('WshSession E2E guards, at the level that chooses the arguments', () =>
 
   const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
+  it('never seals two frames under the same nonce (#39)', async () => {
+    /*
+     * AES-GCM reuses a nonce at its peril: two frames under one key and one
+     * nonce leak the XOR of their plaintexts and forfeit authentication for
+     * the key. The counter at `#e2eSendCounter++` is the only thing that
+     * stops it.
+     *
+     * The old test for this sealed two frames with counters 0 and 1 that IT
+     * supplied, then asserted the nonces differ -- a property of
+     * `buildNonce`, not of the caller that picks the counter. And no test in
+     * the repo wrote twice on one E2E session, so the second frame, the one
+     * that would collide, was never produced. Freezing the counter left the
+     * whole suite green.
+     */
+    const { a, wire } = await linkedPair('sess-nonce');
+
+    await a.write('first');
+    await a.write('second');
+    assert.equal(wire.length, 2, 'both writes reached the wire');
+
+    const [one, two] = wire;
+    assert.notDeepEqual([...one.nonce], [...two.nonce], 'two frames, two nonces');
+
+    // And specifically the counter half advanced -- not just some byte
+    // differing for an unrelated reason.
+    const counterOf = (frame) =>
+      Number(new DataView(frame.nonce.buffer, frame.nonce.byteOffset, 8).getBigUint64(0, false));
+    assert.equal(counterOf(one), 0);
+    assert.equal(counterOf(two), 1);
+  });
+
   it('drops a frame whose session_id belongs to another session', async () => {
     const { a, b, wire } = await linkedPair();
     const delivered = [];
