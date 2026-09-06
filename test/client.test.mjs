@@ -987,11 +987,31 @@ describe('Stream-mode EncryptedFrame chunk framing end-to-end integration', { sk
       delivered = true;
     };
 
+    let closedWith = 'not-closed';
+    sessionB.onClose = (reason) => { closedWith = reason; };
+
     await sessionA.write('will be tampered with on the raw stream');
     // Give the async openFrame()/pump loop a turn to run.
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     assert.equal(delivered, false);
+
+    /*
+     * `delivered === false` on its own proved nothing about the teardown:
+     * #openStreamChunks returns null before onData is ever reached, so it
+     * held whether the session tore down or not. Replacing the `break` with
+     * `continue` -- removing the teardown entirely -- left this test green.
+     *
+     * And 20ms sits inside the 300ms data-EOF grace window, so an immediate
+     * teardown and no teardown at all looked identical at the moment of
+     * assertion. What follows is what actually distinguishes them.
+     */
+    assert.equal(sessionB.state, 'closed', 'a forged frame tears the session down at once');
+    assert.ok(
+      closedWith instanceof Error,
+      `onClose carries the reason; got ${JSON.stringify(closedWith)}`,
+    );
+    assert.match(String(closedWith.message), /authentication failed/);
   });
 });
 
@@ -1279,5 +1299,54 @@ describe('keepalive detects a peer that stops answering', () => {
       errors.some((m) => /stopped answering keepalive/.test(m)),
       `a silent peer is reported; saw ${JSON.stringify(errors)} after ${pings} pings`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Both ways a session closes must settle a parked file chunk (#36)
+// ---------------------------------------------------------------------------
+
+describe('a stream-mode session that EOFs without CLOSE', () => {
+  /*
+   * There were two routes to `closed` and they disagreed. The CLOSE control
+   * handler settled a parked `_readFileChunk()` with null; the data-EOF grace
+   * fallback -- taken when a server ends the data stream without sending
+   * CLOSE, which the comment beside it says is real -- did not.
+   *
+   * `download()` parks on `_readFileChunk()` and turns a null into a thrown
+   * "truncated" error. Via the fallback it got nothing at all: the promise
+   * never settled, so the download hung forever while `onClose` had already
+   * fired and the session read `closed`.
+   *
+   * No test could see it: the file-transfer mock forces virtual mode on every
+   * channel and its `_doOpenStream` is a tripwire, so nothing in the suite
+   * ever ran a stream-mode file session or armed that timer.
+   */
+  it('settles a parked file chunk instead of hanging the caller', async () => {
+    const sessionModule = await import('../src/session.mjs');
+    const { WshSession } = sessionModule;
+
+    const dummyTransport = { sendControl: async () => {} };
+    const session = new WshSession(dummyTransport, 7, {}, 'file', {
+      dataMode: 'stream',
+      sessionId: 'sess-eof-file',
+    });
+
+    // A data stream that ends immediately and no CLOSE ever arrives.
+    const empty = new ReadableStream({ start(controller) { controller.close(); } });
+    session._bind(empty, new WritableStream());
+
+    // What download() does: park on the next chunk.
+    const parked = session._readFileChunk();
+
+    // Past the 300ms data-EOF grace, the fallback closes the session.
+    const settled = await Promise.race([
+      parked.then((v) => ({ settled: true, value: v })),
+      new Promise((resolve) => setTimeout(() => resolve({ settled: false }), 1500)),
+    ]);
+
+    assert.equal(settled.settled, true, 'the parked read settles rather than hanging forever');
+    assert.equal(settled.value, null, 'and reports the truncation download() turns into an error');
+    assert.equal(session.state, 'closed');
   });
 });
