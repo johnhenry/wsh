@@ -81,6 +81,12 @@ function requireArgs(method, args) {
   }
 }
 const DEFAULT_PING_INTERVAL  = 30_000;  // ms
+/*
+ * How long a peer may go without answering a ping before it is treated as
+ * gone. A multiple of the interval, so an ordinary missed pong is tolerated
+ * and a peer that has genuinely stopped answering is not.
+ */
+const DEFAULT_PONG_TIMEOUT   = 90_000;  // ms
 const DEFAULT_EXEC_TIMEOUT   = 60_000;  // ms
 const FILE_CHUNK_SIZE        = 65_536;
 
@@ -236,12 +242,21 @@ export class WshClient {
 
   /** @type {number|null} Timestamp of last pong received. */
   #lastPong = null;
+  #pingIntervalMs = DEFAULT_PING_INTERVAL;
+  #pongTimeoutMs = DEFAULT_PONG_TIMEOUT;
 
-  constructor({ transportFactories } = {}) {
+  constructor({ transportFactories, pingIntervalMs, pongTimeoutMs } = {}) {
     this.#transportFactories = transportFactories || {
       wt: () => new WebTransportTransport(),
       ws: () => new WebSocketTransport(),
     };
+    /*
+     * Overridable so the keepalive is testable at all. Left as constants,
+     * the only way to observe a 90s timeout is to wait 90s or fake the
+     * clock -- which is why nothing observed it before.
+     */
+    this.#pingIntervalMs = pingIntervalMs ?? DEFAULT_PING_INTERVAL;
+    this.#pongTimeoutMs = pongTimeoutMs ?? DEFAULT_PONG_TIMEOUT;
   }
 
   // ── Callbacks ───────────────────────────────────────────────────────
@@ -2282,12 +2297,37 @@ export class WshClient {
         return;
       }
 
+      /*
+       * Act on the pong, rather than merely recording it.
+       *
+       * `#lastPong` was written on every PONG and read nowhere -- `grep -arn
+       * lastPong src/` returned the declaration and two assignments and no
+       * third line. So the keepalive proved the connection was alive when it
+       * was, and said nothing when it stopped being: pings went out forever
+       * at every peer, dead or not, and a caller waiting for data waited
+       * without a reason.
+       *
+       * Compared against a deadline rather than armed as a timer, which
+       * matters: a timer re-armed on each tick is cleared before it can fire
+       * whenever the interval is shorter than the timeout, and is then
+       * incapable of firing at all. (browsermesh#32 shipped exactly that.) A
+       * timestamp comparison has no such failure mode.
+       */
+      if (this.#lastPong !== null && Date.now() - this.#lastPong > this.#pongTimeoutMs) {
+        const silentFor = Date.now() - this.#lastPong;
+        this.#stopPing();
+        this.#emitError(
+          new Error(`wsh: peer stopped answering keepalive pings ${silentFor}ms ago`)
+        );
+        return;
+      }
+
       this.#transport?.sendControl(
         pingMsg({ id: ++this.#pingId })
       ).catch((err) => {
         console.warn('[wsh:client] Failed to send ping:', err.message);
       });
-    }, DEFAULT_PING_INTERVAL);
+    }, this.#pingIntervalMs);
 
     // Don't let the ping timer prevent Node.js/Deno from exiting.
     if (typeof this.#pingTimer === 'object' && this.#pingTimer.unref) {

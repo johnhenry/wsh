@@ -1203,3 +1203,50 @@ describe('WshSession E2E guards, at the level that chooses the arguments', () =>
     assert.deepEqual(delivered, ['deliver me exactly once'], 'the replay is refused');
   });
 });
+
+// ---------------------------------------------------------------------------
+// The keepalive acts on the pong it records (#38)
+// ---------------------------------------------------------------------------
+
+describe('keepalive detects a peer that stops answering', () => {
+  /*
+   * `#lastPong` was written on every PONG and read nowhere -- `grep -arn
+   * lastPong src/` returned the declaration and two assignments and no third
+   * line. The keepalive proved the connection alive when it was and said
+   * nothing when it stopped being: pings went out forever at a dead peer.
+   *
+   * The timings are injectable now because at the shipped 30s/90s they are
+   * unobservable without faking the clock, which is the reason nothing
+   * observed them.
+   */
+  it('reports an error once the peer has been silent past the timeout', async () => {
+    const keyPair = await auth.generateKeyPair(true);
+    const transport = new StandardHandshakeMockTransport('sess-keepalive');
+    const originalSend = transport._doSendControl.bind(transport);
+    let pings = 0;
+    transport._doSendControl = async (msg) => {
+      await originalSend(msg);
+      if (msg.type === MSG.HELLO) setTimeout(() => transport.emitChallenge(), 1);
+      // A peer that is gone: it accepts the ping and never pongs.
+      if (msg.type === MSG.PING) pings += 1;
+    };
+
+    const client = new clientMod.WshClient({
+      transportFactories: { ws: () => transport },
+      pingIntervalMs: 10,
+      pongTimeoutMs: 40,
+    });
+
+    const errors = [];
+    client.onError = (err) => errors.push(err.message);
+
+    await client.connect('ws://test.invalid', { username: 'carol', keyPair, transport: 'ws' });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.ok(pings > 0, 'the keepalive was actually running');
+    assert.ok(
+      errors.some((m) => /stopped answering keepalive/.test(m)),
+      `a silent peer is reported; saw ${JSON.stringify(errors)} after ${pings} pings`,
+    );
+  });
+});
