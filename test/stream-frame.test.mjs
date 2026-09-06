@@ -28,7 +28,7 @@ describe('stream-frame: ChunkAccumulator + encodeChunk', { skip: !hasWebCrypto &
     const chunks = acc.feed(wire);
     assert.equal(chunks.length, 1);
 
-    const opened = await openFrame(key, 'sess-1', 0, chunks[0]);
+    const opened = await openFrame(key, 'sess-1', 0, { ...chunks[0], expectedRoleTag: ROLE_TAGS.initiator });
     assert.deepEqual([...opened], [...plaintext]);
     assert.doesNotThrow(() => acc.finish());
   });
@@ -46,7 +46,7 @@ describe('stream-frame: ChunkAccumulator + encodeChunk', { skip: !hasWebCrypto &
     const [chunk] = acc.feed(tampered);
     assert.ok(chunk);
 
-    await assert.rejects(() => openFrame(key, 'sess-2', 0, chunk));
+    await assert.rejects(() => openFrame(key, 'sess-2', 0, { ...chunk, expectedRoleTag: ROLE_TAGS.initiator }));
   });
 
   it('finish() throws StreamTornChunkError for a torn chunk left at EOF', () => {
@@ -79,7 +79,7 @@ describe('stream-frame: ChunkAccumulator + encodeChunk', { skip: !hasWebCrypto &
     const chunks = acc.feed(combined);
     assert.equal(chunks.length, 3);
 
-    const opened = await Promise.all(chunks.map((chunk, i) => openFrame(key, 'sess-3', i, chunk)));
+    const opened = await Promise.all(chunks.map((chunk, i) => openFrame(key, 'sess-3', i, { ...chunk, expectedRoleTag: ROLE_TAGS.initiator })));
     assert.equal(new TextDecoder().decode(opened[0]), 'first chunk');
     assert.equal(new TextDecoder().decode(opened[1]), 'second chunk');
     assert.equal(new TextDecoder().decode(opened[2]), 'third chunk');
@@ -101,7 +101,7 @@ describe('stream-frame: ChunkAccumulator + encodeChunk', { skip: !hasWebCrypto &
     const chunksAfterSecond = acc.feed(second);
     assert.equal(chunksAfterSecond.length, 1);
 
-    const opened = await openFrame(key, 'sess-4', 0, chunksAfterSecond[0]);
+    const opened = await openFrame(key, 'sess-4', 0, { ...chunksAfterSecond[0], expectedRoleTag: ROLE_TAGS.initiator });
     assert.deepEqual([...opened], [...plaintext]);
     assert.doesNotThrow(() => acc.finish());
   });
@@ -119,7 +119,7 @@ describe('stream-frame: ChunkAccumulator + encodeChunk', { skip: !hasWebCrypto &
     const chunks = acc.feed(second);
     assert.equal(chunks.length, 1);
 
-    const opened = await openFrame(key, 'sess-5', 0, chunks[0]);
+    const opened = await openFrame(key, 'sess-5', 0, { ...chunks[0], expectedRoleTag: ROLE_TAGS.initiator });
     assert.deepEqual([...opened], [...plaintext]);
   });
 
@@ -133,7 +133,7 @@ describe('stream-frame: ChunkAccumulator + encodeChunk', { skip: !hasWebCrypto &
       chunks = chunks.concat(acc.feed(Uint8Array.of(byte)));
     }
     assert.equal(chunks.length, 1);
-    const opened = await openFrame(key, 'sess-6', 0, chunks[0]);
+    const opened = await openFrame(key, 'sess-6', 0, { ...chunks[0], expectedRoleTag: ROLE_TAGS.initiator });
     assert.deepEqual([...opened], [...plaintext]);
   });
 });

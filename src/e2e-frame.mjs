@@ -138,12 +138,43 @@ export async function sealFrame(key, sessionId, roleTag, counter, plaintext) {
  * @param {{nonce: Uint8Array, ciphertext: Uint8Array}} frame
  * @returns {Promise<Uint8Array>} plaintext
  */
-export async function openFrame(key, sessionId, expectedCounter, { nonce, ciphertext }) {
+export async function openFrame(key, sessionId, expectedCounter, { nonce, ciphertext, expectedRoleTag }) {
   if (!key || typeof key !== 'object') {
     throw new Error('e2e-frame: openFrame requires a CryptoKey');
   }
   if (!(nonce instanceof Uint8Array) || nonce.length !== NONCE_LENGTH) {
     throw new Error(`e2e-frame: nonce must be a ${NONCE_LENGTH}-byte Uint8Array`);
+  }
+  /*
+   * The role tag is REQUIRED, and a caller that omits it gets an error rather
+   * than a skipped check.
+   *
+   * The tag exists so the two directions of one session are structurally
+   * distinguishable -- it is the reason a colliding nonce is impossible when
+   * both directions share one AES-GCM key. WshSession computed the peer's
+   * expected tag and stored it, and nothing ever read it: `grep -rn
+   * e2eRecvRoleTag` returned the declaration and the assignment and no third
+   * line. So the receiver accepted a frame sealed with its OWN tag, and the
+   * relay this layer exists to distrust could echo a peer's sealed frame
+   * straight back at it. Both counters start at zero, so the first frame of a
+   * session reflects cleanly.
+   *
+   * Optional would have reproduced the defect: a security check nobody is
+   * forced to pass is the same as no check, and this file already had one --
+   * see TimestampProof.verify's ignored verifyFn for the same shape.
+   */
+  if (!(expectedRoleTag instanceof Uint8Array) || expectedRoleTag.length !== ROLE_TAG_LENGTH) {
+    throw new Error(
+      `e2e-frame: openFrame requires expectedRoleTag, a ${ROLE_TAG_LENGTH}-byte Uint8Array`
+    );
+  }
+  const actualRoleTag = nonce.subarray(COUNTER_LENGTH);
+  for (let i = 0; i < ROLE_TAG_LENGTH; i += 1) {
+    if (actualRoleTag[i] !== expectedRoleTag[i]) {
+      throw new Error(
+        'e2e-frame: role tag mismatch -- this frame was sealed by the wrong side of the session'
+      );
+    }
   }
   const actualCounter = Number(new DataView(nonce.buffer, nonce.byteOffset, nonce.byteLength).getBigUint64(0, false));
   if (actualCounter !== expectedCounter) {
