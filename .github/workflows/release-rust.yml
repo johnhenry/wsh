@@ -1,0 +1,148 @@
+name: Release Rust binaries
+
+# Builds prebuilt wsh-server/wsh-cli binaries for the Rust workspace under
+# crates/ (see issue #52) and attaches them to a GitHub Release.
+#
+# Consumers (notably erisera-code/clawser, which pins a tag and downloads
+# these by exact name for its demo-linux guest image) rely on the asset
+# names produced here being stable:
+#   wsh-server-<target>.tar.gz
+#   wsh-cli-<target>.tar.gz
+# each containing a single binary at the archive root (wsh-server names its
+# binary `wsh-server`; wsh-cli's binary is named `wsh`), plus one
+# SHA256SUMS file covering every archive in the release.
+#
+# Do not rename these without coordinating with clawser's consumer side.
+
+on:
+  push:
+    tags:
+      - "rust-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. rust-v0.1.0)"
+        required: true
+        type: string
+
+jobs:
+  determine-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-native:
+    needs: determine-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.determine-tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build wsh-server + wsh-cli (release)
+        run: cargo build --release --target ${{ matrix.target }} -p wsh-server -p wsh-cli
+
+      - name: Package archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="target/${{ matrix.target }}/release"
+          tar -czf "dist/wsh-server-${{ matrix.target }}.tar.gz" -C "$out" wsh-server
+          tar -czf "dist/wsh-cli-${{ matrix.target }}.tar.gz" -C "$out" wsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-i686-musl:
+    needs: determine-tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.determine-tag.outputs.tag }}
+
+      # Cross-compiling i686-unknown-linux-musl from a plain ubuntu-latest
+      # runner needs a musl toolchain the runner doesn't have; this reuses
+      # the exact Docker-based approach clawser used successfully for the
+      # same target (tools/guest-image/Dockerfile.i686-musl-build) rather
+      # than reaching for `cross` or hand-rolling musl-tools setup.
+      - name: Cross-compile via messense/rust-musl-cross:i686-musl
+        run: |
+          set -euo pipefail
+          docker build -f .github/docker/Dockerfile.i686-musl-build -t wsh-i686-musl-build .
+          docker rm -f wsh-extract >/dev/null 2>&1 || true
+          docker create --name wsh-extract wsh-i686-musl-build >/dev/null
+          mkdir -p dist-bin
+          docker cp wsh-extract:/out/wsh-server dist-bin/wsh-server
+          docker cp wsh-extract:/out/wsh dist-bin/wsh
+          docker rm wsh-extract >/dev/null
+
+      - name: Package archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf dist/wsh-server-i686-unknown-linux-musl.tar.gz -C dist-bin wsh-server
+          tar -czf dist/wsh-cli-i686-unknown-linux-musl.tar.gz -C dist-bin wsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-i686-unknown-linux-musl
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [determine-tag, build-native, build-i686-musl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: List release assets
+        run: ls -la dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.determine-tag.outputs.tag }}
+          name: ${{ needs.determine-tag.outputs.tag }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
