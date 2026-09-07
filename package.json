@@ -16,6 +16,10 @@
   "optionalDependencies": {
     "@noble/post-quantum": "^0.7.0"
   },
+  "devDependencies": {
+    "@fails-components/webtransport": "^1.6.4",
+    "ws": "^8.21.0"
+  },
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "test:rust": "node --test test/rust/*.test.mjs",
