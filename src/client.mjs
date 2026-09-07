@@ -1591,6 +1591,30 @@ export class WshClient {
     this.#assertAuthenticated('initiateE2E');
     const wantHybrid = algorithm === 'X25519+ML-KEM-768';
 
+    // Register the waiter before ANY await, key generation included.
+    //
+    // Two peers establishing E2E both call this at once, and #handleControl
+    // DROPS a KEY_EXCHANGE that no waiter is listening for. Whichever side
+    // finishes its local key generation first sends its round-1 message into
+    // the other's blind window -- the other is still inside generateKey /
+    // exportKey below and has nothing registered. That message is gone, and
+    // the side that lost it then waits the full timeout for something the
+    // peer has already sent and will not send again.
+    //
+    // Registering after the crypto, or merely before sendControl, leaves the
+    // window open: measured at ~10% of runs before, and still ~5% with the
+    // waiter registered after key generation. The only safe point is here,
+    // before this function yields for the first time.
+    const peerMsgPromise = this.#waitForMessage(
+      [MSG.KEY_EXCHANGE],
+      timeout,
+      'Timed out waiting for peer key exchange'
+    );
+    // Mark it handled so a failure in the key generation or send below does
+    // not surface as an unhandled rejection when this waiter later times
+    // out. Awaiting the promise still throws normally.
+    peerMsgPromise.catch(() => {});
+
     // Generate ephemeral X25519 key pair (and, for hybrid, a fresh
     // ML-KEM-768 key pair too).
     const ephemeral = await crypto.subtle.generateKey(
@@ -1607,11 +1631,30 @@ export class WshClient {
       keyExchangeMsg({ algorithm, publicKey: localPub, sessionId, kemPublicKey: localKem?.publicKey })
     );
 
-    const peerMsg = await this.#waitForMessage(
-      [MSG.KEY_EXCHANGE],
-      timeout,
-      'Timed out waiting for peer key exchange'
-    );
+    const peerMsg = await peerMsgPromise;
+
+    // Round 2 has the same shape as round 1, so it needs the same treatment.
+    // Whether we encapsulate or decapsulate is decided entirely by data
+    // already in hand, so decide it now and register the ciphertext waiter
+    // BEFORE the derive below. Registering it inside the `else` branch, after
+    // importKey and deriveBits, let the peer's ciphertext arrive while this
+    // side was still deriving -- dropped, then a full-timeout wait for a
+    // message already sent. That surfaced as "Timed out waiting for peer
+    // ML-KEM-768 ciphertext", which retryOnKnownFlake retries and the test
+    // file attributes to a Node provider stall.
+    const hybridActive = wantHybrid && !!localKem && !!peerMsg.kem_public_key;
+    const isEncapsulator = hybridActive
+      && compareBytes(localPub, new Uint8Array(peerMsg.public_key)) < 0;
+
+    let ctMsgPromise = null;
+    if (hybridActive && !isEncapsulator) {
+      ctMsgPromise = this.#waitForMessage(
+        [MSG.KEY_EXCHANGE],
+        timeout,
+        'Timed out waiting for peer ML-KEM-768 ciphertext'
+      );
+      ctMsgPromise.catch(() => {});
+    }
 
     // Import peer's public key and derive the classical shared secret.
     const peerKey = await crypto.subtle.importKey(
@@ -1627,12 +1670,10 @@ export class WshClient {
       256
     ));
 
-    const hybridActive = wantHybrid && !!localKem && !!peerMsg.kem_public_key;
     let combinedBits = sharedBits;
 
     if (hybridActive) {
       const peerKemPublicKey = new Uint8Array(peerMsg.kem_public_key);
-      const isEncapsulator = compareBytes(localPub, new Uint8Array(peerMsg.public_key)) < 0;
 
       let kemSharedSecret;
       if (isEncapsulator) {
@@ -1640,11 +1681,7 @@ export class WshClient {
         kemSharedSecret = sharedSecret;
         await this.#transport.sendControl(keyExchangeMsg({ algorithm, sessionId, kemCiphertext: ciphertext }));
       } else {
-        const ctMsg = await this.#waitForMessage(
-          [MSG.KEY_EXCHANGE],
-          timeout,
-          'Timed out waiting for peer ML-KEM-768 ciphertext'
-        );
+        const ctMsg = await ctMsgPromise;
         kemSharedSecret = await mlKemDecapsulate(localKem.secretKeySeed, new Uint8Array(ctMsg.kem_ciphertext));
       }
 
