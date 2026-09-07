@@ -26,3 +26,47 @@ jobs:
       - run: npm test
       - name: Examples smoke test
         run: npm run examples
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --workspace --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # Non-blocking: the imported workspace has pre-existing clippy
+      # warnings (dead_code, too_many_arguments, etc.) that haven't been
+      # triaged yet. Flip this to a hard failure once `cargo clippy
+      # --workspace` is clean.
+      - name: cargo clippy --workspace (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: npm install (for codegen:check + test:rust)
+        run: npm install --no-save --include=optional
+
+      - name: npm run codegen:check
+        run: npm run codegen:check
+
+      - name: Build wsh-server (release, for test:rust)
+        run: cargo build --release -p wsh-server
+
+      - name: npm run test:rust
+        run: npm run test:rust
