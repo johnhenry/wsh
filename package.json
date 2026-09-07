@@ -18,6 +18,7 @@
   },
   "devDependencies": {
     "@fails-components/webtransport": "^1.6.4",
+    "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
     "ws": "^8.21.0"
   },
   "scripts": {
