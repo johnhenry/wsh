@@ -536,14 +536,12 @@ mod tests {
         let pty = resolve_coalesce_options(&ChannelKind::Pty, CoalesceOverride::Default).unwrap();
         assert_eq!(pty, PTY_COALESCE_PROFILE);
 
-        let exec =
-            resolve_coalesce_options(&ChannelKind::Exec, CoalesceOverride::Default).unwrap();
+        let exec = resolve_coalesce_options(&ChannelKind::Exec, CoalesceOverride::Default).unwrap();
         assert_eq!(exec, EXEC_COALESCE_PROFILE);
 
         // Unknown/other kinds fall back to the exec (throughput-first)
         // profile, mirroring the JS side's `|| DEFAULT_COALESCE_PROFILES.exec`.
-        let meta =
-            resolve_coalesce_options(&ChannelKind::Meta, CoalesceOverride::Default).unwrap();
+        let meta = resolve_coalesce_options(&ChannelKind::Meta, CoalesceOverride::Default).unwrap();
         assert_eq!(meta, EXEC_COALESCE_PROFILE);
     }
 
@@ -589,7 +587,10 @@ mod tests {
         );
 
         coalescer.write(b"ab").await.unwrap();
-        assert!(flushed.lock().await.is_empty(), "under threshold, no flush yet");
+        assert!(
+            flushed.lock().await.is_empty(),
+            "under threshold, no flush yet"
+        );
         coalescer.write(b"cd").await.unwrap(); // now 4 bytes total -- hits threshold
         assert_eq!(flushed.lock().await.len(), 1);
         assert_eq!(flushed.lock().await[0], b"abcd");
@@ -682,7 +683,11 @@ mod tests {
         // points) to also prove split-across-reads handling agrees.
         let mut acc = ChunkAccumulator::new();
         let mut parsed = Vec::new();
-        for piece in [&expected_wire[..7], &expected_wire[7..82], &expected_wire[82..]] {
+        for piece in [
+            &expected_wire[..7],
+            &expected_wire[7..82],
+            &expected_wire[82..],
+        ] {
             parsed.extend(acc.feed(piece).unwrap());
         }
         acc.finish().unwrap();

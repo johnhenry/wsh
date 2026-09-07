@@ -11,8 +11,7 @@ use wsh_core::messages::*;
 use wsh_core::RemotePeerDescriptor;
 
 use crate::commands::common::{
-    connect_client, load_last_reverse_peer, resolve_target, save_last_reverse_peer,
-    LastReversePeer,
+    connect_client, load_last_reverse_peer, resolve_target, save_last_reverse_peer, LastReversePeer,
 };
 use crate::commands::interactive;
 use crate::commands::reverse_host::{self, ReverseHostOptions};
@@ -72,7 +71,8 @@ fn peer_session_features(
 }
 
 fn filter_peers(peers: Vec<PeerInfo>, options: &PeerQueryOptions) -> Vec<PeerInfo> {
-    peers.into_iter()
+    peers
+        .into_iter()
         .filter(|peer| {
             options
                 .peer_type
@@ -86,12 +86,9 @@ fn filter_peers(peers: Vec<PeerInfo>, options: &PeerQueryOptions) -> Vec<PeerInf
                 .map_or(true, |backend| &peer.shell_backend == backend)
         })
         .filter(|peer| {
-            options
-                .capability
-                .as_ref()
-                .map_or(true, |capability| {
-                    peer.capabilities.iter().any(|cap| cap == capability)
-                })
+            options.capability.as_ref().map_or(true, |capability| {
+                peer.capabilities.iter().any(|cap| cap == capability)
+            })
         })
         .collect()
 }
@@ -229,12 +226,16 @@ fn resolve_saved_last_peer<'a>(
     peers: &'a [PeerInfo],
     last: &LastReversePeer,
 ) -> Result<&'a PeerInfo> {
-    peers.iter()
+    peers
+        .iter()
         .find(|peer| peer.fingerprint == last.fingerprint)
-        .ok_or_else(|| anyhow::anyhow!(
-            "selector `last` refers to peer {} ({}), which is not currently online",
-            last.username, last.fingerprint
-        ))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "selector `last` refers to peer {} ({}), which is not currently online",
+                last.username,
+                last.fingerprint
+            )
+        })
 }
 
 /// Register as a reverse-connectable peer on a relay host.
@@ -272,8 +273,8 @@ pub async fn run_reverse(
     let username = resolved.user.clone();
     let client = Arc::new(
         connect_client(&resolved, identity)
-        .await
-        .context("failed to connect to relay")?,
+            .await
+            .context("failed to connect to relay")?,
     );
 
     // Take the reverse-connect receiver before sending registration
@@ -289,9 +290,11 @@ pub async fn run_reverse(
     // Send ReverseRegister message (fire-and-forget, no reply expected)
     let register = Envelope {
         msg_type: MsgType::ReverseRegister,
-        payload: Payload::ReverseRegister(
-            reverse_options.reverse_register_payload(username, public_bytes, &signing_key),
-        ),
+        payload: Payload::ReverseRegister(reverse_options.reverse_register_payload(
+            username,
+            public_bytes,
+            &signing_key,
+        )),
     };
     client
         .send_fire_and_forget(register)
@@ -301,8 +304,7 @@ pub async fn run_reverse(
 
     println!("Registered as peer {short_fp} on {relay_host}:{port}");
     println!("Waiting for connections... (Ctrl+C to stop)");
-    reverse_host::run_with_options(client.clone(), rc_rx, relay_rx, reverse_options, None)
-        .await?;
+    reverse_host::run_with_options(client.clone(), rc_rx, relay_rx, reverse_options, None).await?;
 
     client
         .disconnect()

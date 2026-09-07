@@ -205,7 +205,10 @@ impl McpProxy {
         match req.send().await {
             Ok(response) if response.status().is_success() => {
                 match response.json::<serde_json::Value>().await {
-                    Ok(result) => McpResultPayload { call_id: call.call_id.clone(), result },
+                    Ok(result) => McpResultPayload {
+                        call_id: call.call_id.clone(),
+                        result,
+                    },
                     Err(e) => McpResultPayload {
                         call_id: call.call_id.clone(),
                         result: json!({

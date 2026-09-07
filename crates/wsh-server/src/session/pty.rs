@@ -194,7 +194,10 @@ fn command_spec(command: Option<&str>, shell: &str) -> WshResult<(String, Vec<St
             if trimmed.is_empty() {
                 return Err(WshError::Other("empty command".into()));
             }
-            Ok((shell.to_string(), vec!["-c".to_string(), trimmed.to_string()]))
+            Ok((
+                shell.to_string(),
+                vec!["-c".to_string(), trimmed.to_string()],
+            ))
         }
         None => Ok((shell.to_string(), Vec::new())),
     }

@@ -28,12 +28,12 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
 
 use crate::qmux::{
-    decode_frames, encode_connection_close, encode_data_blocked, encode_datagram,
-    encode_max_data, encode_max_stream_data, encode_max_streams, encode_record,
-    encode_reset_stream, encode_reset_stream_at, encode_stop_sending, encode_stream,
-    encode_stream_data_blocked, encode_streams_blocked, encode_transport_parameters,
-    first_bidi_stream_id, is_client_initiated, next_bidi_stream_id, ErrorCode, Frame, QMuxError,
-    RecordDecoder, StreamInitiator, TransportParameters,
+    decode_frames, encode_connection_close, encode_data_blocked, encode_datagram, encode_max_data,
+    encode_max_stream_data, encode_max_streams, encode_record, encode_reset_stream,
+    encode_reset_stream_at, encode_stop_sending, encode_stream, encode_stream_data_blocked,
+    encode_streams_blocked, encode_transport_parameters, first_bidi_stream_id, is_client_initiated,
+    next_bidi_stream_id, ErrorCode, Frame, QMuxError, RecordDecoder, StreamInitiator,
+    TransportParameters,
 };
 
 pub const DEFAULT_INITIAL_MAX_DATA: u64 = 8 * 1024 * 1024;
@@ -106,7 +106,10 @@ impl StreamState {
     /// Both directions have reached a terminal state (sent/reset, and received/reset).
     fn is_fully_closed(&self) -> bool {
         let send_done = matches!(self.send_state, SendState::DataSent | SendState::ResetSent);
-        let recv_done = matches!(self.recv_state, RecvState::DataRecvd | RecvState::ResetRecvd);
+        let recv_done = matches!(
+            self.recv_state,
+            RecvState::DataRecvd | RecvState::ResetRecvd
+        );
         send_done && recv_done
     }
 }
@@ -136,16 +139,35 @@ enum PeerStreamLookup {
 /// equivalent of the `on*` callbacks on the JS `QMuxConnection`/`QMuxStream`.
 #[derive(Debug, Clone)]
 pub enum QMuxEvent {
-    StreamOpen { stream_id: u64 },
-    StreamData { stream_id: u64, data: Vec<u8> },
-    StreamEnd { stream_id: u64 },
-    StreamReset { stream_id: u64, error_code: ErrorCode },
+    StreamOpen {
+        stream_id: u64,
+    },
+    StreamData {
+        stream_id: u64,
+        data: Vec<u8>,
+    },
+    StreamEnd {
+        stream_id: u64,
+    },
+    StreamReset {
+        stream_id: u64,
+        error_code: ErrorCode,
+    },
     /// The whole connection died (transport closed/errored) and this
     /// stream was torn down as a result -- not a protocol-level reset.
-    StreamDestroyed { stream_id: u64 },
-    Datagram { data: Vec<u8> },
-    ConnectionClosed { error_code: ErrorCode, reason: String },
-    Error { message: String },
+    StreamDestroyed {
+        stream_id: u64,
+    },
+    Datagram {
+        data: Vec<u8>,
+    },
+    ConnectionClosed {
+        error_code: ErrorCode,
+        reason: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct Inner {
@@ -294,17 +316,29 @@ impl QMuxConnection {
             inner.next_local_stream_id = next_bidi_stream_id(id);
             inner.streams_opened += 1;
             let stream_data = inner.initial_max_stream_data;
-            inner.streams.insert(id, StreamState::new(stream_data, stream_data));
+            inner
+                .streams
+                .insert(id, StreamState::new(stream_data, stream_data));
             return Ok(id);
         }
     }
 
     pub fn stream_send_state(&self, stream_id: u64) -> Option<SendState> {
-        self.inner.lock().unwrap().streams.get(&stream_id).map(|s| s.send_state)
+        self.inner
+            .lock()
+            .unwrap()
+            .streams
+            .get(&stream_id)
+            .map(|s| s.send_state)
     }
 
     pub fn stream_recv_state(&self, stream_id: u64) -> Option<RecvState> {
-        self.inner.lock().unwrap().streams.get(&stream_id).map(|s| s.recv_state)
+        self.inner
+            .lock()
+            .unwrap()
+            .streams
+            .get(&stream_id)
+            .map(|s| s.recv_state)
     }
 
     pub fn stream_exists(&self, stream_id: u64) -> bool {
@@ -321,11 +355,17 @@ impl QMuxConnection {
         {
             let mut inner = self.inner.lock().unwrap();
             let stream = inner.streams.get_mut(&stream_id).ok_or_else(|| {
-                QMuxError::new(ErrorCode::InternalError, format!("write to unknown stream {stream_id}"))
+                QMuxError::new(
+                    ErrorCode::InternalError,
+                    format!("write to unknown stream {stream_id}"),
+                )
             })?;
             match stream.send_state {
                 SendState::ResetSent => {
-                    return Err(QMuxError::new(ErrorCode::StreamStateError, format!("stream {stream_id} already reset")))
+                    return Err(QMuxError::new(
+                        ErrorCode::StreamStateError,
+                        format!("stream {stream_id} already reset"),
+                    ))
                 }
                 SendState::DataSent => {
                     return Err(QMuxError::new(
@@ -340,7 +380,9 @@ impl QMuxConnection {
 
         let mut offset = 0usize;
         while offset < data.len() {
-            let chunk_len = self.wait_for_send_window(stream_id, data.len() - offset).await?;
+            let chunk_len = self
+                .wait_for_send_window(stream_id, data.len() - offset)
+                .await?;
             let slice = &data[offset..offset + chunk_len];
             self.send_stream_chunk(stream_id, slice, false)?;
             offset += chunk_len;
@@ -350,7 +392,11 @@ impl QMuxConnection {
 
     /// Wait until at least 1 byte of send window is available and
     /// reserve it; returns how many bytes may be sent now (<= requested).
-    async fn wait_for_send_window(&self, stream_id: u64, requested: usize) -> Result<usize, QMuxError> {
+    async fn wait_for_send_window(
+        &self,
+        stream_id: u64,
+        requested: usize,
+    ) -> Result<usize, QMuxError> {
         loop {
             let notified = self.send_notify.notified();
             let outcome = {
@@ -365,12 +411,21 @@ impl QMuxConnection {
                 // touched until this borrow ends.
                 let (available, stream_blocked_frame) = {
                     let stream = inner.streams.get_mut(&stream_id).ok_or_else(|| {
-                        QMuxError::new(ErrorCode::InternalError, format!("stream {stream_id} disappeared"))
+                        QMuxError::new(
+                            ErrorCode::InternalError,
+                            format!("stream {stream_id} disappeared"),
+                        )
                     })?;
                     if matches!(stream.send_state, SendState::ResetSent) {
-                        return Err(QMuxError::new(ErrorCode::StreamStateError, format!("stream {stream_id} was reset")));
+                        return Err(QMuxError::new(
+                            ErrorCode::StreamStateError,
+                            format!("stream {stream_id} was reset"),
+                        ));
                     }
-                    let available = (requested as i64).min(stream.send_window).min(conn_send_window).max(0) as usize;
+                    let available = (requested as i64)
+                        .min(stream.send_window)
+                        .min(conn_send_window)
+                        .max(0) as usize;
                     if available > 0 {
                         stream.send_window -= available as i64;
                         (available, None)
@@ -390,7 +445,9 @@ impl QMuxConnection {
                     if let Some(f) = stream_blocked_frame {
                         blocked_frames.push(f);
                     }
-                    if conn_send_window <= 0 && inner.last_data_blocked_at != conn_send_offset as i64 {
+                    if conn_send_window <= 0
+                        && inner.last_data_blocked_at != conn_send_offset as i64
+                    {
                         inner.last_data_blocked_at = conn_send_offset as i64;
                         let limit = (conn_send_offset as i64 + conn_send_window).max(0) as u64;
                         blocked_frames.push(encode_data_blocked(limit)?);
@@ -416,7 +473,10 @@ impl QMuxConnection {
         {
             let mut inner = self.inner.lock().unwrap();
             let stream = inner.streams.get_mut(&stream_id).ok_or_else(|| {
-                QMuxError::new(ErrorCode::InternalError, format!("stream {stream_id} disappeared"))
+                QMuxError::new(
+                    ErrorCode::InternalError,
+                    format!("stream {stream_id} disappeared"),
+                )
             })?;
             let send_offset = stream.send_offset;
             stream.send_offset += data.len() as u64;
@@ -455,11 +515,19 @@ impl QMuxConnection {
     /// counted from offset 0) are guaranteed delivered even though the
     /// stream is reset (draft-ietf-quic-reliable-stream-reset-09). Pass
     /// 0 for an ordinary abrupt reset with no preserved prefix.
-    pub fn reset_stream(&self, stream_id: u64, error_code: ErrorCode, reliable_size: u64) -> Result<(), QMuxError> {
+    pub fn reset_stream(
+        &self,
+        stream_id: u64,
+        error_code: ErrorCode,
+        reliable_size: u64,
+    ) -> Result<(), QMuxError> {
         let (already_done, final_size) = {
             let inner = self.inner.lock().unwrap();
             match inner.streams.get(&stream_id) {
-                Some(s) => (matches!(s.send_state, SendState::ResetSent | SendState::DataSent), s.send_offset),
+                Some(s) => (
+                    matches!(s.send_state, SendState::ResetSent | SendState::DataSent),
+                    s.send_offset,
+                ),
                 None => (true, 0),
             }
         };
@@ -468,7 +536,12 @@ impl QMuxConnection {
         }
 
         let frame = if reliable_size > 0 {
-            encode_reset_stream_at(stream_id, error_code, final_size, reliable_size.min(final_size))?
+            encode_reset_stream_at(
+                stream_id,
+                error_code,
+                final_size,
+                reliable_size.min(final_size),
+            )?
         } else {
             encode_reset_stream(stream_id, error_code, final_size)?
         };
@@ -586,20 +659,42 @@ impl QMuxConnection {
                 if let Some(v) = params.initial_max_data {
                     inner.conn_send_window = v as i64 - inner.conn_send_offset as i64;
                 }
-                inner.peer_max_streams_bidi =
-                    Some(params.initial_max_streams_bidi.unwrap_or(DEFAULT_INITIAL_MAX_STREAMS_BIDI));
+                inner.peer_max_streams_bidi = Some(
+                    params
+                        .initial_max_streams_bidi
+                        .unwrap_or(DEFAULT_INITIAL_MAX_STREAMS_BIDI),
+                );
                 drop(inner);
                 self.stream_open_notify.notify_waiters();
             }
-            Frame::Stream { stream_id, offset, data, fin } => {
+            Frame::Stream {
+                stream_id,
+                offset,
+                data,
+                fin,
+            } => {
                 let delivered = self.receive_stream_data(stream_id, offset, data, fin)?;
                 self.account_conn_recv(delivered);
             }
-            Frame::ResetStream { stream_id, error_code, final_size } => {
+            Frame::ResetStream {
+                stream_id,
+                error_code,
+                final_size,
+            } => {
                 self.receive_reset(stream_id, ErrorCode::from_code(error_code), final_size, 0)?;
             }
-            Frame::ResetStreamAt { stream_id, error_code, final_size, reliable_size } => {
-                self.receive_reset(stream_id, ErrorCode::from_code(error_code), final_size, reliable_size)?;
+            Frame::ResetStreamAt {
+                stream_id,
+                error_code,
+                final_size,
+                reliable_size,
+            } => {
+                self.receive_reset(
+                    stream_id,
+                    ErrorCode::from_code(error_code),
+                    final_size,
+                    reliable_size,
+                )?;
             }
             Frame::StopSending { stream_id, .. } => {
                 // We're being told to stop sending; reset our send side
@@ -616,7 +711,10 @@ impl QMuxConnection {
                     self.send_notify.notify_waiters();
                 }
             }
-            Frame::MaxStreamData { stream_id, max_stream_data } => {
+            Frame::MaxStreamData {
+                stream_id,
+                max_stream_data,
+            } => {
                 let mut inner = self.inner.lock().unwrap();
                 if let Some(s) = inner.streams.get_mut(&stream_id) {
                     let new_window = max_stream_data as i64 - s.send_offset as i64;
@@ -627,7 +725,10 @@ impl QMuxConnection {
                     }
                 }
             }
-            Frame::MaxStreams { unidirectional, max_streams } => {
+            Frame::MaxStreams {
+                unidirectional,
+                max_streams,
+            } => {
                 if !unidirectional {
                     let mut inner = self.inner.lock().unwrap();
                     inner.peer_max_streams_bidi = Some(max_streams);
@@ -635,20 +736,25 @@ impl QMuxConnection {
                     self.stream_open_notify.notify_waiters();
                 }
             }
-            Frame::DataBlocked { .. } | Frame::StreamDataBlocked { .. } | Frame::StreamsBlocked { .. } => {
+            Frame::DataBlocked { .. }
+            | Frame::StreamDataBlocked { .. }
+            | Frame::StreamsBlocked { .. } => {
                 // Informational: the peer is blocked on a limit we control.
                 // Nothing to do -- we already grant more window proactively
                 // as data is consumed (see account_conn_recv / the window-
                 // update logic in receive_stream_data).
             }
-            Frame::ConnectionClose { error_code, reason, .. } => {
+            Frame::ConnectionClose {
+                error_code, reason, ..
+            } => {
                 {
                     let mut inner = self.inner.lock().unwrap();
                     inner.closed = true;
                 }
-                let _ = self
-                    .events
-                    .send(QMuxEvent::ConnectionClosed { error_code: ErrorCode::from_code(error_code), reason });
+                let _ = self.events.send(QMuxEvent::ConnectionClosed {
+                    error_code: ErrorCode::from_code(error_code),
+                    reason,
+                });
             }
             Frame::Datagram { data } => {
                 let _ = self.events.send(QMuxEvent::Datagram { data });
@@ -666,7 +772,11 @@ impl QMuxConnection {
     /// frames -- RESET_STREAM/RESET_STREAM_AT can legitimately be the
     /// first frame ever seen for a stream, reset before ever writing
     /// anything).
-    fn get_or_create_peer_stream(&self, inner: &mut Inner, stream_id: u64) -> Result<PeerStreamLookup, QMuxError> {
+    fn get_or_create_peer_stream(
+        &self,
+        inner: &mut Inner,
+        stream_id: u64,
+    ) -> Result<PeerStreamLookup, QMuxError> {
         if inner.streams.contains_key(&stream_id) {
             return Ok(PeerStreamLookup::Existing);
         }
@@ -685,11 +795,19 @@ impl QMuxConnection {
         }
         inner.peer_streams_opened = inner.peer_streams_opened.max(stream_ordinal);
         let stream_data = inner.initial_max_stream_data;
-        inner.streams.insert(stream_id, StreamState::new(stream_data, stream_data));
+        inner
+            .streams
+            .insert(stream_id, StreamState::new(stream_data, stream_data));
         Ok(PeerStreamLookup::Created)
     }
 
-    fn receive_stream_data(&self, stream_id: u64, offset: u64, data: Vec<u8>, fin: bool) -> Result<usize, QMuxError> {
+    fn receive_stream_data(
+        &self,
+        stream_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+        fin: bool,
+    ) -> Result<usize, QMuxError> {
         enum Outcome {
             Skip,
             Delivered {
@@ -708,7 +826,10 @@ impl QMuxConnection {
                 Outcome::Skip
             } else {
                 let newly_opened = matches!(lookup, PeerStreamLookup::Created);
-                let stream = inner.streams.get_mut(&stream_id).expect("just inserted or existing");
+                let stream = inner
+                    .streams
+                    .get_mut(&stream_id)
+                    .expect("just inserted or existing");
 
                 if offset != stream.recv_buffered_up_to {
                     return Err(QMuxError::new(
@@ -744,7 +865,8 @@ impl QMuxConnection {
                         // size, not the absolute granted limit, so
                         // updates don't become rarer over the stream's
                         // lifetime) has been consumed.
-                        let remaining = stream.recv_window_granted as i64 - stream.recv_buffered_up_to as i64;
+                        let remaining =
+                            stream.recv_window_granted as i64 - stream.recv_buffered_up_to as i64;
                         if remaining.saturating_mul(2) <= stream.recv_window as i64 {
                             let new_limit = stream.recv_buffered_up_to + stream.recv_window;
                             stream.recv_window_granted = new_limit;
@@ -752,14 +874,26 @@ impl QMuxConnection {
                         }
                     }
 
-                    Outcome::Delivered { newly_opened, delivered, fin_fired, reset_fired, window_update }
+                    Outcome::Delivered {
+                        newly_opened,
+                        delivered,
+                        fin_fired,
+                        reset_fired,
+                        window_update,
+                    }
                 }
             }
         };
 
         match outcome {
             Outcome::Skip => Ok(0),
-            Outcome::Delivered { newly_opened, delivered, fin_fired, reset_fired, window_update } => {
+            Outcome::Delivered {
+                newly_opened,
+                delivered,
+                fin_fired,
+                reset_fired,
+                window_update,
+            } => {
                 if newly_opened {
                     let _ = self.events.send(QMuxEvent::StreamOpen { stream_id });
                 }
@@ -771,7 +905,10 @@ impl QMuxConnection {
                     (self.send)(&encode_record(&frame)?);
                 }
                 if let Some(error_code) = reset_fired {
-                    let _ = self.events.send(QMuxEvent::StreamReset { stream_id, error_code });
+                    let _ = self.events.send(QMuxEvent::StreamReset {
+                        stream_id,
+                        error_code,
+                    });
                     self.maybe_stream_closed(stream_id);
                 }
                 if fin_fired {
@@ -797,9 +934,15 @@ impl QMuxConnection {
                 return Ok(());
             }
             let newly_opened = matches!(lookup, PeerStreamLookup::Created);
-            let stream = inner.streams.get_mut(&stream_id).expect("just inserted or existing");
+            let stream = inner
+                .streams
+                .get_mut(&stream_id)
+                .expect("just inserted or existing");
 
-            if matches!(stream.recv_state, RecvState::ResetRecvd | RecvState::DataRecvd) {
+            if matches!(
+                stream.recv_state,
+                RecvState::ResetRecvd | RecvState::DataRecvd
+            ) {
                 (newly_opened, None)
             } else {
                 let _ = final_size; // tracked implicitly via recv_buffered_up_to/reliable_size
@@ -816,7 +959,10 @@ impl QMuxConnection {
             let _ = self.events.send(QMuxEvent::StreamOpen { stream_id });
         }
         if let Some(ec) = fired {
-            let _ = self.events.send(QMuxEvent::StreamReset { stream_id, error_code: ec });
+            let _ = self.events.send(QMuxEvent::StreamReset {
+                stream_id,
+                error_code: ec,
+            });
             self.maybe_stream_closed(stream_id);
         }
         Ok(())
@@ -832,7 +978,8 @@ impl QMuxConnection {
         let update = {
             let mut inner = self.inner.lock().unwrap();
             inner.conn_recv_buffered_up_to += byte_count as u64;
-            let remaining = inner.conn_recv_window_granted as i64 - inner.conn_recv_buffered_up_to as i64;
+            let remaining =
+                inner.conn_recv_window_granted as i64 - inner.conn_recv_buffered_up_to as i64;
             if remaining.saturating_mul(2) <= inner.conn_recv_window as i64 {
                 let new_limit = inner.conn_recv_buffered_up_to + inner.conn_recv_window;
                 inner.conn_recv_window_granted = new_limit;
@@ -968,11 +1115,19 @@ mod tests {
             }
         });
 
-        Pair { client, server, client_events, server_events }
+        Pair {
+            client,
+            server,
+            client_events,
+            server_events,
+        }
     }
 
     fn make_pair() -> Pair {
-        make_pair_with(|is_client| QMuxConnectionConfig { is_client, ..Default::default() })
+        make_pair_with(|is_client| QMuxConnectionConfig {
+            is_client,
+            ..Default::default()
+        })
     }
 
     async fn handshake(pair: &Pair) {
@@ -996,7 +1151,10 @@ mod tests {
         for _ in 0..4 {
             match pair.server_events.recv().await.unwrap() {
                 QMuxEvent::StreamOpen { stream_id: id } => assert_eq!(id, stream_id),
-                QMuxEvent::StreamData { stream_id: id, data } => {
+                QMuxEvent::StreamData {
+                    stream_id: id,
+                    data,
+                } => {
                     assert_eq!(id, stream_id);
                     got_data = Some(data);
                 }
@@ -1045,7 +1203,8 @@ mod tests {
         let stream_id = pair.client.open_stream().await.unwrap();
         let payload = vec![7u8; 20];
         let client = pair.client.clone();
-        let write_task = tokio::spawn(async move { client.write_stream(stream_id, &payload).await });
+        let write_task =
+            tokio::spawn(async move { client.write_stream(stream_id, &payload).await });
 
         // Drain server-side StreamOpen + StreamData events until all 20
         // bytes have arrived, proving the writer didn't just dump
@@ -1075,9 +1234,11 @@ mod tests {
         handshake(&pair).await;
 
         let stream_frame = encode_stream(0, 0, b"abcd", false).unwrap();
-        pair.server.receive_bytes(&encode_record(&stream_frame).unwrap());
+        pair.server
+            .receive_bytes(&encode_record(&stream_frame).unwrap());
         let reset_frame = encode_reset_stream_at(0, ErrorCode::ApplicationError, 6, 4).unwrap();
-        pair.server.receive_bytes(&encode_record(&reset_frame).unwrap());
+        pair.server
+            .receive_bytes(&encode_record(&reset_frame).unwrap());
 
         let mut prefix = Vec::new();
         let mut reset_code = None;
@@ -1111,10 +1272,15 @@ mod tests {
                 _ => {}
             }
         }
-        pair.server.stop_sending(stream_id, ErrorCode::ApplicationError).unwrap();
+        pair.server
+            .stop_sending(stream_id, ErrorCode::ApplicationError)
+            .unwrap();
 
         for _ in 0..20 {
-            if matches!(pair.client.stream_send_state(stream_id), Some(SendState::ResetSent)) {
+            if matches!(
+                pair.client.stream_send_state(stream_id),
+                Some(SendState::ResetSent)
+            ) {
                 return;
             }
             tokio::task::yield_now().await;

@@ -126,7 +126,8 @@ impl AgentState {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let json = serde_json::to_vec_pretty(&snapshot).context("failed to serialize agent state")?;
+        let json =
+            serde_json::to_vec_pretty(&snapshot).context("failed to serialize agent state")?;
         std::fs::write(self.path.as_ref(), json)
             .with_context(|| format!("failed to write {}", self.path.display()))?;
         Ok(())
@@ -261,8 +262,10 @@ pub async fn run(
                     } => {
                         let _ = status_state
                             .update(|snapshot| {
-                                snapshot.last_event =
-                                    Some(format!("accepted {} for {}", requester, target_fingerprint));
+                                snapshot.last_event = Some(format!(
+                                    "accepted {} for {}",
+                                    requester, target_fingerprint
+                                ));
                             })
                             .await;
                     }
@@ -548,7 +551,10 @@ fn normalize_capabilities(capabilities: &[String]) -> Vec<String> {
     let requested = if capabilities.is_empty() {
         vec!["shell".to_string(), "exec".to_string()]
     } else {
-        capabilities.iter().map(|value| value.trim().to_ascii_lowercase()).collect()
+        capabilities
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .collect()
     };
 
     let mut normalized = Vec::new();
@@ -659,11 +665,7 @@ fn startup_command_arguments(
     args
 }
 
-fn render_launchd_plist(
-    label: &str,
-    home: &std::path::Path,
-    args: &[String],
-) -> String {
+fn render_launchd_plist(label: &str, home: &std::path::Path, args: &[String]) -> String {
     let program_arguments = args
         .iter()
         .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
@@ -695,11 +697,7 @@ fn render_launchd_plist(
     )
 }
 
-fn render_systemd_unit(
-    label: &str,
-    home: &std::path::Path,
-    args: &[String],
-) -> String {
+fn render_systemd_unit(label: &str, home: &std::path::Path, args: &[String]) -> String {
     let exec_start = args
         .iter()
         .map(|arg| systemd_quote(arg))
@@ -735,7 +733,9 @@ fn startup_enable_hint(platform: StartupPlatform, label: &str, path: &OsStr) -> 
             label
         ),
         StartupPlatform::SystemdUser => {
-            format!("systemctl --user daemon-reload && systemctl --user enable --now {label}.service")
+            format!(
+                "systemctl --user daemon-reload && systemctl --user enable --now {label}.service"
+            )
         }
     }
 }
@@ -786,8 +786,8 @@ fn load_agent_snapshots(
     }
 
     let mut snapshots = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .with_context(|| format!("failed to read {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
     {
         let entry = entry.with_context(|| format!("failed to read {}", dir.display()))?;
         let path = entry.path();
@@ -883,7 +883,9 @@ mod tests {
     #[test]
     fn reverse_host_options_rejects_unknown_capabilities() {
         let err = reverse_host_options(&["bogus".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("unsupported reverse-host capability"));
+        assert!(err
+            .to_string()
+            .contains("unsupported reverse-host capability"));
     }
 
     #[test]
@@ -928,7 +930,10 @@ mod tests {
 
     #[test]
     fn sanitize_component_replaces_path_unsafe_characters() {
-        assert_eq!(sanitize_component("relay.local:4422/foo"), "relay_local_4422_foo");
+        assert_eq!(
+            sanitize_component("relay.local:4422/foo"),
+            "relay_local_4422_foo"
+        );
     }
 
     #[test]
@@ -997,7 +1002,9 @@ mod tests {
         );
         assert!(spec.contents.contains("[Install]"));
         assert!(spec.contents.contains("WantedBy=default.target"));
-        assert!(spec.contents.contains("ExecStart=\"/tmp/bin/wsh\" \"-i\" \"ops\""));
+        assert!(spec
+            .contents
+            .contains("ExecStart=\"/tmp/bin/wsh\" \"-i\" \"ops\""));
         assert!(spec.enable_hint.contains("systemctl --user enable --now"));
         assert!(spec.disable_hint.contains("systemctl --user disable --now"));
     }

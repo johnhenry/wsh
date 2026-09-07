@@ -175,7 +175,10 @@ fn load_identity_status(identity: &str) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("failed to load key '{identity}'"))?;
     let fingerprint = wsh_core::fingerprint(&wsh_client::auth::public_key_bytes(&verifying_key));
-    Ok(format!("loaded '{identity}' ({})", &fingerprint[..fingerprint.len().min(12)]))
+    Ok(format!(
+        "loaded '{identity}' ({})",
+        &fingerprint[..fingerprint.len().min(12)]
+    ))
 }
 
 fn known_host_status(host: &str, port: u16) -> Result<CheckStatus> {
@@ -294,8 +297,11 @@ mod tests {
 
     #[test]
     fn classify_relay_failure_detects_tls_trust_failures() {
-        let (status, hint) =
-            classify_relay_failure("transport error: received fatal alert: CertificateUnknown", "relay.example", 4422);
+        let (status, hint) = classify_relay_failure(
+            "transport error: received fatal alert: CertificateUnknown",
+            "relay.example",
+            4422,
+        );
         assert_eq!(status, CheckStatus::Error);
         assert!(hint.contains("TLS trust failed"));
     }

@@ -74,7 +74,10 @@ pub struct E2eKeyExchange {
 /// `IKM = x25519_secret || kem_secret` (64 bytes, in that order), salt =
 /// empty, info = `"wsh-hybrid-e2e-v1"`, output length 32 bytes. Mirrors
 /// `@johnhenry/wsh`'s `combineHybridSecret` (`src/client.mjs`) byte-for-byte.
-pub fn combine_hybrid_secret(x25519_secret: &[u8], kem_shared_secret: &[u8]) -> WshResult<[u8; 32]> {
+pub fn combine_hybrid_secret(
+    x25519_secret: &[u8],
+    kem_shared_secret: &[u8],
+) -> WshResult<[u8; 32]> {
     let mut ikm = Vec::with_capacity(x25519_secret.len() + kem_shared_secret.len());
     ikm.extend_from_slice(x25519_secret);
     ikm.extend_from_slice(kem_shared_secret);
@@ -135,10 +138,16 @@ mod tests {
 
         let mut other_x = base_x;
         other_x[0] ^= 0xff;
-        assert_ne!(combine_hybrid_secret(&other_x, &base_kem).unwrap(), baseline);
+        assert_ne!(
+            combine_hybrid_secret(&other_x, &base_kem).unwrap(),
+            baseline
+        );
 
         let mut other_kem = base_kem;
         other_kem[0] ^= 0xff;
-        assert_ne!(combine_hybrid_secret(&base_x, &other_kem).unwrap(), baseline);
+        assert_ne!(
+            combine_hybrid_secret(&base_x, &other_kem).unwrap(),
+            baseline
+        );
     }
 }

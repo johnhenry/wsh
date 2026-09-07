@@ -334,13 +334,8 @@ async fn main() {
                 .await
             }
             AgentCommand::Uninstall { relay_host } => {
-                commands::agent::run_uninstall(
-                    &relay_host,
-                    port,
-                    &identity,
-                    transport.as_deref(),
-                )
-                .await
+                commands::agent::run_uninstall(&relay_host, port, &identity, transport.as_deref())
+                    .await
             }
             AgentCommand::Status { json, relay_host } => {
                 commands::agent::run_status(relay_host.as_deref(), port, &identity, json).await
@@ -359,14 +354,8 @@ async fn main() {
                 shell_backend,
                 capability,
             };
-            commands::relay::run_peers(
-                &relay_host,
-                port,
-                &identity,
-                transport.as_deref(),
-                &options,
-            )
-            .await
+            commands::relay::run_peers(&relay_host, port, &identity, transport.as_deref(), &options)
+                .await
         }
         Some(Command::ReverseConnect { target, relay_host }) => {
             commands::relay::run_connect(

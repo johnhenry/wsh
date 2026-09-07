@@ -44,7 +44,12 @@ fn build_transcript(username: &str, session_id: &str, nonce: &[u8]) -> Vec<u8> {
 /// Sign a server challenge using the client's signing key.
 ///
 /// Returns the raw Ed25519 signature bytes (64 bytes).
-pub fn sign_challenge(signing_key: &SigningKey, username: &str, session_id: &str, nonce: &[u8]) -> Vec<u8> {
+pub fn sign_challenge(
+    signing_key: &SigningKey,
+    username: &str,
+    session_id: &str,
+    nonce: &[u8],
+) -> Vec<u8> {
     let transcript = build_transcript(username, session_id, nonce);
     let signature = signing_key.sign(&transcript);
     signature.to_bytes().to_vec()
@@ -126,7 +131,9 @@ mod tests {
         let session_id = "session";
 
         let sig = sign_challenge(&sk, "alice", session_id, b"nonce-a");
-        assert!(!verify_challenge(&vk, &sig, "alice", session_id, b"nonce-b"));
+        assert!(!verify_challenge(
+            &vk, &sig, "alice", session_id, b"nonce-b"
+        ));
     }
 
     #[test]

@@ -29,9 +29,7 @@ impl ByteStream for WebTransportStream {
             match self.recv.read(buf).await {
                 Ok(Some(n)) => Ok(n),
                 Ok(None) => Ok(0),
-                Err(e) => Err(WshError::Transport(format!(
-                    "WebTransport read error: {e}"
-                ))),
+                Err(e) => Err(WshError::Transport(format!("WebTransport read error: {e}"))),
             }
         })
     }
@@ -155,9 +153,7 @@ impl TransportSession for WebTransportSession {
             .await
             .map_err(|e| WshError::Transport(format!("failed to open stream: {e}")))?
             .await
-            .map_err(|e| {
-                WshError::Transport(format!("failed to initialize stream: {e}"))
-            })?;
+            .map_err(|e| WshError::Transport(format!("failed to initialize stream: {e}")))?;
 
         let id = self.next_stream_id;
         self.next_stream_id += 1;
@@ -235,8 +231,15 @@ mod tests {
 
     #[test]
     fn normalize_webtransport_url_rejects_non_webtransport_schemes() {
-        for url in ["ws://example.com", "wss://example.com", "http://example.com"] {
-            assert!(normalize_webtransport_url(url).is_err(), "{url} should be rejected");
+        for url in [
+            "ws://example.com",
+            "wss://example.com",
+            "http://example.com",
+        ] {
+            assert!(
+                normalize_webtransport_url(url).is_err(),
+                "{url} should be rejected"
+            );
         }
     }
 }

@@ -150,7 +150,10 @@ pub enum RouteTarget {
     Unknown,
 }
 
-pub fn route_frame(frame: &WispFrame, known_reverse: &std::collections::HashSet<u32>) -> RouteTarget {
+pub fn route_frame(
+    frame: &WispFrame,
+    known_reverse: &std::collections::HashSet<u32>,
+) -> RouteTarget {
     match classify_stream(frame.stream_id) {
         StreamDirection::RelayReverse if known_reverse.contains(&frame.stream_id) => {
             RouteTarget::ReverseBridge(frame.stream_id)
@@ -250,7 +253,10 @@ impl WispGuestSession {
                     // so CONTINUE from the guest is a no-op here.
                 }
                 other => {
-                    debug!(frame_type = other, stream_id, "unhandled WISP frame type on reverse stream");
+                    debug!(
+                        frame_type = other,
+                        stream_id, "unhandled WISP frame type on reverse stream"
+                    );
                 }
             },
             RouteTarget::Unknown => {

@@ -50,12 +50,15 @@ pub fn encode_varint(value: u64) -> Result<Vec<u8>, QMuxError> {
 /// Decode a QUIC variable-length integer at `data[offset..]`.
 /// Returns `(value, bytes_consumed)`.
 pub fn decode_varint(data: &[u8], offset: usize) -> Result<(u64, usize), QMuxError> {
-    let first = *data
-        .get(offset)
-        .ok_or_else(|| QMuxError::new(ErrorCode::FrameEncodingError, "varint: no data at offset"))?;
+    let first = *data.get(offset).ok_or_else(|| {
+        QMuxError::new(ErrorCode::FrameEncodingError, "varint: no data at offset")
+    })?;
     let len = 1usize << (first >> 6);
     if offset + len > data.len() {
-        return Err(QMuxError::new(ErrorCode::FrameEncodingError, "varint: truncated"));
+        return Err(QMuxError::new(
+            ErrorCode::FrameEncodingError,
+            "varint: truncated",
+        ));
     }
     let value = match len {
         1 => (first & 0x3f) as u64,
@@ -151,13 +154,21 @@ pub struct QMuxError {
 
 impl QMuxError {
     pub fn new(error_code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { error_code, message: message.into() }
+        Self {
+            error_code,
+            message: message.into(),
+        }
     }
 }
 
 impl fmt::Display for QMuxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (error code 0x{:02x})", self.message, self.error_code.code())
+        write!(
+            f,
+            "{} (error code 0x{:02x})",
+            self.message,
+            self.error_code.code()
+        )
     }
 }
 
@@ -237,13 +248,25 @@ pub fn encode_transport_parameters(params: &TransportParameters) -> Result<Vec<u
         encode_param(transport_param_id::INITIAL_MAX_DATA, v, &mut body)?;
     }
     if let Some(v) = params.initial_max_stream_data_bidi_local {
-        encode_param(transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, v, &mut body)?;
+        encode_param(
+            transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            v,
+            &mut body,
+        )?;
     }
     if let Some(v) = params.initial_max_stream_data_bidi_remote {
-        encode_param(transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, v, &mut body)?;
+        encode_param(
+            transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            v,
+            &mut body,
+        )?;
     }
     if let Some(v) = params.initial_max_stream_data_uni {
-        encode_param(transport_param_id::INITIAL_MAX_STREAM_DATA_UNI, v, &mut body)?;
+        encode_param(
+            transport_param_id::INITIAL_MAX_STREAM_DATA_UNI,
+            v,
+            &mut body,
+        )?;
     }
     if let Some(v) = params.initial_max_streams_bidi {
         encode_param(transport_param_id::INITIAL_MAX_STREAMS_BIDI, v, &mut body)?;
@@ -270,19 +293,32 @@ fn decode_transport_parameters(data: &[u8]) -> Result<TransportParameters, QMuxE
         offset += id_len;
         let (len, len_len) = decode_varint(data, offset)?;
         offset += len_len;
-        let value_bytes = data
-            .get(offset..offset + len as usize)
-            .ok_or_else(|| QMuxError::new(ErrorCode::FrameEncodingError, "transport parameter value truncated"))?;
+        let value_bytes = data.get(offset..offset + len as usize).ok_or_else(|| {
+            QMuxError::new(
+                ErrorCode::FrameEncodingError,
+                "transport parameter value truncated",
+            )
+        })?;
         offset += len as usize;
 
-        let value = if value_bytes.is_empty() { None } else { Some(decode_varint(value_bytes, 0)?.0) };
+        let value = if value_bytes.is_empty() {
+            None
+        } else {
+            Some(decode_varint(value_bytes, 0)?.0)
+        };
 
         match id {
             transport_param_id::MAX_IDLE_TIMEOUT => params.max_idle_timeout = value,
             transport_param_id::INITIAL_MAX_DATA => params.initial_max_data = value,
-            transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => params.initial_max_stream_data_bidi_local = value,
-            transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE => params.initial_max_stream_data_bidi_remote = value,
-            transport_param_id::INITIAL_MAX_STREAM_DATA_UNI => params.initial_max_stream_data_uni = value,
+            transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => {
+                params.initial_max_stream_data_bidi_local = value
+            }
+            transport_param_id::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE => {
+                params.initial_max_stream_data_bidi_remote = value
+            }
+            transport_param_id::INITIAL_MAX_STREAM_DATA_UNI => {
+                params.initial_max_stream_data_uni = value
+            }
             transport_param_id::INITIAL_MAX_STREAMS_BIDI => params.initial_max_streams_bidi = value,
             transport_param_id::INITIAL_MAX_STREAMS_UNI => params.initial_max_streams_uni = value,
             transport_param_id::MAX_DATAGRAM_FRAME_SIZE => params.max_datagram_frame_size = value,
@@ -343,24 +379,70 @@ impl RecordDecoder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Padding,
-    ResetStream { stream_id: u64, error_code: u64, final_size: u64 },
-    ResetStreamAt { stream_id: u64, error_code: u64, final_size: u64, reliable_size: u64 },
-    StopSending { stream_id: u64, error_code: u64 },
-    Stream { stream_id: u64, offset: u64, data: Vec<u8>, fin: bool },
-    MaxData { max_data: u64 },
-    MaxStreamData { stream_id: u64, max_stream_data: u64 },
-    MaxStreams { unidirectional: bool, max_streams: u64 },
-    DataBlocked { data_limit: u64 },
-    StreamDataBlocked { stream_id: u64, stream_data_limit: u64 },
-    StreamsBlocked { unidirectional: bool, stream_limit: u64 },
-    ConnectionClose { application: bool, error_code: u64, close_frame_type: Option<u64>, reason: String },
-    Datagram { data: Vec<u8> },
-    QxTransportParameters { params: TransportParameters },
+    ResetStream {
+        stream_id: u64,
+        error_code: u64,
+        final_size: u64,
+    },
+    ResetStreamAt {
+        stream_id: u64,
+        error_code: u64,
+        final_size: u64,
+        reliable_size: u64,
+    },
+    StopSending {
+        stream_id: u64,
+        error_code: u64,
+    },
+    Stream {
+        stream_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+        fin: bool,
+    },
+    MaxData {
+        max_data: u64,
+    },
+    MaxStreamData {
+        stream_id: u64,
+        max_stream_data: u64,
+    },
+    MaxStreams {
+        unidirectional: bool,
+        max_streams: u64,
+    },
+    DataBlocked {
+        data_limit: u64,
+    },
+    StreamDataBlocked {
+        stream_id: u64,
+        stream_data_limit: u64,
+    },
+    StreamsBlocked {
+        unidirectional: bool,
+        stream_limit: u64,
+    },
+    ConnectionClose {
+        application: bool,
+        error_code: u64,
+        close_frame_type: Option<u64>,
+        reason: String,
+    },
+    Datagram {
+        data: Vec<u8>,
+    },
+    QxTransportParameters {
+        params: TransportParameters,
+    },
 }
 
 // ── Frame encoders ───────────────────────────────────────────────────
 
-pub fn encode_reset_stream(stream_id: u64, error_code: ErrorCode, final_size: u64) -> Result<Vec<u8>, QMuxError> {
+pub fn encode_reset_stream(
+    stream_id: u64,
+    error_code: ErrorCode,
+    final_size: u64,
+) -> Result<Vec<u8>, QMuxError> {
     let mut out = encode_varint(frame_type::RESET_STREAM)?;
     out.extend(encode_varint(stream_id)?);
     out.extend(encode_varint(error_code.code())?);
@@ -368,7 +450,12 @@ pub fn encode_reset_stream(stream_id: u64, error_code: ErrorCode, final_size: u6
     Ok(out)
 }
 
-pub fn encode_reset_stream_at(stream_id: u64, error_code: ErrorCode, final_size: u64, reliable_size: u64) -> Result<Vec<u8>, QMuxError> {
+pub fn encode_reset_stream_at(
+    stream_id: u64,
+    error_code: ErrorCode,
+    final_size: u64,
+    reliable_size: u64,
+) -> Result<Vec<u8>, QMuxError> {
     let mut out = encode_varint(frame_type::RESET_STREAM_AT)?;
     out.extend(encode_varint(stream_id)?);
     out.extend(encode_varint(error_code.code())?);
@@ -387,7 +474,12 @@ pub fn encode_stop_sending(stream_id: u64, error_code: ErrorCode) -> Result<Vec<
 /// Offset and Length are always included (OFF=1, LEN=1) -- QMux Records
 /// already delimit frame boundaries, so omitting Length saves nothing
 /// the way it can in a raw QUIC packet.
-pub fn encode_stream(stream_id: u64, offset: u64, data: &[u8], fin: bool) -> Result<Vec<u8>, QMuxError> {
+pub fn encode_stream(
+    stream_id: u64,
+    offset: u64,
+    data: &[u8],
+    fin: bool,
+) -> Result<Vec<u8>, QMuxError> {
     let flags: u64 = 0x02 /* LEN */ | 0x04 /* OFF */ | if fin { 0x01 } else { 0x00 };
     let mut out = encode_varint(frame_type::STREAM | flags)?;
     out.extend(encode_varint(stream_id)?);
@@ -411,7 +503,11 @@ pub fn encode_max_stream_data(stream_id: u64, max_stream_data: u64) -> Result<Ve
 }
 
 pub fn encode_max_streams(unidirectional: bool, max_streams: u64) -> Result<Vec<u8>, QMuxError> {
-    let ty = if unidirectional { frame_type::MAX_STREAMS_UNI } else { frame_type::MAX_STREAMS_BIDI };
+    let ty = if unidirectional {
+        frame_type::MAX_STREAMS_UNI
+    } else {
+        frame_type::MAX_STREAMS_BIDI
+    };
     let mut out = encode_varint(ty)?;
     out.extend(encode_varint(max_streams)?);
     Ok(out)
@@ -423,23 +519,42 @@ pub fn encode_data_blocked(data_limit: u64) -> Result<Vec<u8>, QMuxError> {
     Ok(out)
 }
 
-pub fn encode_stream_data_blocked(stream_id: u64, stream_data_limit: u64) -> Result<Vec<u8>, QMuxError> {
+pub fn encode_stream_data_blocked(
+    stream_id: u64,
+    stream_data_limit: u64,
+) -> Result<Vec<u8>, QMuxError> {
     let mut out = encode_varint(frame_type::STREAM_DATA_BLOCKED)?;
     out.extend(encode_varint(stream_id)?);
     out.extend(encode_varint(stream_data_limit)?);
     Ok(out)
 }
 
-pub fn encode_streams_blocked(unidirectional: bool, stream_limit: u64) -> Result<Vec<u8>, QMuxError> {
-    let ty = if unidirectional { frame_type::STREAMS_BLOCKED_UNI } else { frame_type::STREAMS_BLOCKED_BIDI };
+pub fn encode_streams_blocked(
+    unidirectional: bool,
+    stream_limit: u64,
+) -> Result<Vec<u8>, QMuxError> {
+    let ty = if unidirectional {
+        frame_type::STREAMS_BLOCKED_UNI
+    } else {
+        frame_type::STREAMS_BLOCKED_BIDI
+    };
     let mut out = encode_varint(ty)?;
     out.extend(encode_varint(stream_limit)?);
     Ok(out)
 }
 
-pub fn encode_connection_close(application: bool, error_code: u64, frame_type_val: Option<u64>, reason: &str) -> Result<Vec<u8>, QMuxError> {
+pub fn encode_connection_close(
+    application: bool,
+    error_code: u64,
+    frame_type_val: Option<u64>,
+    reason: &str,
+) -> Result<Vec<u8>, QMuxError> {
     let reason_bytes = reason.as_bytes();
-    let mut out = encode_varint(if application { frame_type::CONNECTION_CLOSE_APPLICATION } else { frame_type::CONNECTION_CLOSE_TRANSPORT })?;
+    let mut out = encode_varint(if application {
+        frame_type::CONNECTION_CLOSE_APPLICATION
+    } else {
+        frame_type::CONNECTION_CLOSE_TRANSPORT
+    })?;
     out.extend(encode_varint(error_code)?);
     if !application {
         out.extend(encode_varint(frame_type_val.unwrap_or(0))?);
@@ -473,11 +588,16 @@ pub fn decode_frames(data: &[u8]) -> Result<Vec<Frame>, QMuxError> {
         if raw_type == QX_TRANSPORT_PARAMETERS_TYPE {
             let (len, len_len) = decode_varint(data, offset)?;
             offset += len_len;
-            let params_bytes = data
-                .get(offset..offset + len as usize)
-                .ok_or_else(|| QMuxError::new(ErrorCode::FrameEncodingError, "QX_TRANSPORT_PARAMETERS truncated"))?;
+            let params_bytes = data.get(offset..offset + len as usize).ok_or_else(|| {
+                QMuxError::new(
+                    ErrorCode::FrameEncodingError,
+                    "QX_TRANSPORT_PARAMETERS truncated",
+                )
+            })?;
             offset += len as usize;
-            frames.push(Frame::QxTransportParameters { params: decode_transport_parameters(params_bytes)? });
+            frames.push(Frame::QxTransportParameters {
+                params: decode_transport_parameters(params_bytes)?,
+            });
             continue;
         }
 
@@ -507,11 +627,18 @@ pub fn decode_frames(data: &[u8]) -> Result<Vec<Frame>, QMuxError> {
 
             let stream_data = data
                 .get(offset..offset + length)
-                .ok_or_else(|| QMuxError::new(ErrorCode::FrameEncodingError, "STREAM frame data truncated"))?
+                .ok_or_else(|| {
+                    QMuxError::new(ErrorCode::FrameEncodingError, "STREAM frame data truncated")
+                })?
                 .to_vec();
             offset += length;
 
-            frames.push(Frame::Stream { stream_id, offset: stream_offset, data: stream_data, fin });
+            frames.push(Frame::Stream {
+                stream_id,
+                offset: stream_offset,
+                data: stream_data,
+                fin,
+            });
             continue;
         }
 
@@ -527,7 +654,12 @@ pub fn decode_frames(data: &[u8]) -> Result<Vec<Frame>, QMuxError> {
             };
             let payload = data
                 .get(offset..offset + length)
-                .ok_or_else(|| QMuxError::new(ErrorCode::FrameEncodingError, "DATAGRAM frame data truncated"))?
+                .ok_or_else(|| {
+                    QMuxError::new(
+                        ErrorCode::FrameEncodingError,
+                        "DATAGRAM frame data truncated",
+                    )
+                })?
                 .to_vec();
             offset += length;
             frames.push(Frame::Datagram { data: payload });
@@ -539,64 +671,116 @@ pub fn decode_frames(data: &[u8]) -> Result<Vec<Frame>, QMuxError> {
                 frames.push(Frame::Padding);
             }
             frame_type::RESET_STREAM => {
-                let (stream_id, l1) = decode_varint(data, offset)?; offset += l1;
-                let (error_code, l2) = decode_varint(data, offset)?; offset += l2;
-                let (final_size, l3) = decode_varint(data, offset)?; offset += l3;
-                frames.push(Frame::ResetStream { stream_id, error_code, final_size });
+                let (stream_id, l1) = decode_varint(data, offset)?;
+                offset += l1;
+                let (error_code, l2) = decode_varint(data, offset)?;
+                offset += l2;
+                let (final_size, l3) = decode_varint(data, offset)?;
+                offset += l3;
+                frames.push(Frame::ResetStream {
+                    stream_id,
+                    error_code,
+                    final_size,
+                });
             }
             frame_type::RESET_STREAM_AT => {
-                let (stream_id, l1) = decode_varint(data, offset)?; offset += l1;
-                let (error_code, l2) = decode_varint(data, offset)?; offset += l2;
-                let (final_size, l3) = decode_varint(data, offset)?; offset += l3;
-                let (reliable_size, l4) = decode_varint(data, offset)?; offset += l4;
+                let (stream_id, l1) = decode_varint(data, offset)?;
+                offset += l1;
+                let (error_code, l2) = decode_varint(data, offset)?;
+                offset += l2;
+                let (final_size, l3) = decode_varint(data, offset)?;
+                offset += l3;
+                let (reliable_size, l4) = decode_varint(data, offset)?;
+                offset += l4;
                 if reliable_size > final_size {
-                    return Err(QMuxError::new(ErrorCode::FrameEncodingError, "RESET_STREAM_AT: reliableSize > finalSize"));
+                    return Err(QMuxError::new(
+                        ErrorCode::FrameEncodingError,
+                        "RESET_STREAM_AT: reliableSize > finalSize",
+                    ));
                 }
-                frames.push(Frame::ResetStreamAt { stream_id, error_code, final_size, reliable_size });
+                frames.push(Frame::ResetStreamAt {
+                    stream_id,
+                    error_code,
+                    final_size,
+                    reliable_size,
+                });
             }
             frame_type::STOP_SENDING => {
-                let (stream_id, l1) = decode_varint(data, offset)?; offset += l1;
-                let (error_code, l2) = decode_varint(data, offset)?; offset += l2;
-                frames.push(Frame::StopSending { stream_id, error_code });
+                let (stream_id, l1) = decode_varint(data, offset)?;
+                offset += l1;
+                let (error_code, l2) = decode_varint(data, offset)?;
+                offset += l2;
+                frames.push(Frame::StopSending {
+                    stream_id,
+                    error_code,
+                });
             }
             frame_type::MAX_DATA => {
-                let (max_data, l1) = decode_varint(data, offset)?; offset += l1;
+                let (max_data, l1) = decode_varint(data, offset)?;
+                offset += l1;
                 frames.push(Frame::MaxData { max_data });
             }
             frame_type::MAX_STREAM_DATA => {
-                let (stream_id, l1) = decode_varint(data, offset)?; offset += l1;
-                let (max_stream_data, l2) = decode_varint(data, offset)?; offset += l2;
-                frames.push(Frame::MaxStreamData { stream_id, max_stream_data });
+                let (stream_id, l1) = decode_varint(data, offset)?;
+                offset += l1;
+                let (max_stream_data, l2) = decode_varint(data, offset)?;
+                offset += l2;
+                frames.push(Frame::MaxStreamData {
+                    stream_id,
+                    max_stream_data,
+                });
             }
             frame_type::MAX_STREAMS_BIDI | frame_type::MAX_STREAMS_UNI => {
-                let (max_streams, l1) = decode_varint(data, offset)?; offset += l1;
-                frames.push(Frame::MaxStreams { unidirectional: raw_type == frame_type::MAX_STREAMS_UNI, max_streams });
+                let (max_streams, l1) = decode_varint(data, offset)?;
+                offset += l1;
+                frames.push(Frame::MaxStreams {
+                    unidirectional: raw_type == frame_type::MAX_STREAMS_UNI,
+                    max_streams,
+                });
             }
             frame_type::DATA_BLOCKED => {
-                let (data_limit, l1) = decode_varint(data, offset)?; offset += l1;
+                let (data_limit, l1) = decode_varint(data, offset)?;
+                offset += l1;
                 frames.push(Frame::DataBlocked { data_limit });
             }
             frame_type::STREAM_DATA_BLOCKED => {
-                let (stream_id, l1) = decode_varint(data, offset)?; offset += l1;
-                let (stream_data_limit, l2) = decode_varint(data, offset)?; offset += l2;
-                frames.push(Frame::StreamDataBlocked { stream_id, stream_data_limit });
+                let (stream_id, l1) = decode_varint(data, offset)?;
+                offset += l1;
+                let (stream_data_limit, l2) = decode_varint(data, offset)?;
+                offset += l2;
+                frames.push(Frame::StreamDataBlocked {
+                    stream_id,
+                    stream_data_limit,
+                });
             }
             frame_type::STREAMS_BLOCKED_BIDI | frame_type::STREAMS_BLOCKED_UNI => {
-                let (stream_limit, l1) = decode_varint(data, offset)?; offset += l1;
-                frames.push(Frame::StreamsBlocked { unidirectional: raw_type == frame_type::STREAMS_BLOCKED_UNI, stream_limit });
+                let (stream_limit, l1) = decode_varint(data, offset)?;
+                offset += l1;
+                frames.push(Frame::StreamsBlocked {
+                    unidirectional: raw_type == frame_type::STREAMS_BLOCKED_UNI,
+                    stream_limit,
+                });
             }
             frame_type::CONNECTION_CLOSE_TRANSPORT | frame_type::CONNECTION_CLOSE_APPLICATION => {
                 let application = raw_type == frame_type::CONNECTION_CLOSE_APPLICATION;
-                let (error_code, l1) = decode_varint(data, offset)?; offset += l1;
+                let (error_code, l1) = decode_varint(data, offset)?;
+                offset += l1;
                 let mut close_frame_type = None;
                 if !application {
-                    let (ft, l2) = decode_varint(data, offset)?; offset += l2;
+                    let (ft, l2) = decode_varint(data, offset)?;
+                    offset += l2;
                     close_frame_type = Some(ft);
                 }
-                let (reason_len, l3) = decode_varint(data, offset)?; offset += l3;
-                let reason_bytes = data
-                    .get(offset..offset + reason_len as usize)
-                    .ok_or_else(|| QMuxError::new(ErrorCode::FrameEncodingError, "CONNECTION_CLOSE reason truncated"))?;
+                let (reason_len, l3) = decode_varint(data, offset)?;
+                offset += l3;
+                let reason_bytes =
+                    data.get(offset..offset + reason_len as usize)
+                        .ok_or_else(|| {
+                            QMuxError::new(
+                                ErrorCode::FrameEncodingError,
+                                "CONNECTION_CLOSE reason truncated",
+                            )
+                        })?;
                 offset += reason_len as usize;
                 frames.push(Frame::ConnectionClose {
                     application,
@@ -660,12 +844,17 @@ mod tests {
     fn varint_matches_rfc9000_appendix_a1_worked_examples_byte_for_byte() {
         assert_eq!(encode_varint(37).unwrap(), vec![0x25]);
         assert_eq!(encode_varint(15293).unwrap(), vec![0x7b, 0xbd]);
-        assert_eq!(encode_varint(494878333).unwrap(), vec![0x9d, 0x7f, 0x3e, 0x7d]);
+        assert_eq!(
+            encode_varint(494878333).unwrap(),
+            vec![0x9d, 0x7f, 0x3e, 0x7d]
+        );
     }
 
     #[test]
     fn varint_round_trips_at_and_around_every_length_class_boundary() {
-        for v in [0u64, 1, 63, 64, 65, 16383, 16384, 16385, 1073741823, 1073741824, 1073741825] {
+        for v in [
+            0u64, 1, 63, 64, 65, 16383, 16384, 16385, 1073741823, 1073741824, 1073741825,
+        ] {
             let enc = encode_varint(v).unwrap();
             let (value, length) = decode_varint(&enc, 0).unwrap();
             assert_eq!(length, enc.len(), "length mismatch for {v}");
@@ -780,7 +969,15 @@ mod tests {
         let data = vec![65, 66, 67];
         let encoded = encode_stream(4, 10, &data, true).unwrap();
         let frames = decode_frames(&encoded).unwrap();
-        assert_eq!(frames, vec![Frame::Stream { stream_id: 4, offset: 10, data: data.clone(), fin: true }]);
+        assert_eq!(
+            frames,
+            vec![Frame::Stream {
+                stream_id: 4,
+                offset: 10,
+                data: data.clone(),
+                fin: true
+            }]
+        );
         // First byte: 0x08 (STREAM) | 0x01 (FIN) | 0x02 (LEN) | 0x04 (OFF) = 0x0f
         assert_eq!(encoded[0], 0x0f);
     }
@@ -789,21 +986,44 @@ mod tests {
     fn stream_frame_without_fin() {
         let encoded = encode_stream(0, 0, &[1], false).unwrap();
         let frames = decode_frames(&encoded).unwrap();
-        assert_eq!(frames, vec![Frame::Stream { stream_id: 0, offset: 0, data: vec![1], fin: false }]);
+        assert_eq!(
+            frames,
+            vec![Frame::Stream {
+                stream_id: 0,
+                offset: 0,
+                data: vec![1],
+                fin: false
+            }]
+        );
     }
 
     #[test]
     fn reset_stream_round_trip() {
         let encoded = encode_reset_stream(4, ErrorCode::InternalError, 100).unwrap();
         let frames = decode_frames(&encoded).unwrap();
-        assert_eq!(frames, vec![Frame::ResetStream { stream_id: 4, error_code: 1, final_size: 100 }]);
+        assert_eq!(
+            frames,
+            vec![Frame::ResetStream {
+                stream_id: 4,
+                error_code: 1,
+                final_size: 100
+            }]
+        );
     }
 
     #[test]
     fn reset_stream_at_round_trip() {
         let encoded = encode_reset_stream_at(8, ErrorCode::NoError, 1000, 400).unwrap();
         let frames = decode_frames(&encoded).unwrap();
-        assert_eq!(frames, vec![Frame::ResetStreamAt { stream_id: 8, error_code: 0, final_size: 1000, reliable_size: 400 }]);
+        assert_eq!(
+            frames,
+            vec![Frame::ResetStreamAt {
+                stream_id: 8,
+                error_code: 0,
+                final_size: 1000,
+                reliable_size: 400
+            }]
+        );
     }
 
     #[test]
@@ -817,19 +1037,34 @@ mod tests {
     fn stop_sending_round_trip() {
         let encoded = encode_stop_sending(12, ErrorCode::ApplicationError).unwrap();
         let frames = decode_frames(&encoded).unwrap();
-        assert_eq!(frames, vec![Frame::StopSending { stream_id: 12, error_code: 0x0c }]);
+        assert_eq!(
+            frames,
+            vec![Frame::StopSending {
+                stream_id: 12,
+                error_code: 0x0c
+            }]
+        );
     }
 
     #[test]
     fn max_data_round_trip() {
         let encoded = encode_max_data(65536).unwrap();
-        assert_eq!(decode_frames(&encoded).unwrap(), vec![Frame::MaxData { max_data: 65536 }]);
+        assert_eq!(
+            decode_frames(&encoded).unwrap(),
+            vec![Frame::MaxData { max_data: 65536 }]
+        );
     }
 
     #[test]
     fn max_stream_data_round_trip() {
         let encoded = encode_max_stream_data(4, 32768).unwrap();
-        assert_eq!(decode_frames(&encoded).unwrap(), vec![Frame::MaxStreamData { stream_id: 4, max_stream_data: 32768 }]);
+        assert_eq!(
+            decode_frames(&encoded).unwrap(),
+            vec![Frame::MaxStreamData {
+                stream_id: 4,
+                max_stream_data: 32768
+            }]
+        );
     }
 
     #[test]
@@ -837,20 +1072,41 @@ mod tests {
         let bidi = encode_max_streams(false, 10).unwrap();
         let uni = encode_max_streams(true, 5).unwrap();
         assert_ne!(bidi[0], uni[0]);
-        assert_eq!(decode_frames(&bidi).unwrap(), vec![Frame::MaxStreams { unidirectional: false, max_streams: 10 }]);
-        assert_eq!(decode_frames(&uni).unwrap(), vec![Frame::MaxStreams { unidirectional: true, max_streams: 5 }]);
+        assert_eq!(
+            decode_frames(&bidi).unwrap(),
+            vec![Frame::MaxStreams {
+                unidirectional: false,
+                max_streams: 10
+            }]
+        );
+        assert_eq!(
+            decode_frames(&uni).unwrap(),
+            vec![Frame::MaxStreams {
+                unidirectional: true,
+                max_streams: 5
+            }]
+        );
     }
 
     #[test]
     fn data_blocked_round_trip() {
         let encoded = encode_data_blocked(1000).unwrap();
-        assert_eq!(decode_frames(&encoded).unwrap(), vec![Frame::DataBlocked { data_limit: 1000 }]);
+        assert_eq!(
+            decode_frames(&encoded).unwrap(),
+            vec![Frame::DataBlocked { data_limit: 1000 }]
+        );
     }
 
     #[test]
     fn stream_data_blocked_round_trip() {
         let encoded = encode_stream_data_blocked(4, 500).unwrap();
-        assert_eq!(decode_frames(&encoded).unwrap(), vec![Frame::StreamDataBlocked { stream_id: 4, stream_data_limit: 500 }]);
+        assert_eq!(
+            decode_frames(&encoded).unwrap(),
+            vec![Frame::StreamDataBlocked {
+                stream_id: 4,
+                stream_data_limit: 500
+            }]
+        );
     }
 
     #[test]
@@ -858,19 +1114,34 @@ mod tests {
         let bidi = encode_streams_blocked(false, 3).unwrap();
         let uni = encode_streams_blocked(true, 2).unwrap();
         assert_ne!(bidi[0], uni[0]);
-        assert_eq!(decode_frames(&bidi).unwrap(), vec![Frame::StreamsBlocked { unidirectional: false, stream_limit: 3 }]);
+        assert_eq!(
+            decode_frames(&bidi).unwrap(),
+            vec![Frame::StreamsBlocked {
+                unidirectional: false,
+                stream_limit: 3
+            }]
+        );
     }
 
     #[test]
     fn connection_close_transport_round_trip_includes_the_triggering_frame_type() {
-        let encoded = encode_connection_close(false, ErrorCode::ProtocolViolation.code(), Some(frame_type::STREAM), "bad stream order").unwrap();
+        let encoded = encode_connection_close(
+            false,
+            ErrorCode::ProtocolViolation.code(),
+            Some(frame_type::STREAM),
+            "bad stream order",
+        )
+        .unwrap();
         let frames = decode_frames(&encoded).unwrap();
-        assert_eq!(frames, vec![Frame::ConnectionClose {
-            application: false,
-            error_code: 0x0a,
-            close_frame_type: Some(frame_type::STREAM),
-            reason: "bad stream order".to_string(),
-        }]);
+        assert_eq!(
+            frames,
+            vec![Frame::ConnectionClose {
+                application: false,
+                error_code: 0x0a,
+                close_frame_type: Some(frame_type::STREAM),
+                reason: "bad stream order".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -878,7 +1149,12 @@ mod tests {
         let encoded = encode_connection_close(true, 5, None, "bye").unwrap();
         let frames = decode_frames(&encoded).unwrap();
         match &frames[0] {
-            Frame::ConnectionClose { application, close_frame_type, reason, .. } => {
+            Frame::ConnectionClose {
+                application,
+                close_frame_type,
+                reason,
+                ..
+            } => {
                 assert!(*application);
                 assert_eq!(*close_frame_type, None);
                 assert_eq!(reason, "bye");
@@ -900,7 +1176,10 @@ mod tests {
     fn datagram_round_trip() {
         let data = vec![1, 2, 3, 4, 5];
         let encoded = encode_datagram(&data).unwrap();
-        assert_eq!(decode_frames(&encoded).unwrap(), vec![Frame::Datagram { data }]);
+        assert_eq!(
+            decode_frames(&encoded).unwrap(),
+            vec![Frame::Datagram { data }]
+        );
     }
 
     #[test]
@@ -922,7 +1201,10 @@ mod tests {
 
     #[test]
     fn qx_transport_parameters_type_varint_is_always_the_full_8_byte_form() {
-        let params = TransportParameters { initial_max_data: Some(1), ..Default::default() };
+        let params = TransportParameters {
+            initial_max_data: Some(1),
+            ..Default::default()
+        };
         let encoded = encode_transport_parameters(&params).unwrap();
         assert_eq!(encoded[0] >> 6, 0b11);
         assert!(encoded.len() >= 8);

@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use wsh_core::{WshError, WshResult};
 use wtransport::endpoint::endpoint_side;
 use wtransport::{Endpoint, Identity, ServerConfig};
-use wsh_core::{WshError, WshResult};
 
 /// A handle to an accepted WebTransport connection.
 pub struct WebTransportConnection {
@@ -102,12 +102,7 @@ mod tests {
         let cert_path = PathBuf::from(format!("/tmp/wsh-missing-cert-{suffix}.pem"));
         let key_path = PathBuf::from(format!("/tmp/wsh-missing-key-{suffix}.pem"));
 
-        let err = match start_listener(
-            "127.0.0.1:0".parse().unwrap(),
-            &cert_path,
-            &key_path,
-        )
-        .await
+        let err = match start_listener("127.0.0.1:0".parse().unwrap(), &cert_path, &key_path).await
         {
             Ok(_) => panic!("listener startup unexpectedly succeeded"),
             Err(err) => err,

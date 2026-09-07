@@ -58,7 +58,10 @@ pub async fn run(
 
     eprintln!("DEBUGTRACE exec.rs read loop done, getting exit_code");
     let exit_code = session.exit_code().await.unwrap_or(0);
-    eprintln!("DEBUGTRACE exec.rs exit_code={}, closing session", exit_code);
+    eprintln!(
+        "DEBUGTRACE exec.rs exit_code={}, closing session",
+        exit_code
+    );
     let _ = session.close().await;
     eprintln!("DEBUGTRACE exec.rs session closed, disconnecting client");
     let _ = client.disconnect().await;

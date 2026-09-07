@@ -46,7 +46,9 @@ pub fn decode_envelope(data: &[u8]) -> WshResult<Envelope> {
         ciborium::value::Value::Map(entries) => ciborium::value::Value::Map(
             entries
                 .into_iter()
-                .filter(|(key, _)| !matches!(key, ciborium::value::Value::Text(text) if text == "type"))
+                .filter(
+                    |(key, _)| !matches!(key, ciborium::value::Value::Text(text) if text == "type"),
+                )
                 .collect(),
         ),
         other => {

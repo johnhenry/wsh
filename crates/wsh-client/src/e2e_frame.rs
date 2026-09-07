@@ -165,9 +165,9 @@ pub fn open_frame(
     let aad = Aad::from(session_id.as_bytes());
 
     let mut in_out = ciphertext.to_vec();
-    let plaintext = key
-        .open_in_place(nonce, aad, &mut in_out)
-        .map_err(|_| WshError::Other("e2e-frame: authentication failed while opening frame".into()))?;
+    let plaintext = key.open_in_place(nonce, aad, &mut in_out).map_err(|_| {
+        WshError::Other("e2e-frame: authentication failed while opening frame".into())
+    })?;
 
     Ok(plaintext.to_vec())
 }
@@ -205,7 +205,9 @@ mod tests {
         let frames: Vec<(Vec<u8>, Vec<u8>)> = messages
             .iter()
             .enumerate()
-            .map(|(i, msg)| seal_frame(&key, "session-b", RoleTag::Initiator, i as u64, msg).unwrap())
+            .map(|(i, msg)| {
+                seal_frame(&key, "session-b", RoleTag::Initiator, i as u64, msg).unwrap()
+            })
             .collect();
 
         for (i, (nonce, ciphertext)) in frames.iter().enumerate() {
@@ -273,9 +275,12 @@ mod tests {
         let key = test_key();
         let plaintext = b"same plaintext every time";
 
-        let (nonce_a0, _) = seal_frame(&key, "session-h", RoleTag::Initiator, 0, plaintext).unwrap();
-        let (nonce_a1, _) = seal_frame(&key, "session-h", RoleTag::Initiator, 1, plaintext).unwrap();
-        let (nonce_b0, _) = seal_frame(&key, "session-h", RoleTag::Responder, 0, plaintext).unwrap();
+        let (nonce_a0, _) =
+            seal_frame(&key, "session-h", RoleTag::Initiator, 0, plaintext).unwrap();
+        let (nonce_a1, _) =
+            seal_frame(&key, "session-h", RoleTag::Initiator, 1, plaintext).unwrap();
+        let (nonce_b0, _) =
+            seal_frame(&key, "session-h", RoleTag::Responder, 0, plaintext).unwrap();
 
         // Consecutive counters on the same role never collide.
         assert_ne!(nonce_a0, nonce_a1);
@@ -327,14 +332,17 @@ mod tests {
 
         let expected_nonce: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 42, 105, 110, 105, 116];
         let expected_ciphertext: [u8; 54] = [
-            139, 196, 3, 139, 180, 196, 50, 21, 99, 185, 108, 176, 29, 93, 225, 148, 140, 138,
-            162, 0, 170, 225, 39, 159, 204, 224, 253, 83, 228, 159, 74, 217, 49, 35, 55, 101, 234,
-            235, 152, 199, 83, 118, 226, 233, 174, 116, 227, 53, 176, 237, 168, 163, 194, 203,
+            139, 196, 3, 139, 180, 196, 50, 21, 99, 185, 108, 176, 29, 93, 225, 148, 140, 138, 162,
+            0, 170, 225, 39, 159, 204, 224, 253, 83, 228, 159, 74, 217, 49, 35, 55, 101, 234, 235,
+            152, 199, 83, 118, 226, 233, 174, 116, 227, 53, 176, 237, 168, 163, 194, 203,
         ];
 
         let (nonce, ciphertext) =
             seal_frame(&key, session_id, RoleTag::Initiator, counter, plaintext).unwrap();
-        assert_eq!(nonce, expected_nonce, "nonce byte layout must match JS exactly");
+        assert_eq!(
+            nonce, expected_nonce,
+            "nonce byte layout must match JS exactly"
+        );
         assert_eq!(
             ciphertext, expected_ciphertext,
             "ciphertext (incl. AEAD tag) must match JS's crypto.subtle.encrypt output exactly"
@@ -342,7 +350,14 @@ mod tests {
 
         // And Rust must be able to open the exact bytes JS produced too
         // (not just reproduce them from scratch).
-        let opened = open_frame(&key, session_id, counter, &expected_nonce, &expected_ciphertext).unwrap();
+        let opened = open_frame(
+            &key,
+            session_id,
+            counter,
+            &expected_nonce,
+            &expected_ciphertext,
+        )
+        .unwrap();
         assert_eq!(opened, plaintext);
     }
 }

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ml_kem::{Decapsulate, Encapsulate, EncapsulationKey, KeyExport, Kem, MlKem768, TryKeyInit};
+use ml_kem::{Decapsulate, Encapsulate, EncapsulationKey, Kem, KeyExport, MlKem768, TryKeyInit};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
@@ -134,7 +134,8 @@ impl WshClient {
         let reverse_connect_rx = Arc::new(Mutex::new(Some(rc_rx)));
         let (relay_tx, relay_rx) = mpsc::channel::<Envelope>(128);
         let relay_message_rx = Arc::new(Mutex::new(Some(relay_rx)));
-        let accepted_relay_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let accepted_relay_peers: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(HashSet::new()));
 
         let mut client = Self {
             transport: transport.clone(),
@@ -588,9 +589,7 @@ impl WshClient {
         } else {
             None
         };
-        let local_kem_public_bytes = local_kem
-            .as_ref()
-            .map(|(_dk, ek)| ek.to_bytes().to_vec());
+        let local_kem_public_bytes = local_kem.as_ref().map(|(_dk, ek)| ek.to_bytes().to_vec());
 
         let round1 = Envelope {
             msg_type: MsgType::KeyExchange,
@@ -632,9 +631,7 @@ impl WshClient {
 
         let shared_secret = if hybrid_active {
             let (local_dk, _local_ek) = local_kem.expect("checked by hybrid_active");
-            let peer_kem_public_key = peer
-                .kem_public_key
-                .expect("checked by hybrid_active");
+            let peer_kem_public_key = peer.kem_public_key.expect("checked by hybrid_active");
 
             // Lexicographic byte comparison: Rust's `Ord` on `&[u8]`
             // already compares elementwise then by length, matching the
@@ -644,9 +641,7 @@ impl WshClient {
 
             let kem_shared_secret: [u8; 32] = if is_encapsulator {
                 let peer_ek = EncapsulationKey::<MlKem768>::new_from_slice(&peer_kem_public_key)
-                    .map_err(|_| {
-                        WshError::InvalidMessage("invalid peer kem_public_key".into())
-                    })?;
+                    .map_err(|_| WshError::InvalidMessage("invalid peer kem_public_key".into()))?;
                 let (ciphertext, shared) = peer_ek.encapsulate();
 
                 let round2 = Envelope {
@@ -675,13 +670,11 @@ impl WshClient {
                     }
                 };
                 let kem_ciphertext = ct_payload.kem_ciphertext.ok_or_else(|| {
-                    WshError::InvalidMessage(
-                        "round-2 KEY_EXCHANGE missing kem_ciphertext".into(),
-                    )
+                    WshError::InvalidMessage("round-2 KEY_EXCHANGE missing kem_ciphertext".into())
                 })?;
-                let shared = local_dk.decapsulate_slice(&kem_ciphertext).map_err(|_| {
-                    WshError::InvalidMessage("invalid peer kem_ciphertext".into())
-                })?;
+                let shared = local_dk
+                    .decapsulate_slice(&kem_ciphertext)
+                    .map_err(|_| WshError::InvalidMessage("invalid peer kem_ciphertext".into()))?;
                 shared.as_slice().try_into().map_err(|_| {
                     WshError::Other("ML-KEM-768 shared secret was not 32 bytes".into())
                 })?
@@ -800,7 +793,12 @@ impl WshClient {
                 let keystore = crate::keystore::KeyStore::default_location()?;
                 let (signing_key, verifying_key) = keystore.load(key_name)?;
 
-                let signature = auth::sign_challenge(&signing_key, &config.username, &server_session_id, &nonce);
+                let signature = auth::sign_challenge(
+                    &signing_key,
+                    &config.username,
+                    &server_session_id,
+                    &nonce,
+                );
                 let public_key = auth::public_key_bytes(&verifying_key);
 
                 Envelope {
@@ -1005,7 +1003,11 @@ impl WshClient {
 
     /// Wait for the next incoming message of `expected_type`, without
     /// sending anything first.
-    async fn wait_for(&self, expected_type: MsgType, timeout_duration: Duration) -> WshResult<Envelope> {
+    async fn wait_for(
+        &self,
+        expected_type: MsgType,
+        timeout_duration: Duration,
+    ) -> WshResult<Envelope> {
         let rx = self.register_waiter(expected_type).await;
         Self::await_waiter(rx, timeout_duration).await
     }
@@ -1156,195 +1158,204 @@ impl WshClient {
         accepted_relay_peers: &'a Arc<Mutex<HashSet<String>>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-        // Unwrap RelayForward: only deliver the inner message if it came
-        // from a peer this client has actually accepted a bridge with, and
-        // only if the inner message's own type is on the shared
-        // relay-forwardable allowlist (defense in depth against a
-        // misbehaving or compromised relay server).
-        if let MsgType::RelayForward = envelope.msg_type {
-            if let Payload::RelayForward(p) = &envelope.payload {
-                let trusted = accepted_relay_peers.lock().await.contains(&p.from_fingerprint);
-                if !trusted {
-                    tracing::warn!(
-                        from = %p.from_fingerprint,
-                        "dropping RelayForward from untrusted/unaccepted peer"
-                    );
-                    return;
-                }
-                match decode_envelope(&p.inner) {
-                    Ok(inner) if is_relay_forwardable(inner.msg_type) => {
-                        Self::handle_incoming(
-                            inner,
-                            response_tx,
-                            sessions,
-                            outgoing_tx,
-                            reverse_connect_tx,
-                            relay_message_tx,
-                            accepted_relay_peers,
-                        )
-                        .await;
-                    }
-                    Ok(inner) => {
+            // Unwrap RelayForward: only deliver the inner message if it came
+            // from a peer this client has actually accepted a bridge with, and
+            // only if the inner message's own type is on the shared
+            // relay-forwardable allowlist (defense in depth against a
+            // misbehaving or compromised relay server).
+            if let MsgType::RelayForward = envelope.msg_type {
+                if let Payload::RelayForward(p) = &envelope.payload {
+                    let trusted = accepted_relay_peers
+                        .lock()
+                        .await
+                        .contains(&p.from_fingerprint);
+                    if !trusted {
                         tracing::warn!(
-                            msg_type = ?inner.msg_type,
-                            "dropping RelayForward wrapping a non-forwardable message type"
+                            from = %p.from_fingerprint,
+                            "dropping RelayForward from untrusted/unaccepted peer"
                         );
+                        return;
                     }
-                    Err(err) => {
-                        tracing::warn!(%err, "failed to decode RelayForward inner envelope");
-                    }
-                }
-            }
-            return;
-        }
-
-        let msg_type_u8: u8 = envelope.msg_type.into();
-
-        match envelope.msg_type {
-            // Respond to server pings
-            MsgType::Ping => {
-                if let Payload::PingPong(pp) = &envelope.payload {
-                    let pong = Envelope {
-                        msg_type: MsgType::Pong,
-                        payload: Payload::PingPong(PingPongPayload { id: pp.id }),
-                    };
-                    if let Ok(frame) = frame_encode(&pong) {
-                        let _ = outgoing_tx.send(frame).await;
-                    }
-                }
-            }
-
-            // Ignore pong responses (keepalive ack)
-            MsgType::Pong => {
-                tracing::trace!("received pong");
-            }
-
-            MsgType::Exit
-            | MsgType::Close
-            | MsgType::SessionData
-            | MsgType::EncryptedFrame
-            | MsgType::EchoAck
-            | MsgType::EchoState
-            | MsgType::TermSync
-            | MsgType::TermDiff => {
-                let Some(channel_id) = envelope_channel_id(&envelope) else {
-                    tracing::debug!(
-                        "session-scoped message without channel ID: {:?}",
-                        envelope.msg_type
-                    );
-                    return;
-                };
-
-                let session = {
-                    let sessions = sessions.lock().await;
-                    sessions.get(&channel_id).cloned()
-                };
-
-                if let Some(session) = session {
-                    if matches!(envelope.msg_type, MsgType::Exit) {
-                        if let Payload::Exit(exit) = &envelope.payload {
-                            // `eprintln!`, not `tracing::info!`, is
-                            // deliberate here: a `tracing::info!` call at
-                            // exactly this point -- the dispatch loop
-                            // processing an `Exit` envelope for a Virtual
-                            // session, right after that same loop already
-                            // logged at least one other event on this
-                            // connection -- was found to hang forever
-                            // (confirmed by bisecting with manual
-                            // `eprintln!` markers immediately before/after
-                            // the call; execution stops inside the macro
-                            // and never returns). Root cause not
-                            // identified (suspected interaction between
-                            // this i686-unknown-linux-musl cross-compiled
-                            // binary and `tracing-subscriber`'s global
-                            // writer lock, but unconfirmed) -- tracked as
-                            // a known issue on #38. `eprintln!` sidesteps
-                            // the tracing subscriber entirely and is not
-                            // known to hang.
-                            eprintln!("channel {} exited with code {}", exit.channel_id, exit.code);
+                    match decode_envelope(&p.inner) {
+                        Ok(inner) if is_relay_forwardable(inner.msg_type) => {
+                            Self::handle_incoming(
+                                inner,
+                                response_tx,
+                                sessions,
+                                outgoing_tx,
+                                reverse_connect_tx,
+                                relay_message_tx,
+                                accepted_relay_peers,
+                            )
+                            .await;
+                        }
+                        Ok(inner) => {
+                            tracing::warn!(
+                                msg_type = ?inner.msg_type,
+                                "dropping RelayForward wrapping a non-forwardable message type"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "failed to decode RelayForward inner envelope");
                         }
                     }
+                }
+                return;
+            }
 
-                    if let Err(err) = session.handle_control(&envelope).await {
+            let msg_type_u8: u8 = envelope.msg_type.into();
+
+            match envelope.msg_type {
+                // Respond to server pings
+                MsgType::Ping => {
+                    if let Payload::PingPong(pp) = &envelope.payload {
+                        let pong = Envelope {
+                            msg_type: MsgType::Pong,
+                            payload: Payload::PingPong(PingPongPayload { id: pp.id }),
+                        };
+                        if let Ok(frame) = frame_encode(&pong) {
+                            let _ = outgoing_tx.send(frame).await;
+                        }
+                    }
+                }
+
+                // Ignore pong responses (keepalive ack)
+                MsgType::Pong => {
+                    tracing::trace!("received pong");
+                }
+
+                MsgType::Exit
+                | MsgType::Close
+                | MsgType::SessionData
+                | MsgType::EncryptedFrame
+                | MsgType::EchoAck
+                | MsgType::EchoState
+                | MsgType::TermSync
+                | MsgType::TermDiff => {
+                    let Some(channel_id) = envelope_channel_id(&envelope) else {
                         tracing::debug!(
-                            channel_id,
-                            msg_type = ?envelope.msg_type,
-                            "failed to route session control message: {err}"
+                            "session-scoped message without channel ID: {:?}",
+                            envelope.msg_type
                         );
-                    }
+                        return;
+                    };
 
-                    if matches!(envelope.msg_type, MsgType::Close) {
-                        let mut sessions = sessions.lock().await;
-                        sessions.remove(&channel_id);
-                    }
-                } else {
-                    if let Some(tx) = relay_message_tx {
-                        if let Err(err) = tx.send(envelope).await {
-                            tracing::debug!("relay message channel closed: {err}");
+                    let session = {
+                        let sessions = sessions.lock().await;
+                        sessions.get(&channel_id).cloned()
+                    };
+
+                    if let Some(session) = session {
+                        if matches!(envelope.msg_type, MsgType::Exit) {
+                            if let Payload::Exit(exit) = &envelope.payload {
+                                // `eprintln!`, not `tracing::info!`, is
+                                // deliberate here: a `tracing::info!` call at
+                                // exactly this point -- the dispatch loop
+                                // processing an `Exit` envelope for a Virtual
+                                // session, right after that same loop already
+                                // logged at least one other event on this
+                                // connection -- was found to hang forever
+                                // (confirmed by bisecting with manual
+                                // `eprintln!` markers immediately before/after
+                                // the call; execution stops inside the macro
+                                // and never returns). Root cause not
+                                // identified (suspected interaction between
+                                // this i686-unknown-linux-musl cross-compiled
+                                // binary and `tracing-subscriber`'s global
+                                // writer lock, but unconfirmed) -- tracked as
+                                // a known issue on #38. `eprintln!` sidesteps
+                                // the tracing subscriber entirely and is not
+                                // known to hang.
+                                eprintln!(
+                                    "channel {} exited with code {}",
+                                    exit.channel_id, exit.code
+                                );
+                            }
+                        }
+
+                        if let Err(err) = session.handle_control(&envelope).await {
+                            tracing::debug!(
+                                channel_id,
+                                msg_type = ?envelope.msg_type,
+                                "failed to route session control message: {err}"
+                            );
+                        }
+
+                        if matches!(envelope.msg_type, MsgType::Close) {
+                            let mut sessions = sessions.lock().await;
+                            sessions.remove(&channel_id);
                         }
                     } else {
-                        tracing::debug!(
-                            channel_id,
-                            msg_type = ?envelope.msg_type,
-                            "received session control message for unknown channel"
-                        );
-                    }
-                }
-            }
-
-            // Server error
-            MsgType::Error => {
-                if let Payload::Error(err) = &envelope.payload {
-                    tracing::error!("server error [{}]: {}", err.code, err.message);
-                }
-            }
-
-            // Shutdown notice
-            MsgType::Shutdown => {
-                if let Payload::Shutdown(sd) = &envelope.payload {
-                    tracing::warn!("server shutdown: {}", sd.reason);
-                }
-            }
-
-            // Incoming reverse connection request (unsolicited from relay)
-            MsgType::ReverseConnect => {
-                tracing::info!("incoming reverse connect request");
-                if let Some(tx) = reverse_connect_tx {
-                    if let Err(e) = tx.send(envelope).await {
-                        tracing::warn!("reverse connect channel full or closed: {}", e);
-                    }
-                } else {
-                    tracing::debug!("reverse connect received but no handler registered");
-                }
-            }
-
-            // Route to waiting response handlers
-            _ => {
-                let mut responses = response_tx.lock().await;
-                if let Some(waiters) = responses.get_mut(&msg_type_u8) {
-                    if let Some(tx) = waiters.pop() {
-                        let _ = tx.send(envelope);
-                        if waiters.is_empty() {
-                            responses.remove(&msg_type_u8);
+                        if let Some(tx) = relay_message_tx {
+                            if let Err(err) = tx.send(envelope).await {
+                                tracing::debug!("relay message channel closed: {err}");
+                            }
+                        } else {
+                            tracing::debug!(
+                                channel_id,
+                                msg_type = ?envelope.msg_type,
+                                "received session control message for unknown channel"
+                            );
                         }
-                        return;
                     }
                 }
 
-                drop(responses);
+                // Server error
+                MsgType::Error => {
+                    if let Payload::Error(err) = &envelope.payload {
+                        tracing::error!("server error [{}]: {}", err.code, err.message);
+                    }
+                }
 
-                if is_relay_forwardable(envelope.msg_type) {
-                    if let Some(tx) = relay_message_tx {
-                        if let Err(err) = tx.send(envelope).await {
-                            tracing::debug!("relay message channel closed: {err}");
+                // Shutdown notice
+                MsgType::Shutdown => {
+                    if let Payload::Shutdown(sd) = &envelope.payload {
+                        tracing::warn!("server shutdown: {}", sd.reason);
+                    }
+                }
+
+                // Incoming reverse connection request (unsolicited from relay)
+                MsgType::ReverseConnect => {
+                    tracing::info!("incoming reverse connect request");
+                    if let Some(tx) = reverse_connect_tx {
+                        if let Err(e) = tx.send(envelope).await {
+                            tracing::warn!("reverse connect channel full or closed: {}", e);
                         }
-                        return;
+                    } else {
+                        tracing::debug!("reverse connect received but no handler registered");
                     }
                 }
 
-                tracing::debug!("unhandled control message: {:?}", MsgType::try_from(msg_type_u8));
+                // Route to waiting response handlers
+                _ => {
+                    let mut responses = response_tx.lock().await;
+                    if let Some(waiters) = responses.get_mut(&msg_type_u8) {
+                        if let Some(tx) = waiters.pop() {
+                            let _ = tx.send(envelope);
+                            if waiters.is_empty() {
+                                responses.remove(&msg_type_u8);
+                            }
+                            return;
+                        }
+                    }
+
+                    drop(responses);
+
+                    if is_relay_forwardable(envelope.msg_type) {
+                        if let Some(tx) = relay_message_tx {
+                            if let Err(err) = tx.send(envelope).await {
+                                tracing::debug!("relay message channel closed: {err}");
+                            }
+                            return;
+                        }
+                    }
+
+                    tracing::debug!(
+                        "unhandled control message: {:?}",
+                        MsgType::try_from(msg_type_u8)
+                    );
+                }
             }
-        }
         })
     }
 }
@@ -1585,7 +1596,10 @@ mod tests {
         )
         .await;
 
-        let forwarded = relay_rx.recv().await.expect("missing relay-forwarded message");
+        let forwarded = relay_rx
+            .recv()
+            .await
+            .expect("missing relay-forwarded message");
         match forwarded.payload {
             Payload::SessionData(payload) => {
                 assert_eq!(payload.channel_id, 99);
@@ -1825,9 +1839,17 @@ mod tests {
                         session_id,
                     }),
                 },
-                ControlAction::Resize { channel_id, cols, rows } => Envelope {
+                ControlAction::Resize {
+                    channel_id,
+                    cols,
+                    rows,
+                } => Envelope {
                     msg_type: MsgType::Resize,
-                    payload: Payload::Resize(ResizePayload { channel_id, cols, rows }),
+                    payload: Payload::Resize(ResizePayload {
+                        channel_id,
+                        cols,
+                        rows,
+                    }),
                 },
                 ControlAction::Signal { channel_id, signal } => Envelope {
                     msg_type: MsgType::Signal,
@@ -1911,12 +1933,22 @@ mod tests {
         // channel_id=1 and this test's session_id -- as a real OpenOk
         // would establish on each connection.
         let session_a = Arc::new(
-            WshSession::new_virtual(1, ChannelKind::Pty, rig_a.client.control_action_tx.clone(), vec![])
-                .with_session_credentials(Some(session_id.to_string()), None),
+            WshSession::new_virtual(
+                1,
+                ChannelKind::Pty,
+                rig_a.client.control_action_tx.clone(),
+                vec![],
+            )
+            .with_session_credentials(Some(session_id.to_string()), None),
         );
         let session_b = Arc::new(
-            WshSession::new_virtual(1, ChannelKind::Pty, rig_b.client.control_action_tx.clone(), vec![])
-                .with_session_credentials(Some(session_id.to_string()), None),
+            WshSession::new_virtual(
+                1,
+                ChannelKind::Pty,
+                rig_b.client.control_action_tx.clone(),
+                vec![],
+            )
+            .with_session_credentials(Some(session_id.to_string()), None),
         );
         rig_a.sessions.lock().await.insert(1, session_a.clone());
         rig_b.sessions.lock().await.insert(1, session_b.clone());
@@ -2101,7 +2133,11 @@ mod tests {
 
         let mut buf = [0_u8; 256];
         let n = session_b.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], plaintext, "session B must recover A's exact plaintext");
+        assert_eq!(
+            &buf[..n],
+            plaintext,
+            "session B must recover A's exact plaintext"
+        );
 
         let recorded_bytes = recorded.lock().unwrap().clone();
         assert!(
@@ -2134,12 +2170,16 @@ mod tests {
         let (a_to_b, b_to_a) = wire_loopback(&mut rig_a, &mut rig_b);
 
         let (result_a, result_b) = tokio::join!(
-            rig_a
-                .client
-                .initiate_e2e("sess-e2e-classical", ALGORITHM_X25519, Duration::from_secs(5)),
-            rig_b
-                .client
-                .initiate_e2e("sess-e2e-classical", ALGORITHM_X25519, Duration::from_secs(5)),
+            rig_a.client.initiate_e2e(
+                "sess-e2e-classical",
+                ALGORITHM_X25519,
+                Duration::from_secs(5)
+            ),
+            rig_b.client.initiate_e2e(
+                "sess-e2e-classical",
+                ALGORITHM_X25519,
+                Duration::from_secs(5)
+            ),
         );
 
         let result_a = result_a.expect("client A initiate_e2e failed");
@@ -2184,8 +2224,14 @@ mod tests {
             let result_a = result_a.expect("client A initiate_e2e failed");
             let result_b = result_b.expect("client B initiate_e2e failed");
 
-            assert!(result_a.hybrid, "iteration {i}: client A should report hybrid active");
-            assert!(result_b.hybrid, "iteration {i}: client B should report hybrid active");
+            assert!(
+                result_a.hybrid,
+                "iteration {i}: client A should report hybrid active"
+            );
+            assert!(
+                result_b.hybrid,
+                "iteration {i}: client B should report hybrid active"
+            );
             assert_eq!(
                 result_a.shared_secret, result_b.shared_secret,
                 "iteration {i}: both sides must derive the same hybrid-combined key"
@@ -2217,12 +2263,16 @@ mod tests {
         let (a_to_b, b_to_a) = wire_loopback(&mut rig_a, &mut rig_b);
 
         let (result_a, result_b) = tokio::join!(
-            rig_a
-                .client
-                .initiate_e2e("sess-e2e-fallback", ALGORITHM_HYBRID, Duration::from_secs(5)),
-            rig_b
-                .client
-                .initiate_e2e("sess-e2e-fallback", ALGORITHM_X25519, Duration::from_secs(5)),
+            rig_a.client.initiate_e2e(
+                "sess-e2e-fallback",
+                ALGORITHM_HYBRID,
+                Duration::from_secs(5)
+            ),
+            rig_b.client.initiate_e2e(
+                "sess-e2e-fallback",
+                ALGORITHM_X25519,
+                Duration::from_secs(5)
+            ),
         );
 
         let result_a = result_a.expect("client A initiate_e2e failed");

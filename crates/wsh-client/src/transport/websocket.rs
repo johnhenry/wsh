@@ -120,7 +120,9 @@ impl rustls::client::danger::ServerCertVerifier for NoOpServerCertVerifier {
 fn build_insecure_loopback_connector() -> Connector {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(NoOpServerCertVerifier {
-        supported_schemes: provider.signature_verification_algorithms.supported_schemes(),
+        supported_schemes: provider
+            .signature_verification_algorithms
+            .supported_schemes(),
     });
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -192,7 +194,14 @@ impl WebSocketSession {
         let qmux_for_io = qmux.clone();
         let alive_for_io = alive.clone();
         let io_handle = tokio::spawn(async move {
-            Self::io_loop(ws_read, ws_sink_for_io, outbound_rx, qmux_for_io, alive_for_io).await;
+            Self::io_loop(
+                ws_read,
+                ws_sink_for_io,
+                outbound_rx,
+                qmux_for_io,
+                alive_for_io,
+            )
+            .await;
         });
 
         let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(256);

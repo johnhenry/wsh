@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 use wsh_core::{WshError, WshResult};
 
@@ -54,8 +54,13 @@ pub struct WispConnectRequest {
 /// decided from the HTTP request path during the WS handshake.
 enum Route {
     Wsh,
-    WispGuest { fingerprint: String },
-    WispConnect { fingerprint: String, local_port: u16 },
+    WispGuest {
+        fingerprint: String,
+    },
+    WispConnect {
+        fingerprint: String,
+        local_port: u16,
+    },
 }
 
 /// Parse the request path into a [`Route`]. Anything not matching the WISP
@@ -150,10 +155,8 @@ pub async fn start_listener(
                                     .await
                                 {
                                     Ok(ws_stream) => {
-                                        let path = path_slot
-                                            .lock()
-                                            .map(|s| s.clone())
-                                            .unwrap_or_default();
+                                        let path =
+                                            path_slot.lock().map(|s| s.clone()).unwrap_or_default();
                                         match parse_route(&path) {
                                             Route::WispGuest { fingerprint } => {
                                                 debug!(remote = %addr, %fingerprint, "WISP guest tunnel accepted");

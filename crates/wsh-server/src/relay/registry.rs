@@ -120,7 +120,7 @@ impl PeerRegistry {
             PeerMetadata::default(),
             None,
         )
-            .await
+        .await
     }
 
     /// Register a peer with an explicit server-assigned connection ID.

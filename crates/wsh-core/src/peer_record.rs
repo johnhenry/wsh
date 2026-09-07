@@ -144,20 +144,50 @@ mod tests {
         let baseline = build_peer_record_transcript(&base);
 
         let variants = vec![
-            PeerRecord { username: "other".to_string(), ..base.clone() },
-            PeerRecord { peer_type: "vm-guest".to_string(), ..base.clone() },
-            PeerRecord { shell_backend: "virtual-shell".to_string(), ..base.clone() },
-            PeerRecord { capabilities: vec!["shell".to_string()], ..base.clone() },
-            PeerRecord { seq: 2, ..base.clone() },
-            PeerRecord { supports_attach: true, ..base.clone() },
-            PeerRecord { supports_replay: true, ..base.clone() },
-            PeerRecord { supports_echo: true, ..base.clone() },
-            PeerRecord { supports_term_sync: true, ..base.clone() },
+            PeerRecord {
+                username: "other".to_string(),
+                ..base.clone()
+            },
+            PeerRecord {
+                peer_type: "vm-guest".to_string(),
+                ..base.clone()
+            },
+            PeerRecord {
+                shell_backend: "virtual-shell".to_string(),
+                ..base.clone()
+            },
+            PeerRecord {
+                capabilities: vec!["shell".to_string()],
+                ..base.clone()
+            },
+            PeerRecord {
+                seq: 2,
+                ..base.clone()
+            },
+            PeerRecord {
+                supports_attach: true,
+                ..base.clone()
+            },
+            PeerRecord {
+                supports_replay: true,
+                ..base.clone()
+            },
+            PeerRecord {
+                supports_echo: true,
+                ..base.clone()
+            },
+            PeerRecord {
+                supports_term_sync: true,
+                ..base.clone()
+            },
         ];
 
         for variant in variants {
             let t = build_peer_record_transcript(&variant);
-            assert_ne!(t, baseline, "expected a different transcript for {variant:?}");
+            assert_ne!(
+                t, baseline,
+                "expected a different transcript for {variant:?}"
+            );
         }
     }
 
@@ -201,7 +231,11 @@ mod tests {
         let record = base_record();
         let signature = sign_peer_record(&signer, &record);
 
-        assert!(!verify_peer_record(&impostor_public_key, &signature, &record));
+        assert!(!verify_peer_record(
+            &impostor_public_key,
+            &signature,
+            &record
+        ));
     }
 
     #[test]
@@ -247,9 +281,14 @@ mod tests {
 
         // A peer-record signature must not verify as an auth-challenge signature...
         let verifier = signature::UnparsedPublicKey::new(&signature::ED25519, &public_key);
-        assert!(verifier.verify(&challenge_transcript, &record_signature).is_err());
+        assert!(verifier
+            .verify(&challenge_transcript, &record_signature)
+            .is_err());
         // ...and vice versa: an auth-challenge signature must not verify as a peer record.
-        assert!(!verify_peer_record(&public_key, &challenge_signature, &record));
+        assert!(!verify_peer_record(
+            &public_key,
+            &challenge_signature,
+            &record
+        ));
     }
 }
-

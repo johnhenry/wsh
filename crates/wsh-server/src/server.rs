@@ -25,7 +25,9 @@ use wsh_core::keys::{load_authorized_keys, AuthorizedKey};
 use wsh_core::messages::*;
 use wsh_core::qmux::ErrorCode;
 use wsh_core::qmux_connection::{QMuxConnection, QMuxConnectionConfig, QMuxEvent};
-use wsh_core::{decode_envelope, fingerprint, frame_encode, verify_token, FrameDecoder, WshError, WshResult};
+use wsh_core::{
+    decode_envelope, fingerprint, frame_encode, verify_token, FrameDecoder, WshError, WshResult,
+};
 
 /// Per-connection context threaded through the session loop.
 struct ConnectionContext {
@@ -801,10 +803,7 @@ impl WshServer {
                     Ok(Err(_)) | Err(_) => {
                         // Read error (including EIO on PTY close, common on Linux/macOS
                         // when the child exits) — treat as EOF and fall through to wait().
-                        (
-                            [0u8; 8192],
-                            0,
-                        )
+                        ([0u8; 8192], 0)
                     }
                 };
 
@@ -883,7 +882,10 @@ impl WshServer {
                     let _ = peer_tx
                         .send(Envelope {
                             msg_type: MsgType::Exit,
-                            payload: Payload::Exit(ExitPayload { channel_id, code: 1 }),
+                            payload: Payload::Exit(ExitPayload {
+                                channel_id,
+                                code: 1,
+                            }),
                         })
                         .await;
                     let _ = peer_tx
@@ -1942,9 +1944,17 @@ impl WshServer {
                         supports_echo: e.supports_echo,
                         supports_term_sync: e.supports_term_sync,
                         last_seen: Some(e.last_seen.elapsed().as_secs()),
-                        public_key: if e.public_key.is_empty() { None } else { Some(e.public_key.clone()) },
+                        public_key: if e.public_key.is_empty() {
+                            None
+                        } else {
+                            Some(e.public_key.clone())
+                        },
                         seq: Some(e.seq),
-                        record_signature: if e.record_signature.is_empty() { None } else { Some(e.record_signature.clone()) },
+                        record_signature: if e.record_signature.is_empty() {
+                            None
+                        } else {
+                            Some(e.record_signature.clone())
+                        },
                     })
                     .collect();
                 Ok(Some(Envelope {
@@ -2603,8 +2613,17 @@ impl WshServer {
                 // fall through to the session-detach path below and
                 // (since target_session would be None) incorrectly detach
                 // ctx.session_id -- this connection's own top-level session.
-                if self.file_uploads.write().await.remove(&p.channel_id).is_some() {
-                    debug!(channel_id = p.channel_id, "file upload channel closed by client");
+                if self
+                    .file_uploads
+                    .write()
+                    .await
+                    .remove(&p.channel_id)
+                    .is_some()
+                {
+                    debug!(
+                        channel_id = p.channel_id,
+                        "file upload channel closed by client"
+                    );
                     return Ok(None);
                 }
 
@@ -4134,7 +4153,9 @@ mod wisp_reverse_connect_e2e_tests {
     fn insecure_test_connector() -> Connector {
         let provider = StdArc::new(rustls::crypto::ring::default_provider());
         let verifier = StdArc::new(NoOpVerifier {
-            schemes: provider.signature_verification_algorithms.supported_schemes(),
+            schemes: provider
+                .signature_verification_algorithms
+                .supported_schemes(),
         });
         let config = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
@@ -4190,9 +4211,7 @@ mod wisp_reverse_connect_e2e_tests {
     /// bridges bytes between it and WISP `DATA`/`CLOSE` frames on the
     /// relay-assigned stream_id.
     async fn run_fake_guest(
-        mut ws: tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<TcpStream>,
-        >,
+        mut ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
         guest_service_port: u16,
     ) {
         use crate::relay::wisp::{decode_frame, encode_frame, WISP_DATA, WISP_REVERSE_OPEN};
@@ -4282,7 +4301,9 @@ mod wisp_reverse_connect_e2e_tests {
             ws_rx: _ws_rx,
             mut wisp_guest_rx,
             mut wisp_connect_rx,
-        } = websocket::start_listener(bound_addr, tls_config).await.unwrap();
+        } = websocket::start_listener(bound_addr, tls_config)
+            .await
+            .unwrap();
 
         let server = Arc::new(WshServer::new(test_server_config(bound_addr.port())).unwrap());
         {

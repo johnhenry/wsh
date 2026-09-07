@@ -449,8 +449,8 @@ impl WshSession {
             *self.stream_accumulator.lock().await = Some(ChunkAccumulator::new());
             self.stream_read_pending.lock().await.clear();
 
-            let coalescer = stream_frame::resolve_coalesce_options(&self.kind, coalesce).map(
-                |options| {
+            let coalescer =
+                stream_frame::resolve_coalesce_options(&self.kind, coalesce).map(|options| {
                     let stream = stream.clone();
                     let key = shared_secret;
                     let sealed_session_id = session_id.clone();
@@ -472,8 +472,7 @@ impl WshSession {
                         })
                     });
                     Arc::new(WriteCoalescer::new(options, flush))
-                },
-            );
+                });
             *self.stream_coalescer.lock().await = coalescer;
         } else {
             *self.stream_accumulator.lock().await = None;
@@ -615,9 +614,7 @@ impl WshSession {
                 // diagnostic (the stream is ending either way).
                 if let Some(accumulator) = self.stream_accumulator.lock().await.as_ref() {
                     if let Err(err) = accumulator.finish() {
-                        tracing::error!(
-                            "[wsh:session] stream E2E torn chunk at stream end: {err}"
-                        );
+                        tracing::error!("[wsh:session] stream E2E torn chunk at stream end: {err}");
                     }
                 }
                 return Ok(0);
@@ -645,8 +642,13 @@ impl WshSession {
                 })?;
                 for (nonce, ciphertext) in wire_chunks {
                     let counter = e2e.recv_counter.fetch_add(1, Ordering::SeqCst);
-                    let plaintext =
-                        e2e_frame::open_frame(&e2e.key, &e2e.session_id, counter, &nonce, &ciphertext)?;
+                    let plaintext = e2e_frame::open_frame(
+                        &e2e.key,
+                        &e2e.session_id,
+                        counter,
+                        &nonce,
+                        &ciphertext,
+                    )?;
                     opened_chunks.push(plaintext);
                 }
             }
@@ -755,7 +757,10 @@ impl WshSession {
 
     /// Handle a session-specific control message from the server.
     pub(crate) async fn handle_control(&self, envelope: &Envelope) -> WshResult<()> {
-        eprintln!("DEBUGTRACE session.handle_control payload={:?}", envelope.payload);
+        eprintln!(
+            "DEBUGTRACE session.handle_control payload={:?}",
+            envelope.payload
+        );
         match &envelope.payload {
             Payload::SessionData(data) => match &self.backend {
                 SessionBackend::Virtual(backend) => backend.push_data(data.data.clone()).await,

@@ -169,8 +169,7 @@ pub fn save_last_reverse_peer(entry: &LastReversePeer) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let json = serde_json::to_vec_pretty(entry)
-        .context("failed to serialize last reverse peer")?;
+    let json = serde_json::to_vec_pretty(entry).context("failed to serialize last reverse peer")?;
     std::fs::write(&path, json).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }

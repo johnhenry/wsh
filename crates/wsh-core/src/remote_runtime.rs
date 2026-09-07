@@ -197,8 +197,7 @@ pub struct SessionTarget {
 #[cfg(test)]
 mod tests {
     use super::{
-        PeerType, RemoteIdentity, RemotePeerDescriptor, SessionIntent, SessionTarget,
-        ShellBackend,
+        PeerType, RemoteIdentity, RemotePeerDescriptor, SessionIntent, SessionTarget, ShellBackend,
     };
     use crate::messages::PeerInfo;
 
@@ -283,7 +282,10 @@ mod tests {
         assert_eq!(descriptor.identity.canonical_id, "abc123");
         assert_eq!(descriptor.peer_type, PeerType::BrowserShell);
         assert_eq!(descriptor.shell_backend, ShellBackend::VirtualShell);
-        assert_eq!(descriptor.reachability[0].relay_host.as_deref(), Some("relay.example"));
+        assert_eq!(
+            descriptor.reachability[0].relay_host.as_deref(),
+            Some("relay.example")
+        );
         assert!(descriptor.supports_attach);
     }
 

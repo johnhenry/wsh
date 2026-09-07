@@ -96,7 +96,10 @@ impl McpBridge {
         };
 
         match self.execute_tool(tool, &call.arguments).await {
-            Ok(output) => McpResultPayload { call_id: call.call_id.clone(), result: output },
+            Ok(output) => McpResultPayload {
+                call_id: call.call_id.clone(),
+                result: output,
+            },
             Err(e) => McpResultPayload {
                 call_id: call.call_id.clone(),
                 result: json!({
