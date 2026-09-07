@@ -60,6 +60,37 @@ fn whoami() -> String {
 }
 
 /// The main wsh client.
+/// One pending request-response wait.
+///
+/// `matcher` is what makes correlation possible. Without it, waiters were
+/// keyed on message type alone and dispatch took whichever one it found, so
+/// two concurrent requests expecting the same response type received each
+/// other's replies. A waiter with no matcher accepts any envelope of its
+/// type, which is the historical behaviour and still correct for the many
+/// call sites that only ever have one request in flight.
+struct Waiter {
+    tx: oneshot::Sender<Envelope>,
+    #[allow(clippy::type_complexity)]
+    matcher: Option<Box<dyn Fn(&Envelope) -> bool + Send + Sync>>,
+}
+
+/// SERVER_HELLO feature advertising that McpResult echoes McpCall's call_id.
+pub const MCP_CALL_ID_FEATURE: &str = "mcp-call-id";
+
+/// Remove and return the first waiter that claims `envelope`.
+///
+/// FIFO, and matcher-aware. Dispatch used `Vec::pop()`, which is LIFO: with
+/// two requests of the same response type in flight the SECOND caller
+/// received the FIRST reply, so the swap happened even when replies arrived
+/// in call order. Extracted so the selection can be tested directly -- the
+/// dispatch loop it lives in needs a whole client to drive.
+fn take_matching_waiter(waiters: &mut Vec<Waiter>, envelope: &Envelope) -> Option<Waiter> {
+    let idx = waiters
+        .iter()
+        .position(|w| w.matcher.as_ref().is_none_or(|m| m(envelope)))?;
+    Some(waiters.remove(idx))
+}
+
 pub struct WshClient {
     /// The underlying transport session (enum dispatch, not dyn).
     transport: Arc<Mutex<AnyTransport>>,
@@ -78,7 +109,9 @@ pub struct WshClient {
     /// Sender for outgoing control messages (used by dispatch + keepalive).
     outgoing_tx: mpsc::Sender<Vec<u8>>,
     /// Channel for receiving specific response types (request-response pattern).
-    response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+    response_tx: Arc<Mutex<HashMap<u8, Vec<Waiter>>>>,
+    /// Features the server advertised in SERVER_HELLO.
+    server_features: Arc<Mutex<Vec<String>>>,
     /// Whether the client is connected.
     connected: Arc<Mutex<bool>>,
     /// Receiver for incoming ReverseConnect notifications (take-once).
@@ -123,7 +156,7 @@ impl WshClient {
 
         let (control_action_tx, control_action_rx) = mpsc::channel::<ControlAction>(256);
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<Vec<u8>>(256);
-        let response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>> =
+        let response_tx: Arc<Mutex<HashMap<u8, Vec<Waiter>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -147,6 +180,7 @@ impl WshClient {
             keepalive_handle: None,
             outgoing_tx: outgoing_tx.clone(),
             response_tx: response_tx.clone(),
+            server_features: Arc::new(Mutex::new(Vec::new())),
             connected: connected.clone(),
             reverse_connect_rx,
             relay_message_rx,
@@ -304,6 +338,27 @@ impl WshClient {
         expected_type: MsgType,
     ) -> WshResult<Envelope> {
         self.send_and_wait(envelope, expected_type).await
+    }
+
+    /// Whether the server advertised `name` in SERVER_HELLO.
+    pub async fn has_feature(&self, name: &str) -> bool {
+        self.server_features.lock().await.iter().any(|f| f == name)
+    }
+
+    /// `send_and_wait_public`, but the reply must satisfy `matcher`.
+    ///
+    /// Needed wherever concurrent requests share a response type -- without
+    /// it the first reply to arrive satisfies whichever waiter dispatch
+    /// happens to find, and both callers get a result that is not theirs.
+    #[allow(clippy::type_complexity)]
+    pub async fn send_and_wait_matching_public(
+        &self,
+        envelope: Envelope,
+        expected_type: MsgType,
+        matcher: Box<dyn Fn(&Envelope) -> bool + Send + Sync>,
+    ) -> WshResult<Envelope> {
+        self.send_and_wait_matching(envelope, expected_type, Some(matcher))
+            .await
     }
 
     /// Open a new session (pty, exec, etc.).
@@ -761,10 +816,16 @@ impl WshClient {
         let server_hello_data = self.recv_raw().await?;
         let server_hello = decode_envelope(&server_hello_data)?;
 
-        let (_server_hello_session_id, server_fingerprints) = match &server_hello.payload {
-            Payload::ServerHello(sh) => (sh.session_id.clone(), sh.fingerprints.clone()),
-            _ => return Err(WshError::InvalidMessage("expected SERVER_HELLO".into())),
-        };
+        let (_server_hello_session_id, server_fingerprints, advertised_features) =
+            match &server_hello.payload {
+                Payload::ServerHello(sh) => (
+                    sh.session_id.clone(),
+                    sh.fingerprints.clone(),
+                    sh.features.clone(),
+                ),
+                _ => return Err(WshError::InvalidMessage("expected SERVER_HELLO".into())),
+            };
+        *self.server_features.lock().await = advertised_features;
 
         // Verify host key (TOFU)
         if config.verify_host {
@@ -903,10 +964,28 @@ impl WshClient {
     }
 
     /// Send a control message and wait for a specific response type.
+    ///
+    /// Matches on message type alone, which is only safe when one request of
+    /// this type is in flight. Use `send_and_wait_matching` when concurrent
+    /// requests share a response type.
     async fn send_and_wait(
         &self,
         envelope: Envelope,
         expected_type: MsgType,
+    ) -> WshResult<Envelope> {
+        self.send_and_wait_matching(envelope, expected_type, None)
+            .await
+    }
+
+    /// Send a control message and wait for the response that `matcher`
+    /// claims, so concurrent requests sharing a response type cannot receive
+    /// each other's replies. `None` accepts any envelope of `expected_type`.
+    #[allow(clippy::type_complexity)]
+    async fn send_and_wait_matching(
+        &self,
+        envelope: Envelope,
+        expected_type: MsgType,
+        matcher: Option<Box<dyn Fn(&Envelope) -> bool + Send + Sync>>,
     ) -> WshResult<Envelope> {
         let (tx, rx) = oneshot::channel();
 
@@ -916,7 +995,7 @@ impl WshClient {
             responses
                 .entry(expected_type.into())
                 .or_insert_with(Vec::new)
-                .push(tx);
+                .push(Waiter { tx, matcher });
         }
 
         // Also register for the fail variant
@@ -936,7 +1015,10 @@ impl WshClient {
             responses
                 .entry(ft.into())
                 .or_insert_with(Vec::new)
-                .push(fail_tx);
+                .push(Waiter {
+                    tx: fail_tx,
+                    matcher: None,
+                });
             Some(fail_rx)
         } else {
             None
@@ -982,7 +1064,7 @@ impl WshClient {
         responses
             .entry(expected_type.into())
             .or_insert_with(Vec::new)
-            .push(tx);
+            .push(Waiter { tx, matcher: None });
         rx
     }
 
@@ -1038,7 +1120,7 @@ impl WshClient {
         transport: Arc<Mutex<AnyTransport>>,
         mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
         mut action_rx: mpsc::Receiver<ControlAction>,
-        response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        response_tx: Arc<Mutex<HashMap<u8, Vec<Waiter>>>>,
         sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
         connected: Arc<Mutex<bool>>,
         outgoing_tx: mpsc::Sender<Vec<u8>>,
@@ -1150,7 +1232,7 @@ impl WshClient {
     /// Handle an incoming control message.
     fn handle_incoming<'a>(
         envelope: Envelope,
-        response_tx: &'a Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        response_tx: &'a Arc<Mutex<HashMap<u8, Vec<Waiter>>>>,
         sessions: &'a Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
         outgoing_tx: &'a mpsc::Sender<Vec<u8>>,
         reverse_connect_tx: &'a Option<mpsc::Sender<Envelope>>,
@@ -1330,8 +1412,8 @@ impl WshClient {
                 _ => {
                     let mut responses = response_tx.lock().await;
                     if let Some(waiters) = responses.get_mut(&msg_type_u8) {
-                        if let Some(tx) = waiters.pop() {
-                            let _ = tx.send(envelope);
+                        if let Some(waiter) = take_matching_waiter(waiters, &envelope) {
+                            let _ = waiter.tx.send(envelope);
                             if waiters.is_empty() {
                                 responses.remove(&msg_type_u8);
                             }
@@ -1438,13 +1520,124 @@ mod tests {
         OpenOkPayload, Payload, ResizePayload, SessionDataMode, SessionDataPayload, SignalPayload,
     };
 
-    use super::{known_host_label, SessionOpts, WshClient};
+    use super::{known_host_label, SessionOpts, Waiter, WshClient};
     use crate::e2e::{ALGORITHM_HYBRID, ALGORITHM_X25519};
     use crate::session::ControlAction;
     use crate::session::WshSession;
     use crate::stream_frame::CoalesceOverride;
     use wsh_core::transport::ByteStream;
     use wsh_core::WshResult;
+
+    // ── waiter selection (#139) ──────────────────────────────────────
+    //
+    // Waiters were keyed on message type alone and dispatch used Vec::pop(),
+    // which is LIFO. With two McpCalls in flight the second caller received
+    // the first reply; neither could detect it, because the normalised
+    // result carries nothing identifying the tool.
+
+    fn mcp_result(call_id: Option<&str>, body: &str) -> Envelope {
+        Envelope {
+            msg_type: MsgType::McpResult,
+            payload: Payload::McpResult(wsh_core::messages::McpResultPayload {
+                result: serde_json::json!({ "output": body }),
+                call_id: call_id.map(|s| s.to_string()),
+            }),
+        }
+    }
+
+    fn waiter(
+        matcher: Option<Box<dyn Fn(&Envelope) -> bool + Send + Sync>>,
+    ) -> (super::Waiter, oneshot::Receiver<Envelope>) {
+        let (tx, rx) = oneshot::channel();
+        (super::Waiter { tx, matcher }, rx)
+    }
+
+    fn matches_call_id(id: &'static str) -> Box<dyn Fn(&Envelope) -> bool + Send + Sync> {
+        Box::new(move |env: &Envelope| match &env.payload {
+            Payload::McpResult(r) => r.call_id.is_none() || r.call_id.as_deref() == Some(id),
+            _ => true,
+        })
+    }
+
+    fn text_of(e: &Envelope) -> String {
+        match &e.payload {
+            Payload::McpResult(r) => r.result["output"].as_str().unwrap().to_string(),
+            _ => panic!("not an McpResult"),
+        }
+    }
+
+    #[tokio::test]
+    async fn uncorrelated_waiters_are_served_first_in_first_out() {
+        let (first, rx_first) = waiter(None);
+        let (second, rx_second) = waiter(None);
+        let mut waiters = vec![first, second];
+
+        let reply = mcp_result(None, "the first reply");
+        let taken =
+            super::take_matching_waiter(&mut waiters, &reply).expect("a waiter must claim it");
+        taken.tx.send(reply).unwrap();
+
+        // The caller who registered FIRST must receive it. pop() handed this
+        // to the SECOND caller, so this assertion is what fails under LIFO --
+        // checking only `waiters.len()` would pass either way.
+        // Drop the remaining waiter so its receiver resolves (as an error)
+        // instead of hanging. Without this, a regression to LIFO makes this
+        // test hang for the whole suite timeout rather than fail.
+        drop(waiters);
+
+        // The caller who registered FIRST must receive it. Under LIFO this
+        // reply went to the SECOND caller, so rx_first resolves as an error
+        // and this unwrap panics -- fast, and pointing at the real problem.
+        assert_eq!(text_of(&rx_first.await.unwrap()), "the first reply");
+        assert!(
+            rx_second.await.is_err(),
+            "the second waiter must not have been served"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_correlated_waiter_takes_only_its_own_reply() {
+        // Registration order is fast-then-slow and the FAST reply arrives
+        // first. That ordering is deliberate: LIFO would hand it to the SLOW
+        // waiter, which is exactly the swap being tested. Registering the
+        // other way round lets pop() coincidentally do the right thing.
+        let (w_fast, rx_fast) = waiter(Some(matches_call_id("rs-fast")));
+        let (w_slow, rx_slow) = waiter(Some(matches_call_id("rs-slow")));
+        let mut waiters = vec![w_fast, w_slow];
+
+        let fast_reply = mcp_result(Some("rs-fast"), "RESULT OF fast_tool");
+        let taken = super::take_matching_waiter(&mut waiters, &fast_reply)
+            .expect("the fast waiter must claim its own reply");
+        taken.tx.send(fast_reply).unwrap();
+
+        let slow_reply = mcp_result(Some("rs-slow"), "RESULT OF slow_tool");
+        let taken = super::take_matching_waiter(&mut waiters, &slow_reply)
+            .expect("the slow waiter must claim its own reply");
+        taken.tx.send(slow_reply).unwrap();
+
+        assert_eq!(text_of(&rx_fast.await.unwrap()), "RESULT OF fast_tool");
+        assert_eq!(text_of(&rx_slow.await.unwrap()), "RESULT OF slow_tool");
+    }
+
+    #[test]
+    fn a_reply_matching_no_outstanding_call_is_left_alone() {
+        let (w, _rx) = waiter(Some(matches_call_id("rs-mine")));
+        let mut waiters = vec![w];
+
+        let stray = mcp_result(Some("rs-someone-else"), "STRAY");
+        assert!(super::take_matching_waiter(&mut waiters, &stray).is_none());
+        // Still registered, still waiting for its own reply.
+        assert_eq!(waiters.len(), 1);
+    }
+
+    #[test]
+    fn a_responder_that_echoes_no_call_id_is_still_matched() {
+        // An older server predating the field: nothing to correlate on, so
+        // type-matching is all that is available and must keep working.
+        let (w, _rx) = waiter(Some(matches_call_id("rs-mine")));
+        let mut waiters = vec![w];
+        assert!(super::take_matching_waiter(&mut waiters, &mcp_result(None, "legacy")).is_some());
+    }
 
     #[test]
     fn known_host_label_preserves_explicit_websocket_port() {
@@ -1628,6 +1821,7 @@ mod tests {
             keepalive_handle: None,
             outgoing_tx,
             response_tx: response_tx.clone(),
+            server_features: Arc::new(Mutex::new(Vec::new())),
             connected: Arc::new(Mutex::new(true)),
             reverse_connect_rx: Arc::new(Mutex::new(None)),
             relay_message_rx: Arc::new(Mutex::new(None)),
@@ -1641,18 +1835,19 @@ mod tests {
                 .get_mut(&u8::from(MsgType::OpenOk))
                 .and_then(|entries| entries.pop())
                 .expect("missing OPEN_OK waiter");
-            tx.send(Envelope {
-                msg_type: MsgType::OpenOk,
-                payload: Payload::OpenOk(OpenOkPayload {
-                    channel_id: 31,
-                    stream_ids: vec![],
-                    data_mode: SessionDataMode::Virtual,
-                    capabilities: vec!["resize".into(), "signal".into()],
-                    session_id: Some("sess-31".into()),
-                    token: Some(vec![9u8; 40]),
-                }),
-            })
-            .unwrap();
+            tx.tx
+                .send(Envelope {
+                    msg_type: MsgType::OpenOk,
+                    payload: Payload::OpenOk(OpenOkPayload {
+                        channel_id: 31,
+                        stream_ids: vec![],
+                        data_mode: SessionDataMode::Virtual,
+                        capabilities: vec!["resize".into(), "signal".into()],
+                        session_id: Some("sess-31".into()),
+                        token: Some(vec![9u8; 40]),
+                    }),
+                })
+                .unwrap();
         });
 
         let session = client.open_session(SessionOpts::default()).await.unwrap();
@@ -1691,7 +1886,7 @@ mod tests {
     struct TestClientRig {
         client: WshClient,
         outgoing_rx: mpsc::Receiver<Vec<u8>>,
-        response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        response_tx: Arc<Mutex<HashMap<u8, Vec<Waiter>>>>,
         sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
         outgoing_tx: mpsc::Sender<Vec<u8>>,
         accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
@@ -1723,6 +1918,7 @@ mod tests {
             keepalive_handle: None,
             outgoing_tx: outgoing_tx.clone(),
             response_tx: response_tx.clone(),
+            server_features: Arc::new(Mutex::new(Vec::new())),
             connected: Arc::new(Mutex::new(true)),
             reverse_connect_rx: Arc::new(Mutex::new(None)),
             relay_message_rx: Arc::new(Mutex::new(None)),
@@ -1753,7 +1949,7 @@ mod tests {
     /// the dispatch loop (see e.g. `transport::websocket::decode_control_payload`).
     async fn relay_forever(
         mut rx: mpsc::Receiver<Vec<u8>>,
-        response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        response_tx: Arc<Mutex<HashMap<u8, Vec<Waiter>>>>,
         sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
         outgoing_tx: mpsc::Sender<Vec<u8>>,
         accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
@@ -1814,7 +2010,7 @@ mod tests {
     /// calling `e2e_frame::seal_frame` directly.
     async fn action_relay_forever(
         mut rx: mpsc::Receiver<ControlAction>,
-        response_tx: Arc<Mutex<HashMap<u8, Vec<oneshot::Sender<Envelope>>>>>,
+        response_tx: Arc<Mutex<HashMap<u8, Vec<Waiter>>>>,
         sessions: Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
         outgoing_tx: mpsc::Sender<Vec<u8>>,
         accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
