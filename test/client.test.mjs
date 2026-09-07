@@ -556,26 +556,21 @@ class E2EMockTransport extends ChallengeFirstMockTransport {
   }
 }
 
-/**
- * Retries `fn` up to `times` extra attempts if it rejects with a message
- * matching `pattern` -- used below only for the specific, root-caused
- * "Timed out waiting for peer ML-KEM-768 ciphertext" flake (see the
- * comment on the hybrid-mode test): a real protocol bug would fail
- * every attempt, including a fresh one with new transports/keys/timers,
- * so a retry can't paper over a genuine correctness problem here, only
- * the known Node-experimental-provider instability under concurrent
- * multi-process load. `node:test`'s built-in `{ retries }` test option
- * isn't available in the Node version this repo currently targets.
- */
-async function retryOnKnownFlake(fn, { times = 2, pattern = /Timed out waiting for peer ML-KEM-768 ciphertext/ } = {}) {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (attempt >= times || !pattern.test(err.message)) throw err;
-    }
-  }
-}
+// retryOnKnownFlake used to live here, wrapping the hybrid cases against
+// "Timed out waiting for peer ML-KEM-768 ciphertext". Its rationale said the
+// stall was "an instability in Node's still-experimental provider under
+// concurrent multi-process load, not a bug in the protocol logic here" and
+// cited isolated runs of this file as "100% reliable".
+//
+// Both halves were wrong, and the retry is gone with them. Isolated runs of
+// this file failed 5 of 25 measured here, and the stall was initiateE2E
+// dropping the peer's round-2 ciphertext when it arrived before this side
+// registered a waiter for it -- a protocol-logic bug, now fixed in
+// client.mjs. With the ordering corrected the hybrid cases pass 30 of 30
+// with no retry and no run over 8s. See #33.
+//
+// If a genuine provider stall ever does appear, re-add a retry with an
+// accurate comment rather than restoring this one.
 
 describe('WshClient initiateE2E', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
   async function connectedClient(transport) {
@@ -602,29 +597,21 @@ describe('WshClient initiateE2E', { skip: !hasEd25519 && 'Ed25519 not available 
     // exercising both role assignments across the suite's lifetime,
     // rather than only ever testing whichever role wins on one run.
     //
-    // Timeout is deliberately generous (30s, well above initiateE2E's
-    // 10s default) and the iteration count kept modest: on a machine
-    // where `node --test` runs this file concurrently with another
-    // process that's *also* exercising Node's native ML-KEM-768
-    // WebCrypto implementation (still explicitly experimental, see the
-    // ExperimentalWarning it emits), the two processes' calls can
-    // occasionally stall for many seconds -- confirmed via repeated
-    // isolated runs of just this file (100% reliable, always <100ms
-    // total) vs. paired with test/mlkem.test.mjs (occasionally hangs
-    // tens of seconds). That's an instability in Node's still-
-    // experimental provider under concurrent multi-process load, not a
-    // bug in the protocol logic here or in mlkem.mjs.
+    // The 30s timeout is kept as headroom, not as a stall allowance. It
+    // used to be justified by a theory that Node's experimental native
+    // ML-KEM-768 provider stalls under concurrent multi-process load; that
+    // was wrong. The stalls were initiateE2E dropping the peer's round-2
+    // ciphertext, and they are gone now that the waiter is registered
+    // before the derive rather than after it (#33).
     for (let i = 0; i < 3; i++) {
-      await retryOnKnownFlake(async () => {
-        const transport = new E2EMockTransport(`sess-e2e-hybrid-${i}`);
-        const client = await connectedClient(transport);
+      const transport = new E2EMockTransport(`sess-e2e-hybrid-${i}`);
+      const client = await connectedClient(transport);
 
-        const result = await client.initiateE2E(`session-hybrid-${i}`, 'X25519+ML-KEM-768', 30_000);
+      const result = await client.initiateE2E(`session-hybrid-${i}`, 'X25519+ML-KEM-768', 30_000);
 
-        assert.equal(result.hybrid, true);
-        assert.equal(transport.hybridUsed, true);
-        await assertSameAesKey(result.sharedSecret, transport.peerCombinedSecret);
-      });
+      assert.equal(result.hybrid, true);
+      assert.equal(transport.hybridUsed, true);
+      await assertSameAesKey(result.sharedSecret, transport.peerCombinedSecret);
     }
   });
 
@@ -648,11 +635,9 @@ describe('WshClient initiateE2E', { skip: !hasEd25519 && 'Ed25519 not available 
     // the hybrid client's key, then confirm the *classical* peer's
     // X25519-only-derived key fails to decrypt it (AES-GCM's auth tag
     // check throws on any key mismatch, including a valid-but-wrong key).
-    const hybridResult = await retryOnKnownFlake(async () => {
-      const hybridTransport = new E2EMockTransport('sess-e2e-diff-hybrid');
-      const hybridClient = await connectedClient(hybridTransport);
-      return hybridClient.initiateE2E('session-diff-2', 'X25519+ML-KEM-768', 30_000);
-    });
+    const hybridTransport = new E2EMockTransport('sess-e2e-diff-hybrid');
+    const hybridClient = await connectedClient(hybridTransport);
+    const hybridResult = await hybridClient.initiateE2E('session-diff-2', 'X25519+ML-KEM-768', 30_000);
 
     const classicalTransport = new E2EMockTransport('sess-e2e-diff-classical');
     const classicalClient = await connectedClient(classicalTransport);
@@ -719,6 +704,53 @@ class E2ELinkedTransport extends WshTransport {
     throw new Error('not needed for this test');
   }
 }
+
+// ── initiateE2E: the peer's round-1 message can arrive before we listen ──
+//
+// #handleControl DROPS a KEY_EXCHANGE that no waiter is listening for, and
+// initiateE2E used to register its waiter only after generating the local
+// key pair. Two peers establishing E2E both call initiateE2E at once, so
+// whichever finished key generation first sent its round-1 message into the
+// other's blind window; the loser then waited the full timeout for something
+// already sent and never repeated. Measured at ~10% of runs of the
+// EncryptedFrame integration tests, always surfacing as
+// "Timed out waiting for peer key exchange" on a CRYPTOGRAPHIC test. (#33)
+//
+// The test below does not sample that rate -- it drives the race exactly.
+// An async function body runs synchronously up to its first await, so the
+// waiter is registered (or not) before initiateE2E() returns its promise.
+// Delivering the peer message on the very next line therefore lands in the
+// blind window every time when the registration is late, and never when it
+// is early.
+
+describe('initiateE2E round-1 ordering', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
+  it('claims a peer KEY_EXCHANGE delivered before initiateE2E has yielded even once', async () => {
+    const transport = new ChallengeFirstMockTransport('sess-race');
+    const keyPair = await auth.generateKeyPair(true);
+    const client = new clientMod.WshClient({ transportFactories: { ws: () => transport } });
+    await client.connect('ws://test.invalid', { username: 'alice', keyPair, transport: 'ws' });
+
+    // A real X25519 public key, so the derive after the wait succeeds and the
+    // only thing under test is whether the message was heard at all.
+    const peerEphemeral = await crypto.subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
+    const peerPub = new Uint8Array(await crypto.subtle.exportKey('raw', peerEphemeral.publicKey));
+
+    // No await: initiateE2E has run only as far as its first suspension.
+    const pending = client.initiateE2E('sess-race', 'X25519', 2000);
+
+    // The peer answers in that instant -- the whole point of the race.
+    transport._emitControl({
+      type: MSG.KEY_EXCHANGE,
+      algorithm: 'X25519',
+      session_id: 'sess-race',
+      public_key: peerPub,
+    });
+
+    const result = await pending;
+    assert.equal(result.hybrid, false);
+    assert.ok(result.sharedSecret, 'a dropped round-1 message shows up here as a timeout');
+  });
+});
 
 describe('EncryptedFrame end-to-end integration', { skip: !hasEd25519 && 'Ed25519 not available in this runtime' }, () => {
   it('two real WshClient/WshSession pairs exchange sealed data that an eavesdropper on the raw wire cannot read', async () => {
