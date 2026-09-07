@@ -236,6 +236,77 @@ The `spec/` directory contains the protocol definition:
 - `wsh-v1.md` -- human-readable protocol specification
 - `codegen.mjs` -- generates `messages.gen.mjs` from the YAML spec
 
+## Rust implementation
+
+`crates/` is a native Rust implementation of the wsh protocol, moved into
+this repo from erisera-code/clawser on 2026-09-06 (with history, via `git
+subtree`) so it lives next to the JS client whose wire spec it implements
+instead of dragging its own toolchain and CI job into an unrelated
+browser-app repo. It was previously deleted from clawser by accident
+(2026-03-14) and restored (2026-07-05) before this move.
+
+Four crates, workspace-versioned at `0.1.0`:
+
+| Crate | Kind | Description |
+|-------|------|--------------|
+| `wsh-core` | library | Shared protocol types -- CBOR messages (generated, see below), codec, identity, auth, QMux |
+| `wsh-client` | library | Native Rust client -- WebTransport/WebSocket transports, sessions, file transfer, E2E |
+| `wsh-cli` | binary (`wsh`) | SSH-like CLI: connect, exec, scp-style copy, reverse tunnels, key management |
+| `wsh-server` | binary (`wsh-server`) | Server: WebTransport/WebSocket listener, real PTY sessions (`portable-pty`), relay/reverse-connect, WISP bridging |
+
+### Build and test
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+The Node-to-Rust cross-implementation tests (`test/rust/*.test.mjs`) spawn
+the real `wsh-server` binary and drive it with this repo's own JS client --
+they're kept out of the default `npm test` glob so JS-only contributors
+never need a Rust toolchain. Build the release binary first (or set
+`WSH_SERVER_BIN` to point at one), then:
+
+```sh
+cargo build --release -p wsh-server
+npm run test:rust
+```
+
+### Codegen: regenerate, don't hand-edit
+
+`crates/wsh-core/src/messages.gen.rs` is generated from `spec/wsh-v1.yaml`
+by `spec/codegen.mjs`, alongside the JS (`src/messages.gen.mjs`) and
+Markdown (`spec/wsh-v1.md`) outputs -- all three come from the same schema
+and must never be hand-edited. After changing `wsh-v1.yaml`:
+
+```sh
+npm run codegen        # regenerate all three outputs
+npm run codegen:check  # CI check: fails if any output has drifted from the schema
+```
+
+### Release binaries
+
+Tagging `rust-vX.Y.Z` (or running the `Release Rust binaries` workflow
+manually with a tag input) builds and publishes prebuilt `wsh-server` and
+`wsh-cli` binaries for four targets to a GitHub Release:
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `i686-unknown-linux-musl` (the target clawser's demo-linux guest image needs)
+
+Each target produces two archives, each containing a single binary at the
+archive root:
+
+```
+wsh-server-<target>.tar.gz   # binary: wsh-server
+wsh-cli-<target>.tar.gz      # binary: wsh
+```
+
+plus one `SHA256SUMS` file covering every archive in the release. These
+names are a stable contract other repos (clawser) pin and download by --
+do not change them without coordinating downstream.
+
 ## Security
 
 - **Auth transcript binding** -- challenge signatures cover

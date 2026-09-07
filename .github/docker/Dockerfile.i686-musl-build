@@ -1,0 +1,30 @@
+# Cross-compiles wsh-server + wsh-cli (binary name: wsh) statically for
+# i686-unknown-linux-musl. This is the target clawser's demo-linux guest
+# image needs (v86 only emulates 32-bit x86 — see erisera-code/clawser
+# issue #38's Phase 1 design); it moved here with the rest of the Rust
+# workspace (issue #52).
+#
+# Ported as-is from erisera-code/clawser's
+# tools/guest-image/Dockerfile.i686-musl-build, which used this exact
+# image + build to produce a working i686-musl wsh-server/wsh before the
+# move. Used by .github/workflows/release-rust.yml's i686-musl job.
+#
+# Usage (from repo root):
+#   docker build -f .github/docker/Dockerfile.i686-musl-build -t wsh-i686-musl-build .
+#   docker create --name wsh-extract wsh-i686-musl-build
+#   docker cp wsh-extract:/out/wsh-server ./dist/wsh-server
+#   docker cp wsh-extract:/out/wsh ./dist/wsh
+#   docker rm wsh-extract
+FROM messense/rust-musl-cross:i686-musl AS build
+
+WORKDIR /home/rust/src
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release --target i686-unknown-linux-musl -p wsh-server -p wsh-cli -p wsh-core -p wsh-client
+
+# Keep the artifacts reachable via `docker cp` even if downstream steps change.
+RUN mkdir -p /out \
+    && cp target/i686-unknown-linux-musl/release/wsh-server /out/wsh-server \
+    && cp target/i686-unknown-linux-musl/release/wsh /out/wsh

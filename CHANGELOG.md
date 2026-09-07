@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Adopt the Rust wsh workspace (`crates/`) from clawser (#52).** The
+  native Rust implementation of the wsh protocol (`wsh-core`, `wsh-client`,
+  `wsh-cli`, `wsh-server`; ~28k lines) moved here from
+  erisera-code/clawser's `crates/`, imported with history via `git subtree`.
+  It was previously deleted from clawser by accident (2026-03-14) and
+  restored there (2026-07-05) before this move; it now lives next to the
+  JS client whose wire spec (`spec/wsh-v1.yaml`) it implements, rather than
+  dragging a Rust toolchain and CI job into an unrelated browser-app repo.
+  `spec/codegen.mjs` now writes `crates/wsh-core/src/messages.gen.rs`
+  directly (`npm run codegen`, checked via `npm run codegen:check`). The
+  Rust-server cross-implementation test (`test/rust/wsh-rust-server.test.mjs`,
+  formerly clawser's `tools/test/wsh-rust-server.test.mjs`) moved with it,
+  now driving this repo's own JS client instead of the npm package; it runs
+  via `npm run test:rust`, kept out of the default `npm test` glob so
+  JS-only contributors need no Rust toolchain. CI gained a `rust` job
+  (`cargo build/test --workspace`, `codegen:check`, `test:rust`; clippy
+  non-blocking pending a warnings cleanup) and a release workflow that
+  publishes `wsh-server`/`wsh-cli` binaries for four targets on `rust-v*`
+  tags. See the README's "Rust implementation" section. No npm package
+  version bump.
+
 - **Fix: `WshMcpBridge` and `WshFileTransfer.list()` were unreachable from a
   `WshClient`.** Both classes are exported from the package root and both
   document their constructor argument as "a WshClient", and both drive the
