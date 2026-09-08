@@ -1,6 +1,61 @@
 # Changelog
 
-## Unreleased
+## 0.17.0
+
+- **Breaking: `WshSession.onClose` now receives a reason (#36, #37).** The two
+  paths that close a session did not agree; one settled a parked file chunk
+  and one did not. `closeReason` is a new getter (`Error | null`), `onClose`
+  is called with it, and both paths go through one teardown.
+
+- **Breaking: `openFrame()` requires the expected role tag (#35).** The E2E
+  nonce role tag was written on send and never checked on receive, so a peer's
+  own frame could be reflected back at it and open successfully. The tag is
+  now compared against the nonce, which makes the argument mandatory.
+
+- **Fix: `initiateE2E` dropped the peer's key exchange when it arrived first
+  (#33).** `#handleControl` discards a `KEY_EXCHANGE` no waiter is listening
+  for, and the waiter was registered only after generating the local key pair.
+  With both peers initiating at once, whichever finished key generation first
+  sent into the other's blind window and that message was never repeated, so
+  the loser waited the full timeout. Both round-1 and round-2 waiters are now
+  registered before the awaits they were racing. This also removes
+  `retryOnKnownFlake` from the tests: the stalls it retried were this bug, not
+  the Node ML-KEM instability its comment described.
+
+- **MCP calls carry a `call_id` (#32).** `McpCall`/`McpResult` had no
+  correlation field and both client paths matched on message type alone, so
+  two calls in flight returned each other's results with nothing in the reply
+  to reveal the swap. The field is optional and negotiated via a new
+  `mcp-call-id` server feature, because `McpCallPayload` is
+  `deny_unknown_fields` server-side and an unsolicited id makes an older
+  server reject the call. Against a server without the feature, MCP calls are
+  serialised instead.
+
+- **Fix: `index.d.ts` had drifted from the runtime barrel.**
+  `MCP_CALL_ID_FEATURE` was exported and undeclared, `callId` was missing from
+  the `mcpCall`/`mcpResult` option types, and `WshSession.closeReason` was
+  undeclared while `onClose` was typed as taking no argument. A test now
+  asserts every runtime export appears in the declarations.
+
+- **Fix: the noble ML-KEM backend had never executed (#42).** Every assertion
+  about hybrid key exchange ran against the native provider; the fallback that
+  serves browsers without it was untested.
+
+- **Fix: the keepalive recorded the pong and never acted on it (#38).**
+  `pingIntervalMs` and `pongTimeoutMs` are now constructor options.
+
+- **Fix: a failed connect left its socket open, and a broken socket skipped
+  its own teardown.**
+
+- **Fix: stop sending CBOR null for required wire fields**, and test against
+  the spec rather than the implementation.
+
+- **`WebTransport` options are passed through**, so a self-signed certificate
+  can be pinned by `serverCertificateHashes`.
+
+- **`isEd25519Supported()` is exported**, and the compatibility docs state the
+  Ed25519 floor instead of omitting Safari.
+
 
 - **Adopt the Rust wsh workspace (`crates/`) from clawser (#52).** The
   native Rust implementation of the wsh protocol (`wsh-core`, `wsh-client`,
