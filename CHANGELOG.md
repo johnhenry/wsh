@@ -130,6 +130,77 @@
   `WshClient` over a real `WshTransport` subclass through the real handshake,
   and asserts on what reached the wire. `npm test` goes 443 → 453.
 
+<!--
+The three sections below were written after the fact. They were missing
+because this repository's history was re-rooted: 3abc3ff, tagged v0.16.1, is
+main's ROOT commit, and the v0.14.0, v0.15.0 and v0.16.0 tags point at an
+orphaned lineage that main does not contain. `git log` from main therefore
+shows nothing before 0.16.1, which is why these never got written.
+
+All three versions are published and in use (0.15.0 on 2026-08-29, 0.16.0 and
+0.16.1 on 2026-08-30), so their contents are taken from the orphaned lineage,
+which is what was actually released. 0.16.1 has no diff to read at all -- its
+only commit is the root commit -- so its entry is reconstructed from the code
+that root commit contains and from the issue it names.
+-->
+
+## 0.16.1
+
+- **Fix: data-stream EOF could close a stream-mode session before `EXIT`
+  arrived, losing the exit code (#24).** A stream-mode session's data and
+  control streams are independently multiplexed, so nothing orders them: a
+  server that ends the data stream and sends `EXIT`+`CLOSE` in the same
+  synchronous block can have the FIN win. `_pumpDataStream()` treated
+  `done: true` as sufficient grounds to close, so `onClose` resolved while
+  `EXIT` was still in flight and `onExit` never fired. Reproduced reliably
+  against clawser's reference server for fast-exiting commands.
+
+  `CLOSE` is now the authoritative close signal. On data-EOF the session
+  starts a bounded `DATA_EOF_CLOSE_GRACE_MS` (300ms) timer instead of closing;
+  the `CLOSE` handler clears it, so a prompt `CLOSE` short-circuits the wait
+  rather than idling out the full period, and the timer remains as a fallback
+  for servers that never send `CLOSE` after ending the data stream.
+
+## 0.16.0
+
+- **Stream-mode sessions can be sealed (#22).** `WshSession.enableE2E()`
+  previously hard-rejected stream-mode sessions; it now accepts them, reusing
+  `e2e-frame.mjs`'s `sealFrame`/`openFrame` unchanged behind a new inline
+  chunk-framing layer for raw byte streams.
+
+  `src/stream-frame.mjs` (new) carries `ChunkAccumulator`, which reassembles
+  `[4-byte BE length][12-byte nonce][ciphertext+tag]` chunks from
+  arbitrarily-fragmented reads via a cursor-based buffer rather than repeated
+  slicing, and `encodeChunk()` which builds them. `StreamTornChunkError` and
+  `StreamAuthenticationError` distinguish a truncated stream from a failed
+  AEAD check.
+
+  Adds write coalescing: `WriteCoalescer` batches small writes on a byte and
+  timer threshold derived from the session `kind` — pty favours latency, exec
+  favours throughput — with an `enableE2E(key, { coalesce })` override and
+  `coalesce: false` to disable.
+
+## 0.15.0
+
+- **EncryptedFrame AEAD sealing, wired into virtual-mode sessions (#21).**
+  Adds `src/e2e-frame.mjs` (`sealFrame`/`openFrame` over AES-256-GCM, matching
+  the key `initiateE2E()` already derives), an opt-in
+  `WshSession.enableE2E(sharedSecret, { role })` that seals `write()` output
+  into `EncryptedFrame` and opens incoming ones into `onData`, and
+  `WshVirtualSessionBackend.writeEncrypted()` to send them.
+
+  Nonces are an 8-byte big-endian monotonic counter plus a 4-byte per-role
+  tag, so the two peers of a session cannot collide. `session_id` is bound as
+  AEAD additional data, so a relay cannot splice ciphertext across sessions.
+  Incoming frames must match the exact next expected counter; replay and
+  reorder are rejected outright.
+
+  Adds the `channel_id` field `EncryptedFrame`'s spec was missing for routing
+  to a session, regenerated via `spec/codegen.mjs`.
+
+- **Docs brought current** with the 0.8.0-0.14.0 protocol modernization
+  (README, type declarations, examples).
+
 ## 0.14.0
 
 - **Fix: `attachSession()`/`resumeSession()` were both unreachable** (clawser
