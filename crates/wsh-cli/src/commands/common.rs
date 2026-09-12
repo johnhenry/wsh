@@ -7,6 +7,66 @@ use wsh_client::{ConnectConfig, WshClient};
 
 use crate::config::parse_target;
 
+/// A parsed `[user@]host:path` (or plain local path) endpoint, shared by
+/// every command that accepts this syntax (`scp`, `sftp`, `ls` -- wsh #58).
+///
+/// Originally lived only in `scp.rs`; moved here (and made `pub`) so `sftp`
+/// and `ls` reuse the exact same parser rather than writing a second one.
+/// wsh #58 is explicit about why: two parsers for `[user@]host:path` is how
+/// they end up disagreeing about a colon in a filename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    Local(PathBuf),
+    Remote {
+        user: String,
+        host: String,
+        path: String,
+    },
+}
+
+/// Parse an endpoint string. Remote endpoints use `[user@]host:path` syntax.
+pub fn parse_endpoint(s: &str) -> Result<Endpoint> {
+    // Look for the colon that separates host from path, but skip Windows drive letters
+    // (e.g., C:\path) by requiring that the part before the colon contains no path separators
+    // AND isn't itself a single drive-letter character (a bare "C" is never a valid host
+    // either, so treating a single alphabetic char before ':' as local is unambiguous --
+    // this check was previously missing here, so `C:\Users\...` parsed as remote host "C").
+    if let Some(colon_pos) = s.find(':') {
+        let before = &s[..colon_pos];
+        let is_drive_letter =
+            before.len() == 1 && before.chars().next().unwrap().is_ascii_alphabetic();
+        // If the part before the colon looks like a host (no slashes), treat as remote.
+        if !is_drive_letter && !before.contains('/') && !before.contains('\\') && !before.is_empty()
+        {
+            let path = &s[colon_pos + 1..];
+            if path.is_empty() {
+                anyhow::bail!("remote path cannot be empty in '{s}'");
+            }
+            let (user, host) = if before.contains('@') {
+                parse_target(before)?
+            } else {
+                // No user specified — use current username.
+                let user = local_username().unwrap_or_else(|| "root".into());
+                (user, before.to_string())
+            };
+            return Ok(Endpoint::Remote {
+                user,
+                host,
+                path: path.to_string(),
+            });
+        }
+    }
+
+    Ok(Endpoint::Local(PathBuf::from(s)))
+}
+
+/// Get the current system username.
+fn local_username() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+}
+
 /// Resolved connection details for a target.
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
@@ -250,5 +310,75 @@ mod tests {
         assert_eq!(resolved.url, "wss://example.com:4422");
         assert!(resolved.fallback_urls.is_empty());
         assert_eq!(resolved.transport.as_deref(), Some("ws"));
+    }
+
+    // ── parse_endpoint (wsh #58: shared by scp/sftp/ls) ─────────────────
+
+    #[test]
+    fn parse_endpoint_plain_local_path() {
+        assert_eq!(
+            parse_endpoint("/tmp/foo.txt").unwrap(),
+            Endpoint::Local(PathBuf::from("/tmp/foo.txt"))
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_relative_local_path() {
+        assert_eq!(
+            parse_endpoint("./foo/bar.txt").unwrap(),
+            Endpoint::Local(PathBuf::from("./foo/bar.txt"))
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_remote_with_user() {
+        let ep = parse_endpoint("alice@example.com:/home/alice/file.txt").unwrap();
+        assert_eq!(
+            ep,
+            Endpoint::Remote {
+                user: "alice".into(),
+                host: "example.com".into(),
+                path: "/home/alice/file.txt".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_remote_without_user_falls_back_to_local_username() {
+        let ep = parse_endpoint("example.com:/etc/hosts").unwrap();
+        match ep {
+            Endpoint::Remote { host, path, .. } => {
+                assert_eq!(host, "example.com");
+                assert_eq!(path, "/etc/hosts");
+            }
+            other => panic!("expected Endpoint::Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_windows_drive_letter_is_local_not_remote() {
+        // A single-letter "host" before the colon followed by a
+        // backslash-rooted path must not be parsed as [user@]host:path.
+        assert_eq!(
+            parse_endpoint("C:\\Users\\alice\\file.txt").unwrap(),
+            Endpoint::Local(PathBuf::from("C:\\Users\\alice\\file.txt"))
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_empty_remote_path() {
+        assert!(parse_endpoint("example.com:").is_err());
+    }
+
+    #[test]
+    fn parse_endpoint_relative_path_with_colon_in_filename_stays_local() {
+        // A colon inside a filename (no leading host-like prefix without
+        // slashes before it) must not be misparsed as a remote endpoint --
+        // exactly the ambiguity wsh #58 calls out as the reason to share
+        // one parser instead of two.
+        assert_eq!(
+            parse_endpoint("./weird:name.txt").unwrap(),
+            Endpoint::Local(PathBuf::from("./weird:name.txt"))
+        );
     }
 }

@@ -7,23 +7,13 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing::{debug, info};
 use wsh_client::file_transfer;
 
-use crate::commands::common::{connect_client, resolve_target, save_last_session};
-use crate::config::parse_target;
-
-/// A parsed SCP endpoint — either local or remote.
-#[derive(Debug)]
-enum Endpoint {
-    Local(PathBuf),
-    Remote {
-        user: String,
-        host: String,
-        path: String,
-    },
-}
+use crate::commands::common::{
+    connect_client, parse_endpoint, resolve_target, save_last_session, Endpoint,
+};
 
 /// Run a file transfer between src and dst.
 pub async fn run(
@@ -131,43 +121,6 @@ async fn download(
     let _ = client.disconnect().await;
 
     Ok(())
-}
-
-/// Parse an SCP endpoint string. Remote endpoints use `[user@]host:path` syntax.
-fn parse_endpoint(s: &str) -> Result<Endpoint> {
-    // Look for the colon that separates host from path, but skip Windows drive letters
-    // (e.g., C:\path) by requiring that the part before the colon contains no path separators.
-    if let Some(colon_pos) = s.find(':') {
-        let before = &s[..colon_pos];
-        // If the part before the colon looks like a host (no slashes), treat as remote.
-        if !before.contains('/') && !before.contains('\\') && !before.is_empty() {
-            let path = &s[colon_pos + 1..];
-            if path.is_empty() {
-                anyhow::bail!("remote path cannot be empty in '{s}'");
-            }
-            let (user, host) = if before.contains('@') {
-                parse_target(before)?
-            } else {
-                // No user specified — use current username.
-                let user = whoami().unwrap_or_else(|| "root".into());
-                (user, before.to_string())
-            };
-            return Ok(Endpoint::Remote {
-                user,
-                host,
-                path: path.to_string(),
-            });
-        }
-    }
-
-    Ok(Endpoint::Local(PathBuf::from(s)))
-}
-
-/// Get the current system username.
-fn whoami() -> Option<String> {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .ok()
 }
 
 /// Print a progress bar to stderr.
