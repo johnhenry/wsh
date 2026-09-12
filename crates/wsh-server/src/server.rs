@@ -4006,17 +4006,56 @@ impl WshServer {
             (MsgType::FileOp, Payload::FileOp(p)) => {
                 debug!(channel_id = p.channel_id, op = %p.op, path = %p.path, "file op");
 
-                // wsh #59: "list" is now a real implementation (see
-                // handle_file_list above) instead of the unconditional
-                // stub refusal every op previously got. The remaining ops
-                // (stat, read, write, mkdir, remove, rename) are
-                // unchanged -- still refused with a named reason, not
-                // silently dropped or rendered as success. Note
-                // upload/download already work today, but via the
-                // dedicated FileChunk channel path
-                // (Open{kind:File, command:"upload:<path>"/"download:<path>"}
-                // above), not through FileOp at all.
-                let result_payload = if p.op == "list" {
+                // FileOp travels as a bare message with no Open/OpenOk step
+                // (unlike upload/download, which go through
+                // Open{kind:File, ...} and are scope-checked above at the
+                // "Check file transfer scope" block). Without an equivalent
+                // check here, "list"/"remove" would bypass per-key
+                // SessionScope::FileTransfer authorization entirely --
+                // confirmed exploitable: an exec-only key (`restrict,permit-exec`,
+                // no FileTransfer scope) could still `list()` real directory
+                // entries. Mirror the Open<File> check exactly so both paths
+                // enforce the same scope the same way.
+                let key_options = self
+                    .authorized_keys
+                    .iter()
+                    .find(|k| k.fingerprint == ctx.fingerprint)
+                    .and_then(|k| k.options.as_deref());
+                let permissions = crate::auth::permissions::KeyPermissions::from_options(
+                    ctx.fingerprint.clone(),
+                    key_options,
+                );
+
+                let result_payload = if !permissions
+                    .has_scope(&crate::auth::permissions::SessionScope::FileTransfer)
+                {
+                    // Named refusal identifying the missing "fs" capability
+                    // (wsh #58: "an unauthorized fs capability must be
+                    // reported as a named refusal, never rendered as an
+                    // empty directory") -- never an empty Ok, and never a
+                    // generic "not implemented" that would hide the real
+                    // reason.
+                    FileResultPayload {
+                        channel_id: p.channel_id,
+                        success: false,
+                        metadata: serde_json::Value::Object(Default::default()),
+                        entries: vec![],
+                        error_message: Some(format!(
+                            "file operation {:?} requires the \"fs\" capability, which this key does not have (file transfer not permitted for this key)",
+                            p.op
+                        )),
+                    }
+                } else if p.op == "list" {
+                    // wsh #59: "list" is now a real implementation (see
+                    // handle_file_list above) instead of the unconditional
+                    // stub refusal every op previously got. The remaining
+                    // ops (stat, read, write, mkdir, remove, rename) are
+                    // unchanged -- still refused with a named reason, not
+                    // silently dropped or rendered as success. Note
+                    // upload/download already work today, but via the
+                    // dedicated FileChunk channel path
+                    // (Open{kind:File, command:"upload:<path>"/"download:<path>"}
+                    // above), not through FileOp at all.
                     self.handle_file_list(p.channel_id, &p.path).await
                 } else {
                     FileResultPayload {

@@ -993,6 +993,41 @@ describe('Rust wsh-server list() (wsh #59)', () => {
       /cannot list/,
     );
   });
+
+  // Regression test: FileOp ("list"/"remove") travels as a bare message with
+  // no Open/OpenOk step, unlike upload/download which go through
+  // Open{kind:File, ...} and were already scope-checked against
+  // SessionScope::FileTransfer. A verification pass on this PR found that
+  // gap was real and exploitable: an authorized key restricted to
+  // `restrict,permit-exec` (exec only, no file-transfer scope) could still
+  // successfully `list()` real directory entries. Fixed server-side in
+  // crates/wsh-server/src/server.rs's FileOp dispatch arm by mirroring the
+  // exact `permissions.has_scope(SessionScope::FileTransfer)` check
+  // Open<ChannelKind::File> already performs.
+  it('refuses list() by name (naming the "fs" capability) for a key with no file-transfer scope', async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    // restrict,permit-exec: exec-only key, no permit-file-transfer -> no
+    // SessionScope::FileTransfer (see crates/wsh-server/src/auth/permissions.rs).
+    const server = await startServer([`restrict,permit-exec ${publicKeySSH}`]);
+    servers.push(server);
+
+    const dir = path.join(server.homeDir, 'listme-restricted');
+    mkdirSync(dir);
+    writeFileSync(path.join(dir, 'secret.txt'), 'should not be listable');
+
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+
+    // Must be refused outright -- never an empty array (which would be
+    // indistinguishable from "this directory has nothing in it") and never
+    // a silently successful listing of real entries.
+    await assert.rejects(
+      () => new WshFileTransfer(client).list(dir),
+      /fs/,
+      'refusal must name the missing "fs" capability',
+    );
+  });
 });
 
 // ── Authorized-key management (wsh #59) ───────────────────────────────
