@@ -34,9 +34,22 @@ Or via CDN:
 - **Reverse mode** -- register as a peer (via a signed peer record) and accept incoming connections through a relay
 - **File transfer** -- scp-like upload/download as `FileChunk` control messages in 64KB chunks
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
-- **Session recording** -- asciicast v2 compatible recording and playback with seek/pause/resume
+- **Session recording** -- own JSON schema (not asciicast v2 -- see note below) recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
 - **95 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, and more
+
+> **Session recording is not asciicast v2.** Both `SessionRecorder`
+> implementations capture more than asciicast v2's three event codes
+> (`o`/`i`/`r`) can represent -- session lifecycle events (`open`/`exit` in
+> JS; `Start`/`Exit`/`Snapshot` in Rust) have no asciicast v2 equivalent,
+> and dropping them wasn't worth it just to match the format. The JS and
+> Rust recorders also use two different, mutually incompatible schemas from
+> each other (neither is asciicast v2's newline-delimited-JSON shape).
+> `RecordingExport`'s `format: "asciicast"` option is accepted on the wire
+> but not yet implemented server-side -- requesting it currently returns
+> the same custom JSONL as `format: "jsonl"`. If interop with standard
+> asciicast players (`asciinema play`, etc.) is wanted, that needs a real
+> (lossy -- lifecycle events would be dropped) export path, not a rename.
 
 ## Wire Protocol: QMux
 
@@ -208,7 +221,7 @@ so options the platform gains later need no change here.
 | `WshKeyStore` | Ed25519 key management via IndexedDB + OPFS encrypted backup |
 | `WshFileTransfer` | File upload/download over dedicated streams |
 | `WshMcpBridge` | Remote MCP tool discovery and invocation |
-| `SessionRecorder` | Record PTY I/O with timestamps (asciicast v2) |
+| `SessionRecorder` | Record PTY I/O with timestamps (own schema, not asciicast v2) |
 | `SessionPlayer` | Replay recordings with original timing |
 | `generateKeyPair()` | Create Ed25519 key pair via Web Crypto |
 | `signChallenge()` | Build transcript + sign for auth handshake |
