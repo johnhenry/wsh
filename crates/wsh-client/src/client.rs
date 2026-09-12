@@ -492,6 +492,49 @@ impl WshClient {
         }
     }
 
+    /// Install a raw 32-byte Ed25519 public key into the remote host's
+    /// `~/.wsh/authorized_keys` (wsh #59).
+    ///
+    /// Replaces `wsh copy-id`'s previous approach of building and running a
+    /// remote shell command (`crates/wsh-cli/src/commands/copy_id.rs`) --
+    /// see that module's doc comment for the quoting hazard this avoids.
+    /// Making this a real protocol message (rather than CLI-only) also
+    /// makes key installation reachable from implementations with no shell
+    /// channel to build a command string for, starting with the browser
+    /// SDK (`WshClient.addAuthorizedKey` in `src/client.mjs`).
+    ///
+    /// Idempotent: installing an already-present key returns `Ok(false)`
+    /// (not newly added) rather than duplicating the line or erroring.
+    pub async fn add_authorized_key(
+        &self,
+        public_key_raw: &[u8],
+        comment: Option<&str>,
+    ) -> WshResult<bool> {
+        let response = self
+            .send_and_wait(
+                Envelope {
+                    msg_type: MsgType::AuthorizedKeyAdd,
+                    payload: Payload::AuthorizedKeyAdd(AuthorizedKeyAddPayload {
+                        public_key: public_key_raw.to_vec(),
+                        comment: comment.map(str::to_string),
+                    }),
+                },
+                MsgType::AuthorizedKeyResult,
+            )
+            .await?;
+
+        match response.payload {
+            Payload::AuthorizedKeyResult(r) if r.success => Ok(r.added),
+            Payload::AuthorizedKeyResult(r) => Err(WshError::Channel(
+                r.error_message
+                    .unwrap_or_else(|| "key installation refused".into()),
+            )),
+            _ => Err(WshError::InvalidMessage(
+                "unexpected response to AUTHORIZED_KEY_ADD".into(),
+            )),
+        }
+    }
+
     /// Attach to an existing session (read-only or control mode).
     ///
     /// `token` is optional (clawser #48): the server accepts either a
@@ -816,21 +859,49 @@ impl WshClient {
         let server_hello_data = self.recv_raw().await?;
         let server_hello = decode_envelope(&server_hello_data)?;
 
-        let (_server_hello_session_id, server_fingerprints, advertised_features) =
+        let (_server_hello_session_id, server_fingerprints, host_fingerprint, advertised_features) =
             match &server_hello.payload {
                 Payload::ServerHello(sh) => (
                     sh.session_id.clone(),
                     sh.fingerprints.clone(),
+                    sh.host_fingerprint.clone(),
                     sh.features.clone(),
                 ),
                 _ => return Err(WshError::InvalidMessage("expected SERVER_HELLO".into())),
             };
         *self.server_features.lock().await = advertised_features;
 
-        // Verify host key (TOFU)
+        // Verify host key (TOFU).
+        //
+        // wsh #59: prefer `host_fingerprint` -- the server's own persistent
+        // host identity key, the correct thing to pin. Fall back to
+        // `fingerprints[0]` (an authorized *client* key, not a stable
+        // per-server identity -- see ServerHello.fingerprints' doc comment
+        // in spec/wsh-v1.yaml) only for servers that don't populate
+        // host_fingerprint yet, which today is every wsh-server release;
+        // this keeps existing deployments working unchanged while making
+        // the upgrade path (a server that starts sending host_fingerprint)
+        // strictly safer without a client-side flag day. The fallback logs
+        // a warning so operators can see TOFU protection is degraded.
         if config.verify_host {
-            if let Some(first_fp) = server_fingerprints.first() {
-                self.verify_host_key(known_host, first_fp)?;
+            let pinned_fp = match host_fingerprint.as_deref().filter(|fp| !fp.is_empty()) {
+                Some(fp) => Some(fp.to_string()),
+                None => {
+                    if let Some(first_fp) = server_fingerprints.first() {
+                        tracing::warn!(
+                            host = %known_host,
+                            "server did not advertise ServerHello.host_fingerprint (wsh #59); \
+                             falling back to fingerprints[0] (an authorized client key, not a \
+                             stable host identity) -- TOFU protection is degraded for this host"
+                        );
+                        Some(first_fp.clone())
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(fp) = pinned_fp {
+                self.verify_host_key(known_host, &fp)?;
             }
         }
 

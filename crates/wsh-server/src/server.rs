@@ -965,6 +965,223 @@ impl WshServer {
         });
     }
 
+    /// Handle a "list" FileOp: read a directory's entries from the real
+    /// filesystem and return them as typed `FileEntry` values (wsh #59 --
+    /// previously this arrived only as an untyped `metadata` json bag, and
+    /// only over `wsh-server`'s stub, which always refused; there was no
+    /// real implementation on either client, let alone this server).
+    ///
+    /// Same unsandboxed-by-design filesystem access as the existing
+    /// upload/download handlers above (`Open<ChannelKind::File>`): an
+    /// authenticated connection here already has unrestricted exec/file
+    /// access, so this does not introduce a new privilege boundary. Any
+    /// I/O failure (no such path, not a directory, permission denied)
+    /// comes back as `success: false` with `error_message` naming the
+    /// reason -- never as an empty `entries` list, so a caller can't
+    /// mistake "refused" for "empty directory" (wsh #58).
+    async fn handle_file_list(&self, channel_id: u32, path: &str) -> FileResultPayload {
+        fn refusal(channel_id: u32, error_message: String) -> FileResultPayload {
+            FileResultPayload {
+                channel_id,
+                success: false,
+                metadata: serde_json::Value::Object(Default::default()),
+                entries: vec![],
+                error_message: Some(error_message),
+            }
+        }
+
+        let mut read_dir = match tokio::fs::read_dir(path).await {
+            Ok(rd) => rd,
+            Err(e) => return refusal(channel_id, format!("cannot list {path:?}: {e}")),
+        };
+
+        let mut entries = Vec::new();
+        loop {
+            let dir_entry = match read_dir.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) => return refusal(channel_id, format!("error reading {path:?}: {e}")),
+            };
+
+            let name = dir_entry.file_name().to_string_lossy().into_owned();
+            let entry_path = dir_entry.path();
+
+            // symlink_metadata (not metadata()) so a symlink is reported as
+            // a symlink rather than transparently followed to its target's
+            // type -- "a browse surface that flattens that is lying about
+            // the remote filesystem" (wsh #58).
+            let meta = match tokio::fs::symlink_metadata(&entry_path).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(path = %entry_path.display(), error = %e, "list: skipping entry whose metadata could not be read");
+                    continue;
+                }
+            };
+
+            let file_type = meta.file_type();
+            let (entry_type, symlink_target) = if file_type.is_symlink() {
+                let target = tokio::fs::read_link(&entry_path)
+                    .await
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned());
+                (FileEntryType::Symlink, target)
+            } else if file_type.is_dir() {
+                (FileEntryType::Directory, None)
+            } else if file_type.is_file() {
+                (FileEntryType::File, None)
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    if file_type.is_block_device() || file_type.is_char_device() {
+                        (FileEntryType::Device, None)
+                    } else if file_type.is_fifo() {
+                        (FileEntryType::Pipe, None)
+                    } else if file_type.is_socket() {
+                        (FileEntryType::Socket, None)
+                    } else {
+                        (FileEntryType::File, None)
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    (FileEntryType::File, None)
+                }
+            };
+
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            entries.push(FileEntry {
+                name,
+                size: meta.len(),
+                modified,
+                r#type: entry_type,
+                symlink_target,
+            });
+        }
+
+        FileResultPayload {
+            channel_id,
+            success: true,
+            metadata: serde_json::Value::Object(Default::default()),
+            entries,
+            error_message: None,
+        }
+    }
+
+    /// Handle an `AuthorizedKeyAdd` request: idempotently install a raw
+    /// Ed25519 public key into `~/.wsh/authorized_keys` (wsh #59).
+    ///
+    /// This replaces `wsh copy-id`'s previous approach of building and
+    /// running a remote shell command
+    /// (`crates/wsh-cli/src/commands/copy_id.rs`), which had a quoting
+    /// hazard and was unreachable from any implementation without a shell
+    /// channel (notably the browser SDK). Reachable here only by an
+    /// already-authenticated connection, same as every other post-AUTH_OK
+    /// message dispatched by this function -- an authenticated caller can
+    /// already achieve the same file edit via `exec`, so this adds no new
+    /// privilege boundary, only a structured, quote-free way to do it that
+    /// works for clients with no shell channel at all.
+    async fn handle_authorized_key_add(
+        &self,
+        p: &AuthorizedKeyAddPayload,
+    ) -> AuthorizedKeyResultPayload {
+        let raw_key: [u8; 32] = match p.public_key.as_slice().try_into() {
+            Ok(k) => k,
+            Err(_) => {
+                return AuthorizedKeyResultPayload {
+                    success: false,
+                    added: false,
+                    error_message: Some(format!(
+                        "invalid public key length: expected 32 bytes, got {}",
+                        p.public_key.len()
+                    )),
+                };
+            }
+        };
+        let fingerprint = wsh_core::fingerprint(&raw_key);
+
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => {
+                return AuthorizedKeyResultPayload {
+                    success: false,
+                    added: false,
+                    error_message: Some("cannot determine home directory".into()),
+                };
+            }
+        };
+        let wsh_dir = home.join(".wsh");
+        let path = wsh_dir.join("authorized_keys");
+
+        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        if wsh_core::keys::parse_authorized_keys(&existing)
+            .iter()
+            .any(|k| k.fingerprint == fingerprint)
+        {
+            return AuthorizedKeyResultPayload {
+                success: true,
+                added: false,
+                error_message: None,
+            };
+        }
+
+        if let Err(e) = tokio::fs::create_dir_all(&wsh_dir).await {
+            return AuthorizedKeyResultPayload {
+                success: false,
+                added: false,
+                error_message: Some(format!("cannot create {}: {e}", wsh_dir.display())),
+            };
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                tokio::fs::set_permissions(&wsh_dir, std::fs::Permissions::from_mode(0o700)).await
+            {
+                warn!(path = %wsh_dir.display(), error = %e, "authorized-key-add: failed to set directory permissions");
+            }
+        }
+
+        let comment = p.comment.clone().unwrap_or_default();
+        let line = wsh_core::keys::format_authorized_key_line(&raw_key, &comment);
+        let mut new_content = existing;
+        if !new_content.is_empty() && !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        new_content.push_str(&line);
+        new_content.push('\n');
+
+        if let Err(e) = tokio::fs::write(&path, &new_content).await {
+            return AuthorizedKeyResultPayload {
+                success: false,
+                added: false,
+                error_message: Some(format!("cannot write {}: {e}", path.display())),
+            };
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await
+            {
+                warn!(path = %path.display(), error = %e, "authorized-key-add: failed to set file permissions");
+            }
+        }
+
+        info!(fingerprint = %fingerprint, path = %path.display(), "authorized key installed");
+        AuthorizedKeyResultPayload {
+            success: true,
+            added: true,
+            error_message: None,
+        }
+    }
+
     /// Handle a WebSocket connection.
     ///
     /// The transport now speaks QMux (draft-ietf-quic-qmux-02) rather than
@@ -3788,15 +4005,35 @@ impl WshServer {
             // ── Structured file channel ────────────────────────────
             (MsgType::FileOp, Payload::FileOp(p)) => {
                 debug!(channel_id = p.channel_id, op = %p.op, path = %p.path, "file op");
-                // Stub: dispatch file operation (stat, list, read, write, etc.)
-                Ok(Some(Envelope {
-                    msg_type: MsgType::FileResult,
-                    payload: Payload::FileResult(FileResultPayload {
+
+                // wsh #59: "list" is now a real implementation (see
+                // handle_file_list above) instead of the unconditional
+                // stub refusal every op previously got. The remaining ops
+                // (stat, read, write, mkdir, remove, rename) are
+                // unchanged -- still refused with a named reason, not
+                // silently dropped or rendered as success. Note
+                // upload/download already work today, but via the
+                // dedicated FileChunk channel path
+                // (Open{kind:File, command:"upload:<path>"/"download:<path>"}
+                // above), not through FileOp at all.
+                let result_payload = if p.op == "list" {
+                    self.handle_file_list(p.channel_id, &p.path).await
+                } else {
+                    FileResultPayload {
                         channel_id: p.channel_id,
                         success: false,
                         metadata: serde_json::Value::Object(Default::default()),
-                        error_message: Some("file operations not yet implemented".into()),
-                    }),
+                        entries: vec![],
+                        error_message: Some(format!(
+                            "file operation {:?} not yet implemented",
+                            p.op
+                        )),
+                    }
+                };
+
+                Ok(Some(Envelope {
+                    msg_type: MsgType::FileResult,
+                    payload: Payload::FileResult(result_payload),
                 }))
             }
 
@@ -4002,6 +4239,26 @@ impl WshServer {
                     .insert(p.channel_id, config);
                 info!(channel_id = p.channel_id, frontend = %p.frontend, "terminal config updated");
                 Ok(None)
+            }
+
+            // ── Authorized-key management (wsh #59) ─────────────────
+            (MsgType::AuthorizedKeyAdd, Payload::AuthorizedKeyAdd(p)) => {
+                let result = self.handle_authorized_key_add(&p).await;
+                Ok(Some(Envelope {
+                    msg_type: MsgType::AuthorizedKeyResult,
+                    payload: Payload::AuthorizedKeyResult(result),
+                }))
+            }
+
+            (MsgType::AuthorizedKeyResult, Payload::AuthorizedKeyResult(_)) => {
+                // Server-to-client only; reject client-sent, same as FileResult above.
+                Ok(Some(Envelope {
+                    msg_type: MsgType::Error,
+                    payload: Payload::Error(ErrorPayload {
+                        code: 4,
+                        message: "AuthorizedKeyResult is a server-to-client message".into(),
+                    }),
+                }))
             }
 
             // ── Unhandled ───────────────────────────────────────────

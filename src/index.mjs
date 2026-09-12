@@ -35,6 +35,7 @@ export {
   nodeAnnounce, nodeRedirect,
   sessionGrant, sessionRevoke,
   fileOp, fileResult, fileChunk,
+  authorizedKeyAdd, authorizedKeyResult,
   policyEval, policyResult, policyUpdate,
   terminalConfig,
   msgName, isValidMessage,
@@ -76,6 +77,9 @@ export { WshClient, MCP_CALL_ID_FEATURE } from './client.mjs';
 
 // Key storage
 export { WshKeyStore } from './keystore.mjs';
+
+// Host identity (TOFU) -- wsh #59
+export { WshKnownHosts } from './known-hosts.mjs';
 
 // File transfer
 export { WshFileTransfer } from './file-transfer.mjs';

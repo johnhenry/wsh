@@ -523,12 +523,25 @@ function rustInnerType(yamlType) {
   if (yamlType === 'SessionSummary[]') return 'Vec<SessionSummary>';
   if (yamlType === 'PeerInfo[]') return 'Vec<PeerInfo>';
   if (yamlType === 'McpToolSpec[]') return 'Vec<McpToolSpec>';
+  if (yamlType === 'FileEntry[]') return 'Vec<FileEntry>';
   if (yamlType === 'map<string,string>') return 'std::collections::HashMap<String, String>';
   return yamlType; // nested type reference
 }
 
 function isBytesField(yamlType) {
   return yamlType === 'bytes';
+}
+
+// Rust reserved words that can appear as YAML field names (wire/JSON names
+// aren't Rust identifiers, so a field like FileEntry.type needs an escaped
+// identifier on the Rust side while keeping the wire name "type" via
+// #[serde(rename = ...)] -- CBOR/JSON payloads and the JS side, which has
+// no such restriction, are unaffected).
+const RUST_RESERVED_WORDS = new Set(['type', 'move', 'match', 'ref', 'use', 'fn', 'as']);
+
+/** Rust identifier for a wire field name, raw-escaped if it collides with a keyword. */
+function rustFieldIdent(fieldName) {
+  return RUST_RESERVED_WORDS.has(fieldName) ? `r#${fieldName}` : fieldName;
 }
 
 function emitRust(schema) {
@@ -730,6 +743,8 @@ function emitRust(schema) {
 
         // serde attributes
         const attrs = [];
+        const ident = rustFieldIdent(fieldName);
+        if (ident !== fieldName) attrs.push(`rename = "${fieldName}"`);
 
         if (hasDefault && !isBytes) {
           // Check if the default is non-trivial (differs from Rust's Default trait)
@@ -756,6 +771,7 @@ function emitRust(schema) {
           attrs.push('with = "serde_bytes"');
         } else if (isBytes && !isRequired) {
           attrs.length = 0; // rebuild
+          if (ident !== fieldName) attrs.push(`rename = "${fieldName}"`);
           attrs.push('default');
           attrs.push('skip_serializing_if = "Option::is_none"');
           attrs.push('with = "option_bytes"');
@@ -765,7 +781,7 @@ function emitRust(schema) {
           out.push(`    #[serde(${attrs.join(', ')})]`);
         }
 
-        out.push(`    pub ${fieldName}: ${rType},`);
+        out.push(`    pub ${ident}: ${rType},`);
       }
     }
 
@@ -791,6 +807,8 @@ function emitRust(schema) {
       const isBytes = isBytesField(fieldDef.type);
 
       const attrs = [];
+      const ident = rustFieldIdent(fieldName);
+      if (ident !== fieldName) attrs.push(`rename = "${fieldName}"`);
       if (hasDefault) {
         attrs.push('default');
       }
@@ -815,6 +833,7 @@ function emitRust(schema) {
         attrs.push('with = "serde_bytes"');
       } else if (isBytes && !isRequired) {
         attrs.length = 0; // rebuild
+        if (ident !== fieldName) attrs.push(`rename = "${fieldName}"`);
         attrs.push('default');
         attrs.push('skip_serializing_if = "Option::is_none"');
         attrs.push('with = "option_bytes"');
@@ -823,7 +842,7 @@ function emitRust(schema) {
       if (attrs.length > 0) {
         out.push(`    #[serde(${attrs.join(', ')})]`);
       }
-      out.push(`    pub ${fieldName}: ${rType},`);
+      out.push(`    pub ${ident}: ${rType},`);
     }
 
     out.push('}');

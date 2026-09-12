@@ -25,7 +25,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { WshTransport } from '../src/transport.mjs';
-import { MSG, mcpTools, mcpResult, openOk } from '../src/messages.gen.mjs';
+import { MSG, mcpTools, mcpResult, openOk, fileResult } from '../src/messages.gen.mjs';
 import { WshMcpBridge } from '../src/mcp-bridge.mjs';
 import { WshFileTransfer } from '../src/file-transfer.mjs';
 import { attachControlListener } from '../src/control-listener.mjs';
@@ -39,14 +39,6 @@ try {
   // Web Crypto Ed25519 unavailable in this runtime.
 }
 const hasEd25519 = auth && typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined';
-
-const LS_OUTPUT = [
-  'total 8',
-  'drwxr-xr-x  3 user  staff   96 Jan  1 10:00 .',
-  'drwxr-xr-x  5 user  staff  160 Jan  1 09:00 ..',
-  '-rw-r--r--  1 user  staff  512 Jan  2 11:30 notes.txt',
-  '',
-].join('\n');
 
 /**
  * A transport with a small in-process server behind it: it completes the
@@ -82,20 +74,17 @@ class ServerBackedTransport extends WshTransport {
       reply(mcpResult({ result: { success: true, output: `called ${msg.tool}` } }));
     } else if (msg.type === MSG.OPEN) {
       reply(openOk({ channel_id: 1, stream_ids: {}, data_mode: 'stream', capabilities: [] }));
+    } else if (msg.type === MSG.FILE_OP && msg.op === 'list') {
+      // wsh #59: list() goes over FileOp/FileResult now, not `ls -la` over
+      // an exec channel -- see file-transfer.mjs.
+      reply(fileResult({
+        channelId: msg.channel_id,
+        success: true,
+        entries: [
+          { name: 'notes.txt', size: 512, modified: 1_700_000_000, type: 'file' },
+        ],
+      }));
     }
-  }
-
-  async _doOpenStream() {
-    return {
-      id: 1,
-      readable: new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(LS_OUTPUT));
-          controller.close();
-        },
-      }),
-      writable: new WritableStream({ write() {} }),
-    };
   }
 }
 
@@ -156,9 +145,13 @@ describe('helper classes against a real WshClient', { skip: !hasEd25519 && 'Ed25
 
     const entries = await new WshFileTransfer(client).list('/home/alice');
 
-    const open = transport.sent.find((m) => m.type === MSG.OPEN);
-    assert.ok(open, 'no Open reached the transport');
-    assert.match(open.command, /^ls -la /);
+    // wsh #59: list() goes over FileOp{op:"list"}/FileResult now, not
+    // `ls -la` over an exec Open -- the assertion that matters is that
+    // the structured op actually reached the wire.
+    const fileOp = transport.sent.find((m) => m.type === MSG.FILE_OP);
+    assert.ok(fileOp, 'no FileOp reached the transport');
+    assert.equal(fileOp.op, 'list');
+    assert.equal(fileOp.path, '/home/alice');
     assert.ok(entries.some((e) => e.name === 'notes.txt'), `parsed entries: ${JSON.stringify(entries)}`);
   });
 
@@ -169,7 +162,7 @@ describe('helper classes against a real WshClient', { skip: !hasEd25519 && 'Ed25
     );
     await assert.rejects(
       () => new WshFileTransfer({ upload: async () => {} }).list('/tmp'),
-      (err) => err instanceof TypeError && /sendControl\(\) and openStream\(\)/.test(err.message),
+      (err) => err instanceof TypeError && /requires a client exposing fileList/.test(err.message),
     );
   });
 

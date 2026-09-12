@@ -36,7 +36,7 @@ Or via CDN:
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
 - **Session recording** -- asciicast v2 compatible recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
-- **95 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, and more
+- **97 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
 
 ## Wire Protocol: QMux
 
@@ -221,7 +221,7 @@ so options the platform gains later need no change here.
 
 | Export | Description |
 |--------|-------------|
-| `MSG` | 95 message type constants (hex opcodes) |
+| `MSG` | 97 message type constants (hex opcodes) |
 | `CHANNEL_KIND` | Channel types: `pty`, `exec`, `meta`, `file`, `tcp`, `udp`, `job` |
 | `AUTH_METHOD` | Auth methods: `pubkey`, `password` |
 | `cborEncode` / `cborDecode` | CBOR codec (maps, arrays, strings, ints, bytes, bools, null, floats) |
@@ -253,6 +253,26 @@ Four crates, workspace-versioned at `0.1.0`:
 | `wsh-client` | library | Native Rust client -- WebTransport/WebSocket transports, sessions, file transfer, E2E |
 | `wsh-cli` | binary (`wsh`) | SSH-like CLI: connect, exec, scp-style copy, reverse tunnels, key management |
 | `wsh-server` | binary (`wsh-server`) | Server: WebTransport/WebSocket listener, real PTY sessions (`portable-pty`), relay/reverse-connect, WISP bridging |
+
+### Capability matrix: JS SDK vs Rust CLI/client
+
+Two implementations of one protocol will always have *some* asymmetry --
+the question wsh #59 asks is whether it is visible and deliberate, or
+discovered by accident. This table is that answer, made explicit rather
+than left to be found.
+
+| Capability | JS SDK (browser) | Rust CLI/client | Unified via |
+|---|---|---|---|
+| Directory listing (`list`) | `WshFileTransfer.list()` | `wsh_client::file_transfer::list()`, `wsh ls`, `wsh sftp` | **Wire-unified**: `FileOp`/`FileResult` with the generated `FileEntry` type (wsh #59) -- both languages decode the same shape, including symlink targets |
+| Upload/download | `WshClient.upload()`/`.download()` | `file_transfer::upload()`/`download()`, `wsh scp` | **Wire-unified**: `FileChunk` over a `'file'`-kind channel (wsh #13) |
+| Remove a remote file | `WshClient.fileRemove()` | `file_transfer::remove()`, `wsh sftp`'s `rm` | **Wire-unified**: `FileOp`/`FileResult` (`op: "remove"`) -- refused today by every `wsh-server` release ("not yet implemented"), the same refusal on both sides |
+| Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
+| Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, a field no `wsh-server` release populates yet (see [Security](#security)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
+| Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
+| Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service |
+| Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
+| Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast v2) | none | **JS-only** -- no current Rust consumer needs playback; the format itself (asciicast v2) is not proprietary if one is added later |
+| Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | N/A -- Rust dials a cert its own TLS stack already trusts, or `--generate-cert`'s self-signed cert out of band | **Deliberately not unified** -- this is a browser-specific WebTransport API shape, not a wire-protocol concept |
 
 ### Build and test
 
@@ -325,6 +345,25 @@ do not change them without coordinating downstream.
   falling back to classical X25519 automatically when the peer can't do
   hybrid (check the returned `hybrid` flag). The derived AES-256-GCM key is
   not yet wired to actual frame encryption.
+- **Host identity (TOFU), and its current limit (wsh #59)** --
+  `ServerHello.host_fingerprint` is the spec's formal host-identity slot:
+  the SHA-256 fingerprint of a server's persistent Ed25519 host key, meant
+  to be pinned across connections the way SSH pins a host key. **No
+  `wsh-server` release populates this field yet** -- minting and
+  persisting a server host keypair is a separate, security-sensitive
+  feature, deliberately not bundled into this change. Both clients ship
+  the store this field is for: `WshKnownHosts` (JS, `localStorage`-backed)
+  and `KnownHosts` (Rust, `~/.wsh/known_hosts`-backed) have matching
+  verify/add/remove/list semantics. Today, against every real server,
+  both report every host as unverified for host-identity purposes; the
+  Rust client additionally still falls back to `fingerprints[0]` (an
+  *authorized client key* this server happens to have, not this server's
+  own identity -- see `ServerHello.fingerprints`' doc comment in
+  `spec/wsh-v1.yaml`) with a logged warning, for backward compatibility.
+  Do not treat either store as a MITM defense until a server actually
+  populates `host_fingerprint`. `serverCertificateHashes` (below) is a
+  different, narrower mechanism -- it pins a certificate supplied *per
+  connection*, not a persisted record of what a host presented last time.
 
 ## Browser Compatibility
 

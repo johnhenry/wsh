@@ -778,6 +778,14 @@ export function fileResult(opts?: {
   channelId?: number;
   success?: boolean;
   metadata?: Record<string, unknown>;
+  /** wsh #59: typed directory entries for a "list" op (see WshFileListEntry-shaped wire fields). */
+  entries?: Array<{
+    name: string;
+    size: number;
+    modified: number;
+    type: 'file' | 'directory' | 'symlink' | 'device' | 'pipe' | 'socket';
+    symlink_target?: string;
+  }>;
   errorMessage?: string;
 }): WshMessage;
 
@@ -787,6 +795,18 @@ export function fileChunk(opts?: {
   data?: Uint8Array;
   isFinal?: boolean;
   totalSize?: number;
+}): WshMessage;
+
+/** wsh #59: install a public key into the remote's authorized_keys (see WshClient.addAuthorizedKey). */
+export function authorizedKeyAdd(opts?: {
+  publicKey?: Uint8Array;
+  comment?: string;
+}): WshMessage;
+
+export function authorizedKeyResult(opts?: {
+  success?: boolean;
+  added?: boolean;
+  errorMessage?: string;
 }): WshMessage;
 
 export function policyEval(opts?: {
@@ -1765,6 +1785,20 @@ export class WshClient {
   revokeSessionAccess(sessionId: string, principal: string, reason?: string): Promise<void>;
 
   /**
+   * Install a raw 32-byte Ed25519 public key into the remote host's
+   * `~/.wsh/authorized_keys` (wsh #59's `AuthorizedKeyAdd` protocol
+   * message -- replaces `wsh copy-id`'s previous CLI-only shell-command
+   * approach with something every implementation, including this one,
+   * can call directly). Idempotent: installing an already-present key
+   * resolves `added: false` rather than duplicating the line or erroring.
+   */
+  addAuthorizedKey(
+    publicKeyRaw: Uint8Array,
+    comment?: string,
+    timeout?: number,
+  ): Promise<{ added: boolean }>;
+
+  /**
    * Gracefully disconnect: close all sessions and the transport.
    */
   disconnect(): Promise<void>;
@@ -1994,6 +2028,48 @@ export class WshKeyStore {
 }
 
 // ============================================================================
+// known-hosts.mjs -- WshKnownHosts (wsh #59)
+// ============================================================================
+
+/** Minimal storage interface `WshKnownHosts` needs -- `localStorage` already satisfies it. */
+export interface WshKnownHostsStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/** Result of verifying a host's fingerprint against the stored record. */
+export interface WshHostVerifyResult {
+  status: 'known' | 'unknown' | 'changed';
+  /** Previously stored fingerprint, present only when status === 'changed'. */
+  expected?: string;
+}
+
+/**
+ * WshKnownHosts -- trust-on-first-use (TOFU) host-identity store, mirroring
+ * Rust's `KnownHosts`/`HostStatus` (`crates/wsh-client/src/known_hosts.rs`).
+ * Pins `ServerHello.host_fingerprint` (spec/wsh-v1.yaml, wsh #59) -- no
+ * `wsh-server` release populates that field yet, so this has nothing
+ * authoritative to verify against for any real server today. See the
+ * class doc comment in `known-hosts.mjs` for the full reasoning.
+ */
+export class WshKnownHosts {
+  constructor(opts?: { storage?: WshKnownHostsStorage; storageKey?: string });
+
+  /** Verify a host's fingerprint against the stored record. */
+  verifyHost(host: string, fingerprint: string): WshHostVerifyResult;
+
+  /** Add or update a host's fingerprint. */
+  addHost(host: string, fingerprint: string): void;
+
+  /** Remove a host entry. Returns true if an entry was removed. */
+  removeHost(host: string): boolean;
+
+  /** List all known hosts and their fingerprints. */
+  list(): Array<{ host: string; fingerprint: string }>;
+}
+
+// ============================================================================
 // file-transfer.mjs -- WshFileTransfer
 // ============================================================================
 
@@ -2015,12 +2091,21 @@ export interface WshFileUploadResult {
   bytesTransferred: number;
 }
 
-/** File listing entry. */
+/**
+ * File listing entry (wsh #59: generated from spec/wsh-v1.yaml's
+ * `FileEntry` nested type -- the same shape `crates/wsh-core`'s Rust
+ * `FileEntry` struct is generated from, so a directory entry can no longer
+ * describe a symlink as a plain file in one implementation and not the
+ * other). `modified` is converted from the wire's Unix epoch seconds into
+ * a `Date` for JS ergonomics. `symlinkTarget` is only present when
+ * `type === 'symlink'`.
+ */
 export interface WshFileListEntry {
   name: string;
   size: number;
-  modified: string;
+  modified: Date;
   type: 'file' | 'directory' | 'symlink' | 'device' | 'pipe' | 'socket';
+  symlinkTarget?: string;
 }
 
 /**

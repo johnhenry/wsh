@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { WshTransport } from '../src/transport.mjs';
-import { MSG, open, openOk, openFail, exit, close, fileChunk } from '../src/messages.gen.mjs';
+import { MSG, open, openOk, openFail, exit, close, fileChunk, fileResult } from '../src/messages.gen.mjs';
 
 // Note: Web Crypto API (crypto.subtle) with Ed25519 requires Node 20+ or a browser.
 let auth;
@@ -28,14 +28,21 @@ class MockFileServerTransport extends WshTransport {
   sentMessages = [];
   #sessionId;
   #files;
+  #dirs;
   #nextChannelId = 1;
   #uploads = new Map(); // channel_id -> { chunks: Map<offset, Uint8Array>, totalSize }
   #truncateDownloadAfterBytes;
 
-  constructor({ sessionId = 'server-session', files = {}, truncateDownloadAfterBytes = Infinity } = {}) {
+  constructor({
+    sessionId = 'server-session',
+    files = {},
+    dirs = {}, // path -> FileEntry[] (wsh #59 "list" op), or undefined -> refused
+    truncateDownloadAfterBytes = Infinity,
+  } = {}) {
     super();
     this.#sessionId = sessionId;
     this.#files = files;
+    this.#dirs = dirs;
     this.#truncateDownloadAfterBytes = truncateDownloadAfterBytes;
   }
 
@@ -84,6 +91,28 @@ class MockFileServerTransport extends WshTransport {
       }
 
       setTimeout(() => this._emitControl(openFail({ reason: `unsupported command: ${msg.command}` })), 0);
+      return;
+    }
+
+    if (msg.type === MSG.FILE_OP) {
+      if (msg.op === 'list') {
+        const entries = this.#dirs[msg.path];
+        setTimeout(() => {
+          if (entries === undefined) {
+            this._emitControl(fileResult({
+              channelId: msg.channel_id, success: false, errorMessage: `no such directory: ${msg.path}`,
+            }));
+          } else {
+            this._emitControl(fileResult({ channelId: msg.channel_id, success: true, entries }));
+          }
+        }, 0);
+        return;
+      }
+      setTimeout(() => {
+        this._emitControl(fileResult({
+          channelId: msg.channel_id, success: false, errorMessage: `file operation "${msg.op}" not supported by mock`,
+        }));
+      }, 0);
       return;
     }
 
@@ -299,5 +328,78 @@ describe('WshFileTransfer', { skip: !hasEd25519 && 'Ed25519 not available in thi
 
     await assert.rejects(() => ft.upload(new Uint8Array(1), '/tmp/x'), /requires a client exposing upload/);
     await assert.rejects(() => ft.download('/tmp/x'), /requires a client exposing download/);
+  });
+
+  // ── list() over the structured file channel (wsh #59) ────────────────
+  //
+  // Before this, list() ran `ls -la` over an exec channel and parsed text
+  // output -- untested by this suite entirely. These are the first tests
+  // of list() at all, now exercising the real FileOp/FileResult path.
+
+  it('list() sends FileOp{op:"list"} and returns typed entries, including a symlink target', async () => {
+    const entries = [
+      { name: 'README.md', size: 1234, modified: 1_700_000_000, type: 'file' },
+      { name: 'src', size: 0, modified: 1_700_000_100, type: 'directory' },
+      {
+        name: 'current', size: 0, modified: 1_700_000_200, type: 'symlink',
+        symlink_target: '/releases/v3',
+      },
+    ];
+    const transport = new MockFileServerTransport({ dirs: { '/srv/app': entries } });
+    const client = await connectedClient(transport);
+    const ft = new fileTransferMod.WshFileTransfer(client);
+
+    const result = await ft.list('/srv/app');
+
+    const fileOpMsgs = transport.sentMessages.filter((m) => m.type === MSG.FILE_OP);
+    assert.equal(fileOpMsgs.length, 1);
+    assert.equal(fileOpMsgs[0].op, 'list');
+    assert.equal(fileOpMsgs[0].path, '/srv/app');
+
+    assert.equal(result.length, 3);
+    assert.equal(result[0].name, 'README.md');
+    assert.equal(result[0].size, 1234);
+    assert.equal(result[0].type, 'file');
+    assert.ok(result[0].modified instanceof Date);
+    assert.equal(result[0].modified.getTime(), 1_700_000_000 * 1000);
+    assert.equal(result[0].symlinkTarget, undefined);
+
+    assert.equal(result[1].type, 'directory');
+
+    assert.equal(result[2].type, 'symlink');
+    assert.equal(result[2].symlinkTarget, '/releases/v3');
+  });
+
+  it('list() of an empty (but listable) directory returns an empty array, not an error', async () => {
+    const transport = new MockFileServerTransport({ dirs: { '/srv/empty': [] } });
+    const client = await connectedClient(transport);
+    const ft = new fileTransferMod.WshFileTransfer(client);
+
+    const result = await ft.list('/srv/empty');
+    assert.deepEqual(result, []);
+  });
+
+  it('list() throws a named error (not an empty array) when the server refuses', async () => {
+    // No entry for '/no/such/dir' in #dirs -- the mock reports FileResult{success:false}.
+    const transport = new MockFileServerTransport({ dirs: {} });
+    const client = await connectedClient(transport);
+    const ft = new fileTransferMod.WshFileTransfer(client);
+
+    await assert.rejects(() => ft.list('/no/such/dir'), /no such directory/);
+  });
+
+  it('list() throws against a client without fileList()', async () => {
+    const bareClient = { upload: async () => {}, download: async () => {} };
+    const ft = new fileTransferMod.WshFileTransfer(bareClient);
+
+    await assert.rejects(() => ft.list('/tmp'), /requires a client exposing fileList/);
+  });
+
+  it('list() requires a remotePath', async () => {
+    const transport = new MockFileServerTransport({ dirs: {} });
+    const client = await connectedClient(transport);
+    const ft = new fileTransferMod.WshFileTransfer(client);
+
+    await assert.rejects(() => ft.list(), /remotePath is required/);
   });
 });

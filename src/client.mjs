@@ -29,6 +29,7 @@ import {
   keyExchange as keyExchangeMsg,
   fileOp as fileOpMsg,
   fileChunk as fileChunkMsg,
+  authorizedKeyAdd as authorizedKeyAddMsg,
   policyEval as policyEvalMsg, policyUpdate as policyUpdateMsg,
   detach as detachMsg,
   sessionListRequest as sessionListRequestMsg,
@@ -1737,6 +1738,45 @@ export class WshClient {
   async fileRemove(path, timeout) { return this.fileOperation('remove', path, {}, timeout); }
   /** Rename a remote file or directory. */
   async fileRename(oldPath, newPath, timeout) { return this.fileOperation('rename', oldPath, {}, timeout); }
+
+  // ── Authorized-key management (wsh #59) ───────────────────────────
+
+  /**
+   * Install a raw 32-byte Ed25519 public key into the remote host's
+   * ~/.wsh/authorized_keys via the AuthorizedKeyAdd protocol message.
+   *
+   * Replaces `wsh copy-id`'s CLI-only, shell-command-built approach
+   * (`crates/wsh-cli/src/commands/copy_id.rs`) with a real protocol
+   * message every implementation can call -- including this one, the
+   * browser SDK, which previously had no way to install a key at all
+   * (no shell channel to build a command string for). See copy_id.rs's
+   * doc comment for the full security reasoning: an authenticated
+   * connection already has unrestricted exec/file access to this exact
+   * file, so this adds no new privilege boundary.
+   *
+   * Idempotent: installing an already-present key resolves
+   * `{ added: false }` rather than duplicating the line or erroring.
+   *
+   * @param {Uint8Array} publicKeyRaw - Raw 32-byte Ed25519 public key
+   * @param {string} [comment] - Trailing comment for the authorized_keys line
+   * @param {number} [timeout=10000]
+   * @returns {Promise<{ added: boolean }>}
+   */
+  async addAuthorizedKey(publicKeyRaw, comment, timeout = DEFAULT_OPEN_TIMEOUT) {
+    this.#assertAuthenticated('addAuthorizedKey');
+    await this.#transport.sendControl(
+      authorizedKeyAddMsg({ publicKey: publicKeyRaw, comment })
+    );
+    const result = await this.#waitForMessage(
+      [MSG.AUTHORIZED_KEY_RESULT],
+      timeout,
+      'Timed out waiting for authorized-key-add result'
+    );
+    if (!result.success) {
+      throw new Error(result.error_message || 'key installation refused');
+    }
+    return { added: !!result.added };
+  }
 
   // ── Policy Engine ─────────────────────────────────────────────────
 

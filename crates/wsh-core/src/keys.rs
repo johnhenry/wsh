@@ -205,6 +205,70 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
+/// Base64-encode arbitrary bytes (standard alphabet, `=` padding).
+///
+/// Public (unlike `base64_decode` above) so callers outside this crate --
+/// currently `wsh-server`'s `AuthorizedKeyAdd` handler (wsh #59) -- can
+/// format a raw public key as an `authorized_keys` line without a base64
+/// crate dependency, mirroring the equivalent private helper in
+/// `wsh-client`'s `keystore.rs` (kept separate there since that one also
+/// needs `base64_decode`, unlike this crate's already-public parsing path).
+pub fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+
+    while i + 2 < data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        result.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        result.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        result.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        result.push(TABLE[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+
+    let remaining = data.len() - i;
+    if remaining == 1 {
+        let n = (data[i] as u32) << 16;
+        result.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        result.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        result.push('=');
+        result.push('=');
+    } else if remaining == 2 {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+        result.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        result.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        result.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        result.push('=');
+    }
+
+    result
+}
+
+/// Encode a 32-byte Ed25519 public key into SSH wire format:
+/// `[4-byte len]["ssh-ed25519"][4-byte len][32-byte key]`.
+pub fn encode_ssh_ed25519_wire(public_key: &[u8; 32]) -> Vec<u8> {
+    let key_type = b"ssh-ed25519";
+    let mut wire = Vec::with_capacity(4 + key_type.len() + 4 + 32);
+    wire.extend_from_slice(&(key_type.len() as u32).to_be_bytes());
+    wire.extend_from_slice(key_type);
+    wire.extend_from_slice(&(public_key.len() as u32).to_be_bytes());
+    wire.extend_from_slice(public_key);
+    wire
+}
+
+/// Format a raw 32-byte Ed25519 public key as an `authorized_keys` line:
+/// `ssh-ed25519 <base64> [comment]`.
+pub fn format_authorized_key_line(raw_key: &[u8; 32], comment: &str) -> String {
+    let wire = encode_ssh_ed25519_wire(raw_key);
+    let b64 = base64_encode(&wire);
+    if comment.is_empty() {
+        format!("ssh-ed25519 {b64}")
+    } else {
+        format!("ssh-ed25519 {b64} {comment}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +299,75 @@ mod tests {
         let content = "ssh-rsa AAAAB3NzaC1yc2EAAAA... user@host";
         let keys = parse_authorized_keys(content);
         assert_eq!(keys.len(), 0);
+    }
+
+    // ── base64_encode / encode_ssh_ed25519_wire / format_authorized_key_line ──
+    // (wsh #59: added for the server-side AuthorizedKeyAdd handler, which
+    // needs to format a raw public key as an authorized_keys line without
+    // pulling in a base64 crate dependency.)
+
+    #[test]
+    fn base64_encode_round_trips_through_base64_decode() {
+        for data in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            &[0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        ] {
+            let encoded = base64_encode(data);
+            let decoded = base64_decode(&encoded).expect("valid base64 must decode");
+            assert_eq!(decoded, data, "round trip failed for {data:?}");
+        }
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        // RFC 4648 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn encode_ssh_ed25519_wire_matches_expected_layout() {
+        let key = [7u8; 32];
+        let wire = encode_ssh_ed25519_wire(&key);
+        // [4B len=11]["ssh-ed25519"][4B len=32][32B key]
+        assert_eq!(&wire[0..4], &11u32.to_be_bytes());
+        assert_eq!(&wire[4..15], b"ssh-ed25519");
+        assert_eq!(&wire[15..19], &32u32.to_be_bytes());
+        assert_eq!(&wire[19..51], &key[..]);
+        assert_eq!(wire.len(), 51);
+    }
+
+    #[test]
+    fn format_authorized_key_line_round_trips_through_parse_authorized_keys() {
+        let key = [9u8; 32];
+        let line = format_authorized_key_line(&key, "alice@laptop");
+        assert!(line.starts_with("ssh-ed25519 "));
+        assert!(line.ends_with(" alice@laptop"));
+
+        let parsed = parse_authorized_keys(&line);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].comment, "alice@laptop");
+        assert_eq!(parsed[0].fingerprint, crate::identity::fingerprint(&key));
+    }
+
+    #[test]
+    fn format_authorized_key_line_without_comment_has_no_trailing_space() {
+        let key = [1u8; 32];
+        let line = format_authorized_key_line(&key, "");
+        assert!(!line.ends_with(' '));
+        assert_eq!(
+            line.matches(' ').count(),
+            1,
+            "expected exactly one space (type/key, no comment)"
+        );
     }
 }

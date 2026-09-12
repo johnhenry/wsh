@@ -46,6 +46,8 @@ const EXPECTED_CONSTRUCTORS = [
   'sessionGrant', 'sessionRevoke',
   // File channel
   'fileOp', 'fileResult', 'fileChunk',
+  // Authorized-key management (wsh #59)
+  'authorizedKeyAdd', 'authorizedKeyResult',
   // Policy
   'policyEval', 'policyResult', 'policyUpdate',
   // Terminal
