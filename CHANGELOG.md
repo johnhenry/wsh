@@ -2,6 +2,35 @@
 
 ## 0.17.0
 
+- **`list()` now uses the structured file channel on both clients, and
+  `wsh sftp`/`wsh ls` exist (#59, #58).** `WshFileTransfer.list()` ran
+  `ls -la` over an exec channel and parsed text output; the Rust client had
+  no `list()` at all. `FileResult.metadata` (previously untyped `json`)
+  gained a typed `entries: FileEntry[]` field (name/size/modified/type,
+  including symlink targets), generated into both languages, and both
+  `list()` implementations now send `FileOp{op:"list"}` and read it. New
+  Rust CLI commands: `wsh ls [user@]host:path` (one-shot) and
+  `wsh sftp [user@]host` (interactive: ls/cd/pwd/get/put/lls/lcd/rm, plus
+  `-b batchfile`), sharing `scp`'s `[user@]host:path` parser. A refusal
+  (unimplemented op, no such path) now surfaces as a named error on both
+  clients and in the CLI, never as an empty listing.
+
+- **`wsh copy-id` is now a protocol message, not a shell command (#59).**
+  `AuthorizedKeyAdd`/`AuthorizedKeyResult` replace the CLI's previous
+  approach of building and running a remote shell script to append to
+  `~/.wsh/authorized_keys` (a quoting hazard, and unreachable from any
+  implementation without a shell channel). `WshClient.addAuthorizedKey()`
+  is now available in both the JS SDK and the Rust client; idempotent.
+
+- **`WshKnownHosts` (JS) and `ServerHello.host_fingerprint` (spec) (#59).**
+  The browser SDK gets a TOFU host-identity store with the same
+  verify/add/remove/list semantics as Rust's `KnownHosts`. The spec gains a
+  formal host-identity field, distinct from `ServerHello.fingerprints`
+  (which lists this server's *authorized client keys*, not its own
+  identity -- a pre-existing latent mismatch this change documents but does
+  not silently paper over). No `wsh-server` release populates
+  `host_fingerprint` yet; see the README's Security section.
+
 - **Breaking: `WshSession.onClose` now receives a reason (#36, #37).** The two
   paths that close a session did not agree; one settled a parked file chunk
   and one did not. `closeReason` is a new getter (`Error | null`), `onClose`

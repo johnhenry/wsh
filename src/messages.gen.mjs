@@ -145,6 +145,10 @@ export const MSG = Object.freeze({
 
   // Terminal
   TERMINAL_CONFIG:   0x9e,
+
+  // Keys
+  AUTHORIZED_KEY_ADD: 0x9f,
+  AUTHORIZED_KEY_RESULT: 0xa0,
 });
 
 // Reverse lookup: number → name
@@ -187,13 +191,10 @@ export function hello({ username, features = [], authMethod = AUTH_METHOD.PUBKEY
   };
 }
 
-export function serverHello({ sessionId, features = [], fingerprints = [] } = {}) {
-  return {
-    type: MSG.SERVER_HELLO,
-    session_id: sessionId,
-    features,
-    fingerprints,
-  };
+export function serverHello({ sessionId, features = [], fingerprints = [], hostFingerprint } = {}) {
+  const msg = { type: MSG.SERVER_HELLO, session_id: sessionId, features, fingerprints };
+  if (hostFingerprint !== undefined) msg.host_fingerprint = hostFingerprint;
+  return msg;
 }
 
 export function challenge({ nonce, sessionId } = {}) {
@@ -864,8 +865,8 @@ export function fileOp({ channelId, op, path, offset, length } = {}) {
   return msg;
 }
 
-export function fileResult({ channelId, success, metadata = {}, errorMessage } = {}) {
-  const msg = { type: MSG.FILE_RESULT, channel_id: channelId, success, metadata };
+export function fileResult({ channelId, success, metadata = {}, entries = [], errorMessage } = {}) {
+  const msg = { type: MSG.FILE_RESULT, channel_id: channelId, success, metadata, entries };
   if (errorMessage !== undefined) msg.error_message = errorMessage;
   return msg;
 }
@@ -913,6 +914,18 @@ export function terminalConfig({ channelId, frontend, options = {} } = {}) {
     frontend,
     options,
   };
+}
+
+export function authorizedKeyAdd({ publicKey, comment } = {}) {
+  const msg = { type: MSG.AUTHORIZED_KEY_ADD, public_key: publicKey };
+  if (comment !== undefined) msg.comment = comment;
+  return msg;
+}
+
+export function authorizedKeyResult({ success, added = false, errorMessage } = {}) {
+  const msg = { type: MSG.AUTHORIZED_KEY_RESULT, success, added };
+  if (errorMessage !== undefined) msg.error_message = errorMessage;
+  return msg;
 }
 
 // ── Relay forwarding ─────────────────────────────────────────────────

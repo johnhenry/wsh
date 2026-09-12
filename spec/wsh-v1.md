@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 95
+- **Total message types**: 97
 
 ## Enums
 
@@ -54,6 +54,19 @@ Type: `string`
 |-------|
 | `stream` |
 | `virtual` |
+
+### FileEntryType
+
+Type: `string`
+
+| Value |
+|-------|
+| `file` |
+| `directory` |
+| `symlink` |
+| `device` |
+| `pipe` |
+| `socket` |
 
 ## Message Types
 
@@ -154,6 +167,8 @@ Type: `string`
 | `0x9c` | PolicyResult | policy |
 | `0x9d` | PolicyUpdate | policy |
 | `0x9e` | TerminalConfig | terminal |
+| `0x9f` | AuthorizedKeyAdd | keys |
+| `0xa0` | AuthorizedKeyResult | keys |
 
 ## Message Details
 
@@ -181,6 +196,7 @@ Category: **handshake**
 | `session_id` | `string` | yes | — |
 | `features` | `string[]` | no | `[]` |
 | `fingerprints` | `string[]` | no | `[]` |
+| `host_fingerprint` | `string` | no | — |
 
 ### Challenge (`0x03`)
 
@@ -1197,6 +1213,7 @@ Category: **filechannel**
 | `channel_id` | `u32` | yes | — |
 | `success` | `bool` | yes | — |
 | `metadata` | `json` | no | `{}` |
+| `entries` | `FileEntry[]` | no | `[]` |
 | `error_message` | `string` | no | — |
 
 ### FileChunk (`0x9a`)
@@ -1262,7 +1279,40 @@ Category: **terminal**
 | `frontend` | `string` | yes | — |
 | `options` | `json` | no | `{}` |
 
+### AuthorizedKeyAdd (`0x9f`)
+
+Category: **keys**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `public_key` | `bytes` | yes | — |
+| `comment` | `string` | no | — |
+
+### AuthorizedKeyResult (`0xa0`)
+
+Category: **keys**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `success` | `bool` | yes | — |
+| `added` | `bool` | no | `false` |
+| `error_message` | `string` | no | — |
+
 ## Nested Types
+
+### FileEntry
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `name` | `string` | yes | — |
+| `size` | `u64` | yes | — |
+| `modified` | `u64` | yes | — |
+| `type` | `FileEntryType` | yes | — |
+| `symlink_target` | `string` | no | — |
 
 ### AttachmentInfo
 

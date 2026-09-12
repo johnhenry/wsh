@@ -88,8 +88,9 @@ describe('the spec reader actually read the spec', () => {
   // Without these, a parser bug would make every assertion below pass by
   // finding nothing to check.
   it('finds the full set of message types the README advertises', () => {
-    assert.equal(Object.keys(spec.byName).length, 95);
-    assert.equal(spec.byCode.size, 95);
+    // wsh #59 added two: AuthorizedKeyAdd, AuthorizedKeyResult.
+    assert.equal(Object.keys(spec.byName).length, 97);
+    assert.equal(spec.byCode.size, 97);
   });
 
   it('agrees with messages.gen.mjs about opcodes', () => {

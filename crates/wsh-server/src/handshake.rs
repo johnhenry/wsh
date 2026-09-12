@@ -96,6 +96,13 @@ pub fn handle_hello(
                 .map(|f| f.to_vec())
                 .unwrap_or_else(|| vec!["mcp".to_string(), "file-transfer".to_string()]),
             fingerprints: server_fingerprints.to_vec(),
+            // wsh #59: this server does not yet mint/persist a host
+            // identity keypair -- that's a separate, security-sensitive
+            // feature. Left absent rather than falling back to
+            // `fingerprints.first()`, which is an authorized *client* key,
+            // not this server's own identity (see ServerHello.fingerprints'
+            // doc comment in spec/wsh-v1.yaml for the full accounting).
+            host_fingerprint: None,
         }),
     };
 

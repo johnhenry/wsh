@@ -1,10 +1,9 @@
-//! Dedicated-stream file transfer for wsh.
-//!
-//! Uploads and downloads files over a dedicated data stream,
-//! using 64KB chunks with progress reporting.
+//! File transfer for wsh: upload/download over a dedicated data stream
+//! (64KB `FileChunk` chunks with progress reporting), plus `list()` over
+//! the structured file channel (`FileOp`/`FileResult`, wsh #59).
 
 use wsh_core::error::{WshError, WshResult};
-use wsh_core::messages::ChannelKind;
+use wsh_core::messages::{ChannelKind, Envelope, FileEntry, FileOpPayload, MsgType, Payload};
 
 use crate::client::WshClient;
 use crate::session::SessionOpts;
@@ -128,6 +127,94 @@ pub async fn download(client: &WshClient, remote_path: &str) -> WshResult<Vec<u8
     Ok(data)
 }
 
+/// List a remote directory via the structured file channel (`FileOp`/
+/// `FileResult` with `op: "list"`) -- wsh #59.
+///
+/// Before this, the Rust client had no `list()` at all (only `upload`/
+/// `download`, above); the JS SDK's `WshFileTransfer.list()` didn't use
+/// this wire path either -- it ran `ls -la` over a plain exec channel and
+/// parsed the text output client-side (see `src/file-transfer.mjs`). Both
+/// sides now go through the same generated `FileEntry` shape, so a symlink
+/// can't be reported as a plain file in one implementation and not the
+/// other.
+///
+/// A refusal (op not implemented by the server, no such directory,
+/// permission denied) is returned as `Err`, never coerced into `Ok(vec![])`
+/// -- an empty `Ok` only happens for an actually-listable, actually-empty
+/// directory (wsh #58's "an unauthorized fs capability must be reported as
+/// a named refusal, never rendered as an empty directory").
+pub async fn list(client: &WshClient, remote_path: &str) -> WshResult<Vec<FileEntry>> {
+    let result = file_op(client, "list", remote_path).await?;
+    Ok(result.entries)
+}
+
+/// Remove a remote file or (empty) directory via the structured file
+/// channel (`FileOp`/`FileResult` with `op: "remove"`) -- used by `wsh
+/// sftp`'s `rm` (wsh #58: "where the capability allows it" -- today's
+/// `wsh-server` still refuses every op other than "list", so this reaches
+/// a clean, named refusal rather than a hang or a silent no-op; a server
+/// that later implements "remove" needs no client-side change).
+pub async fn remove(client: &WshClient, remote_path: &str) -> WshResult<()> {
+    file_op(client, "remove", remote_path).await?;
+    Ok(())
+}
+
+/// Send a `FileOp` and wait for its `FileResult`, turning `success: false`
+/// into `Err` uniformly for every op that goes through this path -- so a
+/// refusal always surfaces as an error to the caller, never as a
+/// default/empty value that could be mistaken for a real (if boring)
+/// result (wsh #58).
+async fn file_op(
+    client: &WshClient,
+    op: &str,
+    remote_path: &str,
+) -> WshResult<wsh_core::messages::FileResultPayload> {
+    let envelope = Envelope {
+        msg_type: MsgType::FileOp,
+        payload: Payload::FileOp(FileOpPayload {
+            channel_id: next_file_op_channel_id(),
+            op: op.to_string(),
+            path: remote_path.to_string(),
+            offset: None,
+            length: None,
+        }),
+    };
+
+    let response = client
+        .send_and_wait_public(envelope, MsgType::FileResult)
+        .await?;
+
+    let result = match response.payload {
+        Payload::FileResult(r) => r,
+        _ => {
+            return Err(WshError::InvalidMessage(format!(
+                "expected FILE_RESULT in response to {op} FileOp"
+            )))
+        }
+    };
+
+    if !result.success {
+        return Err(WshError::Channel(
+            result
+                .error_message
+                .unwrap_or_else(|| format!("{op} {remote_path:?} refused")),
+        ));
+    }
+
+    Ok(result)
+}
+
+/// FileOp has no Open/OpenOk step (unlike upload/download's dedicated file
+/// channel) -- the server doesn't track or validate this value, only
+/// echoes it back in FileResult, so a process-local monotonic counter is
+/// sufficient to keep concurrent FileOp calls visually distinguishable in
+/// logs. Mirrors `WshClient._nextChannelId()` in `src/client.mjs`.
+fn next_file_op_channel_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 // ── Header builders ──────────────────────────────────────────────────
 
 /// Build the upload header: `[4-byte path_len][path_bytes][8-byte total_size]`
@@ -179,5 +266,13 @@ mod tests {
     #[test]
     fn chunk_size_is_64kb() {
         assert_eq!(CHUNK_SIZE, 65536);
+    }
+
+    #[test]
+    fn file_op_channel_ids_are_monotonic_and_nonzero() {
+        let a = next_file_op_channel_id();
+        let b = next_file_op_channel_id();
+        assert_ne!(a, 0);
+        assert!(b > a);
     }
 }

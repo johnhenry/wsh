@@ -137,13 +137,14 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   WshClient,
+  WshFileTransfer,
   generateKeyPair,
   exportPublicKeySSH,
   exportPublicKeyRaw,
@@ -910,6 +911,160 @@ describe('Rust wsh-server file transfer', () => {
     await assert.rejects(
       () => client.upload(new Uint8Array([1, 2, 3]), '/no/such/directory/file.bin'),
       /Failed to open session/,
+    );
+  });
+});
+
+// ── Structured file channel: list() (wsh #59) ─────────────────────────
+//
+// The cross-implementation guard this repo already uses everywhere else
+// in this file (real Rust binary + real JS client) applied to the one
+// piece of the file-transfer protocol that had never been implemented on
+// *either* side over the wire before this change: `list()` went from a
+// stub that unconditionally refused on the server, and an `ls -la`-over-
+// exec hack that never touched FileOp/FileResult at all on the JS client
+// (see src/file-transfer.mjs's old implementation), to a real op on both.
+// This is the test that proves the Rust server's `FileEntry` values
+// (crates/wsh-core/src/messages.gen.rs, generated from the same
+// spec/wsh-v1.yaml FileEntry nested type as src/messages.gen.mjs) decode
+// on the JS side into exactly the shape WshFileTransfer.list() promises --
+// name/size/modified/type, plus symlink_target for a real symlink.
+
+describe('Rust wsh-server list() (wsh #59)', () => {
+  it('lists a real directory, distinguishing files, subdirectories, and a real symlink', async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    const server = await startServer([publicKeySSH]);
+    servers.push(server);
+
+    const dir = path.join(server.homeDir, 'listme');
+    mkdirSync(dir);
+    writeFileSync(path.join(dir, 'notes.txt'), 'hello');
+    mkdirSync(path.join(dir, 'subdir'));
+    symlinkSync(path.join(dir, 'notes.txt'), path.join(dir, 'link-to-notes'));
+
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+
+    const entries = await new WshFileTransfer(client).list(dir);
+    const byName = Object.fromEntries(entries.map((e) => [e.name, e]));
+
+    assert.equal(byName['notes.txt'].type, 'file');
+    assert.equal(byName['notes.txt'].size, 5);
+    assert.ok(byName['notes.txt'].modified instanceof Date);
+
+    assert.equal(byName['subdir'].type, 'directory');
+
+    // The symlink assertion is the one that would have silently passed as
+    // "file" before wsh #59's typed FileEntry -- a browse surface that
+    // flattens that distinction is lying about the remote filesystem
+    // (wsh #58).
+    assert.equal(byName['link-to-notes'].type, 'symlink');
+    assert.equal(byName['link-to-notes'].symlinkTarget, path.join(dir, 'notes.txt'));
+  });
+
+  it('lists an empty directory as an empty array, not an error', async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    const server = await startServer([publicKeySSH]);
+    servers.push(server);
+
+    const dir = path.join(server.homeDir, 'empty-dir');
+    mkdirSync(dir);
+
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+
+    const entries = await new WshFileTransfer(client).list(dir);
+    assert.deepEqual(entries, []);
+  });
+
+  it('a nonexistent directory is refused by name, not returned as an empty listing', async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    const server = await startServer([publicKeySSH]);
+    servers.push(server);
+
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+
+    await assert.rejects(
+      () => new WshFileTransfer(client).list(path.join(server.homeDir, 'does-not-exist')),
+      /cannot list/,
+    );
+  });
+
+  // Regression test: FileOp ("list"/"remove") travels as a bare message with
+  // no Open/OpenOk step, unlike upload/download which go through
+  // Open{kind:File, ...} and were already scope-checked against
+  // SessionScope::FileTransfer. A verification pass on this PR found that
+  // gap was real and exploitable: an authorized key restricted to
+  // `restrict,permit-exec` (exec only, no file-transfer scope) could still
+  // successfully `list()` real directory entries. Fixed server-side in
+  // crates/wsh-server/src/server.rs's FileOp dispatch arm by mirroring the
+  // exact `permissions.has_scope(SessionScope::FileTransfer)` check
+  // Open<ChannelKind::File> already performs.
+  it('refuses list() by name (naming the "fs" capability) for a key with no file-transfer scope', async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    // restrict,permit-exec: exec-only key, no permit-file-transfer -> no
+    // SessionScope::FileTransfer (see crates/wsh-server/src/auth/permissions.rs).
+    const server = await startServer([`restrict,permit-exec ${publicKeySSH}`]);
+    servers.push(server);
+
+    const dir = path.join(server.homeDir, 'listme-restricted');
+    mkdirSync(dir);
+    writeFileSync(path.join(dir, 'secret.txt'), 'should not be listable');
+
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+
+    // Must be refused outright -- never an empty array (which would be
+    // indistinguishable from "this directory has nothing in it") and never
+    // a silently successful listing of real entries.
+    await assert.rejects(
+      () => new WshFileTransfer(client).list(dir),
+      /fs/,
+      'refusal must name the missing "fs" capability',
+    );
+  });
+});
+
+// ── Authorized-key management (wsh #59) ───────────────────────────────
+//
+// Cross-implementation guard for the AuthorizedKeyAdd/AuthorizedKeyResult
+// protocol message that replaced `wsh copy-id`'s CLI-only shell-command
+// approach: proves the real Rust server accepts the message from the JS
+// client, actually writes ~/.wsh/authorized_keys, and is idempotent.
+
+describe('Rust wsh-server addAuthorizedKey() (wsh #59)', () => {
+  it('installs a new key into ~/.wsh/authorized_keys, and a repeat install reports added:false', async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    const server = await startServer([publicKeySSH]);
+    servers.push(server);
+
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+
+    const newKeyPair = await makeKeyPair();
+    const newPublicKeyRaw = await exportPublicKeyRaw(newKeyPair.kp.publicKey);
+
+    const first = await client.addAuthorizedKey(newPublicKeyRaw, 'alice@laptop');
+    assert.equal(first.added, true);
+
+    const authorizedKeysPath = path.join(server.homeDir, '.wsh', 'authorized_keys');
+    const content = readFileSync(authorizedKeysPath, 'utf8');
+    assert.match(content, /ssh-ed25519 .+ alice@laptop/);
+
+    const second = await client.addAuthorizedKey(newPublicKeyRaw, 'alice@laptop');
+    assert.equal(second.added, false, 'installing an already-present key should not duplicate the line');
+
+    const contentAfter = readFileSync(authorizedKeysPath, 'utf8');
+    assert.equal(
+      contentAfter.split('\n').filter((l) => l.includes('alice@laptop')).length,
+      1,
+      'the key must appear exactly once after a repeat install',
     );
   });
 });

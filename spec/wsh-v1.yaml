@@ -29,6 +29,21 @@ enums:
     value_descriptions:
       stream: "Session uses transport-opened byte streams"
       virtual: "Session uses message-framed SessionData payloads"
+  FileEntryType:
+    # wsh #59: previously each implementation invented this set privately
+    # (the JS SDK's WshFileListEntry.type union) while FileResult.metadata
+    # stayed an untyped `json` bag. Generated into both languages now so a
+    # directory listing can't describe a symlink as a plain file in one
+    # implementation and not the other.
+    type: string
+    values: [file, directory, symlink, device, pipe, socket]
+    value_descriptions:
+      file: "Regular file"
+      directory: "Directory"
+      symlink: "Symbolic link -- see FileEntry.symlink_target for its target"
+      device: "Block or character device node"
+      pipe: "Named pipe (FIFO)"
+      socket: "Unix domain socket"
 
 messages:
   handshake:
@@ -67,6 +82,30 @@ messages:
         fingerprints:
           type: "string[]"
           default: "[]"
+          description: >
+            Fingerprints of the keys THIS SERVER currently authorizes for
+            login (its ~/.wsh/authorized_keys, not this server's own
+            identity). wsh #59 audit: the Rust client's KnownHosts TOFU
+            check (crates/wsh-client/src/client.rs verify_host_key) reads
+            fingerprints[0] as if it were a stable per-server host identity
+            -- it is not; it is whichever authorized client key happens to
+            load first, which can differ per user, per config edit, or be
+            empty. That is a pre-existing latent gap, not introduced here.
+            Use host_fingerprint (below) for actual host identity.
+        host_fingerprint:
+          type: string
+          required: false
+          description: >
+            wsh #59: the formal host-identity record. SHA-256 fingerprint
+            (hex, per crypto.fingerprint) of the server's own persistent
+            Ed25519 host identity key -- what TOFU should actually pin,
+            distinct from `fingerprints` above. Optional because minting
+            and persisting a server host keypair is a separate, security-
+            sensitive feature this spec change does not implement; no
+            wsh-server release populates it yet. A TOFU-capable client MUST
+            treat an absent/empty host_fingerprint as "this server does not
+            support host verification" and must NOT fall back to
+            fingerprints[0] to fabricate one.
 
     Challenge:
       code: 0x03
@@ -1646,7 +1685,21 @@ messages:
         metadata:
           type: json
           default: "{}"
-          description: "File metadata (size, mode, mtime, etc.)"
+          description: >
+            Untyped result payload for ops whose shape genuinely varies by
+            op (stat's single-entry metadata is not currently typed either
+            -- see wsh #59's type:json audit in the PR description for why
+            that one is still open rather than fixed here). For "list",
+            use `entries` instead of this field.
+        entries:
+          type: "FileEntry[]"
+          default: "[]"
+          description: >
+            wsh #59: directory entries for a "list" op, generated into both
+            languages so a symlink can't be reported as a plain file in one
+            implementation and not the other. Previously this arrived only
+            in `metadata` (untyped json), and only in the JS SDK's private
+            `ls -la`-over-exec parsing -- never over this message at all.
         error_message:
           type: string
           required: false
@@ -1684,6 +1737,51 @@ messages:
           type: u64
           required: true
           description: "Total transfer size in bytes, constant across every chunk in the sequence"
+
+  # ── Authorized-key management ─────────────────────────────────────────
+  # wsh #59: `wsh copy-id` previously installed a key by building and
+  # running a remote shell command (crates/wsh-cli/src/commands/copy_id.rs)
+  # -- CLI-only, and a quoting question nobody wanted two answers to. A
+  # connection that has already completed AUTH_OK can already do anything
+  # an equivalent `exec`/FileOp write could do to this same file (this
+  # server grants a fully-authenticated connection unsandboxed filesystem
+  # and shell access -- see FileOp/Open<ChannelKind::Exec> -- so this
+  # message adds no new privilege boundary); it only removes the
+  # shell-quoting hazard and makes key installation reachable from
+  # implementations with no shell channel to build a command string for,
+  # starting with the browser SDK.
+  keys:
+    AuthorizedKeyAdd:
+      code: 0x9f
+      description: >
+        Install a public key into the authenticated user's
+        ~/.wsh/authorized_keys, idempotently (a key already present is
+        left as-is, reported via AuthorizedKeyResult.added = false).
+      fields:
+        public_key:
+          type: bytes
+          required: true
+          description: "Raw 32-byte Ed25519 public key (same encoding as Auth.public_key / PeerInfo.public_key)"
+        comment:
+          type: string
+          required: false
+          description: 'Trailing comment for the authorized_keys line, e.g. "user@host"'
+
+    AuthorizedKeyResult:
+      code: 0xa0
+      description: >
+        Result of an AuthorizedKeyAdd request.
+      fields:
+        success:
+          type: bool
+          required: true
+        added:
+          type: bool
+          default: false
+          description: "True if the key was newly appended; false if it was already present"
+        error_message:
+          type: string
+          required: false
 
   # ── Policy engine ────────────────────────────────────────────────────
   # OPA-like enterprise policy enforcement.  Actions are evaluated
@@ -1768,6 +1866,32 @@ messages:
           description: "Frontend-specific options (font, theme, keybindings)"
 
 nested_types:
+  FileEntry:
+    # wsh #59: the shape of a directory entry, formalized from the JS SDK's
+    # previously-private WshFileListEntry (name, size, modified, type) so
+    # it is generated into both languages instead of invented once. Used
+    # by FileResult.entries for a "list" op.
+    fields:
+      name:
+        type: string
+        required: true
+        description: "Entry name (not a full path) within the listed directory"
+      size:
+        type: u64
+        required: true
+        description: "Size in bytes (0 for directories and most non-regular-file types)"
+      modified:
+        type: u64
+        required: true
+        description: "Last-modified time, Unix epoch seconds (UTC)"
+      type:
+        type: FileEntryType
+        required: true
+      symlink_target:
+        type: string
+        required: false
+        description: "Present only when type == symlink: the link's target path, unresolved"
+
   AttachmentInfo:
     fields:
       session_id:

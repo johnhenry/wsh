@@ -1,15 +1,43 @@
 //! `wsh copy-id [user@]host` — copy local public key to a remote host.
 //!
-//! Reads the local public key from the keystore, connects to the remote host
-//! using password authentication, and installs the key into
-//! `~/.wsh/authorized_keys` via a remote shell command.
+//! Reads the local public key from the keystore, connects to the remote
+//! host using password authentication, and installs it via the
+//! `AuthorizedKeyAdd` protocol message (wsh #59).
+//!
+//! ## wsh #59 decision: a real protocol message, not a shell command
+//!
+//! This previously built a shell script (`mkdir -p ~/.wsh && ... >>
+//! authorized_keys`) and ran it over an `exec` channel, single-quoting the
+//! key with a hand-rolled `shell_single_quote` -- a correct-looking but
+//! narrow escaping scheme (it assumed the string would only ever land
+//! inside single quotes, on a POSIX `sh`) that every new call site had to
+//! get right again. It was also CLI-only: nothing without a shell channel
+//! -- notably the browser SDK, which this project is named for -- had any
+//! way to install a key at all.
+//!
+//! Decision: make key installation a real protocol message
+//! (`AuthorizedKeyAdd`/`AuthorizedKeyResult`, `spec/wsh-v1.yaml`). The
+//! security check for whether this is safe is the same one every other
+//! post-handshake message in this codebase already relies on: everything
+//! dispatched by `wsh-server`'s `dispatch_message` runs only after
+//! `AUTH_OK`, and an authenticated connection already has unrestricted
+//! `exec`/`FileOp` access to this exact file (see
+//! `crates/wsh-server/src/server.rs`'s `Open<ChannelKind::Exec>` and
+//! `FileOp` handlers -- neither is sandboxed to a per-user home directory
+//! or a capability list). `AuthorizedKeyAdd` therefore grants nothing an
+//! authenticated caller couldn't already do via `exec`; it only removes
+//! the shell-quoting hazard and makes the operation reachable from
+//! implementations with no shell channel to build a command string for.
+//! The alternative -- leaving this CLI-only with a documented reason -- was
+//! considered and rejected: no part of the auth model treats "can run
+//! exec" as a lesser privilege than "can append one line to
+//! authorized_keys", so there was no real boundary being preserved by
+//! keeping it CLI-only.
 
 use anyhow::{Context, Result};
 use dialoguer::Password;
-use std::io::Write as _;
 use tracing::{debug, info};
 use wsh_client::{ConnectConfig, WshClient};
-use wsh_core::messages::ChannelKind;
 
 use crate::commands::common::resolve_target;
 
@@ -23,14 +51,11 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to initialize keystore")?;
 
-    let pub_key_ssh = keystore
-        .export_public(identity)
+    let (_signing_key, verifying_key) = keystore
+        .load(identity)
         .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("failed to export public key '{identity}'"))?;
-
-    if pub_key_ssh.is_empty() {
-        anyhow::bail!("public key for '{identity}' is empty");
-    }
+        .with_context(|| format!("failed to load key '{identity}'"))?;
+    let public_key_raw = verifying_key.to_bytes();
 
     let password = load_password(&resolved.user, &resolved.host)?;
     debug!(url = %resolved.url, "transport URL");
@@ -48,60 +73,27 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
     .map_err(|e| anyhow::anyhow!("{e}"))
     .with_context(|| format!("failed to connect to {}", resolved.url))?;
 
-    let result = async {
-        let install_command = build_install_command(&pub_key_ssh);
-        let session = client
-            .open_session(wsh_client::SessionOpts {
-                kind: ChannelKind::Exec,
-                command: Some(install_command),
-                cols: None,
-                rows: None,
-                env: None,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .context("failed to open remote shell for key installation")?;
-
-        let mut stdout = std::io::stdout().lock();
-        let mut output = Vec::new();
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = session
-                .read(&mut buf)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context("failed reading remote output")?;
-            if n == 0 {
-                break;
-            }
-            output.extend_from_slice(&buf[..n]);
-            stdout
-                .write_all(&buf[..n])
-                .context("failed writing remote output")?;
-            stdout.flush().context("failed flushing stdout")?;
-        }
-
-        let exit_code = session.exit_code().await.unwrap_or(1);
-        let _ = session.close().await;
-        if exit_code != 0 {
-            let remote_output = String::from_utf8_lossy(&output);
-            anyhow::bail!(
-                "remote key installation failed with exit code {exit_code}: {}",
-                remote_output.trim()
-            );
-        }
-
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
+    let comment = format!("{}@{}", resolved.user, resolved.host);
+    let result = client
+        .add_authorized_key(&public_key_raw, Some(&comment))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("key installation failed");
 
     let _ = client.disconnect().await;
-    result?;
+    let added = result?;
 
-    println!(
-        "Installed public key '{identity}' on {}@{}",
-        resolved.user, resolved.host
-    );
+    if added {
+        println!(
+            "Installed public key '{identity}' on {}@{}",
+            resolved.user, resolved.host
+        );
+    } else {
+        println!(
+            "Public key '{identity}' is already installed on {}@{}",
+            resolved.user, resolved.host
+        );
+    }
 
     Ok(())
 }
@@ -118,55 +110,4 @@ fn load_password(user: &str, host: &str) -> Result<String> {
         .allow_empty_password(false)
         .interact()
         .context("failed to read password")
-}
-
-fn build_install_script(public_key_ssh: &str) -> String {
-    let quoted_key = shell_single_quote(public_key_ssh);
-    format!(
-        "set -eu\n\
-mkdir -p \"$HOME/.wsh\"\n\
-chmod 700 \"$HOME/.wsh\"\n\
-touch \"$HOME/.wsh/authorized_keys\"\n\
-chmod 600 \"$HOME/.wsh/authorized_keys\"\n\
-if ! grep -qxF -- {quoted_key} \"$HOME/.wsh/authorized_keys\" 2>/dev/null; then\n\
-  printf '%s\\n' {quoted_key} >> \"$HOME/.wsh/authorized_keys\"\n\
-fi\n\
-exit $?\n"
-    )
-}
-
-fn build_install_command(public_key_ssh: &str) -> String {
-    format!(
-        "sh -lc {}",
-        shell_single_quote(&build_install_script(public_key_ssh))
-    )
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{build_install_command, build_install_script, shell_single_quote};
-
-    #[test]
-    fn shell_single_quote_escapes_embedded_quotes() {
-        assert_eq!(shell_single_quote("ab'cd"), "'ab'\"'\"'cd'");
-    }
-
-    #[test]
-    fn install_script_is_idempotent_and_targets_wsh_authorized_keys() {
-        let script = build_install_script("ssh-ed25519 AAA test@example");
-        assert!(script.contains("grep -qxF -- 'ssh-ed25519 AAA test@example'"));
-        assert!(script.contains("\"$HOME/.wsh/authorized_keys\""));
-        assert!(script.contains("printf '%s\\n'"));
-    }
-
-    #[test]
-    fn install_command_wraps_script_in_sh_lc() {
-        let command = build_install_command("ssh-ed25519 AAA test@example");
-        assert!(command.starts_with("sh -lc 'set -eu"));
-        assert!(command.contains("\"$HOME/.wsh/authorized_keys\""));
-    }
 }

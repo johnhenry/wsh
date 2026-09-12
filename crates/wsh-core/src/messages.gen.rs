@@ -125,6 +125,9 @@ pub enum MsgType {
     PolicyUpdate = 0x9d,
 
     TerminalConfig = 0x9e,
+
+    AuthorizedKeyAdd = 0x9f,
+    AuthorizedKeyResult = 0xa0,
 }
 
 impl From<MsgType> for u8 {
@@ -232,6 +235,8 @@ impl TryFrom<u8> for MsgType {
             0x9c => Ok(Self::PolicyResult),
             0x9d => Ok(Self::PolicyUpdate),
             0x9e => Ok(Self::TerminalConfig),
+            0x9f => Ok(Self::AuthorizedKeyAdd),
+            0xa0 => Ok(Self::AuthorizedKeyResult),
             _ => Err(format!("unknown message type: 0x{v:02x}")),
         }
     }
@@ -275,6 +280,19 @@ pub enum SessionDataMode {
     #[default]
     Stream,
     Virtual,
+}
+
+/// FileEntryType enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FileEntryType {
+    #[default]
+    File,
+    Directory,
+    Symlink,
+    Device,
+    Pipe,
+    Socket,
 }
 
 /// Protocol version string.
@@ -390,6 +408,8 @@ pub enum Payload {
     PolicyResult(PolicyResultPayload),
     PolicyUpdate(PolicyUpdatePayload),
     TerminalConfig(TerminalConfigPayload),
+    AuthorizedKeyAdd(AuthorizedKeyAddPayload),
+    AuthorizedKeyResult(AuthorizedKeyResultPayload),
     Empty(EmptyPayload),
 }
 
@@ -494,6 +514,8 @@ impl Payload {
             MsgType::PolicyResult => Ok(Self::PolicyResult(ciborium::from_reader(cursor)?)),
             MsgType::PolicyUpdate => Ok(Self::PolicyUpdate(ciborium::from_reader(cursor)?)),
             MsgType::TerminalConfig => Ok(Self::TerminalConfig(ciborium::from_reader(cursor)?)),
+            MsgType::AuthorizedKeyAdd => Ok(Self::AuthorizedKeyAdd(ciborium::from_reader(cursor)?)),
+            MsgType::AuthorizedKeyResult => Ok(Self::AuthorizedKeyResult(ciborium::from_reader(cursor)?)),
         }
     }
 }
@@ -529,6 +551,8 @@ pub struct ServerHelloPayload {
     pub features: Vec<String>,
     #[serde(default)]
     pub fingerprints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1319,6 +1343,8 @@ pub struct FileResultPayload {
     pub success: bool,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub entries: Vec<FileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 }
@@ -1368,6 +1394,36 @@ pub struct TerminalConfigPayload {
     pub frontend: String,
     #[serde(default)]
     pub options: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizedKeyAddPayload {
+    #[serde(with = "serde_bytes")]
+    pub public_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizedKeyResultPayload {
+    pub success: bool,
+    #[serde(default)]
+    pub added: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub size: u64,
+    pub modified: u64,
+    #[serde(rename = "type")]
+    pub r#type: FileEntryType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -102,6 +102,22 @@ enum Command {
         dst: String,
     },
 
+    /// One-shot remote directory listing (use [user@]host:path syntax)
+    Ls {
+        /// Target in [user@]host:path format
+        target: String,
+    },
+
+    /// Interactive file-browsing session (ls/cd/pwd/get/put/lls/lcd/rm)
+    Sftp {
+        /// Target in [user@]host format
+        target: String,
+
+        /// Run commands from a batch file instead of an interactive prompt
+        #[arg(short = 'b', long = "batch")]
+        batch: Option<String>,
+    },
+
     /// Register as a reverse-connectable peer
     Reverse {
         /// Relay host
@@ -284,6 +300,19 @@ async fn main() {
         }
         Some(Command::Scp { src, dst }) => {
             commands::scp::run(&src, &dst, port, &identity, transport.as_deref()).await
+        }
+        Some(Command::Ls { target }) => {
+            commands::ls::run(&target, port, &identity, transport.as_deref()).await
+        }
+        Some(Command::Sftp { target, batch }) => {
+            commands::sftp::run(
+                &target,
+                port,
+                &identity,
+                transport.as_deref(),
+                batch.as_deref(),
+            )
+            .await
         }
         Some(Command::Reverse {
             relay_host,
