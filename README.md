@@ -3,12 +3,36 @@
 Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.me/wsh/)
 
 > Previously published as `wsh-upon-star` (last release: 0.1.1, now deprecated).
-> Renamed to `@johnhenry/wsh` and restarted at 0.0.0 on import into the
-> @johnhenry family — a new name and era, not a maturity signal.
+> Renamed to `@johnhenry/wsh` on import into the @johnhenry family. Unlike
+> other packages in this family, wsh did **not** restart its version at
+> `0.0.0` on adoption — it was already a mature, actively-depended-upon
+> release, so versioning continued forward and now stands at `0.17.0`. This
+> is a deliberate, permanent exception to the family's usual 0.0.0-restart
+> convention, not an oversight.
+
+[![npm version](https://img.shields.io/npm/v/%40johnhenry%2Fwsh.svg)](https://www.npmjs.com/package/@johnhenry/wsh)
+[![CI](https://github.com/johnhenry/wsh/actions/workflows/ci.yml/badge.svg)](https://github.com/johnhenry/wsh/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/%40johnhenry%2Fwsh.svg)](LICENSE)
 
 Browser-native remote command execution over WebTransport/WebSocket with Ed25519 authentication.
 
 wsh is a pure-JS client library that connects browsers to remote shells. It implements its own binary protocol — CBOR messages over QMux-multiplexed WebSocket or native WebTransport streams — with Ed25519 challenge-response auth, session management, and MCP tool bridging.
+
+## Contents
+
+- [Install](#install)
+- [Features](#features)
+- [Wire Protocol: QMux](#wire-protocol-qmux)
+- [Quick Start](#quick-start)
+- [One-Shot Command Execution](#one-shot-command-execution)
+- [Attach and Resume](#attach-and-resume)
+- [Pinning a Self-Signed Certificate](#pinning-a-self-signed-certificate)
+- [API Overview](#api-overview)
+- [Protocol Specification](#protocol-specification)
+- [Rust implementation](#rust-implementation)
+- [Security](#security)
+- [Browser Compatibility](#browser-compatibility)
+- [License](#license)
 
 ## Install
 
@@ -364,6 +388,21 @@ do not change them without coordinating downstream.
   populates `host_fingerprint`. `serverCertificateHashes` (below) is a
   different, narrower mechanism -- it pins a certificate supplied *per
   connection*, not a persisted record of what a host presented last time.
+- **Password auth has no confidentiality of its own -- it relies entirely
+  on the transport.** `AUTH_METHOD.PASSWORD` sends the password as a plain
+  string inside the `auth` control message (`client.mjs`'s `#performAuth()`
+  calls `sendControl(authMsg({ method: AUTH_METHOD.PASSWORD, password }))`)
+  -- there is no client-side hashing, salting, or key derivation before it
+  goes on the wire. Its confidentiality is entirely a function of whether
+  the underlying connection is encrypted: fine over `wss:`/WebTransport
+  against a certificate the client actually trusts (CA-signed, or pinned
+  via `serverCertificateHashes`), but sent in the clear if the connection
+  is a plain, unencrypted `ws:`. Browsers block that combination from an
+  `https:` page as mixed content (see "Pinning a Self-Signed Certificate"
+  above), but nothing in this protocol or client stops a non-browser
+  caller (Node, the Rust CLI) from dialing `ws://` directly. Prefer pubkey
+  auth, or make sure the transport is actually encrypted, before sending a
+  password.
 
 ## Browser Compatibility
 
