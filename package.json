@@ -53,7 +53,7 @@
   },
   "author": "John Henry",
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=26.0.0"
   },
   "homepage": "https://opensource.johnhenry.me/wsh/"
 }
