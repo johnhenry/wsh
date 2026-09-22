@@ -1,7 +1,5 @@
 # @johnhenry/wsh
 
-Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.me/wsh/)
-
 > Previously published as `wsh-upon-star` (last release: 0.1.1, now deprecated).
 > Renamed to `@johnhenry/wsh` on import into the @johnhenry family. Unlike
 > other packages in this family, wsh did **not** restart its version at
@@ -13,6 +11,8 @@ Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.m
 [![npm version](https://img.shields.io/npm/v/%40johnhenry%2Fwsh.svg)](https://www.npmjs.com/package/@johnhenry/wsh)
 [![CI](https://github.com/johnhenry/wsh/actions/workflows/ci.yml/badge.svg)](https://github.com/johnhenry/wsh/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/%40johnhenry%2Fwsh.svg)](LICENSE)
+
+Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.me/wsh/)
 
 Browser-native remote command execution over WebTransport/WebSocket with Ed25519 authentication.
 
@@ -30,8 +30,9 @@ wsh is a pure-JS client library that connects browsers to remote shells. It impl
 - [API Overview](#api-overview)
 - [Protocol Specification](#protocol-specification)
 - [Rust implementation](#rust-implementation)
-- [Security](#security)
+- [Security model](#security-model)
 - [Browser Compatibility](#browser-compatibility)
+- [Family](#family)
 - [License](#license)
 
 ## Install
@@ -364,25 +365,38 @@ plus one `SHA256SUMS` file covering every archive in the release. These
 names are a stable contract other repos (clawser) pin and download by --
 do not change them without coordinating downstream.
 
-## Security
+## Security model
 
-- **Auth transcript binding** -- challenge signatures cover
+wsh's protocol draws its line at authentication and message integrity: what
+it guarantees is that a handshake and its messages are who and what they
+claim to be. It does not guarantee confidentiality of every auth method, or
+that a server's identity has actually been pinned yet -- both are called
+out explicitly below rather than left to be discovered.
+
+**What wsh guarantees:**
+
+- **Auth transcript binding.** Challenge signatures cover
   `SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce || channel_binding)`,
   so a signature can't be replayed against a different session or relabeled
   to a different username.
-- **Signed peer records** -- reverse-mode registration is self-signed by the
+- **Signed peer records.** Reverse-mode registration is self-signed by the
   peer's identity key (the libp2p RFC 0002/0003 pattern), in a signing
   domain separate from the auth challenge. `listPeers()` verifies every
   entry client-side and reports a `verified` boolean, independent of
   trusting the relay.
-- **Hybrid post-quantum E2E (experimental)** --
-  `initiateE2E(sessionId, 'X25519+ML-KEM-768')` combines X25519 ECDH with
-  ML-KEM-768 via HKDF-SHA256, preferring native WebCrypto ML-KEM-768 (Node
-  24.7+) with the optional `@noble/post-quantum` pure-JS fallback, and
-  falling back to classical X25519 automatically when the peer can't do
-  hybrid (check the returned `hybrid` flag). The derived AES-256-GCM key is
-  not yet wired to actual frame encryption.
-- **Host identity (TOFU), and its current limit (wsh #59)** --
+
+**What is still yours:**
+
+- **Hybrid post-quantum E2E is experimental and not fully wired (in
+  progress).** `initiateE2E(sessionId, 'X25519+ML-KEM-768')` combines
+  X25519 ECDH with ML-KEM-768 via HKDF-SHA256, preferring native WebCrypto
+  ML-KEM-768 (Node 24.7+) with the optional `@noble/post-quantum` pure-JS
+  fallback, and falling back to classical X25519 automatically when the
+  peer can't do hybrid (check the returned `hybrid` flag). The derived
+  AES-256-GCM key is not yet wired to actual frame encryption by default --
+  treat `initiateE2E` as key agreement, not confidentiality, unless you've
+  separately confirmed the session has sealing enabled.
+- **Host identity (TOFU) has a known, named gap (wsh #59).**
   `ServerHello.host_fingerprint` is the spec's formal host-identity slot:
   the SHA-256 fingerprint of a server's persistent Ed25519 host key, meant
   to be pinned across connections the way SSH pins a host key. **No
@@ -493,6 +507,24 @@ The hybrid post-quantum path prefers native WebCrypto ML-KEM (Node 24.7+).
 browser the optional `@noble/post-quantum` dependency is what actually
 runs, loaded dynamically by `src/mlkem.mjs`. Treat it as required, not
 optional, if you want the hybrid handshake on the web today.
+
+## Family
+
+wsh isn't just a standalone remote-shell client -- its `WshClient` is the
+designed transport backing one sibling package's network gateway, and
+`WshClient`'s connected/authenticated shape is a drop-in for that sibling's
+injected-client extension point.
+
+- **[`@johnhenry/browsermesh-netway`](https://github.com/johnhenry/browsermesh)**
+  -- browsermesh-netway's `GatewayBackend` takes a `wshClient` in its
+  constructor and proxies every network operation (socket open/send/close)
+  through it via `sendControl()`, once the client reaches the
+  `'authenticated'` state (`isReady()` checks exactly that). This is a real,
+  verified dependency on wsh's client shape -- `GatewayBackend` is
+  duck-typed against a `WshClient` instance, not declared as an npm
+  dependency -- not a thematic pairing; see
+  `packages/browsermesh-netway/src/gateway-backend.mjs` in the browsermesh
+  repo. wsh itself has no dependency in the other direction.
 
 ## License
 
