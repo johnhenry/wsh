@@ -8,28 +8,25 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # engines.node >=26.0.0 -- test the floor version directly rather
-        # than a matrix of now-unsupported older majors.
-        node-version: [26]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-      # The package has no runtime dependencies, so this was omitted -- but
-      # @noble/post-quantum is an OPTIONAL one, and it is the only ML-KEM
-      # backend a browser can use. Without an install step the noble path
-      # cannot run here, which is why it had never been executed in CI. See
-      # #42.
-      - run: npm install --no-save --include=optional
-      - run: npm test
-      - name: Examples smoke test
-        run: npm run examples
+    uses: johnhenry/workflows/.github/workflows/ci.yml@v1
+    with:
+      node-versions: '["26"]'
+      os: '["ubuntu-latest"]'
+      # The package has no runtime dependencies, so a plain install was
+      # omitted -- but @noble/post-quantum is an OPTIONAL one, and it is
+      # the only ML-KEM backend a browser can use. Without an install step
+      # the noble path cannot run here, which is why it had never been
+      # executed in CI. See #42. No committed lockfile, so no npm cache.
+      install-command: npm install --no-save --include=optional
+      node-cache: ""
+      gate-commands: |
+        npm test
+        npm run examples
 
   rust:
+    # Kept as its own job, not folded into the reusable ci.yml call: it's a
+    # separate Rust toolchain/build, not npm/Node-shaped, which is all the
+    # reusable workflow covers.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
