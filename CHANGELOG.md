@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.17.0
+## 0.17.0 (2026-09-08)
 
 - **`list()` now uses the structured file channel on both clients, and
   `wsh sftp`/`wsh ls` exist (#59, #58).** `WshFileTransfer.list()` ran
@@ -173,7 +173,7 @@ only commit is the root commit -- so its entry is reconstructed from the code
 that root commit contains and from the issue it names.
 -->
 
-## 0.16.1
+## 0.16.1 (2026-08-29)
 
 - **Fix: data-stream EOF could close a stream-mode session before `EXIT`
   arrived, losing the exit code (#24).** A stream-mode session's data and
@@ -190,7 +190,7 @@ that root commit contains and from the issue it names.
   rather than idling out the full period, and the timer remains as a fallback
   for servers that never send `CLOSE` after ending the data stream.
 
-## 0.16.0
+## 0.16.0 (2026-08-29)
 
 - **Stream-mode sessions can be sealed (#22).** `WshSession.enableE2E()`
   previously hard-rejected stream-mode sessions; it now accepts them, reusing
@@ -209,7 +209,7 @@ that root commit contains and from the issue it names.
   favours throughput — with an `enableE2E(key, { coalesce })` override and
   `coalesce: false` to disable.
 
-## 0.15.0
+## 0.15.0 (2026-08-29)
 
 - **EncryptedFrame AEAD sealing, wired into virtual-mode sessions (#21).**
   Adds `src/e2e-frame.mjs` (`sealFrame`/`openFrame` over AES-256-GCM, matching
@@ -230,7 +230,7 @@ that root commit contains and from the issue it names.
 - **Docs brought current** with the 0.8.0-0.14.0 protocol modernization
   (README, type declarations, examples).
 
-## 0.14.0
+## 0.14.0 (2026-08-28)
 
 - **Fix: `attachSession()`/`resumeSession()` were both unreachable** (clawser
   #48). Two independent bugs, found together while wiring a real two-party
@@ -273,7 +273,7 @@ that root commit contains and from the issue it names.
     credential) is renamed to `#authToken` and exposed read-only via the
     new `authToken` getter, mirroring the Rust client's `WshClient::token()`.
 
-## 0.13.0
+## 0.13.0 (2026-08-27)
 
 - **Hybrid X25519+ML-KEM-768 E2E key exchange**: `initiateE2E(sessionId,
   'X25519+ML-KEM-768')` now supports a post-quantum-hybrid mode
@@ -348,7 +348,7 @@ that root commit contains and from the issue it names.
   reimplementation of the protocol server side) to either depend on
   unexported internals or reimplement the whole mux by hand.
 
-## 0.10.0
+## 0.10.0 (2026-08-27)
 
 - **New `WshClient` methods closing a JS/Rust parity gap**:
   `detach(sessionId)`, `listRemoteSessions()`, `grantSessionAccess(sessionId,
@@ -379,7 +379,7 @@ that root commit contains and from the issue it names.
   that `_doOpenStream` (which has resolved synchronously for a while)
   no longer uses; the map was always empty.
 
-## 0.9.0
+## 0.9.0 (2026-08-27)
 
 - **Unify file transfer onto FileChunk control messages (breaking).**
   Consolidates the three incompatible file-transfer schemes this
@@ -416,7 +416,7 @@ that root commit contains and from the issue it names.
   client's control-message dispatch that constructs and registers the
   session synchronously, in the same dispatch step as `OPEN_OK` itself.
 
-## 0.8.0
+## 0.8.0 (2026-08-27)
 
 - **Relay-forward sender identity + unified allowlist (breaking).**
   Relay-forwarded traffic previously carried no sender identity at all,
@@ -443,7 +443,7 @@ that root commit contains and from the issue it names.
     `ReverseAccept`; apps handling incoming `ReverseConnect` should call
     `trustRelayPeer(msg.from_fingerprint)` once they accept.
 
-## 0.7.0
+## 0.7.0 (2026-08-27)
 
 - **New exports**: `WS_FRAME_TYPE` (the WebSocket transport's mux
   frame-type byte values -- `CONTROL`/`DATA`/`OPEN_STREAM`/`CLOSE_STREAM`
@@ -454,7 +454,7 @@ that root commit contains and from the issue it names.
   ordering-safety pattern -- most concretely, a from-scratch
   implementation of this transport in another runtime.
 
-## 0.6.0
+## 0.6.0 (2026-08-27)
 
 - **Removed `WsData`, resolving the `0x60` opcode collision with
   `Detach`.** `WsData` (`messages.framing`) was dead: never constructed
@@ -469,7 +469,7 @@ that root commit contains and from the issue it names.
   **Breaking**: `MSG.WS_DATA` and the `wsData()` constructor no longer
   exist.
 
-## 0.5.0
+## 0.5.0 (2026-08-27)
 
 - **Fixed a second instance of the 0.3.0 dispatch race, and deduplicated
   the fix into two shared, exported primitives.** Auditing for the same
@@ -498,7 +498,7 @@ that root commit contains and from the issue it names.
     that reintroduces a fire-and-forget dispatch loop fails a fast, direct
     test instead of surfacing as an intermittent hang.
 
-## 0.4.0
+## 0.4.0 (2026-08-27)
 
 - **`Challenge` now carries `session_id` directly.** The auth transcript's
   session-id component used to depend on message ordering: a client had
@@ -514,7 +514,7 @@ that root commit contains and from the issue it names.
   **Breaking**: `Challenge.session_id` is now a required field; servers
   must supply it.
 
-## 0.3.0
+## 0.3.0 (2026-08-27)
 
 - **Fixed a real message-dispatch race** in both transports
   (`WebSocketTransport`, `WebTransportTransport`): when several inbound
@@ -533,7 +533,7 @@ that root commit contains and from the issue it names.
   SERVER_HELLO and fall back to a shared literal session-id — servers no
   longer need that workaround against a client built from this version.
 
-## 0.2.0
+## 0.2.0 (2026-08-27)
 
 - **Security fix: the auth challenge transcript now binds `username`.**
   Previously `transcript = SHA-256("wsh-v1\0" || session_id || nonce || channelBinding)`
@@ -549,7 +549,7 @@ that root commit contains and from the issue it names.
   output paths correctly (JS in this repo, Rust in the companion server
   repo) instead of the stale vendored-layout paths.
 
-## 0.0.0
+## 0.0.0 (2026-08-24)
 
 - **Renamed: `wsh-upon-star` is now `@johnhenry/wsh`, restarting at 0.0.0.**
   Same library, same API — a shorter name, a new address, a new version era.
