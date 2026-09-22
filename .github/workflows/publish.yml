@@ -1,5 +1,9 @@
 name: Publish to npm
 
+# Deliberately tag-triggered rather than `release: published` (the family's
+# documented default) -- same intentional choice isomorphic-jj makes, kept
+# here rather than switched, so it needs to stay a documented deviation
+# instead of undocumented drift.
 on:
   push:
     tags:
