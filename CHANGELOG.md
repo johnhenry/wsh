@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.17.1 (2026-09-26)
+
+- **`exports["."]` gains a `types` condition; `fileList`/`fileRemove` are now
+  declared (#63).** Found while building the Web Shell room of ORRERY, which
+  builds a restricted host straight from the exported QMux/CBOR/auth
+  primitives. Two independent gaps in `src/index.d.ts`, both invisible unless
+  a real TypeScript consumer imports the package by name:
+  - `package.json`'s `exports` map had no `types` condition (only a legacy
+    top-level `types` field), so under Node16/NodeNext module resolution
+    TypeScript reported TS7016 ("could not find a declaration file") for
+    `import ... from '@johnhenry/wsh'` -- that legacy field is not consulted
+    once `exports` is present under this resolution mode. `exports["."]` now
+    carries `types` alongside `import`, matching the pattern already used by
+    sibling `@johnhenry/*` packages that ship hand-written declarations
+    (`andbox`).
+  - `WshClient.fileList`/`fileRemove` are implemented and reachable at
+    runtime (`fileOperation()`'s `'list'`/`'remove'` ops) but were absent
+    from the class declaration entirely, so any TypeScript consumer got a
+    "Property does not exist" compile error despite the methods working
+    fine at runtime. Both are now declared, returning a new
+    `WshFileOperationResult` type for the raw (snake_case) `FileResult` wire
+    shape.
+
+  `test/types/file-ops.ts` is a new type-only fixture, checked by a new
+  `npm run typecheck` script (now also gated in CI): it imports
+  `@johnhenry/wsh` by its published name and calls `fileList`/`fileRemove`,
+  so a future regression in either the `exports` map or the class
+  declaration fails the build instead of waiting for the next consumer to
+  hit TS7016 or a missing-property error by hand.
+
+  Also checked, per the issue, whether `MSG`'s message-type count (97) still
+  matched the README (it does -- both were already at 97 by the time this
+  landed); the "97 vs 95" mismatch the issue reported is in the docs site at
+  opensource.johnhenry.me, which lives outside this repo and is unaffected
+  by this change.
+
 ## 0.17.0 (2026-09-08)
 
 - **`list()` now uses the structured file channel on both clients, and

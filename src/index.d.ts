@@ -1670,6 +1670,28 @@ export interface WshE2EResult {
 }
 
 /**
+ * Raw `FileResult` response to a structured file-channel operation
+ * (`WshClient.fileList`/`fileRemove`/etc.), as received off the wire --
+ * wire field names (snake_case), not the camelCase shape the `fileResult()`
+ * message constructor takes as input. `entries` is only populated for a
+ * `"list"` op; `error_message` is only present on failure.
+ */
+export interface WshFileOperationResult {
+  type: number;
+  channel_id: number;
+  success: boolean;
+  metadata: Record<string, unknown>;
+  entries: Array<{
+    name: string;
+    size: number;
+    modified: number;
+    type: 'file' | 'directory' | 'symlink' | 'device' | 'pipe' | 'socket';
+    symlink_target?: string;
+  }>;
+  error_message?: string;
+}
+
+/**
  * WshClient -- manages a wsh connection, authentication, and multiple sessions.
  *
  * Handles the full lifecycle: transport selection, handshake, challenge-response
@@ -1783,6 +1805,22 @@ export class WshClient {
    * Revoke a previously granted principal's access to a session.
    */
   revokeSessionAccess(sessionId: string, principal: string, reason?: string): Promise<void>;
+
+  /**
+   * List a remote directory over the structured file channel (`FileOp`
+   * op `"list"`). Prefer `WshFileTransfer.list()` for a typed
+   * `WshFileListEntry[]` result (with `modified` as a `Date`) -- this is
+   * the raw wire-shaped `FileResult` response `fileOperation()` waits on.
+   */
+  fileList(path: string, timeout?: number): Promise<WshFileOperationResult>;
+
+  /**
+   * Remove a remote file or directory (`FileOp` op `"remove"`). Refused
+   * today by every `wsh-server` release ("not yet implemented" -- see
+   * README's file-op parity table); wired here so clients built against
+   * this SDK don't need to wait on the server to type-check against it.
+   */
+  fileRemove(path: string, timeout?: number): Promise<WshFileOperationResult>;
 
   /**
    * Install a raw 32-byte Ed25519 public key into the remote host's

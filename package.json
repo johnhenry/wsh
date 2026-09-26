@@ -1,11 +1,14 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "Web Shell — browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
   "exports": {
-    ".": "./src/index.mjs"
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.mjs"
+    }
   },
   "types": "./src/index.d.ts",
   "files": [
@@ -19,11 +22,13 @@
   "devDependencies": {
     "@fails-components/webtransport": "^1.6.4",
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
+    "typescript": "^7.0.0",
     "ws": "^8.21.0"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "test:rust": "node --test test/rust/*.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "codegen": "node spec/codegen.mjs",
     "codegen:check": "node scripts/codegen-check.mjs",
     "examples": "for f in examples/0*.mjs; do echo \"== $f\" && node \"$f\" || exit 1; done",
