@@ -849,6 +849,18 @@ messages:
         supports_term_sync:
           type: bool
           default: false
+        features:
+          type: "string[]"
+          required: false
+          description: >
+            Features of the bridged host itself, in the vocabulary of
+            ServerHello.features (e.g. file-write, file-rename,
+            mcp-call-id). A relay's own ServerHello says nothing about the
+            host behind a bridge, so the operator reads these instead once
+            the bridge is up. Empty or absent means "not stated": an
+            operator then falls back to what it knows (the relay's
+            features). The relay forwards the field after bounding it; it
+            is the peer's own claim, as everything else in this message.
 
     ReverseReject:
       code: 0x55
@@ -2070,4 +2082,11 @@ relay:
   # a Set) and Rust (is_relay_forwardable(), a match) by codegen.mjs, so
   # the two implementations can no longer drift out of sync the way the
   # hand-maintained allowlists did before RelayForward existed.
-  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff]
+  #
+  # KeyExchange and EncryptedFrame are on the list so two endpoints can run
+  # E2E through a bridge: the relay carries the CBOR of an EncryptedFrame as
+  # opaque bytes and holds no key. KeyExchange is an UNAUTHENTICATED ephemeral
+  # exchange, so it protects against a relay that only observes, not one that
+  # substitutes keys; peers who need that must authenticate the derived key
+  # themselves (see the README's Security model).
+  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff, KeyExchange, EncryptedFrame]

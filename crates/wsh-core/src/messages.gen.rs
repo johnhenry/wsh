@@ -246,7 +246,7 @@ impl TryFrom<u8> for MsgType {
 pub fn is_relay_forwardable(t: MsgType) -> bool {
     matches!(
         t,
-        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::FileResult | MsgType::FileChunk | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff
+        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::FileResult | MsgType::FileChunk | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff | MsgType::KeyExchange | MsgType::EncryptedFrame
     )
 }
 
@@ -911,6 +911,8 @@ pub struct ReverseAcceptPayload {
     pub supports_echo: bool,
     #[serde(default)]
     pub supports_term_sync: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
 }
 
 fn default_reverse_accept_peer_type() -> String {

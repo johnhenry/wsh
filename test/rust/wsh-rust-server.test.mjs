@@ -696,6 +696,47 @@ describe('Rust wsh-server relay — mixed transports', () => {
   });
 });
 
+// ── Relay bridge: E2E and bridged features (wsh #80) ──────────────────
+//
+// KeyExchange / EncryptedFrame are on the spec's `forwardable` list, so two
+// endpoints bridged through the Rust relay can run E2E with each other, and
+// ReverseAccept's optional `features` (the bridged host's own, which the
+// operator's feature gates then follow) must survive the relay's strict
+// (deny_unknown_fields) decode of ReverseAccept.
+
+describe('Rust wsh-server relay -- E2E and features across a bridge (wsh #80)', () => {
+  it('a relayed bridge carries KeyExchange both ways (E2E key agreement) and the peer\'s stated features', async () => {
+    const operator = await makeKeyPair();
+    const peer = await makeKeyPair();
+    const server = await startServer([operator.publicKeySSH, peer.publicKeySSH], ['--enable-relay']);
+    servers.push(server);
+
+    const peerClient = new WshClient();
+    clients.push(peerClient);
+    await peerClient.connectReverse(server.url, { username: 'browser-tab', keyPair: peer.kp, expose: { exec: true }, transport: 'ws' });
+    peerClient.onReverseConnect = (msg) => {
+      peerClient.trustRelayPeer(msg.from_fingerprint);
+      peerClient.sendRelayControl(reverseAccept({
+        targetFingerprint: msg.target_fingerprint, username: 'browser-tab', features: ['file-write', 'mcp-call-id'],
+      }));
+    };
+
+    const operatorClient = new WshClient();
+    clients.push(operatorClient);
+    await operatorClient.connect(server.url, { username: 'operator', keyPair: operator.kp, transport: 'ws' });
+    const [peerInfo] = await operatorClient.listPeers();
+    const accepted = await operatorClient.reverseConnect(peerInfo.fingerprint);
+    assert.equal(accepted.type, MSG.REVERSE_ACCEPT);
+    assert.deepEqual(accepted.features, ['file-write', 'mcp-call-id'], 'the relay forwards ReverseAccept.features');
+    assert.deepEqual(operatorClient.bridgedFeatures, ['file-write', 'mcp-call-id']);
+    assert.equal(operatorClient.hasFeature('file-write'), true);
+
+    const [a, b] = await Promise.all([operatorClient.initiateE2E('bridged'), peerClient.initiateE2E('bridged')]);
+    assert.ok(a.sharedSecret && b.sharedSecret);
+    assert.equal(a.hybrid, false);
+  });
+});
+
 // ── Relay: signed peer records (wsh #17) ──────────────────────────────
 //
 // Mirrors tools/test/wsh-server.test.mjs's "WshServer relay — registration

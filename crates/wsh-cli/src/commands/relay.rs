@@ -584,6 +584,7 @@ mod tests {
                 supports_replay: true,
                 supports_echo: true,
                 supports_term_sync: true,
+                features: None,
             }),
             "browser-shell / virtual-shell [shell] {attach,replay,echo,sync}"
         );
@@ -659,6 +660,7 @@ mod tests {
             supports_replay: true,
             supports_echo: true,
             supports_term_sync: true,
+            features: None,
         }))
         .unwrap();
         assert_eq!(accept.peer_type, "browser-shell");

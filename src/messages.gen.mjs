@@ -495,19 +495,10 @@ export function reverseConnect({ targetFingerprint, username, fromFingerprint } 
   };
 }
 
-export function reverseAccept({ targetFingerprint, username, capabilities = [], peerType = "host", shellBackend = "pty", supportsAttach = false, supportsReplay = false, supportsEcho = false, supportsTermSync = false } = {}) {
-  return {
-    type: MSG.REVERSE_ACCEPT,
-    target_fingerprint: targetFingerprint,
-    username,
-    capabilities,
-    peer_type: peerType,
-    shell_backend: shellBackend,
-    supports_attach: supportsAttach,
-    supports_replay: supportsReplay,
-    supports_echo: supportsEcho,
-    supports_term_sync: supportsTermSync,
-  };
+export function reverseAccept({ targetFingerprint, username, capabilities = [], peerType = "host", shellBackend = "pty", supportsAttach = false, supportsReplay = false, supportsEcho = false, supportsTermSync = false, features } = {}) {
+  const msg = { type: MSG.REVERSE_ACCEPT, target_fingerprint: targetFingerprint, username, capabilities, peer_type: peerType, shell_backend: shellBackend, supports_attach: supportsAttach, supports_replay: supportsReplay, supports_echo: supportsEcho, supports_term_sync: supportsTermSync };
+  if (features !== undefined) msg.features = features;
+  return msg;
 }
 
 export function reverseReject({ targetFingerprint, username, reason } = {}) {
@@ -962,6 +953,8 @@ export const RELAY_FORWARDABLE = new Set([
   MSG.ECHO_STATE,
   MSG.TERM_SYNC,
   MSG.TERM_DIFF,
+  MSG.KEY_EXCHANGE,
+  MSG.ENCRYPTED_FRAME,
 ]);
 
 /**

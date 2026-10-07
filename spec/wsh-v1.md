@@ -663,6 +663,7 @@ Category: **reverse**
 | `supports_replay` | `bool` | no | `false` |
 | `supports_echo` | `bool` | no | `false` |
 | `supports_term_sync` | `bool` | no | `false` |
+| `features` | `string[]` | no | — |
 
 ### ReverseReject (`0x55`)
 

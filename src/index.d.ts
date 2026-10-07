@@ -603,6 +603,8 @@ export function reverseAccept(opts?: {
   supportsReplay?: boolean;
   supportsEcho?: boolean;
   supportsTermSync?: boolean;
+  /** Features of this (bridged) host, in the vocabulary of `ServerHello.features`; omit rather than send `[]`. */
+  features?: string[];
 }): WshMessage;
 
 export function reverseReject(opts?: {
@@ -1970,8 +1972,15 @@ export class WshClient {
   /** Read-only view of active sessions. */
   readonly sessions: Map<number, WshSession>;
 
-  /** Server-advertised features from SERVER_HELLO. */
+  /**
+   * The features this connection can rely on: those of the host behind an accepted relay bridge when it
+   * stated them (`ReverseAccept.features`), otherwise the server's `SERVER_HELLO` features.
+   */
   readonly features: string[];
+  /** The `SERVER_HELLO` features of the server connected to (the relay, over a bridge). */
+  readonly serverFeatures: string[];
+  /** Features of the host behind an accepted relay bridge as it stated them; `null` when there is no bridge or it did not say. */
+  readonly bridgedFeatures: string[] | null;
 
   /**
    * Low-level transport reference.
@@ -2004,7 +2013,7 @@ export class WshClient {
   onGatewayMessage: ((msg: WshMessage) => void) | null;
 
   /**
-   * Check if the server advertised a specific feature.
+   * Check if a feature is available: advertised by the server, or by the bridged host (see `features`).
    */
   hasFeature(name: string): boolean;
 

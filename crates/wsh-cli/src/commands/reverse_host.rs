@@ -118,6 +118,7 @@ impl ReverseHostOptions {
             supports_replay: self.supports_replay,
             supports_echo: self.supports_echo,
             supports_term_sync: self.supports_term_sync,
+            features: None,
         }
     }
 
