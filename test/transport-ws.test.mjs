@@ -217,9 +217,27 @@ describe('WebSocketTransport (QMux)', { skip: !transportWsMod && 'transport-ws.m
       await writer.write(new Uint8Array([1, 2, 3, 4]));
       writer.releaseLock();
 
-      const dataFrame = ws.sentFrames().find((f) => f.frameType === 'STREAM' && f.streamId === id);
+      const dataFrame = ws.sentFrames().find((f) => f.frameType === 'STREAM' && f.streamId === id && f.data.byteLength > 0);
       assert.ok(dataFrame);
       assert.deepEqual(Array.from(dataFrame.data), [1, 2, 3, 4]);
+    } finally {
+      await transport?.close().catch(() => {});
+      restore();
+    }
+  });
+
+  it('openStream() announces the stream with an empty, non-FIN STREAM frame before any payload', async () => {
+    const restore = installFakeWebSocket();
+    let transport;
+    try {
+      ({ transport } = await connectedTransport());
+      const ws = FakeWebSocket.instances[0];
+      const { id } = await transport.openStream();
+
+      const frames = ws.sentFrames().filter((f) => f.frameType === 'STREAM' && f.streamId === id);
+      assert.equal(frames.length, 1);
+      assert.equal(frames[0].data.byteLength, 0);
+      assert.equal(frames[0].fin, false);
     } finally {
       await transport?.close().catch(() => {});
       restore();

@@ -64,6 +64,13 @@ const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
 export const MCP_CALL_ID_FEATURE = 'mcp-call-id';
 
 /**
+ * ServerHello feature: the host discovers a client-opened exec data stream
+ * on its own (the transport announces it), so the client must NOT write the
+ * one-byte "primer" -- against such a host it would reach the process's stdin.
+ */
+export const STREAM_ANNOUNCE_FEATURE = 'stream-announce';
+
+/**
  * Reject a missing argument that maps to a `required: true` wire field.
  *
  * JavaScript will happily let an omitted argument through, and
@@ -587,9 +594,14 @@ export class WshClient {
    * @param {number} [opts.rows=24] - Initial terminal rows
    * @param {object} [opts.env] - Environment variables
    * @param {number} [opts.timeout] - Timeout in ms
+   * @param {boolean} [opts.primer=true] - For stream-mode `exec` sessions: write
+   *   the one-byte "primer" some hosts need to discover the client-opened data
+   *   stream (without it they never bind the stream and drop all output).
+   *   Skipped automatically against a host advertising `stream-announce`; pass
+   *   `false` to never send it (e.g. a host that forwards stdin verbatim).
    * @returns {Promise<WshSession>}
    */
-  async openSession({ type = 'pty', command, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
+  async openSession({ type = 'pty', command, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT, primer = true } = {}) {
     this.#assertAuthenticated('openSession');
     const requestedChannelId = this._nextChannelId();
 
@@ -605,6 +617,7 @@ export class WshClient {
       const entry = {
         mode: 'session',
         kind: type,
+        primer,
         requestedChannelId,
         resolve,
         reject,
@@ -842,9 +855,10 @@ export class WshClient {
    * @param {CryptoKeyPair} [opts.keyPair]
    * @param {string} [opts.password]
    * @param {number} [opts.timeout=60000] - Overall timeout in ms
+   * @param {boolean} [opts.primer=true] - See `openSession({ primer })`
    * @returns {Promise<{stdout: Uint8Array, exitCode: number}>}
    */
-  static async exec(url, command, { username, keyPair, password, timeout = DEFAULT_EXEC_TIMEOUT } = {}) {
+  static async exec(url, command, { username, keyPair, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true } = {}) {
     const client = new WshClient();
     const chunks = [];
     let exitCode = -1;
@@ -852,7 +866,7 @@ export class WshClient {
     try {
       await client.connect(url, { username, keyPair, password });
 
-      const session = await client.openSession({ type: 'exec', command });
+      const session = await client.openSession({ type: 'exec', command, primer });
 
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -2145,8 +2159,20 @@ export class WshClient {
       // so channel-scoped control messages arriving before the stream
       // finishes binding still route correctly.
       this.#transport.openStream().then(
-        (stream) => {
+        async (stream) => {
           session._bind(stream.readable, stream.writable);
+          // The transport has already announced the stream, which is all a
+          // current host needs. Older hosts only bind a stream on its first
+          // byte, so exec (which has no stdin to send) writes a one-byte
+          // primer they strip -- unless the host says it needs none.
+          if (pending.kind === 'exec' && pending.primer && !this.hasFeature(STREAM_ANNOUNCE_FEATURE)) {
+            try {
+              await session.write(new Uint8Array([0]));
+            } catch (err) {
+              pending.reject(err);
+              return;
+            }
+          }
           pending.resolve(session);
         },
         (err) => pending.reject(err)

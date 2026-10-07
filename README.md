@@ -16,7 +16,7 @@ Full documentation: [opensource.johnhenry.me/wsh](https://opensource.johnhenry.m
 
 Browser-native remote command execution over WebTransport/WebSocket with Ed25519 authentication.
 
-wsh is a pure-JS client library that connects browsers to remote shells. It implements its own binary protocol — CBOR messages over QMux-multiplexed WebSocket or native WebTransport streams — with Ed25519 challenge-response auth, session management, and MCP tool bridging.
+wsh is a pure-JS client library (with an optional Node server at `@johnhenry/wsh/server`) that connects browsers to remote shells. It implements its own binary protocol — CBOR messages over QMux-multiplexed WebSocket or native WebTransport streams — with Ed25519 challenge-response auth, session management, and MCP tool bridging.
 
 ## Contents
 
@@ -25,6 +25,7 @@ wsh is a pure-JS client library that connects browsers to remote shells. It impl
 - [Wire Protocol: QMux](#wire-protocol-qmux)
 - [Quick Start](#quick-start)
 - [One-Shot Command Execution](#one-shot-command-execution)
+- [Node Server](#node-server)
 - [Attach and Resume](#attach-and-resume)
 - [Pinning a Self-Signed Certificate](#pinning-a-self-signed-certificate)
 - [API Overview](#api-overview)
@@ -145,6 +146,48 @@ console.log(new TextDecoder().decode(stdout));
 console.log('Exit code:', exitCode);
 ```
 
+`exec` and `openSession({ type: 'exec' })` need no extra step to receive
+output. Older hosts only discover the client-opened data stream once a byte
+arrives on it, so against a host that does not advertise `stream-announce`
+the client writes a one-byte primer for you (a host that strips it, as those
+hosts do). Pass `primer: false` to never send it.
+
+## Node Server
+
+`@johnhenry/wsh/server` is a Node host for the same protocol, over WebSocket
+(QMux). It is a separate subpath -- the package root stays browser-safe and
+never imports it -- and needs the optional peer dependency `ws`
+(`npm install ws`).
+
+```js
+import { createWshServer } from '@johnhenry/wsh/server';
+import { readFileSync } from 'node:fs';
+
+const server = createWshServer({
+  host: '127.0.0.1',
+  port: 4422,                                          // 0 = pick a free port
+  auth: { authorizedKeys: readFileSync('authorized_keys', 'utf8') },  // ssh-ed25519 lines
+  exec: true,                                          // opt in: run commands via /bin/sh
+  fs: { root: '/srv/share', readOnly: false },         // opt in: list/stat/read/mkdir/remove/upload/download
+  // pty: { spawn: nodePty.spawn },                    // opt in: bring your own node-pty
+});
+const { port } = await server.listen();                // later: server.address(), await server.close()
+```
+
+Everything that touches the machine -- `exec`, `pty`, `fs` -- is **off unless
+you pass it**, and with no `auth` every connection is refused. `auth` is
+`{ authorizedKeys, authorize }` (a key must be on the list and pass
+`authorize({ username, fingerprint, publicKey })` when both are given) or
+just an `authorize` function. `exec` can also be `{ cwd, env, shell,
+timeoutMs, clientEnv }` or a custom `run(command, io)` for a restricted host
+with no shell. `fs.root` confines every path: `..`, absolute paths and
+symlinks pointing out of it are refused. The server advertises
+`stream-announce`, so a current client writes no primer byte; a lone leading
+`0x00` from a client that primes anyway is dropped rather than reaching stdin.
+
+Not implemented: WebTransport, relay/reverse mode, attach/resume, MCP,
+password auth.
+
 ## Attach and Resume
 
 Opening a PTY/exec session returns a session-scoped credential alongside the channel:
@@ -249,6 +292,7 @@ so options the platform gains later need no change here.
 | `SessionRecorder` | Record PTY I/O with timestamps (own schema, not asciicast v2) |
 | `SessionPlayer` | Replay recordings with original timing |
 | `generateKeyPair()` | Create Ed25519 key pair via Web Crypto |
+| `sign(privateKey, message)` / `verify(publicKey, signature, message)` | Raw Ed25519 sign / verify. This positional order (WebCrypto's) is the one canonical form across wsh, raijin and browsermesh |
 | `signChallenge()` | Build transcript + sign for auth handshake |
 | `signPeerRecord()` / `verifyPeerRecord()` | Sign / verify reverse-mode peer records |
 | `fingerprint()` | SHA-256 hex fingerprint of a public key |

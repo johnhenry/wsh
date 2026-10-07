@@ -238,6 +238,13 @@ export const PROTOCOL_VERSION: 'wsh-v1';
  */
 export const MCP_CALL_ID_FEATURE: 'mcp-call-id';
 
+/**
+ * ServerHello feature: the host discovers a client-opened exec data stream
+ * without help (the transport announces it), so the client writes no
+ * one-byte primer against it.
+ */
+export const STREAM_ANNOUNCE_FEATURE: 'stream-announce';
+
 /** A wsh protocol control message (all messages have a numeric `type`). */
 export interface WshMessage {
   type: number;
@@ -895,15 +902,19 @@ export function exportPrivateKeyPKCS8(privateKey: CryptoKey): Promise<Uint8Array
 export function importPrivateKeyPKCS8(pkcs8: Uint8Array, extractable?: boolean): Promise<CryptoKey>;
 
 /**
- * Sign data with an Ed25519 private key.
+ * Sign data with an Ed25519 private key. Positional order mirrors WebCrypto
+ * (`sign(privateKey, message)`) and is the canonical form across wsh, raijin
+ * and browsermesh.
  * @returns 64-byte signature
  */
-export function sign(privateKey: CryptoKey, data: Uint8Array): Promise<Uint8Array>;
+export function sign(privateKey: CryptoKey, message: Uint8Array): Promise<Uint8Array>;
 
 /**
- * Verify an Ed25519 signature.
+ * Verify an Ed25519 signature. Positional order mirrors WebCrypto
+ * (`verify(publicKey, signature, message)`) and is the canonical form across
+ * wsh, raijin and browsermesh.
  */
-export function verify(publicKey: CryptoKey, signature: Uint8Array, data: Uint8Array): Promise<boolean>;
+export function verify(publicKey: CryptoKey, signature: Uint8Array, message: Uint8Array): Promise<boolean>;
 
 /** Options binding extra context into the auth transcript. */
 export interface WshTranscriptOptions {
@@ -1561,6 +1572,13 @@ export interface WshOpenSessionOptions {
   rows?: number;
   env?: Record<string, string>;
   timeout?: number;
+  /**
+   * Stream-mode `exec` only (default `true`): write the one-byte "primer"
+   * that older hosts need to discover the client-opened data stream. Skipped
+   * automatically against a host advertising `stream-announce`; `false`
+   * never sends it.
+   */
+  primer?: boolean;
 }
 
 /** Options for WshClient.attachSession(). */
@@ -1611,6 +1629,8 @@ export interface WshExecOptions {
   keyPair?: CryptoKeyPair;
   password?: string;
   timeout?: number;
+  /** See {@link WshOpenSessionOptions.primer}. */
+  primer?: boolean;
 }
 
 /** Result from WshClient.exec(). */

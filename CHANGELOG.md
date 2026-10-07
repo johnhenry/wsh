@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.18.0 (2026-10-06)
+
+- **New: `@johnhenry/wsh/server`, a Node host for the protocol.**
+  `createWshServer({ host, port, auth?, exec?, pty?, fs? })` returns
+  `{ listen(), close(), address() }` over `ws` (an optional peer dependency;
+  the root entry is untouched and stays browser-safe). Ed25519 allowlist /
+  callback auth, `exec` (child_process or a custom runner), `pty` (inject
+  node-pty), and `fs` (list/stat/read/mkdir/remove, upload/download, confined
+  to a root). All of exec/pty/fs are off by default; no `auth` refuses
+  everyone. Distilled from the host consumers had been vendoring; not
+  included: WebTransport, relay/reverse, attach/resume, MCP.
+- **Fixed: exec sessions lost all output unless the client wrote a primer byte.**
+  Root cause: a QMux/QUIC stream is created lazily on the wire -- opening one
+  sends nothing until the first byte, and an exec client has no stdin, so a
+  host that binds the data stream on first sight never saw it and dropped the
+  output. `WebSocketTransport` now announces every stream it opens with an
+  empty STREAM frame (`QMuxStream.announce()`), so the host sees it at once.
+  The server advertises a new `stream-announce` ServerHello feature
+  (`STREAM_ANNOUNCE_FEATURE`); against any other host the stock client writes
+  the primer itself for stream-mode `exec` (`openSession` and `WshClient.exec`
+  take `primer: false` to opt out). No wire-format or spec change.
+- `sign(privateKey, message)` / `verify(publicKey, signature, message)`
+  (WebCrypto order, unchanged) are now documented as the canonical form
+  across wsh, raijin and browsermesh. `podId()` is not documented API and
+  stays unexported.
+
 ## 0.17.1 (2026-09-26)
 
 - **`exports["."]` gains a `types` condition; `fileList`/`fileRemove` are now
