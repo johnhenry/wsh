@@ -186,7 +186,79 @@ paths and symlinks pointing out of it are refused -- for `write` and `rename`
 (both paths) exactly as for `read`.
 
 Not implemented (each has a tracking issue): WebTransport, relay/reverse
-mode, attach/resume of server-side sessions.
+mode.
+
+### Sessions: attach / resume / detach
+
+By default a pty/exec session dies with the connection that opened it. Pass
+`sessions` and it outlives it, so a dropped socket (a flaky link, a closed
+tab) can be picked up again:
+
+```js
+createWshServer({
+  auth, exec: true, pty: { spawn: nodePty.spawn },
+  sessions: {
+    detachTtlMs: 300_000,   // how long a session nobody is attached to keeps running (0 = kill at once)
+    maxDetached: 16,        // unattended sessions kept at once; the longest-detached is killed beyond that
+    ringBytes: 1 << 20,     // output history kept per session: what a resume can replay
+    // sessionSecret: process.env.WSH_SESSION_SECRET,  // fixes the token key (default: random per process)
+  },
+});
+```
+
+```js
+// original connection
+const s = await client.openSession({ type: 'pty' });
+s.onData = (d) => term.write(d);            // s.seq counts the output bytes received so far
+const { sessionId, resumeToken } = s;       // keep these
+const lastSeq = s.seq;                      // ... the socket drops ...
+
+// fresh connection, same key
+const { session } = await client2.resumeSession(sessionId, resumeToken, { lastSeq });
+session.onData = (d) => term.write(d);      // only the bytes after lastSeq, then live output
+await session.write('ls\n');                // and it is the same process
+```
+
+- **`seq` is the cumulative count of output bytes** the host has produced for
+  a session (stream data or `SessionData` alike). The client counts what it
+  received -- `WshSession.seq` -- so no per-frame field exists, and
+  `Resume.last_seq` is exactly that number. The host keeps the newest
+  `ringBytes` of output and replays `ring[last_seq - ringStart ..]`. A
+  `last_seq` older than the ring still holds is refused with an
+  `output gap` error naming where the history starts (fall back to
+  `attachSession()` for the retained tail); one newer than the session has
+  produced is refused too. While nobody is attached the process keeps running
+  and keeps filling the ring (it is never paused), so a chatty process loses its
+  oldest output rather than blocking.
+- **Token:** `HMAC-SHA256(secret, session_id || expiry)` in the spec's
+  40-byte token format, minted at open, returned as `OpenOk.token` and checked
+  in constant time. **`Resume` needs the token AND ownership** (the same key, or
+  for a password login the same username) -- it is the credentialed connection
+  coming back. **`Attach` accepts the token OR ownership**, so the owner can
+  re-attach with nothing but the session id, and a token holder can join as a
+  guest. Refusals do not say whether the session exists.
+- **What arrives:** the Presence reply names a new channel (`channel_id`) and the
+  `seq` of its first byte; the replay and live output follow as `SessionData` on
+  it. That channel is always message-backed, even for an `exec` session that was
+  opened on a data stream -- neither stock client opens a stream for attach/resume
+  -- so `resumeSession()`/`attachSession()` return the Presence with a
+  non-enumerable `session` (a `WshSession`) to read and write it. A client that
+  ignores that can read the same frames with `addControlListener()`.
+- **Several connections** may attach to one session (up to 16): output fans out
+  to all of them, `attachSession(id, { readOnly: true })` attaches a viewer whose
+  input is dropped, and every change in who is attached is broadcast as `Presence`
+  (the roster, without channel ids).
+- **Ending vs leaving:** `Close` on a channel (which `session.close()` and a
+  graceful `client.disconnect()` send) *ends* the session when its owner sends it,
+  and merely leaves it for anyone else. To walk away from a session and keep it
+  running, `client.detach(sessionId)` first; losing the connection also detaches.
+  `client.listRemoteSessions()` lists the sessions your key owns, attached or not.
+- Exit: when the process ends, everyone attached gets `Exit` + `Close`; the
+  record then lingers for `detachTtlMs` so a late resume still collects the tail
+  and the exit code.
+- Not built: ACL grants (`SessionGrant`/`SessionRevoke`) and `ControlChanged` --
+  only the owner re-attaches as a controller; everyone else needs the token.
+  Sessions are in-memory: a server restart ends them all.
 
 ### MCP tools
 
@@ -361,8 +433,9 @@ Opening a PTY/exec session returns a session-scoped credential alongside the cha
 session.sessionId;   // server-assigned session id (undefined for e.g. file channels)
 session.resumeToken; // token minted at open time; only the opener receives it
 
-// The original opener, reclaiming its session from a fresh connection:
-await client.resumeSession(session.sessionId, session.resumeToken);
+// The original opener, reclaiming its session from a fresh connection,
+// replaying only the output it has not yet seen (`session.seq` counts it):
+await client.resumeSession(session.sessionId, session.resumeToken, { lastSeq });
 
 // Any other authorized principal attaches without a token -- ownership
 // or an ACL grant is enough:
@@ -373,6 +446,11 @@ await otherClient.attachSession(session.sessionId);         // by 'bob'
 await client.detach(session.sessionId);   // leave it running server-side
 await client.listRemoteSessions();        // sessions this key can see
 ```
+
+`@johnhenry/wsh/server` implements all of it with its [`sessions`
+option](#sessions-attach--resume--detach). The Rust `wsh-server` replays its whole
+ring on `Resume` regardless of `last_seq` (the position is defined in
+[spec/wsh-v1.md](spec/wsh-v1.md)).
 
 ## Pinning a Self-Signed Certificate
 
@@ -516,6 +594,7 @@ than left to be found.
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
+| Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` replays its whole ring and leaves them unset |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast v2) | none | **JS-only** -- no current Rust consumer needs playback; the format itself (asciicast v2) is not proprietary if one is added later |

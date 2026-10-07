@@ -1321,6 +1321,8 @@ Category: **keys**
 | `session_id` | `string` | yes | — |
 | `mode` | `string` | yes | — |
 | `username` | `string` | no | — |
+| `channel_id` | `u32` | no | — |
+| `seq` | `u64` | no | — |
 
 ### PeerInfo
 

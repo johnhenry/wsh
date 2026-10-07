@@ -1416,6 +1416,13 @@ export class WshSession {
    */
   readonly resumeToken: Uint8Array | undefined;
 
+  /**
+   * Cumulative session output bytes received so far -- the host's `seq` for
+   * the next byte. Pass it as `lastSeq` to `WshClient.resumeSession()`.
+   * Absolute for a session obtained from `attachSession()`/`resumeSession()`.
+   */
+  readonly seq: number;
+
   /** Called when stdout/stderr data arrives. */
   onData: ((data: Uint8Array) => void) | null;
 
@@ -1621,6 +1628,14 @@ export interface WshOpenSessionOptions {
   primer?: boolean;
 }
 
+/**
+ * The Presence answering `attachSession()` / `resumeSession()`. Against a host
+ * that assigns the attachment a channel (`@johnhenry/wsh/server` with `sessions`),
+ * `session` -- non-enumerable -- is the message-backed `WshSession` receiving
+ * the replay and live output.
+ */
+export type WshAttachResponse = WshMessage & { readonly session?: WshSession };
+
 /** Options for WshClient.attachSession(). */
 export interface WshAttachSessionOptions {
   readOnly?: boolean;
@@ -1637,7 +1652,12 @@ export interface WshAttachSessionOptions {
 
 /** Options for WshClient.resumeSession(). */
 export interface WshResumeSessionOptions {
-  /** Last sequence number this client already has (currently advisory). */
+  /**
+   * Cumulative session output bytes this client already has (`WshSession.seq`
+   * of the session it lost). A host with a bounded history replays only what
+   * follows and refuses a position older than it still holds; the Rust
+   * `wsh-server` ignores it and replays its whole ring. Default 0.
+   */
   lastSeq?: number;
   timeout?: number;
 }
@@ -1851,13 +1871,13 @@ export class WshClient {
    * already owning/being ACL-granted access to `targetSessionId`
    * server-side -- see `WshAttachSessionOptions.token`.
    */
-  attachSession(targetSessionId: string, opts?: WshAttachSessionOptions): Promise<WshMessage>;
+  attachSession(targetSessionId: string, opts?: WshAttachSessionOptions): Promise<WshAttachResponse>;
 
   /**
    * Resume a previously disconnected session. Unlike `attachSession()`,
    * `token` is required and verified unconditionally server-side.
    */
-  resumeSession(targetSessionId: string, token: Uint8Array, opts?: WshResumeSessionOptions): Promise<WshMessage>;
+  resumeSession(targetSessionId: string, token: Uint8Array, opts?: WshResumeSessionOptions): Promise<WshAttachResponse>;
 
   /**
    * Detach from a remote session, leaving it running server-side.

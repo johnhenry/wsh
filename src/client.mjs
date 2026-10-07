@@ -245,6 +245,15 @@ export class WshClient {
   #sessions = new Map();
 
   /**
+   * In-flight attachSession()/resumeSession() calls awaiting the Presence
+   * that answers them. Like #pendingOpens, matched synchronously in
+   * #handleControl so the WshSession exists before the replay (which the
+   * host sends right behind the Presence) is dispatched.
+   * @type {Array<{sessionId: string, token?: Uint8Array}>}
+   */
+  #pendingAttaches = [];
+
+  /**
    * FIFO queue of in-flight openSession() calls awaiting the next
    * OPEN_OK/OPEN_FAIL. Handled as a dedicated synchronous case in
    * #handleControl (not the generic #waitForMessage machinery) so that
@@ -743,27 +752,50 @@ export class WshClient {
    * @param {boolean} [opts.readOnly=false] - Attach in read-only mode
    * @param {Uint8Array} [opts.token] - Session-scoped token (optional; see above)
    * @param {number} [opts.timeout] - Timeout in ms
-   * @returns {Promise<object>} Server's PRESENCE response
+   * @returns {Promise<object>} Server's PRESENCE response. Against a host that
+   *   assigns the attachment a channel (`@johnhenry/wsh/server` with `sessions`)
+   *   the response also has a non-enumerable `session`: a message-backed
+   *   `WshSession` receiving the replay and live output (`onData`, `write()`,
+   *   `resize()`, `onExit`), whose `seq` is the position to resume from next time.
    */
   async attachSession(targetSessionId, { readOnly = false, token, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
     this.#assertAuthenticated('attachSession');
 
     const attachMode = readOnly ? 'readonly' : 'control';
-    await this.#transport.sendControl(
-      attachMsg({ sessionId: targetSessionId, token, mode: attachMode })
+    return this.#attachOrResume(
+      targetSessionId, token, attachMsg({ sessionId: targetSessionId, token, mode: attachMode }),
+      timeout, 'attach', 'Failed to attach',
     );
+  }
 
-    const response = await this.#waitForMessage(
-      [MSG.PRESENCE, MSG.ERROR],
-      timeout,
-      'Timed out waiting for attach response'
-    );
+  /**
+   * Send an Attach/Resume and wait for the Presence that answers it.
+   * @private
+   */
+  async #attachOrResume(sessionId, token, msg, timeout, what, failure) {
+    const pending = { sessionId, token };
+    this.#pendingAttaches.push(pending);
+    try {
+      await this.#transport.sendControl(msg);
 
-    if (response.type === MSG.ERROR) {
-      throw new Error(`Failed to attach: ${response.message || 'rejected'}`);
+      const response = await this.#waitForMessage(
+        [MSG.PRESENCE, MSG.ERROR],
+        timeout,
+        `Timed out waiting for ${what} response`,
+        // A roster Presence about some other session this connection is in is not the answer.
+        (m) => m.type === MSG.ERROR || !Array.isArray(m.attachments) || m.attachments.length === 0
+          || m.attachments.some((a) => a?.session_id === sessionId),
+      );
+
+      if (response.type === MSG.ERROR) {
+        throw new Error(`${failure}: ${response.message || 'rejected'}`);
+      }
+
+      return response;
+    } finally {
+      const i = this.#pendingAttaches.indexOf(pending);
+      if (i !== -1) this.#pendingAttaches.splice(i, 1);
     }
-
-    return response;
   }
 
   /**
@@ -779,28 +811,22 @@ export class WshClient {
    * @param {string} targetSessionId - Session ID to resume
    * @param {Uint8Array} token - Session-scoped resume token (see `WshSession.resumeToken`)
    * @param {object} [opts]
-   * @param {number} [opts.lastSeq=0] - Last sequence number this client already has (currently advisory -- the ring buffer replays its full contents regardless)
+   * @param {number} [opts.lastSeq=0] - Cumulative session output bytes this
+   *   client has already received (`WshSession.seq` of the session it lost).
+   *   A host with a bounded history replays only what follows and refuses a
+   *   position older than it still holds (use `attachSession()` then); the Rust
+   *   `wsh-server` ignores it and replays its whole ring.
    * @param {number} [opts.timeout=10000] - Timeout in ms
-   * @returns {Promise<object>} Server's PRESENCE response
+   * @returns {Promise<object>} Server's PRESENCE response, with a non-enumerable
+   *   `session` exactly as for `attachSession()`.
    */
   async resumeSession(targetSessionId, token, { lastSeq = 0, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
     this.#assertAuthenticated('resumeSession');
 
-    await this.#transport.sendControl(
-      resumeMsg({ sessionId: targetSessionId, token, lastSeq })
+    return this.#attachOrResume(
+      targetSessionId, token, resumeMsg({ sessionId: targetSessionId, token, lastSeq }),
+      timeout, 'resume', 'Failed to resume',
     );
-
-    const response = await this.#waitForMessage(
-      [MSG.PRESENCE, MSG.ERROR],
-      timeout,
-      'Timed out waiting for resume response'
-    );
-
-    if (response.type === MSG.ERROR) {
-      throw new Error(`Failed to resume: ${response.message || 'rejected'}`);
-    }
-
-    return response;
   }
 
   /**
@@ -2388,6 +2414,28 @@ export class WshClient {
         (err) => pending.reject(err)
       );
       return;
+    }
+
+    // The Presence answering this connection's own Attach/Resume names the
+    // channel the host assigned (see AttachmentInfo.channel_id): build the
+    // session now, synchronously, so the replay right behind it finds it.
+    if (type === MSG.PRESENCE && this.#pendingAttaches.length > 0) {
+      const own = Array.isArray(msg.attachments)
+        ? msg.attachments.find((a) => a?.channel_id !== undefined && this.#pendingAttaches.some((p) => p.sessionId === a.session_id))
+        : undefined;
+      if (own) {
+        const pending = this.#pendingAttaches.find((p) => p.sessionId === own.session_id);
+        const session = new WshSession(this.#transport, own.channel_id, {}, 'pty', {
+          dataMode: 'virtual',
+          capabilities: ['resize', 'signal'],
+          sessionId: own.session_id,
+          resumeToken: pending.token,
+        });
+        session._setSeq(Number.isSafeInteger(own.seq) ? own.seq : 0);
+        this.#sessions.set(own.channel_id, session);
+        session._activateVirtual((m) => this.sendRelayControl(m));
+        Object.defineProperty(msg, 'session', { value: session, enumerable: false });
+      }
     }
 
     // First, check if any waiters are listening for this message type.

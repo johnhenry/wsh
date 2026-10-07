@@ -77,6 +77,12 @@ export class WshSession {
   #resumeToken;
 
   /**
+   * Cumulative session OUTPUT BYTES received so far (see `seq`).
+   * @type {number}
+   */
+  #seq = 0;
+
+  /**
    * Stream IDs returned by the server in OPEN_OK.
    * Typically { stdin: number, stdout: number } or a single bidirectional ID.
    * @type {object}
@@ -268,6 +274,27 @@ export class WshSession {
    */
   get resumeToken() {
     return this.#resumeToken;
+  }
+
+  /**
+   * How many bytes of this session's output this client has received: the
+   * host's `seq` for the next byte. Pass it as `lastSeq` to
+   * `WshClient.resumeSession()` so a resume replays only what was missed. For a
+   * session obtained from `attachSession()`/`resumeSession()` it starts at the
+   * host's position of the first replayed byte, so it is an absolute position
+   * either way. Counts bytes delivered to `onData`.
+   * @returns {number}
+   */
+  get seq() {
+    return this.#seq;
+  }
+
+  /**
+   * Set the starting position of a session obtained by attach/resume.
+   * @internal
+   */
+  _setSeq(n) {
+    this.#seq = n;
   }
 
   /** Current session state. */
@@ -657,6 +684,7 @@ export class WshSession {
         if (msg.data && msg.data.byteLength > 0) {
           this.#virtualBackend?.pushData(msg.data);
           try {
+            this.#seq += msg.data.byteLength;
             this.onData?.(msg.data);
           } catch (err) {
             console.error('[wsh:session] onData handler error:', err);
@@ -688,6 +716,7 @@ export class WshSession {
           .then((plaintext) => {
             this.#virtualBackend?.pushData(plaintext);
             try {
+              this.#seq += plaintext.byteLength;
               this.onData?.(plaintext);
             } catch (err) {
               console.error('[wsh:session] onData handler error:', err);
@@ -898,6 +927,7 @@ export class WshSession {
             }
             for (const plaintext of deliverable) {
               try {
+                this.#seq += plaintext.byteLength;
                 this.onData?.(plaintext);
               } catch (err) {
                 console.error('[wsh:session] onData handler error:', err);
@@ -905,6 +935,7 @@ export class WshSession {
             }
           } else {
             try {
+              this.#seq += value.byteLength;
               this.onData?.(value);
             } catch (err) {
               console.error('[wsh:session] onData handler error:', err);

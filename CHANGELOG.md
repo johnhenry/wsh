@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.21.0 (2026-10-07)
+
+- **New: `@johnhenry/wsh/server` attach / resume / detach of pty and exec
+  sessions (#68).** `createWshServer({ sessions: { detachTtlMs, maxDetached,
+  ringBytes, sessionSecret } })` keeps a per-server session registry that
+  outlives connections: a dropped socket detaches its sessions (they keep running
+  and keep filling a ring buffer of the newest `ringBytes`) until `detachTtlMs`
+  elapses, `maxDetached` evicts the longest-detached, or a client resumes.
+  `Resume` (token AND ownership) replays from `last_seq`; `Attach` (token OR
+  ownership) replays the retained tail and supports several connections per
+  session with `readOnly` viewers and `Presence` broadcasts; `Detach` and
+  `SessionListRequest` are answered. Tokens use the spec's 40-byte
+  `[expiry][HMAC-SHA256]` format; `sessionSecret` fixes the key across restarts.
+- **Defined: `seq`.** `Resume.last_seq` is the cumulative number of session
+  OUTPUT BYTES the client has received; no per-frame field was added (the client
+  counts). A `last_seq` older than the ring still holds, or newer than the
+  session has produced, is an error naming the gap. Documented in
+  `spec/wsh-v1.yaml` (`Resume`, `AttachmentInfo`).
+- **Spec (additive):** `AttachmentInfo` gains optional `channel_id` and `seq`,
+  set only on the entry for the caller in the Presence that answers its own
+  Attach/Resume: the channel assigned on this connection and the position of the
+  first byte that will arrive on it. `AttachmentInfo` is not a
+  `deny_unknown_fields` message in the Rust crates, so existing Rust peers ignore
+  them; `crates/wsh-core/src/messages.gen.rs` is regenerated and the four
+  `AttachmentInfo` literals in `wsh-server` set them to `None`. No Rust feature
+  work: the Rust `wsh-server` still replays its whole ring on Resume.
+- **New (client, additive):** `WshSession.seq` (output bytes received), and
+  `attachSession()`/`resumeSession()` now resolve with the Presence plus a
+  non-enumerable `session` -- a message-backed `WshSession` for the new channel --
+  when the host assigns one. The existing return value and every existing call are
+  unchanged.
+- **Behaviour:** the host now finishes handling messages already received before
+  it tears a connection down. A client's `disconnect()` sends `Close` for every
+  channel and then closes the socket; that `Close` used to be dropped on the floor
+  when the socket closed first. Without `sessions`, nothing observable changes
+  except that `Attach`/`Resume` answer `not enabled` (and `SessionListRequest` an
+  empty list) instead of being ignored until the client times out.
+- Sessions are in-memory (a restart ends them), and ACL grants /
+  `ControlChanged` are not built; see the README.
+
 ## 0.20.0 (2026-10-07)
 
 - **New: `@johnhenry/wsh/server` serves MCP tools (#71).**

@@ -387,6 +387,22 @@ messages:
         Resume a session from a specific sequence number.  Like Attach
         but replays only output after last_seq for efficient reconnection.
 
+        seq is the cumulative number of session OUTPUT BYTES: the host
+        counts every byte it produces for the session (stream data or
+        SessionData alike) from 0, and a client counts the bytes it has
+        received.  No per-frame field is needed.  A host that keeps a
+        bounded history replays from last_seq, and refuses a last_seq
+        older than its oldest retained byte (Error naming the gap -- fall
+        back to Attach) or newer than it has produced.  Hosts that retain
+        the whole ring and ignore last_seq (the Rust wsh-server today)
+        remain conformant, replaying more than was asked for.
+
+        The Presence that answers a successful Attach/Resume carries, on
+        the entry for the caller, the channel_id assigned on this
+        connection and the seq of the first byte that will arrive on it
+        (see AttachmentInfo); the replay and the live output follow as
+        SessionData on that channel.
+
         Unlike Attach, token is required and unconditionally verified --
         Resume is specifically the "the credentialed connection that
         received this exact token (from OpenOk, when it opened the
@@ -404,6 +420,18 @@ messages:
         last_seq:
           type: u64
           required: true
+          description: >
+            The cumulative number of session OUTPUT BYTES the client has
+            already received for this session (its `seq`): the host counts
+            every byte it produces for a session -- on a stream, or in
+            SessionData -- from 0, and the client, which sees each of them,
+            counts what arrived. The host replays only the bytes at and
+            after that position. 0 means "from the start". A host that
+            keeps a bounded history refuses a last_seq older than the
+            oldest byte it still has (an Error naming the gap; fall back to
+            Attach) or newer than it has produced. Hosts that retain the
+            whole ring and ignore last_seq (the Rust wsh-server today) are
+            conformant but replay more than was asked for.
 
     Rename:
       code: 0x32
@@ -1903,6 +1931,26 @@ nested_types:
       username:
         type: string
         required: false
+      channel_id:
+        type: u32
+        required: false
+        description: >
+          Only in the Presence that answers this connection's own
+          Attach/Resume, on the entry describing that attachment: the
+          channel id the host assigned on this connection. The replay and
+          the live output follow as SessionData with this channel_id (the
+          channel is always message-backed, whatever data_mode the session
+          was opened with), and Exit/Close end it. Absent from roster
+          broadcasts, where the entry is someone else's.
+      seq:
+        type: u64
+        required: false
+        description: >
+          Alongside channel_id: the session output position (cumulative
+          bytes, see Resume.last_seq) of the first byte that will be
+          delivered on that channel -- the requested last_seq for Resume,
+          the oldest retained byte for Attach. A client adds the length of
+          each SessionData it receives to this to know its own position.
 
   PeerInfo:
     fields:
