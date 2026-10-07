@@ -61,6 +61,26 @@ impl RingBuffer {
         result
     }
 
+    /// Absolute position (count of bytes ever written) of the oldest byte
+    /// still held. A client that has received `n` output bytes holds
+    /// position `n`; it can be replayed from iff `start_seq() <= n <=
+    /// total_written()`.
+    pub fn start_seq(&self) -> u64 {
+        self.total_written - self.len() as u64
+    }
+
+    /// Bytes from absolute position `seq` to the newest, in order. A `seq`
+    /// older than `start_seq()` is clamped to it (check first if the gap
+    /// matters); one at or past `total_written()` yields nothing.
+    pub fn read_from(&self, seq: u64) -> Vec<u8> {
+        let all = self.read_all();
+        let skip = seq.saturating_sub(self.start_seq());
+        if skip >= all.len() as u64 {
+            return Vec::new();
+        }
+        all[skip as usize..].to_vec()
+    }
+
     /// Number of valid bytes currently stored.
     pub fn len(&self) -> usize {
         if self.total_written >= self.capacity as u64 {
@@ -113,6 +133,34 @@ mod tests {
         let rb = RingBuffer::new(10);
         assert!(rb.is_empty());
         assert_eq!(rb.read_all(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn read_from_replays_only_what_follows_a_position() {
+        let mut rb = RingBuffer::new(10);
+        rb.write(b"hello");
+        assert_eq!(rb.start_seq(), 0);
+        assert_eq!(rb.read_from(0), b"hello");
+        assert_eq!(rb.read_from(2), b"llo");
+        assert_eq!(rb.read_from(5), b"");
+        assert_eq!(rb.read_from(99), b"");
+    }
+
+    #[test]
+    fn positions_are_absolute_after_the_ring_wraps() {
+        let mut rb = RingBuffer::new(5);
+        rb.write(b"abcde");
+        rb.write(b"fgh"); // holds "defgh": positions 3..8
+        assert_eq!(rb.start_seq(), 3);
+        assert_eq!(rb.total_written(), 8);
+        assert_eq!(rb.read_from(3), b"defgh");
+        assert_eq!(rb.read_from(6), b"gh");
+        assert_eq!(rb.read_from(8), b"");
+        assert_eq!(
+            rb.read_from(0),
+            b"defgh",
+            "older than the ring clamps to its start"
+        );
     }
 
     #[test]

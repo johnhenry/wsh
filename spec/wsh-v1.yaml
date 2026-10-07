@@ -394,8 +394,9 @@ messages:
         bounded history replays from last_seq, and refuses a last_seq
         older than its oldest retained byte (Error naming the gap -- fall
         back to Attach) or newer than it has produced.  Hosts that retain
-        the whole ring and ignore last_seq (the Rust wsh-server today)
-        remain conformant, replaying more than was asked for.
+        the whole ring and ignore last_seq remain conformant, replaying
+        more than was asked for (both the Node host and the Rust wsh-server
+        honour it).
 
         The Presence that answers a successful Attach/Resume carries, on
         the entry for the caller, the channel_id assigned on this
@@ -430,8 +431,8 @@ messages:
             keeps a bounded history refuses a last_seq older than the
             oldest byte it still has (an Error naming the gap; fall back to
             Attach) or newer than it has produced. Hosts that retain the
-            whole ring and ignore last_seq (the Rust wsh-server today) are
-            conformant but replay more than was asked for.
+            whole ring and ignore last_seq are conformant but replay more
+            than was asked for (the Node and Rust hosts both honour it).
 
     Rename:
       code: 0x32

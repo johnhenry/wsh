@@ -152,6 +152,7 @@ import {
   signChallenge, signPeerRecord,
   FrameDecoder, frameEncode, cborDecode,
   QMuxConnection, SerialQueue,
+  WebSocketTransport,
   MSG,
 } from '../../src/index.mjs';
 import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-components/webtransport';
@@ -1268,6 +1269,198 @@ describe('Rust wsh-server Attach/Resume (clawser #48)', () => {
     );
 
     await session.close();
+  });
+});
+
+// ── Resume replays only what follows last_seq (wsh #79) ─────────────
+//
+// The Rust host honours the same byte-count `seq` contract as the Node host
+// (`@johnhenry/wsh/server` `sessions`, spec `Resume`/`AttachmentInfo`): seq is the
+// cumulative number of session OUTPUT bytes. The client counts what it
+// received (`WshSession.seq`), Resume replays only the bytes after that, and
+// the Presence that answers an Attach/Resume carries the channel assigned on
+// this connection and the seq of the first byte that will arrive on it. The
+// process is the same one throughout (its pid is printed and checked), and it
+// keeps running -- and keeps filling the ring buffer -- while detached.
+//
+// A PTY would echo input and turn "\n" into "\r\n", so scripts start with
+// `stty -echo -opost` to keep the byte counts exact.
+
+describe('Rust wsh-server Resume / Attach seq (wsh #79)', () => {
+  const dec = new TextDecoder();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function until(cond, what, ms = 8000) {
+    const t0 = Date.now();
+    for (;;) {
+      if (await cond()) return;
+      if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`);
+      await sleep(20);
+    }
+  }
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const pidOf = (text) => Number(/pid:(\d+)/.exec(text)[1]);
+  const record = (session) => {
+    const rec = { text: '', exit: undefined, closed: false };
+    session.onData = (d) => { rec.text += dec.decode(d); };
+    session.onExit = (c) => { rec.exit = c; };
+    session.onClose = () => { rec.closed = true; };
+    return rec;
+  };
+  const SCRIPT = 'stty -echo -opost; echo pid:$$; echo first; sleep 0.5; echo second; while read l; do echo "pid:$$ $l"; done';
+
+  /** A client whose socket can be dropped without a Close/Detach, like a network failure. */
+  async function connectDroppable(server, keys, username = 'alice') {
+    const transport = new WebSocketTransport();
+    const client = new WshClient({ transportFactories: { ws: () => transport } });
+    await client.connect(server.url, { username, keyPair: keys.kp, transport: 'ws' });
+    clients.push(client);
+    return { client, drop: () => transport.close() };
+  }
+
+  it('resumes from last_seq on a fresh connection: only the later bytes arrive, same process, live afterwards', async () => {
+    const keys = await makeKeyPair();
+    const server = await startServer([keys.publicKeySSH]);
+    servers.push(server);
+
+    const c1 = await connectDroppable(server, keys);
+    const s1 = await c1.client.openSession({ type: 'pty', command: SCRIPT });
+    const r1 = record(s1);
+    await until(() => r1.text.includes('first\n'), 'first output');
+    const pid = pidOf(r1.text);
+    assert.equal(r1.text, `pid:${pid}\nfirst\n`);
+    assert.equal(s1.seq, Buffer.byteLength(r1.text), 'the client counts output bytes as seq');
+    const { sessionId, resumeToken } = s1;
+    const lastSeq = s1.seq;
+
+    await c1.drop(); // `second` is produced while detached
+    await sleep(900);
+    assert.ok(alive(pid), 'the process outlives its connection');
+
+    const c2 = await connectDroppable(server, keys);
+    const presence = await c2.client.resumeSession(sessionId, resumeToken, { lastSeq });
+    assert.equal(presence.type, MSG.PRESENCE);
+    const own = presence.attachments.find((a) => a.channel_id !== undefined);
+    assert.ok(own, 'the Presence names the channel assigned on this connection');
+    assert.equal(own.seq, lastSeq, 'and the seq of the first byte that will arrive on it');
+    const s2 = presence.session;
+    assert.ok(s2, 'the stock client builds a session for that channel');
+    assert.equal(s2.seq, lastSeq);
+    const r2 = record(s2);
+    await until(() => r2.text === 'second\n', 'the replay');
+    await s2.write('hi\n');
+    await until(() => r2.text.includes(`pid:${pid} hi\n`), 'live output from the same process');
+    assert.equal(r2.text, `second\npid:${pid} hi\n`, 'nothing before last_seq is repeated');
+    assert.equal(s2.seq, lastSeq + Buffer.byteLength(r2.text));
+  });
+
+  it('last_seq 0 replays the whole retained output; Attach replays the retained output and assigns a channel and seq', async () => {
+    const keys = await makeKeyPair();
+    const server = await startServer([keys.publicKeySSH]);
+    servers.push(server);
+
+    const owner = await connectDroppable(server, keys);
+    const s1 = await owner.client.openSession({ type: 'pty', command: SCRIPT });
+    const r1 = record(s1);
+    await until(() => r1.text.includes('second\n'), 'second output');
+    const total = Buffer.byteLength(r1.text);
+
+    const second = await connectDroppable(server, keys);
+    const viaResume = await second.client.resumeSession(s1.sessionId, s1.resumeToken, { lastSeq: 0 });
+    const rr = record(viaResume.session);
+    await until(() => Buffer.byteLength(rr.text) === total, 'the full replay');
+    assert.equal(rr.text, r1.text);
+
+    const third = await connectDroppable(server, keys);
+    const viaAttach = await third.client.attachSession(s1.sessionId);
+    const own = viaAttach.attachments.find((a) => a.channel_id !== undefined);
+    assert.equal(own.seq, 0, 'nothing was evicted, so Attach starts at the beginning');
+    assert.ok(own.channel_id !== viaResume.attachments.find((a) => a.channel_id !== undefined).channel_id, 'each attachment has its own channel');
+    const ra = record(viaAttach.session);
+    await until(() => Buffer.byteLength(ra.text) === total, 'the Attach replay');
+    assert.equal(ra.text, r1.text);
+
+    // Both attachments, and the opener, hear live output.
+    await s1.write('x\n');
+    await until(() => ra.text.endsWith('x\n') && rr.text.endsWith('x\n') && r1.text.endsWith('x\n'), 'live fan-out');
+  });
+
+  it('refuses a last_seq ahead of the session, and one older than the retained ring, naming the gap; Attach still gets the tail', async () => {
+    const keys = await makeKeyPair();
+    const server = await startServer([keys.publicKeySSH]);
+    servers.push(server);
+
+    // ~384 KiB of output while nobody is attached overflows the 256 KiB ring.
+    const c1 = await connectDroppable(server, keys);
+    const s1 = await c1.client.openSession({
+      type: 'pty',
+      command: 'stty -echo -opost; echo ready; sleep 0.5; head -c 393216 /dev/zero | tr "\\000" x; echo; exec sleep 30',
+    });
+    const r1 = record(s1);
+    await until(() => r1.text === 'ready\n', 'ready');
+    const { sessionId, resumeToken } = s1;
+    const lastSeq = s1.seq;
+    await c1.drop();
+    await sleep(1500);
+
+    const c2 = await connectDroppable(server, keys);
+    await assert.rejects(
+      () => c2.client.resumeSession(sessionId, resumeToken, { lastSeq }),
+      /output gap: .*starts at seq \d+ but last_seq is 6/,
+    );
+    await assert.rejects(
+      () => c2.client.resumeSession(sessionId, resumeToken, { lastSeq: 99999999 }),
+      /ahead of the session/,
+    );
+    const { session, attachments } = await c2.client.attachSession(sessionId);
+    const own = attachments.find((a) => a.channel_id !== undefined);
+    assert.ok(own.seq > lastSeq, 'Attach starts at the oldest retained byte');
+    const r2 = record(session);
+    await until(() => session.seq >= 393216, 'the retained tail');
+    assert.equal(session.seq - own.seq, Buffer.byteLength(r2.text));
+    assert.equal(Buffer.byteLength(r2.text), 256 * 1024, 'the whole ring, no more');
+  });
+
+  it('a session that ended while detached replays its output and reports the exit on resume', async () => {
+    const keys = await makeKeyPair();
+    const server = await startServer([keys.publicKeySSH]);
+    servers.push(server);
+
+    const c1 = await connectDroppable(server, keys);
+    const s1 = await c1.client.openSession({ type: 'exec', command: 'stty -echo -opost; echo one; sleep 0.4; echo two; exit 3' });
+    const r1 = record(s1);
+    await until(() => r1.text === 'one\n', 'one');
+    const { sessionId, resumeToken } = s1;
+    await c1.drop();
+    await sleep(900);
+
+    const c2 = await connectDroppable(server, keys);
+    const { session } = await c2.client.resumeSession(sessionId, resumeToken, { lastSeq: s1.seq });
+    const r2 = record(session);
+    await until(() => r2.exit !== undefined, 'the exit');
+    assert.equal(r2.text, 'two\n');
+    assert.equal(r2.exit, 3);
+    await until(() => r2.closed, 'close');
+  });
+
+  it('a read-only attachment sees the output but cannot write to the session', async () => {
+    const keys = await makeKeyPair();
+    const server = await startServer([keys.publicKeySSH]);
+    servers.push(server);
+
+    const owner = await connectDroppable(server, keys);
+    const s1 = await owner.client.openSession({ type: 'pty', command: SCRIPT });
+    const r1 = record(s1);
+    await until(() => r1.text.includes('second\n'), 'second');
+    const viewer = await connectDroppable(server, keys);
+    const { session } = await viewer.client.attachSession(s1.sessionId, { readOnly: true });
+    const rv = record(session);
+    await until(() => rv.text === r1.text, 'the viewer catches up');
+
+    await session.write('from-viewer\n');
+    await sleep(400);
+    assert.ok(!r1.text.includes('from-viewer'), 'a read-only attachment is not a writer');
+    await s1.write('from-owner\n');
+    await until(() => rv.text.includes('from-owner\n') && r1.text.includes('from-owner\n'), 'owner input reaches both');
   });
 });
 
