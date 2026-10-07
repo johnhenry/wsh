@@ -70,3 +70,10 @@ jobs:
 
       - name: npm run test:rust
         run: npm run test:rust
+
+  workflow-lint:
+    uses: johnhenry/workflows/.github/workflows/workflow-lint.yml@v1
+    with:
+      # release-rust.yml builds GitHub Release binaries (no npm publish) and stays
+      # tag-triggered on purpose; clawser pins its rust-v* tags.
+      publish-workflows: ".github/workflows/publish*.yml"
