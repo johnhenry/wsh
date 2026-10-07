@@ -18,12 +18,13 @@ import { QMuxConnection } from '../qmux-connection.mjs';
 import { FrameDecoder, frameEncode } from '../cbor.mjs';
 import {
   MSG, serverHello, challenge, authOk, authFail, openOk, openFail, sessionData,
-  exit as exitMsg, close as closeMsg, pong, fileResult, fileChunk,
+  exit as exitMsg, close as closeMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
 } from '../messages.gen.mjs';
 import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES } from './fs.mjs';
+import { MCP_CALL_ID_FEATURE } from '../client.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -47,6 +48,7 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {object | null} cfg.files - from createFileAccess
  * @param {{ pubkey: boolean, password: Function | null }} cfg.methods - which auth methods are on
  * @param {object | null} cfg.hostKey - from loadHostKey
+ * @param {object | null} cfg.mcp - from createMcpHost
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
  * @param {number} cfg.bindTimeoutMs - how long exec output waits for the data stream
  * @param {(line: string) => void} cfg.log
@@ -59,12 +61,14 @@ export function createConnectionFactory(cfg) {
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
       sessionId: randomUUID(), nonce: null, username: null, authed: false,
-      closed: false, nextChannel: 0,
+      closed: false, nextChannel: 0, fingerprint: null,
     };
     /** @type {Map<number, any>} */
     const channels = new Map();
     /** FileOp `write`/`rename`s awaiting their FileChunk frames, by client-chosen channel id. */
     const fileWrites = new Map();
+    /** AbortControllers of in-flight MCP calls: aborted on disconnect, counted for the cap. */
+    const mcpCalls = new Set();
     /** Channel ids awaiting their client-opened data stream, in OpenOk order. */
     const pendingStreams = [];
     const decoder = new FrameDecoder();
@@ -87,6 +91,8 @@ export function createConnectionFactory(cfg) {
       state.closed = true;
       for (const ch of channels.values()) ch.kill?.();
       channels.clear();
+      for (const c of mcpCalls) c.abort(new Error('connection closed'));
+      mcpCalls.clear();
       for (const w of fileWrites.values()) clearTimeout(w.timer);
       fileWrites.clear();
       try { qmux.destroy(new Error(why)); } catch { /* already gone */ }
@@ -130,6 +136,10 @@ export function createConnectionFactory(cfg) {
         case MSG.CLOSE: { const ch = channels.get(m.channel_id); if (ch) { ch.kill?.(); } return; }
         case MSG.FILE_OP: return handleFileOp(m);
         case MSG.FILE_CHUNK: return (fileWrites.has(m.channel_id) ? handleWriteChunk(m) : channels.get(m.channel_id)?.chunk?.(m));
+        case MSG.MCP_DISCOVER: return handleMcpDiscover();
+        // Not awaited: the handler chain is serial, and a slow tool must not hold up
+        // the next call (or a Close) behind it.
+        case MSG.MCP_CALL: handleMcpCall(m); return;
         default: log(`ignored message type 0x${m.type.toString(16)}`);
       }
     }
@@ -155,6 +165,7 @@ export function createConnectionFactory(cfg) {
         state.username = user;
         state.method = method;
         const features = [STREAM_ANNOUNCE];
+        if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE);
         if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
         let hostFingerprint;
         if (cfg.hostKey) {
@@ -199,6 +210,7 @@ export function createConnectionFactory(cfg) {
         } catch (e) { log(`authorize threw: ${e.message}`); }
         if (!allowed) return refuse('key not authorized');
         state.authed = true;
+        state.fingerprint = fp;
         state.nonce = null;
         await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: 3600 }));
         log(`authenticated ${state.username} (${fp.slice(0, 12)}...)`);
@@ -226,6 +238,63 @@ export function createConnectionFactory(cfg) {
       state.authed = true;
       await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: 3600 }));
       log(`authenticated ${state.username} (password)`);
+    }
+
+    // ── MCP ───────────────────────────────────────────────────────────
+
+    const principal = () => ({ username: state.username, fingerprint: state.fingerprint });
+
+    async function handleMcpDiscover() {
+      let tools = [];
+      if (cfg.mcp) {
+        try { tools = await cfg.mcp.list(state.username, principal()); } catch (e) { log(`mcp discover failed: ${e.message}`); }
+      }
+      return send(mcpTools({ tools }));
+    }
+
+    function handleMcpCall(m) {
+      const callId = typeof m.call_id === 'string' ? m.call_id : undefined;
+      const reply = (result) => {
+        try { return send(mcpResult({ result, callId })); } catch (e) {
+          log(`mcp result for ${m.tool} not encodable: ${e.message}`);
+          return send(mcpResult({ result: { success: false, error: 'tool result could not be encoded' }, callId }));
+        }
+      };
+      const fail = (error) => reply({ success: false, error });
+      if (!cfg.mcp) { fail('mcp is not enabled on this server'); return; }
+      if (mcpCalls.size >= cfg.mcp.maxConcurrent) { fail('too many concurrent MCP calls'); return; }
+
+      const abort = new AbortController();
+      mcpCalls.add(abort);
+      (async () => {
+        const name = typeof m.tool === 'string' ? m.tool : '';
+        const tool = name ? await cfg.mcp.find(name, state.username, principal()) : null;
+        if (!tool) return fail(`unknown tool: ${name || String(m.tool)}`);
+        const args = m.arguments ?? {};
+        const problem = cfg.mcp.validate(tool, args);
+        if (problem) return fail(`invalid arguments: ${problem}`);
+
+        let timer = null;
+        const aborted = new Promise((_, reject) => {
+          abort.signal.addEventListener('abort', () => reject(abort.signal.reason ?? new Error('aborted')), { once: true });
+        });
+        aborted.catch(() => {});
+        if (cfg.mcp.timeoutMs > 0) {
+          timer = setTimeout(() => abort.abort(new Error(`tool ${name} timed out after ${cfg.mcp.timeoutMs}ms`)), cfg.mcp.timeoutMs);
+        }
+        try {
+          const ctx = { user: state.username, fingerprint: state.fingerprint, signal: abort.signal };
+          const out = await Promise.race([Promise.resolve().then(() => tool.call(args, ctx)), aborted]);
+          return reply(out === undefined ? null : out);
+        } catch (e) {
+          if (!state.closed) log(`mcp tool ${name} failed: ${e?.message ?? e}`);
+          return fail(String(e?.message ?? e));
+        } finally {
+          clearTimeout(timer);
+        }
+      })()
+        .catch((e) => log(`mcp call ${m.tool}: ${e.message}`))
+        .finally(() => mcpCalls.delete(abort));
     }
 
     // ── Open ──────────────────────────────────────────────────────────

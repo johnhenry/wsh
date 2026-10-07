@@ -119,6 +119,45 @@ export interface WshServerFsOptions {
   maxFileBytes?: number;
 }
 
+/** Context handed to an MCP tool's `call()`. */
+export interface WshMcpCallContext {
+  /** Authenticated username. */
+  user: string;
+  /** Hex SHA-256 of the client's key (`null` for a password login). */
+  fingerprint: string | null;
+  /** Aborts on client disconnect or `timeoutMs`. A tool that ignores it keeps running but its reply is dropped. */
+  signal: AbortSignal;
+}
+
+/** One tool exposed over `McpDiscover` / `McpCall`. */
+export interface WshMcpTool {
+  name: string;
+  description?: string;
+  /** JSON Schema for the arguments (default `{ type: 'object' }`). Enforced before `call()` runs; keywords outside the supported subset are refused at startup. Advertised to clients as `parameters`. */
+  inputSchema?: Record<string, unknown> | boolean;
+  /** The result is sent as `McpResult.result` verbatim (any CBOR-encodable value). Throwing sends `{ success: false, error: message }`. */
+  call(args: any, ctx: WshMcpCallContext): unknown | Promise<unknown>;
+}
+
+/** The part of an `@modelcontextprotocol/sdk` `Client` that the server proxies. */
+export interface WshMcpClientLike {
+  listTools(): Promise<{ tools: Array<{ name: string; description?: string; inputSchema?: Record<string, unknown> }> }>;
+  callTool(params: { name: string; arguments: unknown }, resultSchema?: unknown, options?: { signal?: AbortSignal }): Promise<{ content?: unknown; structuredContent?: unknown; isError?: boolean }>;
+}
+
+export interface WshServerMcpOptions {
+  /** Tools to serve: a list, or a `{ name: { description, inputSchema, call } }` map. */
+  tools?: WshMcpTool[] | Record<string, Omit<WshMcpTool, 'name'>>;
+  /** An MCP client whose tools are proxied (local `tools` win on a name clash). */
+  client?: WshMcpClientLike;
+  /** Per-principal filter, applied to discovery and to calls alike (a hidden tool looks unknown). */
+  authorize?: (user: string, tool: { name: string; description: string; inputSchema: unknown }, who: { username: string; fingerprint: string | null }) => boolean | Promise<boolean>;
+  /** In-flight calls per connection (default 8); further calls get an error result. */
+  maxConcurrent?: number;
+  /** Per-call time limit in ms (default 30000; 0 = none). */
+  timeoutMs?: number;
+}
+
 export interface WshServerOptions {
   /** Bind address (default `127.0.0.1`). */
   host?: string;
@@ -138,6 +177,8 @@ export interface WshServerOptions {
   hostKey?: true | { file: string } | CryptoKeyPair;
   /** Enable file ops and uploads/downloads under one directory. Off by default. */
   fs?: WshServerFsOptions;
+  /** Serve MCP tools (`McpDiscover` / `McpCall`) and advertise `mcp-call-id`. Off by default. */
+  mcp?: WshServerMcpOptions;
   /** How long exec output waits for a client that has not yet opened its data stream (default 3000). */
   bindTimeoutMs?: number;
   onLog?: (line: string) => void;

@@ -186,7 +186,67 @@ paths and symlinks pointing out of it are refused -- for `write` and `rename`
 (both paths) exactly as for `read`.
 
 Not implemented (each has a tracking issue): WebTransport, relay/reverse
-mode, attach/resume of server-side sessions, MCP.
+mode, attach/resume of server-side sessions.
+
+### MCP tools
+
+`createWshServer({ mcp })` answers `McpDiscover` and `McpCall`, so the stock
+`client.discoverTools()` / `client.callTool()` and `WshMcpBridge` work against
+it. Off unless you pass it.
+
+```js
+const server = createWshServer({
+  auth,
+  mcp: {
+    tools: [{
+      name: 'read_note',
+      description: 'Read a note by id',
+      inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'], additionalProperties: false },
+      call: async ({ id }, { user, signal }) => ({ success: true, output: await readNote(id, { signal }) }),
+    }],
+    authorize: (user, tool) => tool.name !== 'admin_only' || user === 'root',   // optional
+    // client: mcpSdkClient,   // optional: proxy an @modelcontextprotocol/sdk Client's tools too
+    // maxConcurrent: 8, timeoutMs: 30_000,
+  },
+});
+```
+
+- **Tool shape:** `tools` is an array of `{ name, description, inputSchema,
+  call(args, { user, fingerprint, signal }) }` or a `{ name: { ... } }` map.
+  `inputSchema` is advertised to clients as `parameters` (the `McpToolSpec`
+  field).
+- **Arguments are untrusted.** They are validated against `inputSchema` before
+  `call()` runs; invalid arguments never reach the tool. The package has no
+  runtime dependencies, so the validator covers the keywords tool schemas use
+  (`type`, `enum`, `const`, `properties`, `required`, `additionalProperties`,
+  `items`, length/range/`pattern`/`multipleOf` bounds, `allOf`/`anyOf`/`oneOf`/
+  `not`, local `$ref`); a schema using any other keyword (`if`,
+  `patternProperties`, ...) is **refused when the server is created** rather than
+  silently enforced less strictly. Only tools you list are reachable.
+- **Results:** whatever `call()` returns is `McpResult.result` verbatim (the
+  stock `WshMcpBridge` normalizes the `{ success, output, error }` shape, and
+  wraps anything else as `{ success: true, output }`). A tool that throws, an
+  unknown tool, invalid arguments, a timeout or the concurrency cap all answer
+  `{ success: false, error }` -- the error text is the thrown `message`, so
+  throw messages you are happy for the caller to read.
+- **Correlation:** every `McpResult` echoes the call's `call_id`, and the
+  server advertises `mcp-call-id` (when `mcp` is configured), so concurrent
+  calls from one client get their own results, and a slow tool does not hold up
+  the calls behind it.
+- **Limits:** `maxConcurrent` in-flight calls per connection (default 8) and a
+  `timeoutMs` per call (default 30000). On timeout or disconnect the tool's
+  `signal` aborts; a tool that ignores it keeps running but its reply is dropped.
+- **Access:** discovery and calls are answered after authentication only.
+  `authorize(user, tool, { username, fingerprint })` filters both, and a tool
+  hidden from a caller is indistinguishable from one that does not exist.
+- **Proxying:** `client` takes anything with `listTools()` / `callTool()` (an
+  `@modelcontextprotocol/sdk` `Client`; this package does not import the SDK).
+  Its tools are re-listed on every discovery, validated against their own
+  `inputSchema`s here, and `isError` results become `{ success: false, error }`,
+  else the result is `structuredContent` or the `content` array. A proxied tool
+  whose schema uses an unsupported keyword is not exposed.
+- Without `mcp`, `McpDiscover` answers an empty list and `McpCall` an
+  `{ success: false, error: 'mcp is not enabled on this server' }` result.
 
 ### Host key (fingerprint / TOFU)
 
