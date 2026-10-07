@@ -13,10 +13,12 @@ import { loadHostKey } from './host-key.mjs';
 import { buildBackends } from './backends.mjs';
 import { SessionRegistry } from './sessions.mjs';
 import { RelayHub } from './relay.mjs';
+import { startWebTransport } from './webtransport.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
 
 export { parseAuthorizedKeys, STREAM_ANNOUNCE };
 export { createReverseHost } from './reverse-host.mjs';
+export { generateSelfSignedCertificate } from './self-signed.mjs';
 
 /**
  * @param {object} [options]
@@ -30,6 +32,11 @@ export { createReverseHost } from './reverse-host.mjs';
  * @param {{ tools?: object[] | object, client?: object, authorize?: Function, maxConcurrent?: number, timeoutMs?: number }} [options.mcp]
  *   MCP tools served over `McpDiscover` / `McpCall`: `tools` (`{ name, description, inputSchema, call(args, { user, signal }) }`),
  *   and/or `client` (an `@modelcontextprotocol/sdk` Client to proxy). Off unless given.
+ * @param {{ port?: number, host?: string, path?: string, cert?: string, privKey?: string, selfSigned?: boolean | object, secret?: string }} [options.webTransport]
+ *   Also listen for WebTransport (HTTP/3 over UDP) clients, with the same auth and features as the WebSocket
+ *   listener. `cert` / `privKey` are PEM; `selfSigned: true` makes a 13-day ECDSA P-256 certificate and exposes its
+ *   SHA-256 through `webTransport()` for the client's `serverCertificateHashes`. Needs the optional peers
+ *   `@fails-components/webtransport` and `@fails-components/webtransport-transport-http3-quiche`. Off unless given.
  * @param {{ canRegister?: Function, canConnect?: Function, maxPeers?: number, connectTimeoutMs?: number }} [options.relay]
  *   Act as a relay: peers register (`ReverseRegister`, a signed record), operators list and connect to them
  *   (`ReverseList` / `ReverseConnect`) and traffic is carried between them as `RelayForward`. Default deny:
@@ -48,7 +55,7 @@ export { createReverseHost } from './reverse-host.mjs';
  * @returns {{ listen(): Promise<{address: string, port: number}>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, sessions, sessionSecret, relay, bindTimeoutMs = 3000, onLog = () => {},
+  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, sessions, sessionSecret, relay, webTransport, bindTimeoutMs = 3000, onLog = () => {},
 } = {}) {
   let wss = null;
   let bound = null;
@@ -64,6 +71,7 @@ export function createWshServer({
   let host_ = null;
   let registry = null;
   let hub = null;
+  let wt = null;
   const sessionOptions = sessions ? (sessions === true ? {} : sessions) : null;
 
   return {
@@ -113,6 +121,14 @@ export function createWshServer({
       });
       const a = wss.address();
       bound = { address: a.address, port: a.port };
+      if (webTransport) {
+        try {
+          wt = await startWebTransport({ options: webTransport, host, attach, log: onLog });
+        } catch (err) {
+          await this.close();
+          throw err;
+        }
+      }
       return bound;
     },
 
@@ -122,6 +138,8 @@ export function createWshServer({
       wss = null;
       bound = null;
       for (const client of server.clients) client.terminate();
+      await wt?.close();
+      wt = null;
       await new Promise((resolve) => server.close(resolve));
       registry?.closeAll();
       registry = null;
@@ -131,6 +149,18 @@ export function createWshServer({
 
     address() {
       return bound;
+    },
+
+    /**
+     * The WebTransport listener, or `null` (not configured, or `listen()` has not resolved). `certificateHash` is
+     * the SHA-256 of a `selfSigned` certificate, for the client's `serverCertificateHashes`; `null` for your own.
+     */
+    webTransport() {
+      if (!wt) return null;
+      return {
+        port: wt.port, host: wt.host, path: wt.path, url: `https://${wt.host.includes(':') ? `[${wt.host}]` : wt.host}:${wt.port}${wt.path}`,
+        certificateHash: wt.certificateHash, certificateHashHex: wt.certificateHashHex, notAfter: wt.notAfter,
+      };
     },
 
     /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */

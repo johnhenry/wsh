@@ -200,6 +200,55 @@ export interface WshServerRelayOptions {
   connectTimeoutMs?: number;
 }
 
+export interface WshServerWebTransportOptions {
+  /** UDP port for HTTP/3 (default 0 = pick a free one; read it back from `webTransport()`). */
+  port?: number;
+  /** Bind address (default: the server's `host`). */
+  host?: string;
+  /** URL path sessions are accepted on (default `/wsh`). */
+  path?: string;
+  /** PEM certificate chain. With `privKey`. Not together with `selfSigned`. */
+  cert?: string;
+  /** PEM private key for `cert`. */
+  privKey?: string;
+  /**
+   * Generate a short-lived ECDSA P-256 certificate (13 days; browsers refuse a pinned one valid for more than 14) and
+   * expose its SHA-256 as `webTransport().certificateHash`, for the client's `serverCertificateHashes`. It is not
+   * renewed: restart the server before `notAfter`. An object takes `{ hosts, validityDays }`.
+   */
+  selfSigned?: boolean | { hosts?: string[]; validityDays?: number };
+  /** QUIC stateless-reset secret (default: random). */
+  secret?: string;
+}
+
+export interface WshServerWebTransport {
+  port: number;
+  host: string;
+  path: string;
+  /** `https://host:port/path`, what a client connects to. */
+  url: string;
+  /** SHA-256 of the DER certificate, when `selfSigned` made it; `null` for a certificate you supplied. */
+  certificateHash: Uint8Array | null;
+  certificateHashHex: string | null;
+  /** When the `selfSigned` certificate expires; `null` otherwise. */
+  notAfter: Date | null;
+}
+
+export interface WshSelfSignedCertificate {
+  /** PEM certificate. */
+  cert: string;
+  /** PEM (PKCS#8) private key. */
+  privKey: string;
+  /** SHA-256 of the DER certificate: the value to pin. */
+  hash: Uint8Array;
+  hashHex: string;
+  notBefore: Date;
+  notAfter: Date;
+}
+
+/** A dependency-free self-signed ECDSA P-256 certificate fit for WebTransport's `serverCertificateHashes`. */
+export function generateSelfSignedCertificate(opts?: { hosts?: string[]; validityDays?: number; now?: Date }): WshSelfSignedCertificate;
+
 export interface WshServerOptions {
   /** Bind address (default `127.0.0.1`). */
   host?: string;
@@ -233,6 +282,12 @@ export interface WshServerOptions {
    * Default deny -- give both `canRegister` and `canConnect`. Off by default.
    */
   relay?: WshServerRelayOptions;
+  /**
+   * Also listen for WebTransport (HTTP/3 over UDP) clients -- the same auth, exec, pty, fs, mcp, sessions and relay as the
+   * WebSocket listener, with real independent streams. Needs the optional peers `@fails-components/webtransport` and
+   * `@fails-components/webtransport-transport-http3-quiche`, imported only when this is set. Off by default.
+   */
+  webTransport?: WshServerWebTransportOptions;
   /** Serve MCP tools (`McpDiscover` / `McpCall`) and advertise `mcp-call-id`. Off by default. */
   mcp?: WshServerMcpOptions;
   /** How long exec output waits for a client that has not yet opened its data stream (default 3000). */
@@ -252,6 +307,8 @@ export interface WshServer {
   close(): Promise<void>;
   /** The bound address, or `null` when not listening. */
   address(): WshServerAddress | null;
+  /** The WebTransport listener; `null` when not configured or before `listen()` resolves. */
+  webTransport(): WshServerWebTransport | null;
   /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */
   peerFingerprints(): string[];
   /** The advertised host identity; `null` before `listen()` resolves or without a `hostKey`. */

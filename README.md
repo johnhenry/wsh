@@ -155,7 +155,7 @@ hosts do). Pass `primer: false` to never send it.
 ## Node Server
 
 `@johnhenry/wsh/server` is a Node host for the same protocol, over WebSocket
-(QMux). It is a separate subpath -- the package root stays browser-safe and
+(QMux) and, optionally, [WebTransport](#webtransport-listener). It is a separate subpath -- the package root stays browser-safe and
 never imports it -- and needs the optional peer dependency `ws`
 (`npm install ws`).
 
@@ -185,7 +185,50 @@ restricted host with no shell. `fs.root` confines every path: `..`, absolute
 paths and symlinks pointing out of it are refused -- for `write` and `rename`
 (both paths) exactly as for `read`.
 
-Not implemented (tracking issue): WebTransport.
+### WebTransport listener
+
+The client's ladder prefers WebTransport (`https://`) and falls back to `wss://`;
+`webTransport` gives the Node host the first rung, with real independent QUIC
+streams (no head-of-line blocking across channels):
+
+```js
+const server = createWshServer({
+  auth, exec: true, fs: { root: '/srv/share' },
+  webTransport: { port: 4433, selfSigned: true },        // or { cert, privKey } PEM
+});
+await server.listen();                                    // the WebSocket listener still runs
+const { url, certificateHash } = server.webTransport();  // https://127.0.0.1:4433/wsh, sha-256 of the cert
+
+// client (a browser, or Node with a WebTransport implementation)
+await client.connect(url, {
+  username, keyPair, transport: 'wt',
+  webTransport: { serverCertificateHashes: [{ algorithm: 'sha-256', value: certificateHash }] },
+});
+```
+
+- **Optional peers**, imported only when `webTransport` is set:
+  `npm install @fails-components/webtransport @fails-components/webtransport-transport-http3-quiche`
+  (a native HTTP/3 build, prebuilt for Linux/macOS/Windows on x64 and arm).
+  Without them `listen()` rejects with that instruction, and a server with no `webTransport`
+  never loads them.
+- **Same host, other wire.** Auth (keys, password, host key), `exec`, `pty`, `fs`, `mcp`,
+  `sessions` and `relay` behave identically; only the transport differs. The control stream is the
+  session's first bidirectional stream (length-prefixed CBOR frames); every bidirectional stream the client
+  opens afterwards is a data stream, bound to the next exec channel in `OpenOk` order. A client-created
+  stream is visible to the host as soon as it exists, so the host advertises `stream-announce` and the
+  client writes no primer.
+- **`selfSigned: true`** generates (no dependency) an ECDSA P-256 certificate valid for 13 days -- a browser refuses a
+  pinned certificate valid for more than 14 -- and exposes the SHA-256 for `serverCertificateHashes`
+  (`{ selfSigned: { hosts, validityDays } }` to change the SANs or the lifetime). **It is not renewed:**
+  restart before `notAfter`, and re-pin. A certificate you pass as `cert`/`privKey` is used as is
+  (`certificateHash` is then `null`). `generateSelfSignedCertificate()` is exported for the same
+  certificate without a server. The web platform's other pinning rules apply (`https:` URL, HTTP/3 only; see
+  [Pinning a Self-Signed Certificate](#pinning-a-self-signed-certificate)).
+- Node has no `WebTransport` global: a Node *client* needs `globalThis.WebTransport = (await import(
+  '@fails-components/webtransport')).WebTransport` first. UDP, so a firewall must allow `port`, and there
+  is no `wss://`-style TLS terminator in front: the certificate is the one this process serves.
+- Tests (`test/server-webtransport.test.mjs`) run the stock client against it over a real HTTP/3
+  connection and are **skipped, with the reason, where the native binary cannot load**.
 
 ### Relay / reverse mode
 
