@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.20.0 (2026-10-07)
+
+- **New: `@johnhenry/wsh/server` serves MCP tools (#71).**
+  `createWshServer({ mcp: { tools, client?, authorize?, maxConcurrent?,
+  timeoutMs? } })` answers `McpDiscover` with the operator's tools (advertised
+  with their `inputSchema` as `parameters`) and `McpCall` by validating the
+  untrusted arguments against `inputSchema`, running `call(args, { user,
+  fingerprint, signal })`, and replying with the call's own `call_id` (the
+  server advertises `mcp-call-id`, so concurrent calls from `client.callTool()`
+  / `WshMcpBridge` each get their own result, and a slow tool never blocks the
+  calls behind it). Unknown or `authorize()`-hidden tools, invalid arguments,
+  throwing tools, timeouts (default 30 s) and the per-connection cap (default
+  8) all answer `{ success: false, error }`; in-flight calls abort on
+  disconnect. `mcp.client` proxies an `@modelcontextprotocol/sdk` client's tools
+  (duck-typed -- the SDK is not a dependency). The schema validator is built in
+  (no runtime dependency) and refuses unsupported keywords at startup. No spec,
+  codegen, Rust or client change. Without `mcp`, discovery now answers an empty
+  list and a call an error result instead of being ignored.
+
 ## 0.19.1 (2026-10-06)
 
 - **Fixed: overlapping file operations could receive each other's result

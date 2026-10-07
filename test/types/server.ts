@@ -16,6 +16,14 @@ const pwOptions: WshServerOptions = {
   auth: { password: async (u, p) => u === p, rateLimit: { maxFailures: 3, key: ({ address }) => address ?? '' } },
   hostKey: true,
 };
+const mcpOptions: WshServerOptions = {
+  mcp: {
+    tools: [{ name: 'echo', inputSchema: { type: 'object' }, call: (args, { user, signal }) => ({ user, args, aborted: signal.aborted }) }],
+    authorize: (user, tool) => user === 'alice' && tool.name !== 'secret',
+    maxConcurrent: 4,
+    timeoutMs: 1000,
+  },
+};
 const server: WshServer = createWshServer(options);
 const bound: Promise<{ address: string; port: number }> = server.listen();
 const maybe: { address: string; port: number } | null = server.address();
@@ -25,4 +33,4 @@ const hk: { fingerprint: string; publicKey: Uint8Array; openssh: string } | null
 declare const key: CryptoKey;
 const sig: Promise<Uint8Array> = sign(key, new Uint8Array(1));
 const ok: Promise<boolean> = verify(key, new Uint8Array(64), new Uint8Array(1));
-export { bound, maybe, closed, sig, ok, pwOptions, hk };
+export { mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };
