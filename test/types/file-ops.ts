@@ -47,3 +47,16 @@ async function inspectRemove() {
   return errorMessage;
 }
 void inspectRemove;
+
+// 0.19: host key pinning + fileWrite / fileRename
+import { WshClient as Client19, WshKnownHosts, HostKeyError, type WshHostKey } from '@johnhenry/wsh';
+declare const c19: Client19;
+const hostKey19: WshHostKey | null = c19.hostKey;
+c19.onHostKey = (hk) => hk.status !== 'unknown';
+const connected19: Promise<string> = c19.connect('ws://h', {
+  username: 'a', password: 'p', expectHostKey: 'ab', knownHosts: new WshKnownHosts(), trustOnFirstUse: true,
+});
+const w19: Promise<{ success: boolean }> = c19.fileWrite('p', 'text', 0);
+const r19: Promise<{ success: boolean }> = c19.fileRename('a', 'b');
+const code19: string | undefined = (new HostKeyError('HOST_KEY_MISSING', 'x') as HostKeyError).code;
+export { hostKey19, connected19, w19, r19, code19 };

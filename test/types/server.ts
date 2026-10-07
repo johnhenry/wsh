@@ -10,13 +10,19 @@ const options: WshServerOptions = {
   auth: { authorizedKeys: 'ssh-ed25519 AAAA', authorize: async ({ username }) => username === 'alice' },
   exec: { timeoutMs: 1000 },
   fs: { root: '/tmp', readOnly: true },
+  hostKey: { file: '/tmp/host_key' },
+};
+const pwOptions: WshServerOptions = {
+  auth: { password: async (u, p) => u === p, rateLimit: { maxFailures: 3, key: ({ address }) => address ?? '' } },
+  hostKey: true,
 };
 const server: WshServer = createWshServer(options);
 const bound: Promise<{ address: string; port: number }> = server.listen();
 const maybe: { address: string; port: number } | null = server.address();
 const closed: Promise<void> = server.close();
+const hk: { fingerprint: string; publicKey: Uint8Array; openssh: string } | null = server.hostKey();
 
 declare const key: CryptoKey;
 const sig: Promise<Uint8Array> = sign(key, new Uint8Array(1));
 const ok: Promise<boolean> = verify(key, new Uint8Array(64), new Uint8Array(1));
-export { bound, maybe, closed, sig, ok };
+export { bound, maybe, closed, sig, ok, pwOptions, hk };

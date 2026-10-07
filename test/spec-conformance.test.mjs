@@ -140,6 +140,7 @@ class RecordingTransport extends WshTransport {
     const reply = (m) => setTimeout(() => this._emitControl(m), 0);
     switch (msg.type) {
       case MSG.HELLO:
+        reply({ type: MSG.SERVER_HELLO, session_id: 'sid', features: ['file-write', 'file-rename'] });
         reply({ type: MSG.CHALLENGE, nonce: new Uint8Array(32).fill(7), session_id: 'sid' });
         break;
       case MSG.AUTH:

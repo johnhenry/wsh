@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.19.0 (2026-10-06)
+
+Closes the gaps between `@johnhenry/wsh/server` and the hosts consumers had
+been vendoring. No spec, codegen or Rust change; everything new rides in
+existing frames and `features` strings (see README, Node Server).
+
+- **New: host key / TOFU.** `createWshServer({ hostKey })` (`{ file }`,
+  `true`, or a `CryptoKeyPair`) populates `ServerHello.host_fingerprint` and
+  proves possession of the key with a signature over a client-chosen nonce, so
+  the proof cannot be replayed. The stock client surfaces it as
+  `client.hostKey` / `onHostKey` and enforces `expectHostKey` (fingerprint,
+  ssh line or raw key) and `knownHosts` + `trustOnFirstUse`, throwing the new
+  `HostKeyError` (`HOST_KEY_MISSING | _INVALID | _MISMATCH | _UNKNOWN |
+  _REJECTED`) **before any signature or password is sent**. `server.hostKey()`
+  returns the advertised identity. `exec()` and `connectReverse()` take the
+  same options. Pinning is not confidentiality: the proof covers the
+  ServerHello, not the stream -- use `wss://`.
+- **New: password auth.** `auth: { password: (user, pass) => boolean |
+  Promise<boolean> }`, using the protocol's existing password `Auth` frame (no
+  extension). Per-address failure throttle (`auth.rateLimit`: `maxFailures`,
+  `windowMs`, `lockoutMs`, `failureDelayMs`, `key`); a locked-out caller never
+  reaches the callback. Methods are independent: key-only hosts refuse
+  passwords and password-only hosts refuse keys.
+- **Fixed: `client.fileWrite()` and `client.fileRename()` never sent the data /
+  the new path** (the `FileOp` frame has no field for either, and the client
+  dropped both arguments). They now send the payload as `FileChunk` frames on
+  the op's channel, gated on new host features `file-write` / `file-rename`
+  (the client throws against a host without them rather than send a request
+  the host would misread). The server implements both under `fs` with the same
+  traversal and symlink confinement as every other op, `readOnly` and
+  `maxFileBytes` honoured; `fileWrite` replaces the file or writes in place at
+  an `offset`, `fileRename` refuses to overwrite, to move a directory into
+  itself, or to touch the root. `upload` now also refuses non-regular files
+  (a FIFO would block the host).
+- **Docs:** the server README now documents the leading-`0x00` primer drop and
+  a Compatibility table of announce-vs-primer behaviour for every
+  client/host pairing; the stale "no server populates `host_fingerprint`"
+  statements are scoped to the Rust server.
+- **Tracked, not built:** server attach/resume (#68), relay/reverse (#69),
+  WebTransport (#70), MCP (#71); concurrent file ops can receive each other's
+  result (#72).
+
 ## 0.18.0 (2026-10-06)
 
 - **New: `@johnhenry/wsh/server`, a Node host for the protocol.**

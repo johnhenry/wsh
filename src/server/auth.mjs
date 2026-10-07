@@ -73,3 +73,60 @@ export async function buildAuthorizer(auth) {
     return true;
   };
 }
+
+/**
+ * Whether `auth` allows public-key login at all (an allowlist and/or an
+ * `authorize` callback, or the function shorthand) and/or password login.
+ *
+ * @param {any} auth
+ * @returns {{ pubkey: boolean, password: ((user: string, pass: string) => boolean | Promise<boolean>) | null }}
+ */
+export function authMethods(auth) {
+  if (typeof auth === 'function') return { pubkey: true, password: null };
+  if (!auth) return { pubkey: false, password: null };
+  if (auth.password !== undefined && typeof auth.password !== 'function') {
+    throw new TypeError('createWshServer: auth.password must be a function (user, pass) => boolean | Promise<boolean>');
+  }
+  return {
+    pubkey: auth.authorizedKeys !== undefined || typeof auth.authorize === 'function',
+    password: auth.password ?? null,
+  };
+}
+
+/**
+ * Failure throttle for password logins, keyed (by default) on the peer's
+ * address. After `maxFailures` failures inside `windowMs` the key is locked
+ * for `lockoutMs`, during which the password callback is not even called.
+ * A success clears the key. In-memory and per-process, by design.
+ */
+export class FailureLimiter {
+  #entries = new Map();
+  #now;
+  constructor({ maxFailures = 5, windowMs = 60_000, lockoutMs = 60_000, now = Date.now } = {}) {
+    this.maxFailures = maxFailures;
+    this.windowMs = windowMs;
+    this.lockoutMs = lockoutMs;
+    this.#now = now;
+  }
+
+  /** @returns {number} ms the key is still locked out (0 = free to try) */
+  lockedFor(key) {
+    const e = this.#entries.get(key);
+    if (!e) return 0;
+    const t = this.#now();
+    if (e.lockedUntil > t) return e.lockedUntil - t;
+    if (t - e.first > this.windowMs) this.#entries.delete(key);
+    return 0;
+  }
+
+  fail(key) {
+    const t = this.#now();
+    let e = this.#entries.get(key);
+    if (!e || t - e.first > this.windowMs) { e = { count: 0, first: t, lockedUntil: 0 }; this.#entries.set(key, e); }
+    e.count++;
+    if (e.count >= this.maxFailures) e.lockedUntil = t + this.lockoutMs;
+    if (this.#entries.size > 10_000) this.#entries.delete(this.#entries.keys().next().value);
+  }
+
+  succeed(key) { this.#entries.delete(key); }
+}

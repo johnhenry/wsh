@@ -80,6 +80,7 @@ export { WshKeyStore } from './keystore.mjs';
 
 // Host identity (TOFU) -- wsh #59
 export { WshKnownHosts } from './known-hosts.mjs';
+export { HostKeyError } from './host-key.mjs';
 
 // File transfer
 export { WshFileTransfer } from './file-transfer.mjs';

@@ -1549,8 +1549,48 @@ export class WshVirtualSessionBackend {
 // client.mjs -- WshClient
 // ============================================================================
 
+/** The host identity a server proved it holds (see `WshClient.hostKey`). */
+export interface WshHostKey {
+  /** Hex SHA-256 of the raw key (same as `fingerprint()` / `ServerHello.host_fingerprint`). */
+  fingerprint: string;
+  /** Raw 32-byte Ed25519 host public key. */
+  publicKey: Uint8Array;
+  /** `ssh-ed25519 AAAA...` form, for display or `expectHostKey`. */
+  openssh: string;
+  /** `pinned` matched `expectHostKey`; `known`/`unknown` per `knownHosts`; `unpinned` = surfaced, nothing checked. */
+  status: 'pinned' | 'known' | 'unknown' | 'unpinned';
+}
+
+/** Why a host key was refused. */
+export type WshHostKeyErrorCode =
+  | 'HOST_KEY_MISSING' | 'HOST_KEY_INVALID' | 'HOST_KEY_MISMATCH' | 'HOST_KEY_UNKNOWN' | 'HOST_KEY_REJECTED';
+
+/** Thrown by `connect()` when the host key fails the caller's policy. No credential has been sent. */
+export class HostKeyError extends Error {
+  constructor(code: WshHostKeyErrorCode, message: string, details?: { expected?: string; actual?: string });
+  readonly code: WshHostKeyErrorCode;
+  /** MISMATCH: the pinned / expected fingerprint. */
+  readonly expected?: string;
+  /** MISMATCH / UNKNOWN: the fingerprint the host presented. */
+  readonly actual?: string;
+}
+
+/** Host-key policy shared by `connect()`, `exec()` and `connectReverse()`. */
+export interface WshHostKeyOptions {
+  /** Pin: hex fingerprint (optionally `sha256:`-prefixed), raw 32-byte key, or `ssh-ed25519 AAAA...` line. Refuses on mismatch or when the host presents no key. */
+  expectHostKey?: string | Uint8Array;
+  /** TOFU store. A changed key is always refused; an unseen host is refused unless `trustOnFirstUse` / `onHostKey` accepts it. */
+  knownHosts?: WshKnownHosts;
+  /** Pin an unseen host's key into `knownHosts`. */
+  trustOnFirstUse?: boolean;
+  /** Key `knownHosts` records this host under (default: the URL's `host:port`). */
+  hostLabel?: string;
+  /** Sees the verified key before any credential is sent; return `false` (or throw) to refuse. */
+  onHostKey?: (hostKey: WshHostKey) => boolean | void | Promise<boolean | void>;
+}
+
 /** Options for WshClient.connect(). */
-export interface WshConnectOptions {
+export interface WshConnectOptions extends WshHostKeyOptions {
   username: string;
   keyPair?: CryptoKeyPair;
   password?: string;
@@ -1609,6 +1649,11 @@ export interface WshConnectReverseOptions {
   password?: string;
   /** Forwarded to the underlying `connect()` -- see `WshConnectOptions`. */
   webTransport?: WshWebTransportOptions;
+  expectHostKey?: WshHostKeyOptions['expectHostKey'];
+  knownHosts?: WshKnownHosts;
+  trustOnFirstUse?: boolean;
+  hostLabel?: string;
+  onHostKey?: WshHostKeyOptions['onHostKey'];
   expose?: {
     shell?: boolean;
     exec?: boolean;
@@ -1624,7 +1669,7 @@ export interface WshConnectReverseOptions {
 }
 
 /** Options for WshClient.exec(). */
-export interface WshExecOptions {
+export interface WshExecOptions extends WshHostKeyOptions {
   username: string;
   keyPair?: CryptoKeyPair;
   password?: string;
@@ -1777,6 +1822,15 @@ export class WshClient {
   hasFeature(name: string): boolean;
 
   /**
+   * The host's Ed25519 identity once it has proven it holds the key for this
+   * connection; `null` if the server advertised none (e.g. the Rust server).
+   */
+  readonly hostKey: WshHostKey | null;
+
+  /** Default `onHostKey` for `connect()` (a per-call option wins). */
+  onHostKey: ((hostKey: WshHostKey) => boolean | void | Promise<boolean | void>) | null;
+
+  /**
    * Connect to a wsh server, authenticate, and return the session ID.
    */
   connect(url: string, opts?: WshConnectOptions): Promise<string>;
@@ -1833,6 +1887,20 @@ export class WshClient {
    * the raw wire-shaped `FileResult` response `fileOperation()` waits on.
    */
   fileList(path: string, timeout?: number): Promise<WshFileOperationResult>;
+
+  /**
+   * Write bytes to a remote file. `offset` omitted replaces the file; given,
+   * writes in place at that offset. Needs the host feature `file-write`
+   * (`@johnhenry/wsh/server` with `fs` has it); throws against a host without
+   * it. Failure is reported as `success: false` in the result.
+   */
+  fileWrite(path: string, data: Uint8Array | string, offset?: number, timeout?: number): Promise<WshFileOperationResult>;
+
+  /**
+   * Rename/move a remote file or directory. Needs the host feature
+   * `file-rename`; throws against a host without it. Refuses to overwrite.
+   */
+  fileRename(oldPath: string, newPath: string, timeout?: number): Promise<WshFileOperationResult>;
 
   /**
    * Remove a remote file or directory (`FileOp` op `"remove"`). Refused
