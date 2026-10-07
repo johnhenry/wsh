@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.25.1 (2026-10-07) / Rust `rust-v0.2.0`
+
+- **Rust `wsh-server` honours `Resume.last_seq` and sets `AttachmentInfo.channel_id`/`seq` (#79).**
+  Per-session state now lives in the session, not the connection that opened it: a PTY/exec
+  session has one output pump that appends to its ring buffer (the byte count is `seq`, as in
+  0.21.0) and fans out `SessionData` to every attachment, so the process keeps running and
+  keeps filling the ring after its connection drops. `Resume` replays only the bytes after
+  `last_seq`; a `last_seq` older than the 256 KiB ring still holds, or newer than the session
+  produced, is an `Error` (code 4) naming the gap. Attach/Resume answer with a Presence whose
+  entry for the caller carries the assigned `channel_id` and the `seq` of the first byte on it,
+  then the replay and live output arrive as `SessionData` on that channel (not `GatewayData`
+  id 0), in order. Read-only attachments (`mode: "readonly"`, also read-only guest joins)
+  cannot write, and a connection can no longer write to a channel that is not its own
+  control attachment. Connections going away detach; a session that ends while detached
+  lingers (not counted against a key's `max_sessions`) until the next attach replays it and
+  delivers `Exit`/`Close`. The ring buffer, which was never actually written before, now is.
+- **Tests:** `cargo test` unit tests for the ring positions and the session manager (replay
+  from `last_seq`, gaps, pruning, write permission, exit while detached); five new cross-
+  implementation tests in `test/rust/wsh-rust-server.test.mjs` drive the Rust binary with
+  the stock JS client (drop the socket, resume from a fresh connection: same pid, only later
+  bytes, live afterwards; Attach channel/seq; gaps; exit while detached; read-only viewer).
+- **Docs:** spec and README no longer say the Rust host ignores `last_seq`. The Rust
+  workspace is versioned independently: this change is `rust-v0.2.0`; the npm package gets a
+  patch release only for the documentation.
 ## 0.25.0 (2026-10-07)
 
 - **New: typed ("object-mode") RPC channels as a subsystem (#85).**

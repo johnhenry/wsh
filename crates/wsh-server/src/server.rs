@@ -11,7 +11,7 @@ use crate::gateway::GatewayEvent;
 use crate::handshake;
 use crate::mcp::{McpBridge, McpProxy};
 use crate::relay::{wisp, PeerMetadata, PeerRegistry, RelayBroker, WispGuestSession, WispRegistry};
-use crate::session::SessionManager;
+use crate::session::{AttachError, Attachment, SessionManager};
 use crate::transport::{websocket, webtransport};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -742,6 +742,7 @@ impl WshServer {
                     self.peer_senders.write().await.remove(&cid);
                     self.conn_session_map.write().await.remove(&cid);
                     self.clear_relay_links(cid).await;
+                    self.sessions.detach_connection(cid).await;
                 }
                 self.peer_registry.unregister(&ctx.fingerprint).await;
             }
@@ -756,24 +757,86 @@ impl WshServer {
         Ok(())
     }
 
-    /// Spawn a background task that pumps PTY output to the client as
-    /// `SessionData` control messages, and sends `Exit` + `Close` once the
-    /// child process terminates.
+    /// Attach the calling connection to `session_id` on a fresh channel
+    /// (Attach: the retained output; Resume: `from` = `last_seq`, only the
+    /// bytes after it). The reply, the replay and the live output all travel
+    /// through the attachment's ordered queue (see `Attachment`), so this
+    /// returns `Ok(None)` once it is queued -- the Presence answering the
+    /// request is the first thing on it.
+    async fn attach_to_session(
+        &self,
+        ctx: &ConnectionContext,
+        session_id: &str,
+        mode: &str,
+        from: Option<u64>,
+    ) -> WshResult<Option<Envelope>> {
+        let error = |code: u32, message: String| {
+            Ok(Some(Envelope {
+                msg_type: MsgType::Error,
+                payload: Payload::Error(ErrorPayload { code, message }),
+            }))
+        };
+        let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
+        let (att_tx, att_rx) = mpsc::unbounded_channel();
+        let attachment = Attachment {
+            conn_id: ctx.conn_id,
+            channel_id,
+            mode: mode.to_string(),
+            username: ctx.username.clone(),
+            tx: att_tx,
+        };
+        match self
+            .sessions
+            .attach_with_replay(session_id, attachment, from)
+            .await
+        {
+            Ok(start_seq) => {
+                // Register channel -> session so SessionData/Close/Resize on the
+                // new channel route; conn_session_map so E2E relay is session-scoped.
+                self.channel_sessions
+                    .write()
+                    .await
+                    .insert(channel_id, session_id.to_string());
+                if let Some(cid) = ctx.conn_id {
+                    self.conn_session_map
+                        .write()
+                        .await
+                        .insert(cid, session_id.to_string());
+                }
+                // Only now can the client learn the channel id (the Presence is
+                // still queued, undelivered), so everything is routable by then.
+                Self::spawn_attachment_forwarder(att_rx, ctx.peer_tx.clone());
+                info!(
+                    session_id,
+                    channel_id,
+                    mode,
+                    from = start_seq,
+                    "client attached"
+                );
+                Ok(None)
+            }
+            Err(AttachError::NotFound) => error(3, format!("session not found: {session_id}")),
+            Err(AttachError::Gap(message)) => error(4, message),
+        }
+    }
+
+    /// Spawn the background task that pumps a session's PTY output into the
+    /// session (`SessionManager::push_output`: the ring buffer, whose byte
+    /// count is `seq`, and every attached channel as `SessionData`), and
+    /// reports the exit (`SessionManager::finish`) once the child terminates.
+    ///
+    /// The pump belongs to the session, not to a connection: when the
+    /// connection that opened it drops, the process keeps running and its
+    /// output keeps filling the ring buffer, ready for a Resume/Attach.
     ///
     /// This is the "virtual" data-mode counterpart to a real multiplexed
     /// data stream: neither the WebSocket transport (which only ever
     /// reads/writes `FRAME_CONTROL` frames) nor the WebTransport transport
     /// (which only accepts a single bidirectional control stream) implement
     /// a second stream for session I/O, so output is delivered over the
-    /// existing control-channel envelope path via `peer_tx` — the same
-    /// sender `session_loop_ws`/`session_loop_quic` already drain for
-    /// gateway data and relay-forwarded messages.
-    fn spawn_pty_output_pump(
-        &self,
-        session_id: String,
-        channel_id: u32,
-        peer_tx: mpsc::Sender<Envelope>,
-    ) {
+    /// existing control-channel envelope path (each attachment's queue,
+    /// forwarded to its connection's `peer_tx`).
+    fn spawn_pty_output_pump(&self, session_id: String) {
         let sessions = self.sessions.clone();
         tokio::spawn(async move {
             let (reader, child_handle) = match sessions
@@ -811,23 +874,14 @@ impl WshServer {
                     break;
                 }
 
-                sessions.touch(&session_id).await;
-
-                let data_msg = Envelope {
-                    msg_type: MsgType::SessionData,
-                    payload: Payload::SessionData(SessionDataPayload {
-                        channel_id,
-                        data: buf[..n].to_vec(),
-                    }),
-                };
-                if peer_tx.send(data_msg).await.is_err() {
-                    debug!(session_id = %session_id, "PTY output pump: peer channel closed, stopping");
+                if !sessions.push_output(&session_id, &buf[..n]).await {
+                    debug!(session_id = %session_id, "PTY output pump: session gone, stopping");
                     return;
                 }
             }
 
             // EOF on the PTY reader — the child has exited or is exiting.
-            // Wait for the exact exit code, then notify the client.
+            // Wait for the exact exit code, then notify whoever is attached.
             let code = tokio::task::spawn_blocking(move || {
                 let mut child = child_handle.blocking_lock();
                 child.wait()
@@ -838,22 +892,23 @@ impl WshServer {
             .map(|status| status.exit_code().try_into().unwrap_or(-1))
             .unwrap_or(-1);
 
-            info!(session_id = %session_id, channel_id, code, "PTY session ended");
+            info!(session_id = %session_id, code, "PTY session ended");
+            sessions.finish(&session_id, code).await;
+        });
+    }
 
-            let exit_msg = Envelope {
-                msg_type: MsgType::Exit,
-                payload: Payload::Exit(ExitPayload { channel_id, code }),
-            };
-            let _ = peer_tx.send(exit_msg).await;
-
-            let close_msg = Envelope {
-                msg_type: MsgType::Close,
-                payload: Payload::Close(ClosePayload { channel_id }),
-            };
-            let _ = peer_tx.send(close_msg).await;
-
-            if let Err(e) = sessions.remove(&session_id).await {
-                debug!(session_id = %session_id, error = %e, "PTY output pump: session already removed");
+    /// Forward one attachment's ordered queue to its connection's sender.
+    /// Ends (closing the queue, so the attachment is pruned on the next
+    /// push) when the connection goes away.
+    fn spawn_attachment_forwarder(
+        mut rx: mpsc::UnboundedReceiver<Envelope>,
+        peer_tx: mpsc::Sender<Envelope>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(envelope) = rx.recv().await {
+                if peer_tx.send(envelope).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -1605,6 +1660,7 @@ impl WshServer {
                 self.peer_senders.write().await.remove(&cid);
                 self.conn_session_map.write().await.remove(&cid);
                 self.clear_relay_links(cid).await;
+                self.sessions.detach_connection(cid).await;
             }
             self.peer_registry.unregister(&ctx.fingerprint).await;
         }
@@ -2318,53 +2374,16 @@ impl WshServer {
                         }),
                     }));
                 }
-                if let Err(e) = self.sessions.attach(&p.session_id).await {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::Error,
-                        payload: Payload::Error(ErrorPayload {
-                            code: 3,
-                            message: e.to_string(),
-                        }),
-                    }));
-                }
-                // Update conn_session_map so E2E relay is session-scoped
-                if let Some(cid) = ctx.conn_id {
-                    self.conn_session_map
-                        .write()
-                        .await
-                        .insert(cid, p.session_id.clone());
-                }
-                // Replay ring buffer contents
-                let replay_data = self
-                    .sessions
-                    .with_session(&p.session_id, |s| Ok(s.ring_buffer.read_all()))
-                    .await
-                    .unwrap_or_default();
-                if !replay_data.is_empty() {
-                    // Send replay as GatewayData on channel 0 (convention for PTY replay)
-                    // The client knows to render this as terminal output
-                    let replay_envelope = Envelope {
-                        msg_type: MsgType::GatewayData,
-                        payload: Payload::GatewayData(GatewayDataPayload {
-                            gateway_id: 0,
-                            data: replay_data,
-                        }),
-                    };
-                    let _ = ctx.peer_tx.try_send(replay_envelope);
-                }
-                info!(session_id = %p.session_id, mode = %p.mode, "client attached");
-                Ok(Some(Envelope {
-                    msg_type: MsgType::Presence,
-                    payload: Payload::Presence(PresencePayload {
-                        attachments: vec![AttachmentInfo {
-                            session_id: p.session_id.clone(),
-                            mode: p.mode.clone(),
-                            username: Some(ctx.username.clone()),
-                            channel_id: None,
-                            seq: None,
-                        }],
-                    }),
-                }))
+                // The mode is normalised: only a read-only request is read-only.
+                let mode = if matches!(
+                    p.mode.to_ascii_lowercase().as_str(),
+                    "readonly" | "read" | "view" | "ro"
+                ) {
+                    "readonly"
+                } else {
+                    "control"
+                };
+                self.attach_to_session(ctx, &p.session_id, mode, None).await
             }
             (MsgType::SessionListRequest, Payload::SessionListRequest(_)) => {
                 let all_sessions = self.sessions.list().await;
@@ -2399,8 +2418,12 @@ impl WshServer {
                         }),
                     }));
                 }
-                match self.sessions.detach(&p.session_id).await {
-                    Ok(()) => {
+                match self
+                    .sessions
+                    .detach_session(&p.session_id, ctx.conn_id)
+                    .await
+                {
+                    Ok(_) => {
                         if let Some(cid) = ctx.conn_id {
                             self.conn_session_map.write().await.remove(&cid);
                         }
@@ -2450,51 +2473,10 @@ impl WshServer {
                         }),
                     }));
                 }
-                if let Err(e) = self.sessions.attach(&p.session_id).await {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::Error,
-                        payload: Payload::Error(ErrorPayload {
-                            code: 3,
-                            message: e.to_string(),
-                        }),
-                    }));
-                }
-                // Update conn_session_map so E2E relay is session-scoped
-                if let Some(cid) = ctx.conn_id {
-                    self.conn_session_map
-                        .write()
-                        .await
-                        .insert(cid, p.session_id.clone());
-                }
-                // For resume, replay from last_seq - ring buffer replays all for now
-                let replay_data = self
-                    .sessions
-                    .with_session(&p.session_id, |s| Ok(s.ring_buffer.read_all()))
+                // `last_seq` is the cumulative number of output bytes the
+                // client has received: only what follows it is replayed.
+                self.attach_to_session(ctx, &p.session_id, "control", Some(p.last_seq))
                     .await
-                    .unwrap_or_default();
-                if !replay_data.is_empty() {
-                    let replay_envelope = Envelope {
-                        msg_type: MsgType::GatewayData,
-                        payload: Payload::GatewayData(GatewayDataPayload {
-                            gateway_id: 0,
-                            data: replay_data,
-                        }),
-                    };
-                    let _ = ctx.peer_tx.try_send(replay_envelope);
-                }
-                info!(session_id = %p.session_id, last_seq = p.last_seq, "client resumed");
-                Ok(Some(Envelope {
-                    msg_type: MsgType::Presence,
-                    payload: Payload::Presence(PresencePayload {
-                        attachments: vec![AttachmentInfo {
-                            session_id: p.session_id.clone(),
-                            mode: "control".into(),
-                            username: Some(ctx.username.clone()),
-                            channel_id: None,
-                            seq: None,
-                        }],
-                    }),
-                }))
             }
 
             // ── Channel management ──────────────────────────────────
@@ -2651,11 +2633,6 @@ impl WshServer {
                                 // scope for wsh #22 PR 3, whose actual live caller
                                 // is tools/wsh-server.mjs.
                                 let data_mode = SessionDataMode::Virtual;
-                                self.spawn_pty_output_pump(
-                                    session_id.clone(),
-                                    channel_id,
-                                    ctx.peer_tx.clone(),
-                                );
 
                                 // Mint the session-scoped HMAC token here, at the
                                 // only point a PTY/exec session_id actually comes
@@ -2671,7 +2648,15 @@ impl WshServer {
                                     self.config.session_ttl,
                                 );
 
-                                Ok(Some(Envelope {
+                                // The opener is the session's first attachment.
+                                // OpenOk goes through the attachment's own ordered
+                                // queue so no output can overtake it, and the
+                                // pump starts only once the attachment exists
+                                // (the opener sees the output from byte 0). The
+                                // pump belongs to the session, not this
+                                // connection (see `spawn_pty_output_pump`).
+                                let (att_tx, att_rx) = mpsc::unbounded_channel();
+                                let _ = att_tx.send(Envelope {
                                     msg_type: MsgType::OpenOk,
                                     payload: Payload::OpenOk(OpenOkPayload {
                                         channel_id,
@@ -2681,7 +2666,31 @@ impl WshServer {
                                         session_id: Some(session_id.clone()),
                                         token: Some(session_token),
                                     }),
-                                }))
+                                });
+                                if let Err(e) = self
+                                    .sessions
+                                    .add_attachment(
+                                        &session_id,
+                                        Attachment {
+                                            conn_id: ctx.conn_id,
+                                            channel_id,
+                                            mode: "control".into(),
+                                            username: ctx.username.clone(),
+                                            tx: att_tx,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    return Ok(Some(Envelope {
+                                        msg_type: MsgType::OpenFail,
+                                        payload: Payload::OpenFail(OpenFailPayload {
+                                            reason: e.to_string(),
+                                        }),
+                                    }));
+                                }
+                                Self::spawn_attachment_forwarder(att_rx, ctx.peer_tx.clone());
+                                self.spawn_pty_output_pump(session_id.clone());
+                                Ok(None)
                             }
                             Err(e) => Ok(Some(Envelope {
                                 msg_type: MsgType::OpenFail,
@@ -2814,6 +2823,17 @@ impl WshServer {
                     ch_map.get(&p.channel_id).cloned()
                 };
                 if let Some(sid) = target_session {
+                    // Only a control attachment of THIS connection writes to the
+                    // session (a read-only viewer, or a channel id that belongs to
+                    // another connection, does not).
+                    if !self
+                        .sessions
+                        .may_write(&sid, ctx.conn_id, p.channel_id)
+                        .await
+                    {
+                        warn!(channel_id = p.channel_id, session_id = %sid, "SessionData refused: not a control attachment of this connection");
+                        return Ok(None);
+                    }
                     self.sessions.touch(&sid).await;
                     let data = p.data.clone();
                     if let Err(e) = self
@@ -2856,7 +2876,11 @@ impl WshServer {
                 let sid = target_session.as_deref().unwrap_or(&ctx.session_id);
                 debug!(channel_id = p.channel_id, session_id = %sid, "close request");
                 // Detach from the correct session and clean up channel mapping
-                if let Err(e) = self.sessions.detach(sid).await {
+                if let Err(e) = self
+                    .sessions
+                    .detach_channel(sid, ctx.conn_id, p.channel_id)
+                    .await
+                {
                     warn!(channel_id = p.channel_id, error = %e, "detach failed on close");
                 }
                 self.channel_sessions.write().await.remove(&p.channel_id);
@@ -3351,41 +3375,16 @@ impl WshServer {
                             g.revoked = true;
                         }
                         drop(tokens);
-                        // Update conn_session_map so E2E relay is session-scoped
-                        if let Some(cid) = ctx.conn_id {
-                            self.conn_session_map
-                                .write()
-                                .await
-                                .insert(cid, session_id.clone());
-                        }
-                        // Attach the guest to the session
-                        if let Err(e) = self.sessions.attach(&session_id).await {
-                            return Ok(Some(Envelope {
-                                msg_type: MsgType::Error,
-                                payload: Payload::Error(ErrorPayload {
-                                    code: 3,
-                                    message: e.to_string(),
-                                }),
-                            }));
-                        }
+                        // Attach the guest like any other attachment: it gets its
+                        // own channel, the retained output and the live stream,
+                        // read-only unless the invite granted "control".
                         let mode = if permissions.contains(&"control".to_string()) {
                             "control"
                         } else {
-                            "read"
+                            "readonly"
                         };
                         info!(session_id = %session_id, mode, "guest joined session");
-                        Ok(Some(Envelope {
-                            msg_type: MsgType::Presence,
-                            payload: Payload::Presence(PresencePayload {
-                                attachments: vec![AttachmentInfo {
-                                    session_id,
-                                    mode: mode.into(),
-                                    username: p.device_label.clone(),
-                                    channel_id: None,
-                                    seq: None,
-                                }],
-                            }),
-                        }))
+                        self.attach_to_session(ctx, &session_id, mode, None).await
                     }
                     Some(_) => {
                         // Token exists but expired or revoked

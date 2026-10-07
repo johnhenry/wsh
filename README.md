@@ -672,9 +672,14 @@ await client.listRemoteSessions();        // sessions this key can see
 ```
 
 `@johnhenry/wsh/server` implements all of it with its [`sessions`
-option](#sessions-attach--resume--detach). The Rust `wsh-server` replays its whole
-ring on `Resume` regardless of `last_seq` (the position is defined in
-[spec/wsh-v1.md](spec/wsh-v1.md)).
+option](#sessions-attach--resume--detach), and so does the Rust `wsh-server`
+(since `rust-v0.2.0`): `Resume` replays only the output after `last_seq`
+(the position is defined in [spec/wsh-v1.md](spec/wsh-v1.md)), and Attach/Resume
+answer with a Presence carrying the new `channel_id` and `seq`, replay and live
+output arriving as `SessionData` on it. The Rust host's ring is a fixed 256 KiB
+per session and its sessions end with the server process; a session that exits
+while no one is attached is kept (for the replay and the exit) until it is
+resumed or expires.
 
 ## Pinning a Self-Signed Certificate
 
@@ -822,7 +827,7 @@ than left to be found.
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
 | Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | none yet (a Rust `wsh-server` does not advertise `rpc`; a JS client falls back to `FileOp` for files) | **JS server only, no wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
-| Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` replays its whole ring and leaves them unset |
+| Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast v2) | none | **JS-only** -- no current Rust consumer needs playback; the format itself (asciicast v2) is not proprietary if one is added later |
