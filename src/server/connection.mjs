@@ -24,8 +24,12 @@ import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES } from './fs.mjs';
+import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
+const MAX_PENDING_WRITES = 8;
+const MAX_RENAME_PATH_BYTES = 4096;
+const WRITE_IDLE_MS = 30_000;
 
 const MAX_CHANNELS = 64;
 const USERNAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
@@ -41,13 +45,16 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {object} cfg.execOptions
  * @param {object | null} cfg.pty - normalized (see pty.mjs)
  * @param {object | null} cfg.files - from createFileAccess
+ * @param {{ pubkey: boolean, password: Function | null }} cfg.methods - which auth methods are on
+ * @param {object | null} cfg.hostKey - from loadHostKey
+ * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
  * @param {number} cfg.bindTimeoutMs - how long exec output waits for the data stream
  * @param {(line: string) => void} cfg.log
  */
 export function createConnectionFactory(cfg) {
   let counter = 0;
 
-  return function attach({ send: sendBytes }) {
+  return function attach({ send: sendBytes, remote = {} }) {
     const cid = ++counter;
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
@@ -56,6 +63,8 @@ export function createConnectionFactory(cfg) {
     };
     /** @type {Map<number, any>} */
     const channels = new Map();
+    /** FileOp `write`/`rename`s awaiting their FileChunk frames, by client-chosen channel id. */
+    const fileWrites = new Map();
     /** Channel ids awaiting their client-opened data stream, in OpenOk order. */
     const pendingStreams = [];
     const decoder = new FrameDecoder();
@@ -78,6 +87,8 @@ export function createConnectionFactory(cfg) {
       state.closed = true;
       for (const ch of channels.values()) ch.kill?.();
       channels.clear();
+      for (const w of fileWrites.values()) clearTimeout(w.timer);
+      fileWrites.clear();
       try { qmux.destroy(new Error(why)); } catch { /* already gone */ }
       log(`closed (${why})`);
     }
@@ -118,7 +129,7 @@ export function createConnectionFactory(cfg) {
         case MSG.SIGNAL: channels.get(m.channel_id)?.signal?.(String(m.signal ?? '')); return;
         case MSG.CLOSE: { const ch = channels.get(m.channel_id); if (ch) { ch.kill?.(); } return; }
         case MSG.FILE_OP: return handleFileOp(m);
-        case MSG.FILE_CHUNK: return channels.get(m.channel_id)?.chunk?.(m);
+        case MSG.FILE_CHUNK: return (fileWrites.has(m.channel_id) ? handleWriteChunk(m) : channels.get(m.channel_id)?.chunk?.(m));
         default: log(`ignored message type 0x${m.type.toString(16)}`);
       }
     }
@@ -133,15 +144,37 @@ export function createConnectionFactory(cfg) {
       if (m.type === MSG.HELLO) {
         const user = String(m.username ?? '');
         if (!USERNAME_RE.test(user)) return refuse(`bad username ${JSON.stringify(user)}`);
-        if (m.auth_method && m.auth_method !== 'pubkey') return refuse('this host only accepts Ed25519 pubkey auth');
+        const method = m.auth_method || 'pubkey';
+        if (method === 'password') {
+          if (!cfg.methods.password) return refuse('password auth is not enabled on this host');
+        } else if (method === 'pubkey') {
+          if (!cfg.methods.pubkey) return refuse('pubkey auth is not enabled on this host');
+        } else {
+          return refuse(`unsupported auth method ${JSON.stringify(method)}`);
+        }
         state.username = user;
-        state.nonce = generateNonce();
+        state.method = method;
         const features = [STREAM_ANNOUNCE];
-        if (cfg.files) features.push('file-transfer');
-        await send(serverHello({ sessionId: state.sessionId, features }));
-        await send(challenge({ nonce: state.nonce, sessionId: state.sessionId }));
+        if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
+        let hostFingerprint;
+        if (cfg.hostKey) {
+          hostFingerprint = cfg.hostKey.fingerprint;
+          const clientNonce = findClientNonce(m.features);
+          if (clientNonce) {
+            const sig = await cfg.hostKey.sign(hostKeyProofMessage({ sessionId: state.sessionId, clientNonce, username: user }));
+            features.push(HOST_KEY_PREFIX + toHex(cfg.hostKey.publicKey), HOST_KEY_SIG_PREFIX + toHex(sig));
+          }
+        }
+        await send(serverHello({ sessionId: state.sessionId, features, hostFingerprint }));
+        if (method === 'pubkey') {
+          state.nonce = generateNonce();
+          await send(challenge({ nonce: state.nonce, sessionId: state.sessionId }));
+        } else {
+          state.awaitingPassword = true;
+        }
         return;
       }
+      if (m.type === MSG.AUTH && state.awaitingPassword) return handlePasswordAuth(m);
       if (m.type === MSG.AUTH) {
         if (!state.nonce) return;
         if (m.method !== 'pubkey' || !(m.public_key instanceof Uint8Array) || !(m.signature instanceof Uint8Array)) {
@@ -170,6 +203,29 @@ export function createConnectionFactory(cfg) {
         await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: 3600 }));
         log(`authenticated ${state.username} (${fp.slice(0, 12)}...)`);
       }
+    }
+
+    async function handlePasswordAuth(m) {
+      state.awaitingPassword = false; // one guess per connection
+      if (m.method !== 'password' || typeof m.password !== 'string') return refuse('expected a password AUTH');
+      const rl = cfg.rateLimit;
+      const key = rl.key({ address: remote.address, headers: remote.headers, username: state.username });
+      const locked = rl.limiter.lockedFor(key);
+      if (locked > 0) {
+        // Not even evaluated: a locked-out caller learns nothing and costs nothing.
+        return refuse(`too many failed attempts; try again in ${Math.ceil(locked / 1000)}s`);
+      }
+      let ok = false;
+      try { ok = (await cfg.methods.password(state.username, m.password)) === true; } catch (e) { log(`password check threw: ${e.message}`); }
+      if (!ok) {
+        rl.limiter.fail(key);
+        if (rl.failureDelayMs > 0) await new Promise((r) => setTimeout(r, rl.failureDelayMs));
+        return refuse('authentication failed');
+      }
+      rl.limiter.succeed(key);
+      state.authed = true;
+      await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: 3600 }));
+      log(`authenticated ${state.username} (password)`);
     }
 
     // ── Open ──────────────────────────────────────────────────────────
@@ -363,12 +419,68 @@ export function createConnectionFactory(cfg) {
     async function handleFileOp(m) {
       const channelId = m.channel_id;
       if (!cfg.files) return send(fileResult({ channelId, success: false, errorMessage: 'file access is not enabled on this server' }));
+      if (m.op === 'write' || m.op === 'rename') return startPayloadOp(m);
       try {
         const r = await cfg.files.operate(m.op, m.path, { offset: m.offset, length: m.length });
         return send(fileResult({ channelId, success: true, metadata: r.metadata ?? {}, entries: r.entries ?? [] }));
       } catch (e) {
         const message = e.wsh ? e.message : (e.code === 'ENOENT' ? 'no such file or directory' : `${m.op} failed`);
         if (!e.wsh && e.code !== 'ENOENT') log(`file ${m.op} ${m.path}: ${e.message}`);
+        return send(fileResult({ channelId, success: false, errorMessage: message }));
+      }
+    }
+
+    // write / rename = FileOp then FileChunk frame(s) on the same channel id
+    // (rename's payload is the UTF-8 destination path); one FileResult once
+    // the last chunk lands (see WshClient.fileOperation).
+    async function startPayloadOp(m) {
+      const channelId = m.channel_id;
+      const failWrite = (errorMessage) => send(fileResult({ channelId, success: false, errorMessage }));
+      const rename = m.op === 'rename';
+      const length = Number(m.length);
+      if (!Number.isSafeInteger(length) || length < 0) return failWrite(`${m.op} needs a length`);
+      const limit = rename ? MAX_RENAME_PATH_BYTES : cfg.files.maxFileBytes;
+      if (length > limit) return failWrite(`${m.op} payload of ${length} bytes exceeds the ${limit} byte limit`);
+      if (channels.has(channelId) || fileWrites.has(channelId)) return failWrite('channel id already in use');
+      if (fileWrites.size >= MAX_PENDING_WRITES) return failWrite('too many writes in flight');
+      const w = { rename, path: m.path, offset: m.offset, length, buf: new Uint8Array(length), next: 0, timer: null };
+      const arm = () => {
+        clearTimeout(w.timer);
+        w.timer = setTimeout(() => {
+          if (fileWrites.delete(channelId)) failWrite('write timed out waiting for data');
+        }, WRITE_IDLE_MS);
+        w.timer.unref?.();
+      };
+      arm();
+      w.arm = arm;
+      fileWrites.set(channelId, w);
+    }
+
+    async function handleWriteChunk(m) {
+      const channelId = m.channel_id;
+      const w = fileWrites.get(channelId);
+      const abort = (errorMessage) => {
+        clearTimeout(w.timer);
+        fileWrites.delete(channelId);
+        return send(fileResult({ channelId, success: false, errorMessage }));
+      };
+      const data = m.data instanceof Uint8Array ? m.data : new Uint8Array(0);
+      if (m.offset !== w.next) return abort('chunks must arrive in order');
+      if (w.next + data.byteLength > w.length) return abort('chunk past the declared length');
+      w.buf.set(data, w.next);
+      w.next += data.byteLength;
+      if (!m.is_final) { w.arm(); return; }
+      clearTimeout(w.timer);
+      fileWrites.delete(channelId);
+      if (w.next !== w.length) return send(fileResult({ channelId, success: false, errorMessage: 'payload ended short of the declared length' }));
+      try {
+        const r = w.rename
+          ? await cfg.files.operate('rename', w.path, { newPath: new TextDecoder('utf-8', { fatal: true }).decode(w.buf) })
+          : await cfg.files.operate('write', w.path, { offset: w.offset, data: w.buf });
+        return send(fileResult({ channelId, success: true, metadata: r.metadata ?? {} }));
+      } catch (e) {
+        const message = e.wsh ? e.message : (e.code === 'ENOENT' ? 'no such file or directory' : `${w.rename ? 'rename' : 'write'} failed`);
+        if (!e.wsh && e.code !== 'ENOENT') log(`file write ${w.path}: ${e.message}`);
         return send(fileResult({ channelId, success: false, errorMessage: message }));
       }
     }

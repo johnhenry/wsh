@@ -20,6 +20,36 @@ export interface WshServerAuthOptions {
   authorizedKeys?: string | Uint8Array | Array<string | Uint8Array>;
   /** Extra policy, run after the signature verifies (and after the allowlist, when given). */
   authorize?: (who: WshServerPrincipal) => boolean | Promise<boolean>;
+  /**
+   * Enable password login: return `true` to admit. Sent in the clear inside the
+   * connection -- serve over `wss://` / a trusted link. Use a constant-time
+   * compare against hashes, never `===` on plaintext. Failures are throttled
+   * (see `rateLimit`); the callback is not consulted while a caller is locked out.
+   */
+  password?: (username: string, password: string) => boolean | Promise<boolean>;
+  /** Password-failure throttle. */
+  rateLimit?: {
+    /** Failures inside `windowMs` before lockout (default 5). */
+    maxFailures?: number;
+    /** Failure counting window (default 60000). */
+    windowMs?: number;
+    /** Lockout length once tripped (default 60000). */
+    lockoutMs?: number;
+    /** Pause before answering a failed attempt (default 250). */
+    failureDelayMs?: number;
+    /** Throttle bucket; default the peer address. Use this behind a proxy (e.g. read `x-forwarded-for` from `headers`). */
+    key?: (info: { address: string | undefined; headers: Record<string, string | string[] | undefined>; username: string }) => string;
+  };
+}
+
+/** The server's own identity, as advertised to clients. */
+export interface WshServerHostKey {
+  /** Hex SHA-256 of the raw key. */
+  fingerprint: string;
+  /** Raw 32-byte Ed25519 key. */
+  publicKey: Uint8Array;
+  /** `ssh-ed25519 AAAA...` */
+  openssh: string;
 }
 
 /** What a custom `exec` runner receives for one session. */
@@ -100,6 +130,12 @@ export interface WshServerOptions {
   exec?: true | WshServerExecOptions | WshExecRunner;
   /** Enable `pty` sessions by injecting a pty implementation. Off by default. */
   pty?: WshServerPtyOptions;
+  /**
+   * Advertise an Ed25519 host identity (with proof of possession) so clients can pin it.
+   * `{ file }` persists a PKCS#8 PEM (created 0600 on first start) -- the normal choice;
+   * `true` is a fresh key every start; or pass a `CryptoKeyPair`. Off by default.
+   */
+  hostKey?: true | { file: string } | CryptoKeyPair;
   /** Enable file ops and uploads/downloads under one directory. Off by default. */
   fs?: WshServerFsOptions;
   /** How long exec output waits for a client that has not yet opened its data stream (default 3000). */
@@ -119,6 +155,8 @@ export interface WshServer {
   close(): Promise<void>;
   /** The bound address, or `null` when not listening. */
   address(): WshServerAddress | null;
+  /** The advertised host identity; `null` before `listen()` resolves or without a `hostKey`. */
+  hostKey(): WshServerHostKey | null;
 }
 
 export function createWshServer(options?: WshServerOptions): WshServer;

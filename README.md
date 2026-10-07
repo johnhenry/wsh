@@ -167,8 +167,9 @@ const server = createWshServer({
   host: '127.0.0.1',
   port: 4422,                                          // 0 = pick a free port
   auth: { authorizedKeys: readFileSync('authorized_keys', 'utf8') },  // ssh-ed25519 lines
+  hostKey: { file: '/etc/wsh/host_key' },              // advertise a pinnable host identity (created 0600 on first start)
   exec: true,                                          // opt in: run commands via /bin/sh
-  fs: { root: '/srv/share', readOnly: false },         // opt in: list/stat/read/mkdir/remove/upload/download
+  fs: { root: '/srv/share', readOnly: false },         // opt in: list/stat/read/write/rename/mkdir/remove/upload/download
   // pty: { spawn: nodePty.spawn },                    // opt in: bring your own node-pty
 });
 const { port } = await server.listen();                // later: server.address(), await server.close()
@@ -176,17 +177,121 @@ const { port } = await server.listen();                // later: server.address(
 
 Everything that touches the machine -- `exec`, `pty`, `fs` -- is **off unless
 you pass it**, and with no `auth` every connection is refused. `auth` is
-`{ authorizedKeys, authorize }` (a key must be on the list and pass
-`authorize({ username, fingerprint, publicKey })` when both are given) or
-just an `authorize` function. `exec` can also be `{ cwd, env, shell,
-timeoutMs, clientEnv }` or a custom `run(command, io)` for a restricted host
-with no shell. `fs.root` confines every path: `..`, absolute paths and
-symlinks pointing out of it are refused. The server advertises
-`stream-announce`, so a current client writes no primer byte; a lone leading
-`0x00` from a client that primes anyway is dropped rather than reaching stdin.
+`{ authorizedKeys, authorize, password, rateLimit }` (a key must be on the
+list and pass `authorize({ username, fingerprint, publicKey })` when both are
+given) or just an `authorize` function. `exec` can also be `{ cwd, env,
+shell, timeoutMs, clientEnv }` or a custom `run(command, io)` for a
+restricted host with no shell. `fs.root` confines every path: `..`, absolute
+paths and symlinks pointing out of it are refused -- for `write` and `rename`
+(both paths) exactly as for `read`.
 
-Not implemented: WebTransport, relay/reverse mode, attach/resume, MCP,
-password auth.
+Not implemented (each has a tracking issue): WebTransport, relay/reverse
+mode, attach/resume of server-side sessions, MCP.
+
+### Host key (fingerprint / TOFU)
+
+Give the server an identity and the stock client can pin it:
+
+```js
+// server
+const server = createWshServer({ auth, hostKey: { file: '/etc/wsh/host_key' } });
+await server.listen();
+server.hostKey();   // { fingerprint, publicKey, openssh } -- publish this out of band
+
+// client
+import { WshClient, WshKnownHosts, HostKeyError } from '@johnhenry/wsh';
+const client = new WshClient();
+await client.connect(url, { username, keyPair, expectHostKey: fingerprint });   // pin; refuses on mismatch
+// or trust-on-first-use, remembered in a store:
+await client.connect(url, { username, keyPair, knownHosts: new WshKnownHosts(), trustOnFirstUse: true });
+client.hostKey;  // { fingerprint, publicKey, openssh, status: 'pinned' | 'known' | 'unknown' | 'unpinned' }
+client.onHostKey = (hk) => confirm(`Trust ${hk.fingerprint}?`);   // or per call: connect(..., { onHostKey })
+```
+
+- `hostKey` is `{ file }` (a PKCS#8 PEM, created mode 0600 on first start --
+  use this), a `CryptoKeyPair`, or `true` (a fresh key every start: every TOFU
+  client will see "changed" after a restart; tests and demos only).
+- `expectHostKey` takes a hex fingerprint (`sha256:` prefix fine), raw 32-byte
+  key, or an `ssh-ed25519 AAAA...` line. With `knownHosts`, a **changed** key is
+  always refused (and never overwrites the pin); an **unseen** host is refused
+  unless `trustOnFirstUse` is set or `onHostKey` accepts it. Either option also
+  refuses a host that presents no key at all. Refusals are `HostKeyError` with
+  a `code` (`HOST_KEY_MISSING | _INVALID | _MISMATCH | _UNKNOWN | _REJECTED`),
+  thrown **before any credential -- signature or password -- is sent**.
+- `WshClient.exec()` and `connectReverse()` accept the same options.
+- `WshKnownHosts` defaults to `localStorage`, which in Node is not a persistent file store: for a real TOFU file pass `new WshKnownHosts({ storage })` with a `getItem`/`setItem`/`removeItem` object you back with a file.
+- Wire shape: the spec's `ServerHello.host_fingerprint` is populated, and
+  because a bare fingerprint proves nothing (anyone can repeat it) the key and
+  a signature ride in `features` strings: the client sends `host-key-nonce:<hex>`
+  in `Hello`; the server answers `host-key:<hex>` and `host-key-sig:<hex>`
+  (Ed25519 over a tag, the session id, the client's nonce and the username).
+  The fresh nonce makes the proof unreplayable. Hosts that don't know these
+  strings ignore them (the Rust `wsh-server` advertises no key, so a pin
+  against it is refused with `HOST_KEY_MISSING`, never silently skipped).
+- **What it does not give you:** the proof authenticates the ServerHello, not
+  the byte stream. Over plain `ws://` an active attacker can relay a genuine
+  ServerHello and then read or alter the rest. Pinning keeps you from talking
+  to the wrong host; confidentiality still needs `wss://` or a link you trust.
+
+### Password auth
+
+```js
+createWshServer({
+  auth: {
+    password: async (username, password) => verifyAgainstYourHashes(username, password),
+    // authorizedKeys / authorize may be given too: both methods are then served.
+    rateLimit: { maxFailures: 5, windowMs: 60_000, lockoutMs: 60_000, failureDelayMs: 250 },
+  },
+});
+await client.connect(url, { username, password });
+```
+
+The wire already has it (`Hello.auth_method: 'password'` then `Auth{ method:
+'password', password }`, no challenge), so no extension is involved -- and
+that is also its limit: the password travels as plain text inside the
+connection, so serve password logins over `wss://` (TLS-terminating proxy)
+or a link you trust, and pin the host key so it is only ever sent to the right
+host. Use a constant-time comparison against stored hashes in the callback,
+never `===` on plaintext. A host with only `password` refuses key logins and
+vice versa; with neither configured every connection is refused.
+
+Failures are throttled per peer address (override with `rateLimit.key`, e.g.
+read `x-forwarded-for` from `headers` behind a proxy): each connection gets one
+guess, a failed one is answered after `failureDelayMs`, and after
+`maxFailures` in `windowMs` the caller is locked out for `lockoutMs` -- the
+callback is not even consulted during lockout, so the right password does not
+get through either. The counter is in-process memory and per server.
+
+### Files: write and rename
+
+`client.fileWrite(path, data, offset?)` and `client.fileRename(from, to)` work
+against the server's `fs` (earlier versions of the client sent neither the
+bytes nor the new path). Without `offset`, `fileWrite` replaces the file
+(creating it); with one, it writes in place at that byte offset without
+truncating. `fileRename` refuses to overwrite an existing destination, to move
+a directory into itself, or to touch the root. Both honour `readOnly` and
+`maxFileBytes`, and a failure comes back as `success: false` with an
+`error_message`.
+
+`FileOp` has no field for the bytes or the destination, so both use
+spec-conformant frames only: the `FileOp` is followed by `FileChunk` frame(s) on
+the same channel id (for `rename`, one chunk holding the UTF-8 destination).
+The host advertises `file-write` / `file-rename` in `ServerHello`; the client
+throws instead of sending to a host without them (the Rust `wsh-server`
+refuses these ops).
+
+### Compatibility: announce vs. primer
+
+An exec session's output flows on a second, client-opened stream, and a QMux
+stream is invisible on the wire until its first byte. Two mechanisms exist for
+the host to find it:
+
+| Client | Host | What happens |
+|---|---|---|
+| Current stock client | `@johnhenry/wsh/server` (advertises `stream-announce`) | The client's transport announces the stream with an empty STREAM frame. **No primer is written.** |
+| Current stock client | Host without `stream-announce` (e.g. the Rust `wsh-server`, older vendored hosts) | The client writes a one-byte primer (`0x00`) on the new stream so the host sees it; that host strips it. `primer: false` disables this (then such a host never binds the stream and the output is lost). |
+| A client that primes anyway (older stock client, `primer` forced, other implementations) | `@johnhenry/wsh/server` | **The leading `0x00` is dropped:** if the first data on an exec stream is exactly one `0x00` byte it is discarded, never forwarded to the process's stdin. Only that first chunk is inspected; a later `0x00`, or a first chunk that is longer than one byte, is delivered untouched. The cost: a client whose genuine first stdin chunk is a lone NUL loses it. |
+| A client that neither announces nor primes | `@johnhenry/wsh/server` | The host waits `bindTimeoutMs` (default 3000) for the stream, then drops the output and logs it. |
 
 ## Attach and Resume
 
@@ -349,7 +454,7 @@ than left to be found.
 | Upload/download | `WshClient.upload()`/`.download()` | `file_transfer::upload()`/`download()`, `wsh scp` | **Wire-unified**: `FileChunk` over a `'file'`-kind channel (wsh #13) |
 | Remove a remote file | `WshClient.fileRemove()` | `file_transfer::remove()`, `wsh sftp`'s `rm` | **Wire-unified**: `FileOp`/`FileResult` (`op: "remove"`) -- refused today by every `wsh-server` release ("not yet implemented"), the same refusal on both sides |
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
-| Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, a field no `wsh-server` release populates yet (see [Security](#security)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
+| Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
@@ -443,8 +548,11 @@ out explicitly below rather than left to be discovered.
 - **Host identity (TOFU) has a known, named gap (wsh #59).**
   `ServerHello.host_fingerprint` is the spec's formal host-identity slot:
   the SHA-256 fingerprint of a server's persistent Ed25519 host key, meant
-  to be pinned across connections the way SSH pins a host key. **No
-  `wsh-server` release populates this field yet** -- minting and
+  to be pinned across connections the way SSH pins a host key. **As of 0.19
+  `@johnhenry/wsh/server` populates it** (with a signed proof of possession;
+  see [Host key](#host-key-fingerprint--tofu)) and the JS client pins it
+  (`expectHostKey`, `knownHosts`) -- but **no Rust `wsh-server` release does
+  yet**, and the paragraph below still describes that Rust-side gap -- minting and
   persisting a server host keypair is a separate, security-sensitive
   feature, deliberately not bundled into this change. Both clients ship
   the store this field is for: `WshKnownHosts` (JS, `localStorage`-backed)

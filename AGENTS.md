@@ -62,10 +62,12 @@ before pushing a change that touches `crates/`.
   (#36, #37).** A parked file chunk is settled on one path and wasn't on
   the other before the fix; `closeReason` and both teardown paths need to
   move together, not be patched independently.
-- **`ServerHello.host_fingerprint` (TOFU host identity, wsh #59) is a
-  populated spec field with no populating implementation yet.** Don't
-  write code, docs, or tests that assume any real server pins its host
-  identity today -- see the README's [Security model](README.md#security-model).
+- **`ServerHello.host_fingerprint` (TOFU host identity, wsh #59) is
+  populated only by `@johnhenry/wsh/server` (0.19+, `hostKey` option), with
+  the key and a replay-proof signature carried in `features` strings
+  (`src/host-key.mjs`).** No Rust `wsh-server` release populates it, so don't
+  write code, docs, or tests that assume every server pins its host identity
+  -- see the README's [Security model](README.md#security-model).
 - **Release binary target names are a stable external contract.** The
   `x86_64-unknown-linux-gnu` / `aarch64-apple-darwin` /
   `x86_64-apple-darwin` / `i686-unknown-linux-musl` archive names under a

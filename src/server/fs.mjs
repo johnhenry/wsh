@@ -1,6 +1,6 @@
 /**
  * File access for `@johnhenry/wsh/server`: FileOp requests (list, stat, read,
- * mkdir, remove) and `upload:`/`download:` file channels, confined to one
+ * write, rename, mkdir, remove) and `upload:`/`download:` file channels, confined to one
  * root directory.
  *
  * Every path a client sends is resolved against `root`; a path that would
@@ -8,8 +8,9 @@
  */
 
 import {
-  readdir, lstat, stat, readFile, writeFile, mkdir, rmdir, unlink, readlink, realpath, open,
+  readdir, lstat, stat, readFile, writeFile, mkdir, rmdir, unlink, readlink, realpath, open, rename,
 } from 'node:fs/promises';
+import { constants as fsc } from 'node:fs';
 import path from 'node:path';
 
 export const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -71,7 +72,7 @@ export function createFileAccess({ root, readOnly = false, maxFileBytes = DEFAUL
     maxFileBytes,
 
     /** @returns {Promise<{ metadata?: object, entries?: object[] }>} */
-    async operate(op, clientPath, { offset, length } = {}) {
+    async operate(op, clientPath, { offset, length, newPath, data } = {}) {
       switch (op) {
         case 'list': {
           const dir = await resolveInside(clientPath || '/');
@@ -111,8 +112,28 @@ export function createFileAccess({ root, readOnly = false, maxFileBytes = DEFAUL
           await ((await lstat(full)).isDirectory() ? rmdir(full) : unlink(full));
           return { metadata: { removed: clientPath } };
         }
+        case 'write': {
+          if (!(data instanceof Uint8Array)) throw fail('write needs data');
+          await this.writeAt(clientPath, data, offset);
+          return { metadata: { written: data.byteLength } };
+        }
+        case 'rename': {
+          assertWritable();
+          if (typeof newPath !== 'string' || !newPath) throw fail('rename needs a destination path');
+          const from = await resolveInside(clientPath);
+          const to = await resolveInside(newPath);
+          if (from === base || to === base) throw fail('refusing to rename the file root');
+          if (from === to) return { metadata: { renamed: clientPath, to: newPath } };
+          if (to.startsWith(from + path.sep)) throw fail('cannot move a directory into itself');
+          await lstat(from); // ENOENT -> "no such file or directory"
+          let exists = true;
+          try { await lstat(to); } catch (e) { if (e.code === 'ENOENT') exists = false; else throw e; }
+          if (exists) throw fail('destination already exists');
+          await rename(from, to);
+          return { metadata: { renamed: clientPath, to: newPath } };
+        }
         default:
-          throw fail(`"${op}" is not offered by this host (list, stat, read, mkdir, remove; use upload/download to write)`);
+          throw fail(`"${op}" is not offered by this host (list, stat, read, write, rename, mkdir, remove)`);
       }
     },
 
@@ -125,10 +146,29 @@ export function createFileAccess({ root, readOnly = false, maxFileBytes = DEFAUL
     },
 
     async writeWhole(clientPath, data) {
+      return this.writeAt(clientPath, data, undefined, { mkdirs: true });
+    },
+
+    /**
+     * Write bytes into a regular file. `offset` omitted: replace the whole
+     * file (create/truncate). `offset` given: write in place at that byte
+     * offset without truncating (creates the file if missing).
+     */
+    async writeAt(clientPath, data, offset, { mkdirs = false } = {}) {
       assertWritable();
       const full = await resolveInside(clientPath);
-      await mkdir(path.dirname(full), { recursive: true });
-      await writeFile(full, data);
+      if (full === base) throw fail('not a regular file');
+      const at = offset === undefined || offset === null ? undefined : Number(offset);
+      if (at !== undefined && (!Number.isSafeInteger(at) || at < 0)) throw fail('illegal offset');
+      if ((at ?? 0) + data.byteLength > maxFileBytes) throw fail(`write would exceed the ${maxFileBytes} byte limit`);
+      if (mkdirs) await mkdir(path.dirname(full), { recursive: true });
+      // A FIFO or device would block or misbehave on open: regular files only.
+      try {
+        if (!(await stat(full)).isFile()) throw fail('not a regular file');
+      } catch (e) { if (e.wsh) throw e; if (e.code !== 'ENOENT') throw e; }
+      if (at === undefined) { await writeFile(full, data); return; }
+      const fh = await open(full, fsc.O_RDWR | fsc.O_CREAT, 0o644);
+      try { await fh.write(data, 0, data.byteLength, at); } finally { await fh.close(); }
     },
   };
 }

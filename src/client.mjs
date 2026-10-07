@@ -40,6 +40,11 @@ import { signChallenge, exportPublicKeyRaw, signPeerRecord, verifyPeerRecord, im
 import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
 import { WshSession } from './session.mjs';
 import { cborDecode } from './cbor.mjs';
+import {
+  HostKeyError, newHostKeyNonce, hostKeyProofMessage, findHostKeyAdvert,
+  HOST_KEY_NONCE_PREFIX,
+} from './host-key.mjs';
+import { verify as verifySignature, exportPublicKeySSH, parseSSHPublicKey, extractRawFromSSHWire } from './auth.mjs';
 
 // ── Client states ─────────────────────────────────────────────────────
 
@@ -175,6 +180,28 @@ async function combineHybridSecret(x25519Bits, kemSharedSecret) {
   return new Uint8Array(bits);
 }
 
+/**
+ * `expectHostKey` accepts a hex fingerprint, a raw 32-byte key, or an
+ * `ssh-ed25519 AAAA...` line; all normalize to the hex fingerprint.
+ * @param {string|Uint8Array} v
+ * @returns {Promise<string>}
+ */
+async function normalizeExpectedHostKey(v) {
+  if (v instanceof Uint8Array) {
+    if (v.byteLength !== 32) throw new TypeError('expectHostKey: a raw key must be 32 bytes');
+    return computeFingerprint(v);
+  }
+  const text = String(v).trim();
+  if (/^ssh-ed25519\s/.test(text)) {
+    const parsed = parseSSHPublicKey(text);
+    if (!parsed) throw new TypeError('expectHostKey: malformed ssh-ed25519 line');
+    return computeFingerprint(extractRawFromSSHWire(parsed.data));
+  }
+  const hex = text.replace(/^sha256:/i, '').replace(/:/g, '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) throw new TypeError('expectHostKey: expected a 64-char hex fingerprint, a raw key, or an ssh-ed25519 line');
+  return hex;
+}
+
 // ── Client class ──────────────────────────────────────────────────────
 
 export class WshClient {
@@ -200,6 +227,16 @@ export class WshClient {
 
   /** @type {import('./transport.mjs').WshTransport|null} Active transport. */
   #transport = null;
+
+  /** @type {{fingerprint: string, publicKey: Uint8Array, openssh: string, status: string}|null} */
+  #hostKey = null;
+
+  /**
+   * Called with the host's verified key before any credential is sent.
+   * Return `false` (or throw) to refuse the host. See `connect({ onHostKey })`.
+   * @type {((hostKey: object) => boolean|void|Promise<boolean|void>)|null}
+   */
+  onHostKey = null;
 
   /** @type {{ wt: () => import('./transport.mjs').WshTransport, ws: () => import('./transport.mjs').WshTransport }} */
   #transportFactories;
@@ -409,6 +446,18 @@ export class WshClient {
     return this.#serverFeatures.includes(name);
   }
 
+  /**
+   * The host's Ed25519 identity, once the server has proven it holds the
+   * key for this connection (`null` when the server advertised none, or
+   * before `connect()` got that far). `{ fingerprint, publicKey, openssh,
+   * status }` where `status` is `'pinned'` (matched `expectHostKey`),
+   * `'known'` / `'unknown'` (per `knownHosts`), or `'unpinned'` (no policy
+   * asked for one -- the key is surfaced but nothing was checked against it).
+   */
+  get hostKey() {
+    return this.#hostKey;
+  }
+
   // ── Connection ──────────────────────────────────────────────────────
 
   /**
@@ -429,9 +478,21 @@ export class WshClient {
    *   fine), or base64. Ignored by the WebSocket rung, which has no
    *   equivalent mechanism.
    * @param {number} [opts.timeout] - Auth handshake timeout in ms
+   * @param {string|Uint8Array} [opts.expectHostKey] - Pin: the host's hex
+   *   SHA-256 fingerprint, raw 32-byte Ed25519 key, or `ssh-ed25519 AAAA...`
+   *   line. Refuses (`HostKeyError`) on mismatch OR when the host presents
+   *   no verifiable key -- before any credential is sent.
+   * @param {import('./known-hosts.mjs').WshKnownHosts} [opts.knownHosts] - TOFU
+   *   store. A changed key is always refused; an unseen host is refused
+   *   unless `trustOnFirstUse` (or an `onHostKey` that does not return
+   *   `false`) accepts it, in which case it is pinned.
+   * @param {boolean} [opts.trustOnFirstUse] - Pin an unseen host's key.
+   * @param {string} [opts.hostLabel] - Key under which `knownHosts` records
+   *   this host (default: the URL's `host:port`).
+   * @param {Function} [opts.onHostKey] - Per-connect `onHostKey`.
    * @returns {Promise<string>} The server-assigned session ID
    */
-  async connect(url, { username, keyPair, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT } = {}) {
+  async connect(url, { username, keyPair, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, ...hostKeyOpts } = {}) {
     if (this.#state !== STATE_DISCONNECTED && this.#state !== STATE_CLOSED) {
       throw new Error(`Client already ${this.#state}`);
     }
@@ -448,6 +509,7 @@ export class WshClient {
     this.#waiters.clear();
     this.#sessionId = null;
     this.#authToken = null;
+    this.#hostKey = null;
 
     try {
       // ── Select and connect transport ──────────────────────────────
@@ -457,9 +519,11 @@ export class WshClient {
 
       // ── Auth handshake ────────────────────────────────────────────
       const authMethod = keyPair ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
+      const hostKeyNonce = newHostKeyNonce();
       await transport.sendControl(
-        hello({ username, authMethod })
+        hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce] })
       );
+      const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
       // Wait for SERVER_HELLO (which may include a session ID directly) or CHALLENGE.
       const firstResponse = await this.#waitForMessage(
@@ -478,14 +542,18 @@ export class WshClient {
         // Server may proceed directly to auth if it accepted the hello.
         tempSessionId = firstResponse.session_id;
         this.#serverFeatures = firstResponse.features || [];
+        // If pubkey auth, we still need a challenge. Its waiter is registered
+        // BEFORE the host key check awaits anything: the server sends the
+        // Challenge right behind ServerHello, and a message nobody is waiting
+        // for yet is dropped.
+        const challengeWait = authMethod === AUTH_METHOD.PUBKEY
+          ? this.#waitForMessage([MSG.CHALLENGE, MSG.AUTH_OK], timeout, 'Auth handshake timed out waiting for challenge')
+          : null;
+        challengeWait?.catch(() => {});
+        await this.#verifyHostKey(firstResponse, hostCtx);
 
-        // If pubkey auth, we still need a challenge.
         if (authMethod === AUTH_METHOD.PUBKEY) {
-          const challengeMsg = await this.#waitForMessage(
-            [MSG.CHALLENGE, MSG.AUTH_OK],
-            timeout,
-            'Auth handshake timed out waiting for challenge'
-          );
+          const challengeMsg = await challengeWait;
 
           if (challengeMsg.type === MSG.AUTH_OK) {
             // Server accepted without challenge (e.g. trusted key).
@@ -525,6 +593,7 @@ export class WshClient {
         }
       } else if (firstResponse.type === MSG.CHALLENGE) {
         // Some servers skip SERVER_HELLO and go straight to CHALLENGE.
+        await this.#verifyHostKey(null, hostCtx);
         if (authMethod !== AUTH_METHOD.PUBKEY || !keyPair) {
           throw new Error('Server sent CHALLENGE but no key pair was provided');
         }
@@ -858,13 +927,13 @@ export class WshClient {
    * @param {boolean} [opts.primer=true] - See `openSession({ primer })`
    * @returns {Promise<{stdout: Uint8Array, exitCode: number}>}
    */
-  static async exec(url, command, { username, keyPair, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true } = {}) {
+  static async exec(url, command, { username, keyPair, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, ...hostKeyOpts } = {}) {
     const client = new WshClient();
     const chunks = [];
     let exitCode = -1;
 
     try {
-      await client.connect(url, { username, keyPair, password });
+      await client.connect(url, { username, keyPair, password, ...hostKeyOpts });
 
       const session = await client.openSession({ type: 'exec', command, primer });
 
@@ -935,9 +1004,10 @@ export class WshClient {
     supportsReplay,
     supportsEcho,
     supportsTermSync,
+    ...hostKeyOpts
   } = {}) {
     // Authenticate normally first.
-    const sessionId = await this.connect(url, { username, keyPair, password, webTransport });
+    const sessionId = await this.connect(url, { username, keyPair, password, webTransport, ...hostKeyOpts });
 
     // Build capabilities list from expose options.
     const capabilities = [];
@@ -1719,15 +1789,57 @@ export class WshClient {
 
   /**
    * Perform a file operation on the remote host.
+   *
+   * `write` and `rename` carry data the wsh-v1 `FileOp` frame has no field
+   * for, so both send the payload as a `FileChunk` on the same channel id
+   * (no frame or field outside the spec), and the host must advertise
+   * `file-write` / `file-rename` in ServerHello; against a host that does
+   * not, they throw instead of sending a request the host would misread:
+   *  - `write`: `FileOp{ op: 'write', path, offset?, length }`, then the bytes
+   *    as `FileChunk` frames (the last with `is_final`).
+   *  - `rename`: `FileOp{ op: 'rename', path: <old> }`, then one final
+   *    `FileChunk` whose data is the UTF-8 destination path.
+   * Either way the single `FileResult` arrives after the final chunk.
+   *
    * @param {string} op - Operation: 'stat', 'list', 'read', 'write', 'mkdir', 'remove', 'rename'
    * @param {string} path - File path
-   * @param {object} [opts] - Optional: offset, length for read; data for write; newPath for rename
+   * @param {object} [opts] - Optional: offset, length for read; `data` (+ `offset`) for write; `newPath` for rename
    * @param {number} [timeout=10000]
    * @returns {Promise<object>} FileResult response
    */
   async fileOperation(op, path, opts = {}, timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('fileOperation');
     const channelId = this._nextChannelId();
+
+    if (op === 'write' || op === 'rename') {
+      const feature = op === 'write' ? 'file-write' : 'file-rename';
+      if (!this.hasFeature(feature)) throw new Error(`this host does not support file ${op} (no "${feature}" feature)`);
+      let data;
+      if (op === 'write') {
+        data = typeof opts.data === 'string' ? new TextEncoder().encode(opts.data) : opts.data;
+        if (!(data instanceof Uint8Array)) throw new TypeError('fileWrite: data must be a string or Uint8Array');
+      } else {
+        if (typeof opts.newPath !== 'string' || !opts.newPath) throw new TypeError('fileRename: newPath is required');
+        data = new TextEncoder().encode(opts.newPath);
+      }
+      // Registered before sending: the host may fail fast (read-only, too big)
+      // and answer before the last chunk goes out.
+      const result = this.#waitForMessage([MSG.FILE_RESULT], timeout, `Timed out waiting for file ${op} result`);
+      result.catch(() => {});
+      await this.#transport.sendControl(fileOpMsg({
+        channelId, op, path, offset: op === 'write' ? opts.offset : undefined, length: data.byteLength,
+      }));
+      let off = 0;
+      do {
+        const end = Math.min(off + FILE_CHUNK_SIZE, data.byteLength);
+        await this.#transport.sendControl(fileChunkMsg({
+          channelId, offset: off, data: data.subarray(off, end), isFinal: end >= data.byteLength, totalSize: data.byteLength,
+        }));
+        off = end;
+      } while (off < data.byteLength);
+      return result;
+    }
+
     await this.#transport.sendControl(
       fileOpMsg({ channelId, op, path, offset: opts.offset, length: opts.length })
     );
@@ -1745,13 +1857,13 @@ export class WshClient {
   /** Read a remote file. */
   async fileRead(path, offset, length, timeout) { return this.fileOperation('read', path, { offset, length }, timeout); }
   /** Write to a remote file. */
-  async fileWrite(path, data, offset, timeout) { return this.fileOperation('write', path, { offset }, timeout); }
+  async fileWrite(path, data, offset, timeout) { return this.fileOperation('write', path, { data, offset }, timeout); }
   /** Create a remote directory. */
   async fileMkdir(path, timeout) { return this.fileOperation('mkdir', path, {}, timeout); }
   /** Remove a remote file or directory. */
   async fileRemove(path, timeout) { return this.fileOperation('remove', path, {}, timeout); }
   /** Rename a remote file or directory. */
-  async fileRename(oldPath, newPath, timeout) { return this.fileOperation('rename', oldPath, {}, timeout); }
+  async fileRename(oldPath, newPath, timeout) { return this.fileOperation('rename', oldPath, { newPath }, timeout); }
 
   // ── Authorized-key management (wsh #59) ───────────────────────────
 
@@ -1955,7 +2067,95 @@ export class WshClient {
     // Proceed with auth using the same logic.
     // We can't call this.connect() directly because it would create a new
     // transport, so we duplicate the auth portion.
-    return this.#performAuth(opts);
+    return this.#performAuth({ ...opts, url });
+  }
+
+  // ── Internal: host key (TOFU / pinning) ─────────────────────────────
+
+  /**
+   * Check the host's advertised key (see host-key.mjs) against the caller's
+   * policy. Runs before any credential leaves this client. Throws a
+   * `HostKeyError`; the surrounding handshake `catch` closes the transport.
+   *
+   * @param {object|null} serverHello - ServerHello, or null when the server went straight to CHALLENGE
+   * @param {object} ctx - { url, username, nonce, expectHostKey, knownHosts, hostLabel, trustOnFirstUse, onHostKey }
+   * @private
+   */
+  async #verifyHostKey(serverHello, ctx) {
+    const { expectHostKey, knownHosts, trustOnFirstUse, nonce, username } = ctx;
+    const wantsCheck = Boolean(expectHostKey || knownHosts);
+    const advert = serverHello ? findHostKeyAdvert(serverHello.features) : null;
+
+    if (!advert) {
+      if (wantsCheck) {
+        throw new HostKeyError('HOST_KEY_MISSING',
+          'host key required (expectHostKey/knownHosts) but the server presented none; refusing before sending credentials');
+      }
+      return;
+    }
+
+    const { key, sig } = advert;
+    if (!key || key.byteLength !== 32 || !sig) {
+      throw new HostKeyError('HOST_KEY_INVALID', 'server advertised a malformed host key or no proof of possession');
+    }
+    let ok = false;
+    let fp;
+    try {
+      fp = await computeFingerprint(key);
+      ok = await verifySignature(
+        await importPublicKeyRaw(key), sig,
+        hostKeyProofMessage({ sessionId: serverHello.session_id, clientNonce: nonce, username }),
+      );
+    } catch { ok = false; }
+    if (!ok) throw new HostKeyError('HOST_KEY_INVALID', 'host key proof does not verify (not signed over this connection)');
+    if (serverHello.host_fingerprint && serverHello.host_fingerprint !== fp) {
+      throw new HostKeyError('HOST_KEY_INVALID', 'ServerHello.host_fingerprint does not match the advertised host key');
+    }
+
+    let openssh = '';
+    try { openssh = await exportPublicKeySSH(await importPublicKeyRaw(key)); } catch { /* informational only */ }
+    const info = { fingerprint: fp, publicKey: key, openssh, status: 'unpinned' };
+    this.#hostKey = info;
+
+    if (expectHostKey) {
+      const want = await normalizeExpectedHostKey(expectHostKey);
+      if (want !== fp) {
+        throw new HostKeyError('HOST_KEY_MISMATCH',
+          `host key mismatch: expected ${want}, host presented ${fp}`, { expected: want, actual: fp });
+      }
+      info.status = 'pinned';
+    }
+
+    let label = ctx.hostLabel;
+    if (knownHosts) {
+      if (!label) {
+        try { label = new URL(ctx.url).host; } catch { label = String(ctx.url); }
+      }
+      const v = knownHosts.verifyHost(label, fp);
+      if (v.status === 'changed') {
+        throw new HostKeyError('HOST_KEY_MISMATCH',
+          `HOST KEY CHANGED for ${label}: pinned ${v.expected}, host presented ${fp} (possible impersonation)`,
+          { expected: v.expected, actual: fp });
+      }
+      info.status = v.status; // 'known' | 'unknown'
+    }
+
+    const cb = ctx.onHostKey ?? this.onHostKey;
+    if (typeof cb === 'function') {
+      let verdict;
+      try { verdict = await cb({ ...info }); } catch (e) {
+        throw new HostKeyError('HOST_KEY_REJECTED', `onHostKey threw: ${e?.message ?? e}`);
+      }
+      if (verdict === false) throw new HostKeyError('HOST_KEY_REJECTED', 'host key rejected by onHostKey');
+    }
+
+    if (knownHosts && info.status === 'unknown') {
+      if (!trustOnFirstUse && typeof cb !== 'function') {
+        throw new HostKeyError('HOST_KEY_UNKNOWN',
+          `${label} is not in knownHosts; pass trustOnFirstUse: true (or an onHostKey) to pin it`, { actual: fp });
+      }
+      knownHosts.addHost(label, fp);
+    }
   }
 
   // ── Internal: auth handshake ────────────────────────────────────────
@@ -1972,13 +2172,16 @@ export class WshClient {
    * @returns {Promise<string>} Session ID
    * @private
    */
-  async #performAuth({ username, keyPair, password, timeout = DEFAULT_AUTH_TIMEOUT } = {}) {
+  async #performAuth({ username, keyPair, password, timeout = DEFAULT_AUTH_TIMEOUT, url, ...hostKeyOpts } = {}) {
     if (!username) throw new Error('username is required');
     if (!keyPair && !password) throw new Error('Either keyPair or password is required');
 
+    this.#hostKey = null;
     try {
       const authMethod = keyPair ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
-      await this.#transport.sendControl(hello({ username, authMethod }));
+      const hostKeyNonce = newHostKeyNonce();
+      await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce] }));
+      const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
       const firstResponse = await this.#waitForMessage(
         [MSG.SERVER_HELLO, MSG.CHALLENGE, MSG.AUTH_FAIL],
@@ -1995,13 +2198,15 @@ export class WshClient {
       if (firstResponse.type === MSG.SERVER_HELLO) {
         tempSessionId = firstResponse.session_id;
         this.#serverFeatures = firstResponse.features || [];
+        // Waiter first, then the (async) host key check -- see connect().
+        const challengeWait = authMethod === AUTH_METHOD.PUBKEY
+          ? this.#waitForMessage([MSG.CHALLENGE, MSG.AUTH_OK], timeout, 'Timed out waiting for challenge')
+          : null;
+        challengeWait?.catch(() => {});
+        await this.#verifyHostKey(firstResponse, hostCtx);
 
         if (authMethod === AUTH_METHOD.PUBKEY) {
-          const challengeMsg = await this.#waitForMessage(
-            [MSG.CHALLENGE, MSG.AUTH_OK],
-            timeout,
-            'Timed out waiting for challenge'
-          );
+          const challengeMsg = await challengeWait;
 
           if (challengeMsg.type === MSG.AUTH_OK) {
             this.#sessionId = challengeMsg.session_id || tempSessionId;
@@ -2025,6 +2230,7 @@ export class WshClient {
         }
       } else if (firstResponse.type === MSG.CHALLENGE) {
         if (!keyPair) throw new Error('Server sent CHALLENGE but no key pair provided');
+        await this.#verifyHostKey(null, hostCtx);
 
         // Challenge carries session_id directly — see connect()'s
         // CHALLENGE branch for why. Keep tempSessionId as a fallback for
