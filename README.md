@@ -287,27 +287,56 @@ const s = await client.openSession({ type: 'exec', command: 'echo hello' });
   checked against the allowlist (a non-forwardable or undecodable inner is
   dropped, logged), and re-wrapped with the real sender; traffic from a connection
   that is not bridged is never forwarded.
-- **One operator per peer at a time**; a second `ReverseConnect` is rejected as
-  `busy`, and one the peer does not answer within `connectTimeoutMs` (default
-  8 s) as `peer did not respond`. A bridge lasts as long as both connections:
-  when either ends, the relay closes the other, so nothing an operator started
-  outlives it (the reverse host kills its processes). `createReverseHost`
-  redials with backoff by default (`reconnect: false` to turn it off), so it is
-  registered again for the next operator.
+- **One operator per peer at a time**, by design: a `RelayForward` names its
+  sender but not its recipient, and nothing on the wire tells a peer that one
+  of several operators left, so replies could not be addressed and a departed
+  operator's work could not be cleaned up. A second `ReverseConnect` to a peer
+  that already has an operator (or a request awaiting its answer) is rejected
+  with `ReverseReject.reason` `busy: this peer already has an operator ...`
+  (exported as `BUSY_PEER` from `src/server/relay.mjs`), and an operator that
+  already has a bridge or a request in flight is rejected with `busy: you
+  already have a bridge ...` (`BUSY_OPERATOR`); a request the peer does not
+  answer within `connectTimeoutMs` (default 8 s) is `peer did not respond`.
+  A bridge lasts as long as both connections: when either ends, the relay
+  closes the other, so nothing an operator started outlives it (the reverse
+  host kills its processes). `createReverseHost` redials with backoff by
+  default (`reconnect: false` to turn it off), so it is registered again for
+  the next operator. Lifting the limit needs a spec addition (a recipient on
+  `RelayForward`, a bridge-ended notice) shared with the Rust side; it is
+  tracked rather than built.
 - **On the peer**, the bridged operator is served by the same connection code as
   a direct client, over an in-memory message pipe instead of a socket. Nothing a
   client opens can cross the relay but control messages, so exec sessions are
   `data_mode: 'virtual'` there (stdin and output ride `SessionData`; there is no
   stdin EOF).
-- **Not provided:** end-to-end encryption between operator and peer -- `KeyExchange` /
-  `EncryptedFrame` are not on the spec's `forwardable` list, so the relay sees the
-  traffic in clear (serve it over `wss://`, and treat the relay operator as trusted).
-  Client-side feature gates (`fileWrite`/`fileRename` need `file-write`/`file-rename`,
-  `callTool` correlates on `mcp-call-id`) read the **relay's** `ServerHello`, which
-  says nothing about the peer behind it: against a relay without `fs`, `fileWrite()`
-  refuses locally (reads, listing, stat and exec are unaffected). Multiplexing
-  several operators onto one peer needs a way to address replies, which `RelayForward`
-  does not have.
+- **End-to-end encryption through the bridge.** `KeyExchange` and `EncryptedFrame`
+  are on the spec's `forwardable` list, so an operator and a peer can run
+  `initiateE2E()` / `enableE2E()` with each other through the relay: it carries
+  the CBOR of each as opaque bytes and holds no key, so it sees only public
+  values and ciphertext (`test/server-relay-bridge.test.mjs` checks the relay
+  never holds the plaintext). **`KeyExchange` is unauthenticated**: this
+  protects against a relay that only observes, not against one that substitutes
+  the exchanged keys, so if the relay operator is not trusted, authenticate the
+  derived key yourself (compare it out of band, or sign it with the keys the
+  bridge already names). Only a stock-client peer (a browser tab, `connectReverse`)
+  speaks E2E: **`createReverseHost` does not answer `KeyExchange` or open
+  `EncryptedFrame`s** (the Node host has no E2E layer at all), so against it traffic
+  is in the clear to the relay -- serve the relay over `wss://` and treat its
+  operator as trusted. Key exchange from a connection that is not bridged is
+  never carried.
+- **Feature gates follow the host behind the bridge.** The host's own features
+  (`file-write`, `file-rename`, `mcp-call-id`) are stated in the optional
+  `ReverseAccept.features`; the relay forwards the list (bounded: at most 64
+  strings of 128 characters, otherwise it is dropped) and, once
+  `reverseConnect()` resolves, `client.hasFeature()` / `client.features` answer
+  from it instead of the relay's `ServerHello`. `client.bridgedFeatures` is that
+  list (`null` before a bridge, or when the peer did not say, in which case the
+  gates fall back to `client.serverFeatures`, the relay's, as before).
+  `createReverseHost` always states its features (`reportFeatures: false` leaves
+  them out). A **Rust `wsh-server` / `wsh` older than `rust-v0.3.0` rejects a
+  `ReverseAccept` that carries `features`** (the message is `deny_unknown_fields`
+  there): against such a relay or operator, set `reportFeatures: false` on the
+  host (and use `ReverseAccept` without the field in your own peers).
 
 ### Sessions: attach / resume / detach
 
@@ -828,7 +857,7 @@ than left to be found.
 | Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | none yet (a Rust `wsh-server` does not advertise `rpc`; a JS client falls back to `FileOp` for files) | **JS server only, no wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
-| Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer |
+| Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast v2) | none | **JS-only** -- no current Rust consumer needs playback; the format itself (asciicast v2) is not proprietary if one is added later |
 | Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | N/A -- Rust dials a cert its own TLS stack already trusts, or `--generate-cert`'s self-signed cert out of band | **Deliberately not unified** -- this is a browser-specific WebTransport API shape, not a wire-protocol concept |
@@ -900,6 +929,11 @@ out explicitly below rather than left to be discovered.
   `SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce || channel_binding)`,
   so a signature can't be replayed against a different session or relabeled
   to a different username.
+- **E2E through a relay is opt-in and unauthenticated key agreement.** The relay
+  carries `KeyExchange` / `EncryptedFrame` between a bridged operator and peer
+  without being able to read the sealed frames, but `KeyExchange` carries no
+  signature: a relay that substitutes keys is not detected (see the [relay
+  section](#relay--reverse-mode)).
 - **Signed peer records.** Reverse-mode registration is self-signed by the
   peer's identity key (the libp2p RFC 0002/0003 pattern), in a signing
   domain separate from the auth challenge. `listPeers()` verifies every

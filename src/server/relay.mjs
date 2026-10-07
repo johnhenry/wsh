@@ -27,7 +27,14 @@ export const DEFAULT_CONNECT_TIMEOUT_MS = 8000;
 const MAX_FORWARD_BYTES = 8 * 1024 * 1024;
 const MAX_REMEMBERED_SEQS = 4096;
 const MAX_CAPABILITIES = 32;
+const MAX_FEATURES = 64;
+const MAX_FEATURE_LENGTH = 128;
 const SHORT_PREFIX_MIN = 8;
+
+/** `ReverseReject.reason` for a peer that already has an operator (or a request awaiting its answer). */
+export const BUSY_PEER = 'busy: this peer already has an operator (the relay bridges one operator per peer at a time; retry when it leaves)';
+/** `ReverseReject.reason` for an operator that already has a bridge, or a request in flight. */
+export const BUSY_OPERATOR = 'busy: you already have a bridge or a pending connect on this relay (one at a time)';
 
 const isStr = (v, max) => typeof v === 'string' && v.length <= max;
 
@@ -186,9 +193,13 @@ export class RelayHub {
         fingerprint: target.meta.fingerprint, username: target.meta.username, capabilities: target.meta.capabilities,
       }))) return reject('no such peer');
     if (this.#peers.get(target.meta.fingerprint) !== target) return reject('no such peer');
-    if (this.#pairs.has(operator) || this.#pairs.has(target.handle)
-      || [...this.#pending.values()].some((p) => p.operator === operator) || this.#pending.has(target.handle)) {
-      return reject('busy');
+    // One bridge per peer, and one per operator: a RelayForward names its sender but not its recipient, so a
+    // peer's reply could not be addressed to one of several operators (see the README's relay section).
+    if (this.#pairs.has(target.handle) || this.#pending.has(target.handle)) {
+      return reject(BUSY_PEER);
+    }
+    if (this.#pairs.has(operator) || [...this.#pending.values()].some((p) => p.operator === operator)) {
+      return reject(BUSY_OPERATOR);
     }
     const timer = setTimeout(() => {
       if (this.#pending.get(target.handle)?.operator !== operator) return;
@@ -213,8 +224,13 @@ export class RelayHub {
     if (!p) return;
     clearTimeout(p.timer);
     this.#pending.delete(peer);
-    // The answer names the answering peer, not whatever it wrote.
-    p.operator.send({ ...msg, target_fingerprint: peer.fingerprint });
+    // The answer names the answering peer, not whatever it wrote; its features claim is bounded.
+    const answer = { ...msg, target_fingerprint: peer.fingerprint };
+    if (msg.type === MSG.REVERSE_ACCEPT) {
+      if (Array.isArray(msg.features) && msg.features.length <= MAX_FEATURES && msg.features.every((f) => isStr(f, MAX_FEATURE_LENGTH))) answer.features = [...msg.features];
+      else delete answer.features;
+    }
+    p.operator.send(answer);
     if (msg.type === MSG.REVERSE_ACCEPT) {
       this.#pairs.set(p.operator, peer);
       this.#pairs.set(peer, p.operator);

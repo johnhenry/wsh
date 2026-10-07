@@ -31,6 +31,22 @@ import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } f
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
+
+/**
+ * The features a host built from `cfg` advertises (`ServerHello.features`, minus the host-key proof).
+ * Over a relay bridge (`dataStreams: false`) there are no client-opened streams, so the
+ * stream-based ones (`stream-announce`, `rpc`) are not offered; a reverse host reports this
+ * list to the operator in `ReverseAccept.features`.
+ */
+export function hostFeatures(cfg, { dataStreams = true } = {}) {
+  const features = dataStreams ? [STREAM_ANNOUNCE] : [];
+  if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE);
+  if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
+  if (cfg.rpc && dataStreams && cfg.rpc.protocols.size) {
+    features.push(RPC_FEATURE, ...[...cfg.rpc.protocols.keys()].map(rpcProtocolFeature), RPC_MAX_MESSAGE_PREFIX + cfg.rpc.maxMessageBytes);
+  }
+  return features;
+}
 const MAX_PENDING_WRITES = 8;
 const MAX_RENAME_PATH_BYTES = 4096;
 const WRITE_IDLE_MS = 30_000;
@@ -201,12 +217,7 @@ export function createConnectionFactory(cfg) {
         }
         state.username = user;
         state.method = method;
-        const features = [STREAM_ANNOUNCE];
-        if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE);
-        if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
-        if (cfg.rpc && dataStreams && cfg.rpc.protocols.size) {
-          features.push(RPC_FEATURE, ...[...cfg.rpc.protocols.keys()].map(rpcProtocolFeature), RPC_MAX_MESSAGE_PREFIX + cfg.rpc.maxMessageBytes);
-        }
+        const features = hostFeatures(cfg, { dataStreams });
         let hostFingerprint;
         if (cfg.hostKey) {
           hostFingerprint = cfg.hostKey.fingerprint;

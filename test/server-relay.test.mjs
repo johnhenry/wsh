@@ -3,7 +3,7 @@
 // command through the bridge.
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWshServer, createReverseHost } from '@johnhenry/wsh/server';
@@ -13,6 +13,7 @@ import {
 } from '@johnhenry/wsh';
 
 const dec = new TextDecoder();
+const relayFeaturesHave = (client, name) => client.serverFeatures.includes(name);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(cond, what, ms = 4000) {
   const t0 = Date.now();
@@ -141,9 +142,14 @@ describe('relay / reverse mode', () => {
       assert.equal((await bob.fileStat('a.txt')).success, true);
       assert.equal(dec.decode((await bob.fileRead('a.txt', 6, 4)).metadata.data), 'file');
       assert.deepEqual((await bob.fileList('/')).entries.map((e) => e.name), ['a.txt']);
-      // fileWrite()/fileRename() are gated on the *relay's* ServerHello features (file-write / file-rename), which a
-      // relay without `fs` does not advertise: the client refuses to send them, rather than the host misreading them.
-      await assert.rejects(() => bob.fileWrite('b.txt', 'x'), /does not support file write/);
+      // fileWrite()/fileRename() are gated on the features of the host behind the bridge (it states them in
+      // ReverseAccept.features), not on the relay's ServerHello, which has no `fs` here (#80).
+      assert.equal(relayFeaturesHave(bob, 'file-write'), false, 'the relay itself has no fs');
+      assert.equal(bob.hasFeature('file-write'), true, 'the bridged host does');
+      assert.ok(bob.bridgedFeatures.includes('file-rename'));
+      assert.equal((await bob.fileWrite('b.txt', 'x')).success, true);
+      assert.equal((await bob.fileRename('b.txt', 'c.txt')).success, true);
+      assert.equal(await readFile(path.join(root, 'c.txt'), 'utf8'), 'x');
       assert.deepEqual((await bob.discoverTools()).map((t) => t.name), ['add']);
       assert.equal(await bob.callTool('add', { a: 2, b: 3 }), 5);
       assert.match((await bob.callTool('add', { a: 'x' })).error, /invalid arguments/);
@@ -364,7 +370,7 @@ describe('relay / reverse mode', () => {
       const bob = await login(url, 'bob');
       await bob.reverseConnect(keys.host.fp);
       const carol = await login(url, 'carol');
-      assert.equal((await carol.reverseConnect(keys.host.fp)).reason, 'busy');
+      assert.match((await carol.reverseConnect(keys.host.fp)).reason, /^busy: this peer already has an operator/);
     });
 
     it('a ReverseConnect to a peer that never answers is rejected after connectTimeoutMs', async () => {

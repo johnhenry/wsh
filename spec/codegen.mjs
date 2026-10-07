@@ -497,7 +497,7 @@ function rustType(yamlType, required, hasDefault) {
   // Optional (no default) → Option<T>
   // Has default → T (with #[serde(default)])
   // Required → T
-  if (required === false && !hasDefault && !yamlType.endsWith('[]') && yamlType !== 'json') {
+  if (required === false && !hasDefault && yamlType !== 'json') {
     return `Option<${inner}>`;
   }
   return inner;

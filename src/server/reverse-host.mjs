@@ -13,7 +13,7 @@ import { WshClient } from '../client.mjs';
 import { exportPublicKeyRaw, fingerprint } from '../auth.mjs';
 import { reverseAccept, reverseReject } from '../messages.gen.mjs';
 import { buildBackends } from './backends.mjs';
-import { createConnectionFactory } from './connection.mjs';
+import { createConnectionFactory, hostFeatures } from './connection.mjs';
 
 const BACKOFF_START_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
@@ -32,10 +32,13 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {boolean} [options.reconnect=true] - Dial again (with backoff) after the relay connection ends. A relay ends it when a bridge does.
  * @param {object} [options.connect] - Extra options for the relay connection (`expectHostKey`, `knownHosts`, ...).
  * @param {string} [options.peerType='host']
+ * @param {boolean} [options.reportFeatures=true] - State this host's features in `ReverseAccept.features`, so the operator's
+ *   feature gates follow this host rather than the relay. Turn off only for a relay (a Rust `wsh-server` older than the field)
+ *   that rejects a `ReverseAccept` carrying it.
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost({
-  url, username, keyPair, accept, exec, pty, fs, mcp, reconnect = true, connect = {}, peerType = 'host', onLog = () => {},
+  url, username, keyPair, accept, exec, pty, fs, mcp, reconnect = true, connect = {}, peerType = 'host', reportFeatures = true, onLog = () => {},
 } = {}) {
   if (!url) throw new TypeError('createReverseHost: url is required');
   if (!username) throw new TypeError('createReverseHost: username is required');
@@ -46,6 +49,9 @@ export function createReverseHost({
   const expose = { shell: !!backends.pty, exec: !!backends.execRunner, fs: !!backends.files, tools: !!backends.mcp };
   const capabilities = Object.entries(expose).filter(([, on]) => on).map(([k]) => k);
   const shellBackend = backends.pty ? 'pty' : 'exec-only';
+  // What this host can do over a bridge, for the operator's feature gates (`ReverseAccept.features`).
+  // `reportFeatures: false` leaves them out (a Rust peer or relay older than the field rejects a ReverseAccept that has it).
+  const bridgeFeatures = hostFeatures({ mcp: backends.mcp, files: backends.files }, { dataStreams: false });
   const factory = createConnectionFactory({
     authorize: async () => false, methods: { pubkey: false, password: null }, hostKey: null, rateLimit: null,
     execRunner: backends.execRunner, execOptions: backends.execOptions, pty: backends.pty, files: backends.files, mcp: backends.mcp,
@@ -74,7 +80,7 @@ export function createReverseHost({
       const from = req.from_fingerprint;
       const answer = (m) => c.sendRelayControl(m).catch(() => {});
       const refuse = (reason) => answer(reverseReject({ targetFingerprint: myFingerprint, username, reason }));
-      if (bridge || typeof from !== 'string' || !from) { await refuse('busy'); return; }
+      if (bridge || typeof from !== 'string' || !from) { await refuse('busy: this host is already serving an operator'); return; }
       let ok = false;
       try { ok = (await accept?.({ fingerprint: from, username: String(req.username ?? '') })) === true; } catch (e) { onLog(`[reverse] accept threw: ${e.message}`); }
       if (!ok || bridge) { await refuse('not accepted'); return; }
@@ -89,6 +95,7 @@ export function createReverseHost({
       await answer(reverseAccept({
         targetFingerprint: myFingerprint, username, capabilities, peerType, shellBackend,
         supportsAttach: false, supportsReplay: false, supportsEcho: false, supportsTermSync: false,
+        features: reportFeatures ? bridgeFeatures : undefined,
       }));
     };
     c.onClose = () => {

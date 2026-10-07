@@ -313,6 +313,11 @@ export class WshClient {
 
   /** @type {string[]} Server-advertised features from SERVER_HELLO. */
   #serverFeatures = [];
+  /**
+   * @type {string[]|null} Features of the host behind an accepted relay bridge, from
+   * `ReverseAccept.features`; `null` when no bridge is up or the peer stated none.
+   */
+  #bridgedFeatures = null;
 
   /** @type {number|null} Ping interval handle. */
   #pingTimer = null;
@@ -437,9 +442,27 @@ export class WshClient {
     return new Map(this.#sessions);
   }
 
-  /** Server-advertised features from SERVER_HELLO. */
+  /**
+   * The features this connection's operations can rely on: those of the host
+   * behind an accepted relay bridge when it stated them (`ReverseAccept.features`,
+   * see `reverseConnect()`), otherwise the server's `SERVER_HELLO` features.
+   */
   get features() {
+    return [...(this.#bridgedFeatures ?? this.#serverFeatures)];
+  }
+
+  /** The `SERVER_HELLO` features of the server this connection is to (the relay, over a bridge). */
+  get serverFeatures() {
     return [...this.#serverFeatures];
+  }
+
+  /**
+   * Features of the host behind an accepted relay bridge, as it stated them in
+   * `ReverseAccept.features`; `null` when there is no bridge, or the peer did
+   * not say (then `hasFeature()` falls back to the server's own).
+   */
+  get bridgedFeatures() {
+    return this.#bridgedFeatures ? [...this.#bridgedFeatures] : null;
   }
 
   /**
@@ -458,7 +481,7 @@ export class WshClient {
    * @returns {boolean}
    */
   hasFeature(name) {
-    return this.#serverFeatures.includes(name);
+    return (this.#bridgedFeatures ?? this.#serverFeatures).includes(name);
   }
 
   /**
@@ -980,6 +1003,7 @@ export class WshClient {
 
     this.#stopPing();
     this.#state = STATE_CLOSED;
+    this.#bridgedFeatures = null;
 
     // Close all sessions concurrently.
     const closePromises = [];
@@ -1217,6 +1241,12 @@ export class WshClient {
 
     if (response.type === MSG.REVERSE_ACCEPT) {
       this.trustRelayPeer(response.target_fingerprint);
+      // The relay's SERVER_HELLO describes the relay, not the host behind the
+      // bridge: when that host says what it supports, feature gates
+      // (file-write, file-rename, mcp-call-id) follow it instead.
+      this.#bridgedFeatures = Array.isArray(response.features) && response.features.every((f) => typeof f === 'string')
+        ? [...response.features]
+        : null;
     }
 
     return response;
@@ -2747,6 +2777,7 @@ export class WshClient {
     if (this.#state === STATE_CLOSED) return;
 
     this.#state = STATE_CLOSED;
+    this.#bridgedFeatures = null;
     this.#stopPing();
     this.#rejectAllWaiters(new Error('Transport closed'));
 

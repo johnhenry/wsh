@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.26.0 (2026-10-07) / Rust `rust-v0.3.0`
+
+- **Relay: E2E can cross a bridge (#80).** `KeyExchange` and `EncryptedFrame` are now on
+  the spec's `relay.forwardable` list (regenerated into JS and Rust), so two endpoints bridged
+  through the Node or the Rust relay can run `initiateE2E()` and exchange sealed frames; the
+  relay carries them as opaque bytes and holds no key (a test checks it never sees the
+  plaintext). `KeyExchange` is unauthenticated, so this defeats a relay that only observes,
+  not one that substitutes keys; the README says so. Key exchange from an unbridged connection
+  is still never carried. The Node host (`createReverseHost`) has no E2E layer and does not
+  answer `KeyExchange`: tracked in #90.
+- **Relay: one operator per peer, now explicit.** Several operators would need a recipient on
+  `RelayForward` and a bridge-ended notice (a spec addition shared with Rust), so the limit
+  stays and is tracked in #89. `ReverseReject.reason` is now `busy: this peer already has an
+  operator ...` (`BUSY_PEER`) or `busy: you already have a bridge ...` (`BUSY_OPERATOR`)
+  instead of a bare `busy`; clients matching `=== 'busy'` should match the `busy` prefix.
+- **Relay: client feature gates read the bridged host (spec, additive).** `ReverseAccept` gains
+  an optional `features: string[]` (the host's own, in the vocabulary of `ServerHello.features`).
+  `createReverseHost` states them (`reportFeatures: false` leaves them out); the relay forwards
+  them after bounding (<= 64 strings of <= 128 characters, otherwise dropped); after
+  `reverseConnect()` the client's `hasFeature()` / `features` answer from them, with the new
+  `bridgedFeatures` (`null` when no bridge or the peer did not say, then the relay's features
+  apply as before) and `serverFeatures` (always the relay's). `fileWrite()` / `fileRename()`
+  therefore work through a relay without `fs`, and refuse locally when the *host* lacks them.
+  The Rust crates: `ReverseAcceptPayload.features` is `Option<Vec<String>>` (the codegen now
+  emits `Option` for an optional array too; no other field was affected), and
+  `ReverseAccept` is `deny_unknown_fields`, so a **Rust peer or relay older than `rust-v0.3.0`
+  rejects a `ReverseAccept` that carries `features`**; set `reportFeatures: false` against one.
+- **Tests:** `test/server-relay-bridge.test.mjs` (E2E key agreement and sealed frames both ways
+  with the relay's view recorded, key exchange not carried unbridged, both busy reasons, the
+  peer freed after its operator leaves, bridged feature gates in every combination, bounding,
+  reset on disconnect); one cross-implementation test against the Rust relay (features forwarded,
+  `KeyExchange` both ways). The relay test that asserted `fileWrite()` refusing through a relay
+  without `fs` now asserts it working.
+
 ## 0.25.1 (2026-10-07) / Rust `rust-v0.2.0`
 
 - **Rust `wsh-server` honours `Resume.last_seq` and sets `AttachmentInfo.channel_id`/`seq` (#79).**
