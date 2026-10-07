@@ -116,6 +116,12 @@ class QMuxStream {
     if (this.#sendState === SEND_STATE.DATA_SENT) {
       throw new Error(`Cannot write to stream ${this.id}: already closed (FIN sent)`);
     }
+    if (bytes.byteLength === 0) {
+      // Nothing to send, but a first write is still the caller saying "this
+      // stream exists": announce it (a no-op once anything has been sent).
+      this.announce();
+      return;
+    }
     this.#sendState = SEND_STATE.SEND;
 
     let offset = 0;
