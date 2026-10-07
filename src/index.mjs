@@ -91,3 +91,10 @@ export { SessionRecorder, SessionPlayer } from './recording.mjs';
 
 // MCP bridge
 export { WshMcpBridge } from './mcp-bridge.mjs';
+
+// Typed (object-mode) RPC channels -- wsh #85
+export {
+  RpcChannel, RpcError, CborSequenceDecoder, RPC_ERROR, RPC_FEATURE, RPC_PROTOCOL_PREFIX, RPC_MAX_MESSAGE_PREFIX,
+  RPC_DEFAULT_MAX_MESSAGE, RPC_PROTOCOL_NAME_RE, rpcProtocolFeature, parseRpcFeatures,
+} from './rpc.mjs';
+export { RpcMcpTransport, mcpClientTransport, mcpServerTransport } from './rpc-mcp.mjs';

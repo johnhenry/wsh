@@ -26,6 +26,7 @@ wsh is a pure-JS client library (with an optional Node server at `@johnhenry/wsh
 - [Quick Start](#quick-start)
 - [One-Shot Command Execution](#one-shot-command-execution)
 - [Node Server](#node-server)
+- [RPC channels (object mode)](#rpc-channels-object-mode)
 - [Attach and Resume](#attach-and-resume)
 - [Pinning a Self-Signed Certificate](#pinning-a-self-signed-certificate)
 - [API Overview](#api-overview)
@@ -545,6 +546,109 @@ the host to find it:
 | A client that primes anyway (older stock client, `primer` forced, other implementations) | `@johnhenry/wsh/server` | **The leading `0x00` is dropped:** if the first data on an exec stream is exactly one `0x00` byte it is discarded, never forwarded to the process's stdin. Only that first chunk is inspected; a later `0x00`, or a first chunk that is longer than one byte, is delivered untouched. The cost: a client whose genuine first stdin chunk is a lone NUL loses it. |
 | A client that neither announces nor primes (a third-party QMux client; the stock client always does one or the other) | `@johnhenry/wsh/server` | The host waits `bindTimeoutMs` (default 3000) for the stream, then drops the output and logs it. This cannot be fixed host-side: nothing about the stream has been sent, so there is nothing to bind. Such a client must send `QMuxStream.announce()` (an empty STREAM frame) or any first write -- a zero-length `write()` now does the same. |
 
+## RPC channels (object mode)
+
+An `rpc` channel is an ordinary QMux stream whose payload is a sequence of
+**objects**, not bytes -- wsh's counterpart of an SSH *subsystem*: SSH channels
+are byte streams, SFTP is a typed, id-correlated protocol layered inside one.
+Each message is one CBOR data item (a [CBOR sequence](https://www.rfc-editor.org/rfc/rfc8742),
+self-delimiting, no length prefix) shaped as JSON-RPC 2.0, so MCP maps 1:1 and
+binary values are native byte strings (`Uint8Array`). Stream-announce,
+backpressure and close/reset apply unchanged; the control plane, the Rust
+codegen and exec/pty byte streams do not change.
+
+```js
+// client
+const rpc = await client.openRpc('mcp', { timeoutMs: 30_000 });   // sugar over openSession({ type: 'rpc', protocol })
+const { tools } = await rpc.request('tools/list', {});            // rejects with RpcError
+rpc.notify('notifications/initialized');
+rpc.onRequest('sampling/createMessage', async (params, ctx) => ({ /* server -> client request */ }));
+const call = rpc.request('read', { path: 'big.bin' }, { onProgress: (chunk) => {} });   // $/progress chunks
+call.cancel();                                                    // $/cancel; rejects -32001 now, late answer dropped
+rpc.onProgress(call.id, (chunk) => {});                           // or attach to a request already in flight
+await rpc.close();
+
+// server
+import { createWshServer, mcpServerAdapter } from '@johnhenry/wsh/server';
+createWshServer({
+  auth, fs: { root: '/srv/files' },
+  rpc: {
+    'wsh-host': true,                       // host.info, host.ping
+    'wsh-fs': true,                         // the server's `fs`; or { root, readOnly, maxFileBytes }
+    mcp: mcpServerAdapter(mcpServer),       // any @modelcontextprotocol/sdk Server (or a factory for one per channel)
+    custom: (channel, ctx) => {             // anything else: a function run per opened channel
+      channel.onRequest('echo', (params, { signal, progress }) => params);
+    },
+  },
+});
+```
+
+**Negotiation.** The host advertises `rpc`, one `rpc-protocol:<name>` per
+protocol and `rpc-max-message:<bytes>` (default 1 MiB) in `ServerHello.features`.
+`openRpc()` / `openSession({ type: 'rpc', protocol })` refuse an unadvertised
+`rpc` or protocol with an `RpcError` (`code` -32000, `reason: 'UNSUPPORTED_PROTOCOL'`)
+**before sending any bytes**. `Open.command` carries the protocol name (the
+`Open` message has no other free field; `kind` is `'rpc'`).
+
+**Semantics.** `id` is unique per direction per channel and both sides may
+request. Responses are matched by `id` only (the class of bug behind #72).
+`$/cancel { id }` asks the callee to stop: it answers `-32001` at once, its
+`ctx.signal` aborts, and the caller drops any late result. `$/progress
+{ id, chunk }` notifications may precede the final response (file reads, logs).
+Closing the stream rejects every pending request with `-32001` / `reason:
+'channel-closed'`. Error codes: JSON-RPC's `-32700..-32603`, plus `-32000`
+unsupported protocol, `-32001` cancelled / timed out / closed, `-32002` too many
+requests in flight (`rpcMaxInflight`, default 64), `-32003` unauthorized.
+A message over the negotiated maximum is refused locally when sending and
+closes the channel when received.
+
+**Built-in protocols**
+
+| Protocol | Methods |
+|---|---|
+| `wsh-host` | `host.info` -> `{ version, protocol, features (this connection's ServerHello), hostFingerprint, user, rpc }`; `host.ping` -> `{ time }` |
+| `wsh-fs` | `stat`, `list`, `mkdir`, `remove`, `rename { path, newPath }`, `write { path, data, offset? }`, `upload { path, data, offset? }` (offset omitted/0 creates or truncates, later offsets continue in place: chunk big files), `read { path, offset?, length? }` and `download { path }` (the bytes arrive as `$/progress` chunks of at most 64 KiB; the result is `{ size, offset, length, eof }`). Same confinement as `fs`: no traversal or symlink escapes, `readOnly`, `maxFileBytes`; policy refusals are `-32003`. |
+| `mcp` | The MCP JSON-RPC surface verbatim; see below |
+
+When a host advertises `rpc-protocol:wsh-fs`, `fileStat` / `fileList` / `fileRead` /
+`fileWrite` / `fileRename` / `fileMkdir` / `fileRemove` use it (results keep the
+`FileResult` shape; `client.preferRpcFiles = false` opts out). The control-plane
+`FileOp`/`FileResult` path stays for hosts that do not advertise it.
+
+**MCP.** `mcpServerAdapter(server)` implements the official SDK's `Transport`
+interface over the channel, so any `Server` can be exposed (pass a factory
+`(ctx) => new Server(...)` for one per channel; an instance serves one channel
+at a time). On the other end, `mcpClientTransport(channel)` is a `Transport` for
+the SDK's `Client`:
+
+```js
+const channel = await client.openRpc('mcp');
+const mcp = new Client({ name: 'me', version: '1' }, { capabilities: {} });
+await mcp.connect(mcpClientTransport(channel));
+await mcp.callTool({ name: 'echo', arguments: { text: 'hi' } });
+```
+
+MCP is already JSON-RPC, so the adapter is a pass-through: request ids,
+results, errors and notifications (including `notifications/progress`) are
+forwarded verbatim. The one translation is cancellation: an MCP client abort
+(`notifications/cancelled`) becomes `$/cancel` on the wire, and an incoming
+`$/cancel` is delivered to the SDK as `notifications/cancelled`, so the tool
+handler's `signal` fires. The SDK is **not** imported by this package (the
+transport is structural); `@modelcontextprotocol/sdk` is an optional peer for
+whoever supplies the `Server`/`Client`, and the package root stays
+dependency-free and browser-safe.
+
+**Compatibility.** Purely additive. Old clients never open `rpc` sessions; an old
+host (or the Rust `wsh-server`, which has no `rpc` kind yet) does not advertise
+`rpc`, so a new client fails fast with `UNSUPPORTED_PROTOCOL` instead of waiting
+on an `OpenFail`. Only `@johnhenry/wsh/server` serves `rpc` today. Not goals: a
+replacement for byte streams (exec/pty are unchanged), a new transport (`rpc`
+rides WebSocket/QMux and WebTransport streams), or an auth change -- an `rpc`
+session is opened on an authenticated connection and per-method authorization is
+the handler's job (`-32003`; `ctx.user` / `ctx.fingerprint` identify the caller).
+Handlers run per channel, so register methods synchronously (or before the
+returned promise settles: inbound messages are held until it does).
+
 ## Attach and Resume
 
 Opening a PTY/exec session returns a session-scoped credential alongside the channel:
@@ -652,6 +756,8 @@ so options the platform gains later need no change here.
 | `WshKeyStore` | Ed25519 key management via IndexedDB + OPFS encrypted backup |
 | `WshFileTransfer` | File upload/download over dedicated streams |
 | `WshMcpBridge` | Remote MCP tool discovery and invocation |
+| `RpcChannel` / `RpcError` | Typed RPC channel (JSON-RPC 2.0 over a CBOR sequence): `client.openRpc(protocol)`; `RPC_FEATURE`, `rpcProtocolFeature(name)`, `RPC_ERROR`, `CborSequenceDecoder` |
+| `mcpClientTransport()` / `mcpServerAdapter()` (`/server`) | MCP SDK `Transport` over an `rpc` channel |
 | `SessionRecorder` | Record PTY I/O with timestamps (own schema, not asciicast v2) |
 | `SessionPlayer` | Replay recordings with original timing |
 | `generateKeyPair()` | Create Ed25519 key pair via Web Crypto |
@@ -714,6 +820,7 @@ than left to be found.
 | Remove a remote file | `WshClient.fileRemove()` | `file_transfer::remove()`, `wsh sftp`'s `rm` | **Wire-unified**: `FileOp`/`FileResult` (`op: "remove"`) -- refused today by every `wsh-server` release ("not yet implemented"), the same refusal on both sides |
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
+| Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | none yet (a Rust `wsh-server` does not advertise `rpc`; a JS client falls back to `FileOp` for files) | **JS server only, no wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` replays its whole ring and leaves them unset |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer |

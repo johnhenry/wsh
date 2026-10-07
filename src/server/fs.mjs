@@ -25,6 +25,8 @@ export function createFileAccess({ root, readOnly = false, maxFileBytes = DEFAUL
   let realBase = null;
 
   const fail = (message) => Object.assign(new Error(message), { wsh: true });
+  /** A refusal on policy grounds (confinement, read-only): `wsh-fs` answers these `-32003`. */
+  const deny = (message) => Object.assign(new Error(message), { wsh: true, denied: true });
 
   /** Resolve a client path to an absolute path inside `root`, or throw. */
   async function resolveInside(clientPath) {
@@ -32,13 +34,13 @@ export function createFileAccess({ root, readOnly = false, maxFileBytes = DEFAUL
     if (clientPath.includes('\0')) throw fail('illegal path');
     realBase ??= await realpath(base);
     const target = path.resolve(base, '.' + path.sep + clientPath.replace(/^[/\\]+/, ''));
-    if (target !== base && !target.startsWith(base + path.sep)) throw fail('path escapes the file root');
+    if (target !== base && !target.startsWith(base + path.sep)) throw deny('path escapes the file root');
     // Symlink escape: the deepest existing ancestor must still be inside the real root.
     let probe = target;
     for (;;) {
       try {
         const real = await realpath(probe);
-        if (real !== realBase && !real.startsWith(realBase + path.sep)) throw fail('path escapes the file root');
+        if (real !== realBase && !real.startsWith(realBase + path.sep)) throw deny('path escapes the file root');
         break;
       } catch (err) {
         if (err.wsh) throw err;
@@ -66,7 +68,7 @@ export function createFileAccess({ root, readOnly = false, maxFileBytes = DEFAUL
     return entry;
   }
 
-  const assertWritable = () => { if (readOnly) throw fail('file root is read-only'); };
+  const assertWritable = () => { if (readOnly) throw deny('file root is read-only'); };
 
   return {
     maxFileBytes,
@@ -135,6 +137,37 @@ export function createFileAccess({ root, readOnly = false, maxFileBytes = DEFAUL
         default:
           throw fail(`"${op}" is not offered by this host (list, stat, read, write, rename, mkdir, remove)`);
       }
+    },
+
+    /**
+     * Stream a byte range of a regular file in `chunkBytes` (default `FILE_CHUNK_BYTES`) pieces (for `wsh-fs` `read`/`download`).
+     * `length` omitted = to the end of the file; a range longer than `maxFileBytes` is refused up front.
+     * @returns {Promise<{ size: number, offset: number, length: number, chunks: AsyncGenerator<Uint8Array> }>}
+     */
+    async openRange(clientPath, { offset, length, chunkBytes = FILE_CHUNK_BYTES } = {}) {
+      const full = await resolveInside(clientPath);
+      const st = await stat(full);
+      if (!st.isFile()) throw fail('not a regular file');
+      const start = offset === undefined || offset === null ? 0 : Number(offset);
+      if (!Number.isSafeInteger(start) || start < 0) throw fail('illegal offset');
+      if (length !== undefined && length !== null && (!Number.isSafeInteger(Number(length)) || Number(length) < 0)) throw fail('illegal length');
+      const available = Math.max(0, st.size - start);
+      const want = length === undefined || length === null ? available : Math.min(Number(length), available);
+      if (want > maxFileBytes) throw fail(`read of ${want} bytes exceeds the ${maxFileBytes} byte limit`);
+      async function* chunks() {
+        const fh = await open(full, 'r');
+        try {
+          let pos = start; let left = want;
+          while (left > 0) {
+            const buf = new Uint8Array(Math.min(chunkBytes, left));
+            const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
+            if (bytesRead === 0) break; // truncated underneath us
+            yield bytesRead === buf.length ? buf : buf.subarray(0, bytesRead);
+            pos += bytesRead; left -= bytesRead;
+          }
+        } finally { await fh.close(); }
+      }
+      return { size: st.size, offset: start, length: want, chunks: chunks() };
     },
 
     async readWhole(clientPath) {

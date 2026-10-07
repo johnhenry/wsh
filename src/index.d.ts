@@ -245,6 +245,146 @@ export const MCP_CALL_ID_FEATURE: 'mcp-call-id';
  */
 export const STREAM_ANNOUNCE_FEATURE: 'stream-announce';
 
+// ── Typed (object-mode) RPC channels -- wsh #85 ────────────────────────
+
+/** ServerHello feature: the host serves `rpc` sessions (`openSession({ type: 'rpc', protocol })`). */
+export const RPC_FEATURE: 'rpc';
+/** ServerHello feature prefix: one `rpc-protocol:<name>` per protocol the host serves. */
+export const RPC_PROTOCOL_PREFIX: 'rpc-protocol:';
+/** ServerHello feature prefix: `rpc-max-message:<bytes>`. */
+export const RPC_MAX_MESSAGE_PREFIX: 'rpc-max-message:';
+/** Largest single rpc message when the host does not say (1 MiB). */
+export const RPC_DEFAULT_MAX_MESSAGE: 1048576;
+/** Allowed protocol names. */
+export const RPC_PROTOCOL_NAME_RE: RegExp;
+/** `'rpc-protocol:' + name`. */
+export function rpcProtocolFeature(name: string): string;
+/** Read the rpc advertisement out of `ServerHello.features` (`client.features`). */
+export function parseRpcFeatures(features?: string[]): { enabled: boolean; protocols: string[]; maxMessageBytes: number };
+
+/** JSON-RPC's reserved error codes plus wsh's. */
+export const RPC_ERROR: Readonly<{
+  PARSE: -32700;
+  INVALID_REQUEST: -32600;
+  METHOD_NOT_FOUND: -32601;
+  INVALID_PARAMS: -32602;
+  INTERNAL: -32603;
+  /** The host does not serve the requested protocol. */
+  UNSUPPORTED_PROTOCOL: -32000;
+  /** Cancelled (`$/cancel`, a timeout, or the channel closing: see `RpcError.reason`). */
+  CANCELLED: -32001;
+  /** Too many requests in flight on the channel. */
+  STREAM_LIMIT: -32002;
+  /** Refused on policy grounds (confinement, read-only, a handler's own authorization). */
+  UNAUTHORIZED: -32003;
+}>;
+
+/** A JSON-RPC error: what `request()` rejects with, and what a handler throws to answer with one. */
+export class RpcError extends Error {
+  constructor(code: number, message: string, data?: unknown, reason?: string);
+  readonly code: number;
+  readonly data?: unknown;
+  /** A short machine-readable cause: `channel-closed`, `timeout`, `cancelled`, `aborted`, `message-too-large`, `UNSUPPORTED_PROTOCOL`. */
+  readonly reason?: string;
+  toJSON(): { code: number; message: string; data?: unknown };
+}
+
+/** Incremental decoder for a CBOR sequence (RFC 8742); feed bytes, get completed items. */
+export class CborSequenceDecoder {
+  constructor(opts?: { maxItemBytes?: number });
+  feed(chunk: Uint8Array): unknown[];
+  /** Bytes buffered towards an incomplete item. */
+  readonly pending: number;
+}
+
+/** What a request handler receives beside the params. */
+export interface RpcContext {
+  readonly id: string | number;
+  readonly method: string;
+  /** Aborts on `$/cancel` or channel close. */
+  readonly signal: AbortSignal;
+  readonly channel: RpcChannel;
+  /** Send a `$/progress` chunk for this request (resolves once written; no-op after cancel). */
+  progress(chunk: unknown): Promise<void>;
+}
+
+export interface RpcRequestOptions {
+  onProgress?: (chunk: any) => void;
+  signal?: AbortSignal;
+  /** Overrides the channel's default timeout; on expiry the request rejects with `-32001` / `timeout` and the callee is told. */
+  timeoutMs?: number;
+  /** Use this JSON-RPC id instead of the channel's counter (it must not be in flight). */
+  id?: string | number;
+}
+
+/** A pending request: a promise that also knows its id and can be cancelled. */
+export interface RpcRequestPromise<T = any> extends Promise<T> {
+  readonly id: string | number;
+  cancel(reason?: string): boolean;
+}
+
+export interface RpcChannelOptions {
+  write(bytes: Uint8Array): Promise<void> | void;
+  close?(): Promise<void> | void;
+  maxMessageBytes?: number;
+  timeoutMs?: number;
+  maxInflight?: number;
+}
+
+/**
+ * One end of a typed RPC channel: JSON-RPC 2.0 over a CBOR sequence on one QMux stream. Symmetric -- either side may
+ * request, notify and answer. Binary values are `Uint8Array`.
+ */
+export class RpcChannel {
+  constructor(opts: RpcChannelOptions);
+  /** The `WshSession` carrying this channel (client side, from `openRpc`). */
+  session?: WshSession;
+  readonly closed: boolean;
+  readonly closeReason: string | null;
+  readonly maxMessageBytes: number;
+  readonly pendingCount: number;
+  readonly inflightCount: number;
+  /** Called once when the channel ends. */
+  onClose: ((reason: string) => void) | null;
+
+  request<T = any>(method: string, params?: unknown, opts?: RpcRequestOptions): RpcRequestPromise<T>;
+  notify(method: string, params?: unknown): Promise<void>;
+  /** Cancel an outbound request: `$/cancel` to the callee, `-32001` locally, late responses dropped. */
+  cancel(id: string | number, reason?: string): boolean;
+  onRequest(method: string, handler: (params: any, ctx: RpcContext) => unknown): () => void;
+  onNotification(method: string, handler: (params: any) => void): () => void;
+  onProgress(id: string | number, fn: (chunk: any) => void): void;
+  setFallbackRequestHandler(fn: ((method: string, params: any, ctx: RpcContext) => unknown) | null): void;
+  setFallbackNotificationHandler(fn: ((method: string, params: any) => void) | null): void;
+  /** Pending requests reject with `-32001` / `channel-closed`; the stream is closed. */
+  close(reason?: string): Promise<void>;
+  /** Transport hooks. */
+  feed(bytes: Uint8Array): void;
+  handleClose(reason?: string): void;
+  hold(): void;
+  release(): void;
+}
+
+/**
+ * An MCP SDK `Transport` (structural -- the SDK is not imported) over an {@link RpcChannel}.
+ * `await mcpClient.connect(mcpClientTransport(await client.openRpc('mcp')))`.
+ */
+export class RpcMcpTransport {
+  constructor(channel: RpcChannel);
+  readonly channel: RpcChannel;
+  sessionId?: string;
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: (message: any, extra?: any) => void;
+  start(): Promise<void>;
+  send(message: any, options?: any): Promise<void>;
+  close(): Promise<void>;
+}
+/** A transport for an MCP `Client` over a channel from `openRpc('mcp')`. */
+export function mcpClientTransport(channel: RpcChannel): RpcMcpTransport;
+/** A transport for an MCP `Server` over a server-side channel (`mcpServerAdapter` wraps this). */
+export function mcpServerTransport(channel: RpcChannel): RpcMcpTransport;
+
 /** A wsh protocol control message (all messages have a numeric `type`). */
 export interface WshMessage {
   type: number;
@@ -1633,8 +1773,15 @@ export interface WshConnectOptions extends WshHostKeyOptions {
 
 /** Options for WshClient.openSession(). */
 export interface WshOpenSessionOptions {
-  type?: 'pty' | 'exec';
+  type?: 'pty' | 'exec' | 'file' | 'rpc';
   command?: string;
+  /**
+   * `type: 'rpc'` only: the protocol to speak (`mcp`, `wsh-fs`, `wsh-host`, or a host-defined name). Throws
+   * `RpcError` (`UNSUPPORTED_PROTOCOL`) before sending anything if the host does not advertise it.
+   */
+  protocol?: string;
+  /** Advanced: called synchronously when the data stream binds, before any received byte is delivered. */
+  attach?: (session: WshSession) => void;
   cols?: number;
   rows?: number;
   env?: Record<string, string>;
@@ -1879,6 +2026,19 @@ export class WshClient {
    * Open a new PTY or exec session on the remote server.
    */
   openSession(opts?: WshOpenSessionOptions): Promise<WshSession>;
+
+  /**
+   * Open a typed (object-mode) RPC channel (wsh #85): JSON-RPC 2.0 over a CBOR sequence on one stream. Sugar over
+   * `openSession({ type: 'rpc', protocol })`. Throws `RpcError` (`UNSUPPORTED_PROTOCOL`) before sending any bytes
+   * if the host does not advertise `rpc` and `rpc-protocol:<protocol>`.
+   */
+  openRpc(protocol: string, opts?: { timeoutMs?: number; openTimeout?: number }): Promise<RpcChannel>;
+
+  /**
+   * Use the `wsh-fs` rpc protocol for `fileStat`/`fileList`/`fileRead`/`fileWrite`/... when the host advertises it
+   * (default `true`); `false` always uses the FileOp control path. Results keep the `FileResult` shape.
+   */
+  preferRpcFiles: boolean;
 
   /**
    * List locally tracked sessions with their current state.

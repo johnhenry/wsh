@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.25.0 (2026-10-07)
+
+- **New: typed ("object-mode") RPC channels as a subsystem (#85).**
+  `client.openRpc(protocol, { timeoutMs })` (sugar over `openSession({ type: 'rpc', protocol })`)
+  opens an ordinary QMux stream whose payload is a CBOR sequence (RFC 8742) of JSON-RPC 2.0
+  messages; `createWshServer({ rpc: { [protocol]: handler } })` serves them. Requests are
+  correlated by `id` only (the fix class for #72), either side may request, `$/cancel { id }`
+  answers `-32001` and aborts the handler, `$/progress { id, chunk }` streams results, and closing
+  the stream rejects pending requests with `-32001` / `channel-closed`. Negotiated through
+  `ServerHello.features` (`rpc`, `rpc-protocol:<name>`, `rpc-max-message:<bytes>`); the client
+  refuses an unadvertised protocol with `UNSUPPORTED_PROTOCOL` before sending anything. No control
+  message, spec or Rust codegen change: `Open { kind: 'rpc', command: <protocol> }` (the `Open`
+  message has no dedicated field, so the protocol name rides `command`).
+  New exports: `RpcChannel`, `RpcError`, `RPC_ERROR`, `RPC_FEATURE`, `rpcProtocolFeature()`,
+  `parseRpcFeatures()`, `CborSequenceDecoder` (incremental, size-bounded, reuses the existing CBOR
+  codec), `RpcMcpTransport` / `mcpClientTransport()` / `mcpServerTransport()`; server:
+  `mcpServerAdapter()`, options `rpc`, `rpcMaxMessageBytes`, `rpcMaxInflight`.
+- **First protocols.** `wsh-host` (`host.info`, `host.ping`); `wsh-fs` (`stat list read write upload
+  download rename mkdir remove`, same confinement / `readOnly` / `maxFileBytes` as `fs`, reads
+  streamed as `$/progress` chunks, policy refusals `-32003`); and `mcp`, which closes #71: an MCP
+  SDK `Server` is exposed with `rpc: { mcp: mcpServerAdapter(server) }` (an SDK `Transport`
+  implemented over the channel; MCP is already JSON-RPC, so it is a pass-through apart from
+  `notifications/cancelled` <-> `$/cancel`) and an MCP `Client` consumes it with
+  `mcpClientTransport(await client.openRpc('mcp'))`. The SDK is never imported by this package;
+  `@modelcontextprotocol/sdk` is an optional peer (and a dev dependency for the tests).
+- **Client prefers `wsh-fs`.** When a host advertises `rpc-protocol:wsh-fs`, `fileStat` /
+  `fileList` / `fileRead` / `fileWrite` / `fileRename` / `fileMkdir` / `fileRemove` go over it
+  (results keep the `FileResult` shape; `client.preferRpcFiles = false` opts out) and fall back to
+  `FileOp` otherwise. This is the control-plane file path #72 was a correlation bug in; it stays
+  for compatibility with the Rust server.
+- **Not done / follow-ups.** The Rust `wsh-server` does not serve `rpc` sessions or the built-in
+  protocols (it does not advertise `rpc`, so clients fail fast); tracked on the Rust side. #68
+  (`session.attach`) and #69 (relay control) are the natural next protocols and are not part of
+  this release.
+- **Tests:** `test/rpc-codec.test.mjs` (CBOR-sequence decoding over split and concatenated
+  buffers, size limits, binary), `test/rpc-channel.test.mjs` (out-of-order correlation, cancel,
+  late responses, close, progress, limits), `test/rpc-server.test.mjs` (negotiation, `wsh-host`,
+  `wsh-fs` confinement / `readOnly` / size limit / chunked reads, the stock file API over
+  `wsh-fs`), `test/rpc-mcp.test.mjs` (`initialize` -> `tools/list` -> `tools/call`, in-flight
+  cancel, server-initiated requests, with the real SDK); `test/types/rpc.ts`; example 06.
+- **Docs:** README "RPC channels (object mode)" and the capability matrix row.
+
 ## 0.24.0 (2026-10-07)
 
 - **New: `podId()`, `fingerprintToPodId()` and `podIdToFingerprint()` are exported from the package
