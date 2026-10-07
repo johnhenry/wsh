@@ -1,6 +1,6 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.23.1",
+  "version": "0.24.0",
   "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
@@ -42,6 +42,7 @@
   "devDependencies": {
     "@fails-components/webtransport": "^1.6.4",
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
+    "@johnhenry/browsermesh-primitives": "^0.2.0",
     "typescript": "^7.0.0",
     "ws": "^8.21.0"
   },

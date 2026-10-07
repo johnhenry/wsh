@@ -1005,6 +1005,26 @@ export function verifyPeerRecord(publicKey: CryptoKey, signature: Uint8Array, re
 export function fingerprint(publicKeyRaw: Uint8Array): Promise<string>;
 
 /**
+ * The BrowserMesh pod ID of a raw public key: base64url (no padding, 43
+ * characters) of the SHA-256 of the 32 raw key bytes. For the same key this
+ * equals `@johnhenry/browsermesh-primitives`' `derivePodId(cryptoKey)` /
+ * `PodIdentity.podId`, and is the same hash as `fingerprint()` in a different
+ * encoding (hex there, base64url here).
+ */
+export function podId(publicKeyRaw: Uint8Array): Promise<string>;
+
+/**
+ * Re-encode a hex `fingerprint()` as a pod ID (pure; no hashing).
+ * @throws TypeError if the argument is not an even-length hex string
+ */
+export function fingerprintToPodId(hexFingerprint: string): string;
+
+/**
+ * Re-encode a pod ID as the hex `fingerprint()` of the same key (pure; no hashing).
+ */
+export function podIdToFingerprint(podId: string): string;
+
+/**
  * Get the shortest unique prefix of a fingerprint within a set.
  */
 export function shortFingerprint(

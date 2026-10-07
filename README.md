@@ -659,6 +659,7 @@ so options the platform gains later need no change here.
 | `signChallenge()` | Build transcript + sign for auth handshake |
 | `signPeerRecord()` / `verifyPeerRecord()` | Sign / verify reverse-mode peer records |
 | `fingerprint()` | SHA-256 hex fingerprint of a public key |
+| `podId()` / `fingerprintToPodId()` / `podIdToFingerprint()` | The same SHA-256 as base64url, the BrowserMesh pod ID: `await podId(raw) === await derivePodId(cryptoKey)` (`@johnhenry/browsermesh-primitives`) for the same Ed25519 key, so one key carries both the wsh fingerprint and the mesh identity. The two converters are pure re-encodings between the two forms |
 | `parseCertificateHash()` | Decode a certificate digest from hex / base64 / bytes |
 | `normalizeWebTransportOptions()` | Build a `WebTransportOptions` dictionary from loose input |
 

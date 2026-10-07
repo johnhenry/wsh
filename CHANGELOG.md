@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.24.0 (2026-10-07)
+
+- **New: `podId()`, `fingerprintToPodId()` and `podIdToFingerprint()` are exported from the package
+  root, with typings (#66).** `podId(rawPublicKey)` is base64url(SHA-256(raw key)), the BrowserMesh
+  identity, and equals `@johnhenry/browsermesh-primitives`' `derivePodId(cryptoKey)` /
+  `PodIdentity.podId` for the same Ed25519 key; it is the same hash as `fingerprint()` in a
+  different encoding, and the two converters re-encode between them. They already existed in
+  `src/auth.mjs` but were unexported and untyped (0.18.0 had said they would stay private).
+  `fingerprintToPodId()` now throws a `TypeError` on a value that is not an even-length hex string
+  instead of silently producing a wrong ID from non-hex input.
+- **Tests:** `test/pod-id.test.mjs` checks parity against `@johnhenry/browsermesh-primitives`
+  0.2.0 (new devDependency) for generated keys and `PodIdentity`, round-trips and refuses bad
+  input; `test/types/pod-id.ts` type-checks the declarations. README documents the helpers.
+
 ## 0.23.1 (2026-10-07)
 
 - **Verified and closed: stream-mode sessions invisible to the host until the client writes a
