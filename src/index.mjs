@@ -49,6 +49,7 @@ export {
   sign, verify, buildTranscript, signChallenge, verifyChallenge,
   buildPeerRecordTranscript, signPeerRecord, verifyPeerRecord,
   fingerprint, shortFingerprint, generateNonce,
+  podId, fingerprintToPodId, podIdToFingerprint,
   parseSSHPublicKey, extractRawFromSSHWire, base64Decode,
 } from './auth.mjs';
 

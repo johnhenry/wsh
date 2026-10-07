@@ -396,7 +396,8 @@ export async function fingerprint(publicKeyRaw) {
 
 /**
  * Compute the base64url-encoded SHA-256 pod ID of a raw public key.
- * This is the BrowserMesh identity format (43 chars).
+ * This is the BrowserMesh identity format (43 chars): for the same key it equals
+ * `@johnhenry/browsermesh-primitives`' `derivePodId(cryptoKey)` and `PodIdentity.podId`.
  * @param {Uint8Array} publicKeyRaw - 32-byte raw Ed25519 public key
  * @returns {Promise<string>} base64url-encoded pod ID
  */
@@ -411,6 +412,9 @@ export async function podId(publicKeyRaw) {
  * @returns {string} base64url pod ID
  */
 export function fingerprintToPodId(hexFingerprint) {
+  if (typeof hexFingerprint !== 'string' || !/^(?:[0-9a-fA-F]{2})+$/.test(hexFingerprint)) {
+    throw new TypeError('fingerprintToPodId: expected a hex fingerprint');
+  }
   const bytes = new Uint8Array(hexFingerprint.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = parseInt(hexFingerprint.slice(i * 2, i * 2 + 2), 16);
