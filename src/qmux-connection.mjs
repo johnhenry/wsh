@@ -134,6 +134,27 @@ class QMuxStream {
     }
   }
 
+  /**
+   * Make this locally-initiated stream visible to the peer without sending
+   * any payload. A QMux/QUIC stream is created lazily on the wire: opening
+   * one only allocates an id locally, and the peer first learns it exists
+   * from the first STREAM frame it sees. A zero-length STREAM frame (no FIN)
+   * is legal QUIC and is exactly that first frame, so the peer's
+   * `onStreamOpen` fires now instead of whenever (if ever) the first real
+   * byte is written -- which for an exec session, with no stdin, is never.
+   * No-op once anything has been sent on the stream.
+   */
+  announce() {
+    if (this.#sendState !== SEND_STATE.READY) return;
+    this.#sendState = SEND_STATE.SEND;
+    this.#conn._sendFrame(encodeStream({
+      streamId: this.id,
+      offset: this.#sendOffset,
+      data: new Uint8Array(0),
+      fin: false,
+    }), 0);
+  }
+
   /** Half-close the send side: send FIN. No more write() calls after this. */
   async close() {
     if (this.#sendState === SEND_STATE.RESET_SENT || this.#sendState === SEND_STATE.DATA_SENT) return;

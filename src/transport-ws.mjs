@@ -256,6 +256,10 @@ export class WebSocketTransport extends WshTransport {
   /** @override */
   async _doOpenStream() {
     const qs = await this.#qmux.openStream();
+    // A stream is invisible to the peer until its first frame; a data stream
+    // that may never carry client bytes (exec has no stdin) must announce
+    // itself or the host never discovers it.
+    qs.announce();
     const adapter = new QMuxStreamAdapter(qs);
     return { readable: adapter.readable, writable: adapter.writable, id: qs.id };
   }
