@@ -1810,6 +1810,9 @@ export class WshClient {
   async fileOperation(op, path, opts = {}, timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('fileOperation');
     const channelId = this._nextChannelId();
+    // FileOp and FileResult both carry channel_id; each call claims only the
+    // result for its own id, so overlapping operations cannot swap replies (#72).
+    const byChannel = (m) => m.channel_id === channelId;
 
     if (op === 'write' || op === 'rename') {
       const feature = op === 'write' ? 'file-write' : 'file-rename';
@@ -1824,7 +1827,7 @@ export class WshClient {
       }
       // Registered before sending: the host may fail fast (read-only, too big)
       // and answer before the last chunk goes out.
-      const result = this.#waitForMessage([MSG.FILE_RESULT], timeout, `Timed out waiting for file ${op} result`);
+      const result = this.#waitForMessage([MSG.FILE_RESULT], timeout, `Timed out waiting for file ${op} result`, byChannel);
       result.catch(() => {});
       await this.#transport.sendControl(fileOpMsg({
         channelId, op, path, offset: op === 'write' ? opts.offset : undefined, length: data.byteLength,
@@ -1846,7 +1849,8 @@ export class WshClient {
     return this.#waitForMessage(
       [MSG.FILE_RESULT],
       timeout,
-      `Timed out waiting for file ${op} result`
+      `Timed out waiting for file ${op} result`,
+      byChannel
     );
   }
 

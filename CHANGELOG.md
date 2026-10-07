@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.19.1 (2026-10-06)
+
+- **Fixed: overlapping file operations could receive each other's result
+  (#72).** `fileOperation()` (and so `fileStat`/`fileRead`/`fileWrite`/
+  `fileRename`/...) resolved with the next `FileResult` of any channel. It now
+  matches on `channel_id`, which `FileOp` and `FileResult` already carry, so no
+  wire change. It bit whenever replies arrived in a different order from the
+  requests -- e.g. a multi-chunk `fileWrite` (answered after its last chunk)
+  racing a `fileStat`. A host that does not echo `channel_id` on `FileResult`
+  (required by the spec) would now time out where it used to work by luck.
+
 ## 0.19.0 (2026-10-06)
 
 Closes the gaps between `@johnhenry/wsh/server` and the hosts consumers had
