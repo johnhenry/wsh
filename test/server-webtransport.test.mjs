@@ -226,6 +226,138 @@ describe('WebTransport listener', { skip: skipReason }, () => {
   });
 });
 
+describe('WebTransport certificate rotation (#81)', { skip: skipReason }, () => {
+  let keyPair; let authorizedKeys; let savedWT;
+  before(async () => {
+    keyPair = await generateKeyPair(true);
+    authorizedKeys = `${await exportPublicKeySSH(keyPair.publicKey)} alice\n`;
+    savedWT = globalThis.WebTransport;
+    globalThis.WebTransport = wtLib.WebTransport;
+  });
+  after(() => { globalThis.WebTransport = savedWT; });
+
+  const open = [];
+  afterEachClose();
+  function afterEachClose() { after(async () => { for (const c of open.splice(0)) await c.disconnect().catch(() => {}); }); }
+
+  /** Connect pinning a LIST of hashes, as a client that re-pinned from `certificateHashes()` would. */
+  async function connectPinned(hashes, url) {
+    const client = new WshClient();
+    await client.connect(url, { username: 'alice', keyPair, transport: 'wt', webTransport: { serverCertificateHashes: hashes } });
+    open.push(client);
+    return client;
+  }
+  const echo = async (client, word) => {
+    const session = await client.openSession({ type: 'exec', command: `echo ${word}` });
+    return new Promise((resolve) => {
+      let out = '';
+      session.onData = (d) => { out += dec.decode(d); };
+      session.onClose = () => resolve(out);
+    });
+  };
+  const hex = (h) => Buffer.from(h.value).toString('hex');
+
+  it('a very short validity is honoured (the back-dating shrinks with it)', () => {
+    const c = generateSelfSignedCertificate({ validityDays: 10 / 86_400 });
+    const x = new X509Certificate(c.cert);
+    const seconds = (new Date(x.validTo) - new Date(x.validFrom)) / 1000;
+    assert.ok(seconds >= 9 && seconds <= 11, `window ${seconds}s`);
+    assert.ok(c.notAfter > new Date() && c.notAfter - new Date() <= 6000, 'expires within seconds, not in the past');
+    assert.ok(new Date(x.validFrom) <= new Date());
+  });
+
+  it('rotateCertificate() publishes the next hash first (both pinned work), and activate switches the listener', async () => {
+    const server = createWshServer({ auth: { authorizedKeys }, exec: true, webTransport: { selfSigned: { rotate: false } } });
+    await server.listen();
+    try {
+      const wt = server.webTransport();
+      const [h1] = server.certificateHashes();
+      assert.deepEqual(server.certificateHashes().map(hex), [wt.certificateHashHex]);
+      assert.equal((await echo(await connectPinned([h1], wt.url), 'one')), 'one\n');
+
+      // Overlap window: both hashes are published, the first is still what is presented.
+      const prepared = await server.rotateCertificate();
+      assert.equal(prepared.next.active, false);
+      assert.equal(prepared.current.hashHex, hex(h1));
+      const both = server.certificateHashes();
+      assert.equal(both.length, 2);
+      assert.equal(hex(both[0]), hex(h1));
+      assert.equal(server.webTransport().certificateHashHex, hex(h1), 'not switched yet');
+      assert.equal((await echo(await connectPinned(both, wt.url), 'two')), 'two\n');
+      await assert.rejects(() => connectPinned([both[1]], wt.url), Error, 'the next certificate is not presented yet');
+      assert.equal(server.certificateHashes().length, 2, 'asking again does not mint another');
+
+      // A client connected before the switch loses its session when the listener restarts.
+      const before = await connectPinned(both, wt.url);
+      const switched = await server.rotateCertificate({ activate: true });
+      assert.equal(switched.current.active, true);
+      assert.equal(switched.current.hashHex, hex(both[1]));
+      assert.equal(server.webTransport().certificateHashHex, hex(both[1]));
+      assert.deepEqual(server.certificateHashes().map(hex), [hex(both[1])], 'the old hash is retired');
+      for (let i = 0; i < 100 && before.state === 'authenticated'; i++) await sleep(20);
+      assert.notEqual(before.state, 'authenticated', 'the old listener took its sessions with it');
+
+      // The client that pinned [old, new] reconnects with no new pin; one that only had the old hash cannot.
+      assert.equal((await echo(await connectPinned(both, wt.url), 'three')), 'three\n');
+      await assert.rejects(() => connectPinned([h1], wt.url), Error);
+      assert.equal(server.webTransport().port, wt.port, 'same port');
+    } finally { await server.close(); }
+  });
+
+  it('rotates by itself before the certificate expires: next hash first, then the switch, and the overlap pin keeps working', async () => {
+    // A 12 s window (6 s of it back-dated): the next certificate is made 4 s before notAfter, the listener switches 2 s before.
+    const server = createWshServer({
+      auth: { authorizedKeys }, exec: true,
+      webTransport: { selfSigned: { validityDays: 12 / 86_400, prepareBeforeMs: 4000, activateBeforeMs: 2000 } },
+    });
+    await server.listen();
+    try {
+      const wt = server.webTransport();
+      const first = wt.certificateHashHex;
+      const notAfter = wt.notAfter;
+      assert.equal(server.certificateHashes().length, 1);
+
+      let overlap = null;
+      for (let i = 0; i < 400 && !overlap; i++) { if (server.certificateHashes().length === 2) overlap = server.certificateHashes(); else await sleep(25); }
+      assert.ok(overlap, 'the next hash was published ahead of time');
+      assert.equal(hex(overlap[0]), first);
+      assert.ok(new Date() < notAfter, 'and before the certificate expired');
+      assert.equal(server.webTransport().certificateHashHex, first);
+
+      for (let i = 0; i < 400 && server.webTransport().certificateHashHex === first; i++) await sleep(25);
+      const now = server.webTransport();
+      assert.equal(now.certificateHashHex, hex(overlap[1]), 'switched to the published certificate');
+      assert.ok(new Date() < notAfter, 'before the old one expired');
+      assert.equal(hex(server.certificateHashes()[0]), hex(overlap[1]), 'the retired hash is gone (the next rotation then starts on its own schedule)');
+
+      // A client that pinned the overlap list before the switch connects after it (and after the old certificate's notAfter).
+      assert.equal(await echo(await connectPinned(overlap, now.url), 'after'), 'after\n');
+      await sleep(Math.max(0, notAfter - new Date()) + 200);
+      assert.equal(await echo(await connectPinned(overlap, now.url), 'later'), 'later\n');
+    } finally { await server.close(); }
+  });
+
+  it('only a selfSigned certificate rotates; a supplied one reports nothing to pin', async () => {
+    const own = generateSelfSignedCertificate({ validityDays: 3 });
+    const server = createWshServer({ auth: { authorizedKeys }, exec: true, webTransport: { cert: own.cert, privKey: own.privKey } });
+    await assert.rejects(() => server.rotateCertificate(), /no WebTransport listener/, 'before listen()');
+    await server.listen();
+    try {
+      assert.deepEqual(server.certificateHashes(), []);
+      await assert.rejects(() => server.rotateCertificate(), /only a selfSigned certificate/);
+    } finally { await server.close(); }
+    await assert.rejects(() => createWshServer({ webTransport: { selfSigned: { prepareBeforeMs: -1 } } }).listen(), /prepareBeforeMs/);
+  });
+
+  it('close() cancels a pending rotation and a closed listener cannot be rotated', async () => {
+    const server = createWshServer({ auth: { authorizedKeys }, exec: true, webTransport: { selfSigned: true } });
+    await server.listen();
+    await server.close();
+    assert.deepEqual(server.certificateHashes(), []);
+    await assert.rejects(() => server.rotateCertificate(), /no WebTransport listener/);
+  });
+});
+
 describe('WebTransport without the native packages', () => {
   it('the server stays importable and WebSocket-only servers never touch them', async () => {
     const s = createWshServer({});

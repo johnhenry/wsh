@@ -82,9 +82,11 @@ export function generateSelfSignedCertificate({ hosts = ['localhost', '127.0.0.1
   }
   const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   // An hour of back-dating tolerates clock skew; the whole window stays under 14 days for validityDays <= 13.
-  const skewMs = Math.min(60 * 60 * 1000, (MAX_PINNED_CERT_DAYS - validityDays) * DAY_MS);
+  // (A very short validity, as rotation tests use, gets a proportionally smaller back-dating.)
+  const validityMs = validityDays * DAY_MS;
+  const skewMs = Math.min(60 * 60 * 1000, validityMs / 2, (MAX_PINNED_CERT_DAYS - validityDays) * DAY_MS);
   const notBefore = new Date(Math.floor((now.getTime() - skewMs) / 1000) * 1000);
-  const notAfter = new Date(Math.floor((now.getTime() + validityDays * DAY_MS - skewMs) / 1000) * 1000);
+  const notAfter = new Date(Math.ceil((now.getTime() + validityMs - skewMs) / 1000) * 1000);
 
   const name = seq(set(seq(oid(OID.commonName), utf8('wsh self-signed'))));
   const san = seq(...hosts.map((h) => (net.isIP(h) ? der(0x87, ipBytes(h)) : der(0x82, Buffer.from(h, 'ascii')))));

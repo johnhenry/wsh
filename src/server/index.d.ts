@@ -215,10 +215,22 @@ export interface WshServerWebTransportOptions {
   privKey?: string;
   /**
    * Generate a short-lived ECDSA P-256 certificate (13 days; browsers refuse a pinned one valid for more than 14) and
-   * expose its SHA-256 as `webTransport().certificateHash`, for the client's `serverCertificateHashes`. It is not
-   * renewed: restart the server before `notAfter`. An object takes `{ hosts, validityDays }`.
+   * expose its SHA-256 as `webTransport().certificateHash`, for the client's `serverCertificateHashes`.
+   *
+   * It is rotated before it expires: `prepareBeforeMs` ahead of `notAfter` (default: 3 days, at most a third of the
+   * validity) the next certificate is generated and its hash published next to the current one
+   * (`server.certificateHashes()` returns both: a client that re-reads the list pins both), and `activateBeforeMs` ahead
+   * (default: 1 hour, at most a sixth of the validity) the listener switches to it. The switch restarts the HTTP/3
+   * listener on the same port, so live WebTransport sessions end and clients reconnect. `rotate: false` turns
+   * all of this off (restart before `notAfter`). An object takes `{ hosts, validityDays }` for the certificates too.
    */
-  selfSigned?: boolean | { hosts?: string[]; validityDays?: number };
+  selfSigned?: boolean | {
+    hosts?: string[];
+    validityDays?: number;
+    rotate?: boolean;
+    prepareBeforeMs?: number;
+    activateBeforeMs?: number;
+  };
   /** QUIC stateless-reset secret (default: random). */
   secret?: string;
 }
@@ -234,6 +246,27 @@ export interface WshServerWebTransport {
   certificateHashHex: string | null;
   /** When the `selfSigned` certificate expires; `null` otherwise. */
   notAfter: Date | null;
+  /** The `serverCertificateHashes` to pin now: the certificate being presented and, during a rotation's overlap, the next. */
+  certificateHashes(): WshPinnedCertificateHash[];
+  /** The same certificates with their validity and which one is being presented. */
+  certificates(): WshServerCertificateInfo[];
+  /** See `WshServer.rotateCertificate()`. */
+  rotateCertificate(options?: { activate?: boolean }): Promise<{ current: WshServerCertificateInfo; next: WshServerCertificateInfo | null }>;
+}
+
+/** A `serverCertificateHashes` entry, ready to pass to `new WebTransport(url, { serverCertificateHashes })`. */
+export interface WshPinnedCertificateHash {
+  algorithm: 'sha-256';
+  value: Uint8Array;
+}
+
+export interface WshServerCertificateInfo {
+  hash: Uint8Array;
+  hashHex: string;
+  notBefore: Date;
+  notAfter: Date;
+  /** Is it the one the listener presents right now? */
+  active: boolean;
 }
 
 export interface WshSelfSignedCertificate {
@@ -344,6 +377,19 @@ export interface WshServer {
   address(): WshServerAddress | null;
   /** The WebTransport listener; `null` when not configured or before `listen()` resolves. */
   webTransport(): WshServerWebTransport | null;
+  /**
+   * The `serverCertificateHashes` a WebTransport client should pin right now: the `selfSigned` certificate being
+   * presented and, during a rotation's overlap window, the next one. `[]` without a WebTransport listener or with a
+   * certificate you supplied. Serve it to your clients out of band (see the README's re-pin flow).
+   */
+  certificateHashes(): WshPinnedCertificateHash[];
+  /**
+   * Start rotating the `selfSigned` certificate: generate the next one and publish it in `certificateHashes()` now; the
+   * listener switches to it shortly before the current one expires (automatically, unless `selfSigned.rotate` is
+   * `false`). `{ activate: true }` switches immediately: live WebTransport sessions end. Rejects for a certificate
+   * you supplied, or before `listen()`.
+   */
+  rotateCertificate(options?: { activate?: boolean }): Promise<{ current: WshServerCertificateInfo; next: WshServerCertificateInfo | null }>;
   /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */
   peerFingerprints(): string[];
   /** The advertised host identity; `null` before `listen()` resolves or without a `hostKey`. */
