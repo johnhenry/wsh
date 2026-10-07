@@ -220,11 +220,66 @@ await client.connect(url, {
   client writes no primer.
 - **`selfSigned: true`** generates (no dependency) an ECDSA P-256 certificate valid for 13 days -- a browser refuses a
   pinned certificate valid for more than 14 -- and exposes the SHA-256 for `serverCertificateHashes`
-  (`{ selfSigned: { hosts, validityDays } }` to change the SANs or the lifetime). **It is not renewed:**
-  restart before `notAfter`, and re-pin. A certificate you pass as `cert`/`privKey` is used as is
-  (`certificateHash` is then `null`). `generateSelfSignedCertificate()` is exported for the same
-  certificate without a server. The web platform's other pinning rules apply (`https:` URL, HTTP/3 only; see
-  [Pinning a Self-Signed Certificate](#pinning-a-self-signed-certificate)).
+  (`{ selfSigned: { hosts, validityDays } }` to change the SANs or the lifetime). A certificate you pass as
+  `cert`/`privKey` is used as is (`certificateHash` is then `null`, and nothing rotates).
+  `generateSelfSignedCertificate()` is exported for the same certificate without a server. The web platform's other
+  pinning rules apply (`https:` URL, HTTP/3 only; see
+  [Pinning a Self-Signed Certificate](#pinning-a-self-signed-certificate)). **It is rotated, see below.**
+- Node has no `WebTransport` global: a Node *client* needs `globalThis.WebTransport = (await import(
+  '@fails-components/webtransport')).WebTransport` first. UDP, so a firewall must allow `port`, and there
+  is no `wss://`-style TLS terminator in front: the certificate is the one this process serves.
+- Tests (`test/server-webtransport.test.mjs`) run the stock client against it over a real HTTP/3
+  connection and are **skipped, with the reason, where the native binary cannot load**.
+
+#### Certificate rotation
+
+A pinned certificate cannot just be renewed in place: clients hold its hash, and the platform
+takes none valid for more than 14 days. So a `selfSigned` certificate is rotated **ahead of its expiry, with an
+overlap in which both hashes are published**:
+
+```js
+server.certificateHashes();       // [{ algorithm: 'sha-256', value }, ...]: what a client should pin right now
+await server.rotateCertificate(); // make the next certificate now and publish its hash too -> [current, next]
+await server.rotateCertificate({ activate: true });   // ... and switch the listener to it immediately
+```
+
+- **Automatically**: `prepareBeforeMs` before `notAfter` (default 3 days, at most a third of the validity) the next
+  certificate is generated and `certificateHashes()` becomes `[current, next]`; `activateBeforeMs` before `notAfter`
+  (default 1 hour, at most a sixth) the listener switches to it and the list drops the old hash. Then the next rotation
+  is scheduled from the new certificate. `selfSigned: { rotate: false }` turns this off (restart before `notAfter`,
+  as before); `{ prepareBeforeMs, activateBeforeMs, validityDays }` tune it (tests use a seconds-long validity).
+  The same list is on `server.webTransport().certificateHashes()`, with validity and which one is active in
+  `.certificates()`; `certificateHash`/`notAfter` there always describe the certificate being presented.
+- **The switch restarts the HTTP/3 listener on the same port.** The native transport has no way to swap a certificate
+  in place and presents one certificate at a time, so live WebTransport sessions end at the switch (the WebSocket
+  listener is untouched) and clients reconnect. A client that pinned the overlap list `[current, next]` before the
+  switch connects after it; one that only has the old hash does not, so it must **re-pin**.
+- **Client re-pin flow.** `serverCertificateHashes` takes several values, and `connect()` / `WebTransportTransport` pass the
+  whole array. Publish `server.certificateHashes()` over something the client already trusts (your page's
+  HTTPS, an API call, a config endpoint) and have the client fetch it (a) before connecting and (b) again whenever
+  the WebTransport handshake fails, then retry once:
+
+  ```js
+  // server: GET /wsh-pins -> hex strings (parseCertificateHash() on the client accepts hex)
+  app.get('/wsh-pins', (req, res) => res.json(server.certificateHashes().map((h) => Buffer.from(h.value).toString('hex'))));
+
+  // client
+  async function connectPinned(url, opts) {
+    for (let attempt = 0; ; attempt++) {
+      const pins = (await (await fetch('/wsh-pins')).json()).map((hex) => ({ algorithm: 'sha-256', value: hexToBytes(hex) }));
+      try { return await client.connect(url, { ...opts, transport: 'wt', webTransport: { serverCertificateHashes: pins } }); }
+      catch (err) { if (attempt === 1) throw err; }   // stale pins: fetch the list again and retry once
+    }
+  }
+  ```
+
+  Because the next hash is published `prepareBeforeMs` (3 days) before the switch, a client that refreshes at least that
+  often (or on any failure) never sees a certificate it has not pinned. A client that stays up for longer than a certificate
+  lives and never refetches needs this retry; `transport: 'wt'` makes the failure explicit instead of falling back to
+  `wss://`.
+- Not covered: a certificate you supply (`cert`/`privKey`) is yours to renew; restart the server (or run it behind a
+  CA-issued certificate, which needs no pinning).
+
 - Node has no `WebTransport` global: a Node *client* needs `globalThis.WebTransport = (await import(
   '@fails-components/webtransport')).WebTransport` first. UDP, so a firewall must allow `port`, and there
   is no `wss://`-style TLS terminator in front: the certificate is the one this process serves.
@@ -756,7 +811,10 @@ The constraints are the platform's, not wsh's:
 
 - The URL must be `https:`; pinning is HTTP/3 only, with no HTTP/2 fallback.
 - The certificate must use an **ECDSA P-256** key and be valid for **at most
-  14 days**, so it has to be reissued on a schedule.
+  14 days**, so it has to be reissued on a schedule. `serverCertificateHashes`
+  takes several digests: pin the current and the next one across a rotation
+  (the Node host's `certificateHashes()` publishes both; see
+  [Certificate rotation](#certificate-rotation)).
 - Connection pooling is disabled for a pinned connection.
 - Only `sha-256` is accepted as the algorithm.
 

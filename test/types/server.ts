@@ -40,6 +40,9 @@ const peers: string[] = createWshServer(relayOptions).peerFingerprints();
 const wtOptions: WshServerOptions = { webTransport: { port: 4433, path: '/wsh', selfSigned: { hosts: ['localhost'], validityDays: 7 } } };
 const wtOwnCert: WshServerOptions = { webTransport: { cert: 'pem', privKey: 'pem', host: '0.0.0.0' } };
 const wtInfo: { url: string; certificateHash: Uint8Array | null } | null = createWshServer(wtOptions).webTransport();
+const wtRotation: WshServerOptions = { webTransport: { selfSigned: { rotate: true, prepareBeforeMs: 1000, activateBeforeMs: 500 } } };
+const pins: { algorithm: 'sha-256'; value: Uint8Array }[] = createWshServer(wtOptions).certificateHashes();
+const rotated: Promise<{ current: { hashHex: string; active: boolean }; next: { notAfter: Date } | null }> = createWshServer(wtOptions).rotateCertificate({ activate: true });
 const selfSigned: { cert: string; privKey: string; hash: Uint8Array; notAfter: Date } = generateSelfSignedCertificate({ validityDays: 3 });
 const server: WshServer = createWshServer(options);
 const bound: Promise<{ address: string; port: number }> = server.listen();
@@ -50,4 +53,4 @@ const hk: { fingerprint: string; publicKey: Uint8Array; openssh: string } | null
 declare const key: CryptoKey;
 const sig: Promise<Uint8Array> = sign(key, new Uint8Array(1));
 const ok: Promise<boolean> = verify(key, new Uint8Array(64), new Uint8Array(1));
-export { wtOptions, wtOwnCert, wtInfo, selfSigned, relayOptions, reverse, peers, sessionOptions, sessionsOn, mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };
+export { wtRotation, pins, rotated, wtOptions, wtOwnCert, wtInfo, selfSigned, relayOptions, reverse, peers, sessionOptions, sessionsOn, mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };

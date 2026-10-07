@@ -36,7 +36,8 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  * @param {{ port?: number, host?: string, path?: string, cert?: string, privKey?: string, selfSigned?: boolean | object, secret?: string }} [options.webTransport]
  *   Also listen for WebTransport (HTTP/3 over UDP) clients, with the same auth and features as the WebSocket
  *   listener. `cert` / `privKey` are PEM; `selfSigned: true` makes a 13-day ECDSA P-256 certificate and exposes its
- *   SHA-256 through `webTransport()` for the client's `serverCertificateHashes`. Needs the optional peers
+ *   SHA-256 through `webTransport()` / `certificateHashes()` for the client's `serverCertificateHashes`, and rotates it
+ *   before it expires (`rotateCertificate()`). Needs the optional peers
  *   `@fails-components/webtransport` and `@fails-components/webtransport-transport-http3-quiche`. Off unless given.
  * @param {{ canRegister?: Function, canConnect?: Function, maxPeers?: number, connectTimeoutMs?: number }} [options.relay]
  *   Act as a relay: peers register (`ReverseRegister`, a signed record), operators list and connect to them
@@ -168,7 +169,27 @@ export function createWshServer({
       return {
         port: wt.port, host: wt.host, path: wt.path, url: `https://${wt.host.includes(':') ? `[${wt.host}]` : wt.host}:${wt.port}${wt.path}`,
         certificateHash: wt.certificateHash, certificateHashHex: wt.certificateHashHex, notAfter: wt.notAfter,
+        certificateHashes: () => wt.certificateHashes(), certificates: () => wt.certificates(), rotateCertificate: (o) => wt.rotateCertificate(o),
       };
+    },
+
+    /**
+     * The `serverCertificateHashes` a WebTransport client should pin right now: the `selfSigned` certificate being
+     * presented and, during a rotation's overlap window, the next one too. `[]` with no WebTransport listener or
+     * with a certificate you supplied.
+     */
+    certificateHashes() {
+      return wt ? wt.certificateHashes() : [];
+    },
+
+    /**
+     * Start rotating the `selfSigned` WebTransport certificate: generate the next one and publish its hash in
+     * `certificateHashes()` now; it is switched to shortly before the current one expires (this happens by itself
+     * unless `selfSigned: { rotate: false }`). `{ activate: true }` switches immediately, ending live sessions.
+     */
+    rotateCertificate(options) {
+      if (!wt) return Promise.reject(new Error('rotateCertificate: there is no WebTransport listener (configure `webTransport` and `listen()`)'));
+      return wt.rotateCertificate(options);
     },
 
     /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.27.0 (2026-10-07)
+
+- **`@johnhenry/wsh/server`: a `selfSigned` WebTransport certificate is rotated (#81).** It used to
+  expire (13 days) and make a long-running server unreachable for pinned clients. Now
+  `prepareBeforeMs` before `notAfter` (default 3 days, at most a third of the validity) the next
+  certificate is generated and `certificateHashes()` publishes `[current, next]`, and
+  `activateBeforeMs` before `notAfter` (default 1 hour, at most a sixth) the listener switches to
+  it and retires the old hash; the next rotation is then scheduled from the new certificate.
+  New on the server: `certificateHashes()` (a `serverCertificateHashes` list, `{ algorithm:
+  'sha-256', value }` per hash), `rotateCertificate()` (publish the next hash now; `{ activate:
+  true }` also switches now) -- also on `webTransport()`, which gains `certificates()` and whose
+  `certificateHash` / `notAfter` follow the certificate being presented. `selfSigned: { rotate:
+  false }` restores the old behaviour. The switch restarts the HTTP/3 listener on the same port
+  (the native transport cannot swap a certificate in place and presents one at a time), so live
+  WebTransport sessions end and clients reconnect; the WebSocket listener is untouched. A client
+  that pinned the overlap list survives the switch, one with only the old hash must re-pin. The
+  client already accepted several pinned hashes; the README documents the re-pin flow
+  (publish `certificateHashes()` over a channel the client trusts, refetch on failure, retry
+  once). A certificate you supply is never rotated (`rotateCertificate()` rejects).
+- **Fixed:** `generateSelfSignedCertificate({ validityDays })` with a validity under a few hours
+  produced a certificate that had already expired (the one-hour back-dating exceeded it); the
+  back-dating now shrinks with the validity.
+- **Tests:** forced short validity (a 12 s window): publication ahead of expiry, the automatic
+  switch, a client pinned to the overlap list connecting after the switch and after the old
+  `notAfter`; manual `rotateCertificate()` / `{ activate: true }` (both pinned work before the
+  switch, the next one alone does not, the old one alone fails after, live sessions end, same
+  port); supplied certificates and closed listeners.
 ## 0.26.0 (2026-10-07) / Rust `rust-v0.3.0`
 
 - **Relay: E2E can cross a bridge (#80).** `KeyExchange` and `EncryptedFrame` are now on
