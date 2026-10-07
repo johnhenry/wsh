@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.22.0 (2026-10-07)
+
+- **New: `@johnhenry/wsh/server` is a relay (#69).** `createWshServer({ relay: {
+  canRegister, canConnect, maxPeers?, connectTimeoutMs? } })` keeps a peer table
+  keyed by key fingerprint. `ReverseRegister` is checked against the connection's
+  authenticated key and its self-signed record is verified (with the existing
+  `verifyPeerRecord` transcript) before it is accepted; the record `seq` must
+  increase per fingerprint and is remembered across reconnects. `ReverseList`
+  answers only the peers the caller may connect to; `ReverseConnect` is forwarded
+  with `from_fingerprint`/`username` set from the operator's authenticated login;
+  `ReverseAccept`/`Reject` pair the two connections; and from then on forwardable
+  messages cross as `RelayForward` with a server-set `from_fingerprint`. A
+  client-written `RelayForward` is unwrapped, its inner checked against the spec's
+  `forwardable` allowlist, and re-wrapped with the real sender; unbridged traffic is
+  never forwarded. **Default deny**: `canRegister` and `canConnect` both default to
+  refusing. One operator per peer at a time (`busy`); a bridge ends when either
+  connection does, closing the other. `server.peerFingerprints()` lists who is
+  registered. Without `relay`, `ReverseList` answers an empty list and
+  `ReverseConnect` a `ReverseReject` instead of being ignored.
+- **New: `createReverseHost({ url, username, keyPair, accept, exec, pty, fs, mcp })`**,
+  the registered side: it dials out with `connectReverse()`, asks `accept` (default:
+  refuse everyone) about each operator, and serves the bridged one with the same
+  connection code `createWshServer` uses, over an in-memory message pipe. Exec
+  sessions are `data_mode: 'virtual'` over a bridge. Redials with backoff (a relay
+  closes the peer when a bridge ends); `reconnect: false` to disable.
+- **Internal:** the connection factory can now attach to a message transport
+  (`sendMessage` / `receiveMessage` / `bindStream`, pre-authenticated, with
+  `dataStreams: false`) as well as a QMux byte pipe, and closes the socket when the
+  host ends a connection itself (a refused login, an ended bridge) instead of
+  leaving that to the client. Backends (`exec`/`pty`/`fs`/`mcp`) are built in one
+  place shared by the server and the reverse host. No spec, codegen, Rust or client change.
+- **Not provided:** E2E between operator and peer (`KeyExchange` is not on the
+  `forwardable` list, so the relay sees traffic in clear); several operators per
+  peer. See the README.
+
 ## 0.21.0 (2026-10-07)
 
 - **New: `@johnhenry/wsh/server` attach / resume / detach of pty and exec

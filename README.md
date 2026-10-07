@@ -185,8 +185,85 @@ restricted host with no shell. `fs.root` confines every path: `..`, absolute
 paths and symlinks pointing out of it are refused -- for `write` and `rename`
 (both paths) exactly as for `read`.
 
-Not implemented (each has a tracking issue): WebTransport, relay/reverse
-mode.
+Not implemented (tracking issue): WebTransport.
+
+### Relay / reverse mode
+
+A host that cannot accept connections (behind NAT, or a browser tab) dials *out*
+and registers; an operator reaches it through a relay. `@johnhenry/wsh/server`
+is both ends:
+
+```js
+// The relay -- anyone who can reach it and authenticate; nothing is permitted by default.
+createWshServer({
+  auth: { authorizedKeys },
+  relay: {
+    canRegister: (who, record) => who.username === 'build-box',          // who may be a peer
+    canConnect: (from, to) => from.username === 'alice',                  // who may list and reach which peer
+  },
+});
+
+// The peer, on the machine behind the NAT: same backends as createWshServer.
+const host = createReverseHost({
+  url: 'wss://relay.example/', username: 'build-box', keyPair,
+  exec: true, fs: { root: '/srv/share' }, mcp: { tools },
+  accept: ({ fingerprint, username }) => fingerprint === aliceFingerprint, // default: nobody
+});
+await host.start();                    // host.fingerprint is what operators connect to
+
+// The operator: stock client.
+const peers = await client.listPeers();                       // each entry's signed record verified client-side
+await client.reverseConnect(peers[0].fingerprint);            // ReverseAccept trusts the peer for RelayForward
+const s = await client.openSession({ type: 'exec', command: 'echo hello' });
+```
+
+- **Default deny, twice.** The relay admits no peer (`canRegister`) and lets no
+  one connect (`canConnect`) unless you say so, and the peer refuses every
+  operator unless `accept` says otherwise -- the client's `trustRelayPeer()` is
+  the third gate. A peer an operator may not connect to is not listed and is
+  indistinguishable from an absent one (`ReverseReject: no such peer`).
+  Relay roles need a **key** login (`from_fingerprint` is a key fingerprint);
+  password logins can still use the relay server as an ordinary host.
+- **Peer table.** Keyed by fingerprint. `ReverseRegister` is checked against the
+  connection's own authenticated key (`public_key` must hash to it) and its
+  self-signed record (`buildPeerRecordTranscript` / `signPeerRecord`) is verified
+  here, not trusted; `ReversePeers` forwards the signed fields so operators verify
+  them again themselves. The record `seq` must increase per fingerprint -- and is
+  remembered across reconnects (the last 4096 fingerprints), so an old record
+  cannot regress a peer. Failures answer an `Error` (the stock client surfaces it
+  through `onError`); there is no acknowledgement of success on the wire, so poll
+  `listPeers()` (or `server.peerFingerprints()`) if you need to know it landed.
+- **Bridge.** `ReverseConnect` is forwarded to the peer with `from_fingerprint`
+  (and `username`) set from the operator's authenticated login, whatever the
+  client wrote; the peer's `ReverseAccept`/`Reject` goes back, attributed to the
+  peer that sent it, and an accept pairs the two connections. From then on every
+  spec-`forwardable` message from either end is wrapped as `RelayForward {
+  from_fingerprint, inner }` with `from_fingerprint` the sender's authenticated
+  key. A `RelayForward` a client writes itself is unwrapped, its inner type
+  checked against the allowlist (a non-forwardable or undecodable inner is
+  dropped, logged), and re-wrapped with the real sender; traffic from a connection
+  that is not bridged is never forwarded.
+- **One operator per peer at a time**; a second `ReverseConnect` is rejected as
+  `busy`, and one the peer does not answer within `connectTimeoutMs` (default
+  8 s) as `peer did not respond`. A bridge lasts as long as both connections:
+  when either ends, the relay closes the other, so nothing an operator started
+  outlives it (the reverse host kills its processes). `createReverseHost`
+  redials with backoff by default (`reconnect: false` to turn it off), so it is
+  registered again for the next operator.
+- **On the peer**, the bridged operator is served by the same connection code as
+  a direct client, over an in-memory message pipe instead of a socket. Nothing a
+  client opens can cross the relay but control messages, so exec sessions are
+  `data_mode: 'virtual'` there (stdin and output ride `SessionData`; there is no
+  stdin EOF).
+- **Not provided:** end-to-end encryption between operator and peer -- `KeyExchange` /
+  `EncryptedFrame` are not on the spec's `forwardable` list, so the relay sees the
+  traffic in clear (serve it over `wss://`, and treat the relay operator as trusted).
+  Client-side feature gates (`fileWrite`/`fileRename` need `file-write`/`file-rename`,
+  `callTool` correlates on `mcp-call-id`) read the **relay's** `ServerHello`, which
+  says nothing about the peer behind it: against a relay without `fs`, `fileWrite()`
+  refuses locally (reads, listing, stat and exec are unaffected). Multiplexing
+  several operators onto one peer needs a way to address replies, which `RelayForward`
+  does not have.
 
 ### Sessions: attach / resume / detach
 
@@ -595,7 +672,7 @@ than left to be found.
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` replays its whole ring and leaves them unset |
-| Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service |
+| Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast v2) | none | **JS-only** -- no current Rust consumer needs playback; the format itself (asciicast v2) is not proprietary if one is added later |
 | Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | N/A -- Rust dials a cert its own TLS stack already trusts, or `--generate-cert`'s self-signed cert out of band | **Deliberately not unified** -- this is a browser-specific WebTransport API shape, not a wire-protocol concept |

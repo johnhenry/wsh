@@ -10,14 +10,13 @@
 
 import { buildAuthorizer, parseAuthorizedKeys, authMethods, FailureLimiter } from './auth.mjs';
 import { loadHostKey } from './host-key.mjs';
-import { spawnRunner } from './exec.mjs';
-import { normalizePty } from './pty.mjs';
-import { createFileAccess } from './fs.mjs';
-import { createMcpHost } from './mcp.mjs';
+import { buildBackends } from './backends.mjs';
 import { SessionRegistry } from './sessions.mjs';
+import { RelayHub } from './relay.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
 
 export { parseAuthorizedKeys, STREAM_ANNOUNCE };
+export { createReverseHost } from './reverse-host.mjs';
 
 /**
  * @param {object} [options]
@@ -31,6 +30,10 @@ export { parseAuthorizedKeys, STREAM_ANNOUNCE };
  * @param {{ tools?: object[] | object, client?: object, authorize?: Function, maxConcurrent?: number, timeoutMs?: number }} [options.mcp]
  *   MCP tools served over `McpDiscover` / `McpCall`: `tools` (`{ name, description, inputSchema, call(args, { user, signal }) }`),
  *   and/or `client` (an `@modelcontextprotocol/sdk` Client to proxy). Off unless given.
+ * @param {{ canRegister?: Function, canConnect?: Function, maxPeers?: number, connectTimeoutMs?: number }} [options.relay]
+ *   Act as a relay: peers register (`ReverseRegister`, a signed record), operators list and connect to them
+ *   (`ReverseList` / `ReverseConnect`) and traffic is carried between them as `RelayForward`. Default deny:
+ *   `canRegister(who, record)` and `canConnect(from, to)` must both be given and return true. See `createReverseHost`.
  * @param {true | { detachTtlMs?: number, maxDetached?: number, ringBytes?: number, sessionSecret?: string | Uint8Array }} [options.sessions]
  *   Keep pty/exec sessions alive across disconnects so a client can `resumeSession()` / `attachSession()`
  *   them: a per-server registry, a ring buffer of the newest `ringBytes` (default 1 MiB) of output, and
@@ -45,22 +48,12 @@ export { parseAuthorizedKeys, STREAM_ANNOUNCE };
  * @returns {{ listen(): Promise<{address: string, port: number}>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, sessions, sessionSecret, bindTimeoutMs = 3000, onLog = () => {},
+  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, sessions, sessionSecret, relay, bindTimeoutMs = 3000, onLog = () => {},
 } = {}) {
   let wss = null;
   let bound = null;
 
-  let execRunner = null;
-  let execOptions = {};
-  if (typeof exec === 'function') {
-    execRunner = exec;
-  } else if (exec) {
-    execOptions = exec === true ? {} : exec;
-    execRunner = typeof execOptions.run === 'function' ? execOptions.run : spawnRunner(execOptions);
-  }
-  const ptyConfig = pty ? normalizePty(pty) : null;
-  const files = fs ? createFileAccess(fs) : null;
-  const mcpHost = mcp ? createMcpHost(mcp) : null;
+  const { execRunner, execOptions, pty: ptyConfig, files, mcp: mcpHost } = buildBackends({ exec, pty, fs, mcp });
   const methods = authMethods(auth);
   const rl = auth?.rateLimit ?? {};
   const rateLimit = {
@@ -70,6 +63,7 @@ export function createWshServer({
   };
   let host_ = null;
   let registry = null;
+  let hub = null;
   const sessionOptions = sessions ? (sessions === true ? {} : sessions) : null;
 
   return {
@@ -93,9 +87,10 @@ export function createWshServer({
           log: onLog,
         });
       }
+      if (relay) hub = new RelayHub({ ...relay, log: onLog });
       const attach = createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, log: onLog,
-        methods, hostKey: host_, rateLimit, mcp: mcpHost, sessions: registry,
+        methods, hostKey: host_, rateLimit, mcp: mcpHost, sessions: registry, relay: hub,
       });
 
       wss = new WebSocketServer({ host, port });
@@ -103,6 +98,7 @@ export function createWshServer({
         const conn = attach({
           send: (b) => { if (ws.readyState === 1) ws.send(b); },
           remote: { address: req?.socket?.remoteAddress, headers: req?.headers ?? {} },
+          closeTransport: () => ws.close(1000),
         });
         ws.on('message', (d) => {
           const buf = Array.isArray(d) ? Buffer.concat(d) : Buffer.isBuffer(d) ? d : Buffer.from(d);
@@ -129,10 +125,17 @@ export function createWshServer({
       await new Promise((resolve) => server.close(resolve));
       registry?.closeAll();
       registry = null;
+      hub?.closeAll();
+      hub = null;
     },
 
     address() {
       return bound;
+    },
+
+    /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */
+    peerFingerprints() {
+      return hub ? hub.peerFingerprints() : [];
     },
 
     /** The advertised host identity (`null` until `listen()` resolves, or with no `hostKey`). */
