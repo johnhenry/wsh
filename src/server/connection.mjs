@@ -19,11 +19,13 @@ import { FrameDecoder, frameEncode } from '../cbor.mjs';
 import {
   MSG, serverHello, challenge, authOk, authFail, openOk, openFail, sessionData,
   exit as exitMsg, close as closeMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
+  presence as presenceMsg, error as errorMsg, sessionList, detachOk, detachFail,
 } from '../messages.gen.mjs';
 import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES } from './fs.mjs';
+import { MAX_ATTACHMENTS } from './sessions.mjs';
 import { MCP_CALL_ID_FEATURE } from '../client.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
@@ -33,6 +35,7 @@ const MAX_RENAME_PATH_BYTES = 4096;
 const WRITE_IDLE_MS = 30_000;
 
 const MAX_CHANNELS = 64;
+const REPLAY_CHUNK_BYTES = 32 * 1024;
 const USERNAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
 const enc = new TextEncoder();
 
@@ -49,6 +52,7 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {{ pubkey: boolean, password: Function | null }} cfg.methods - which auth methods are on
  * @param {object | null} cfg.hostKey - from loadHostKey
  * @param {object | null} cfg.mcp - from createMcpHost
+ * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
  * @param {number} cfg.bindTimeoutMs - how long exec output waits for the data stream
  * @param {(line: string) => void} cfg.log
@@ -89,7 +93,9 @@ export function createConnectionFactory(cfg) {
     function shutdown(why) {
       if (state.closed) return;
       state.closed = true;
-      for (const ch of channels.values()) ch.kill?.();
+      // A hosted session survives its connection (it is detached, then expires or is resumed);
+      // everything else dies with it.
+      for (const ch of [...channels.values()]) (ch.detach ?? ch.kill)?.call(ch);
       channels.clear();
       for (const c of mcpCalls) c.abort(new Error('connection closed'));
       mcpCalls.clear();
@@ -99,8 +105,13 @@ export function createConnectionFactory(cfg) {
       log(`closed (${why})`);
     }
 
+    // A transport that closes right behind a message (a client's `disconnect()` sends Close for
+    // every channel and then goes) must not make the host forget that message: it is processed
+    // first, then the connection is torn down.
+    const shutdownAfterQueue = (why) => { chain = chain.then(() => shutdown(why)); };
+
     qmux.onError = (e) => log(`qmux error: ${e.message}`);
-    qmux.onClose = () => shutdown('peer sent CONNECTION_CLOSE');
+    qmux.onClose = () => shutdownAfterQueue('peer sent CONNECTION_CLOSE');
     qmux.onStreamOpen = (s) => {
       if (s.id !== 0) { bindDataStream(s); return; }
       control = s;
@@ -109,8 +120,8 @@ export function createConnectionFactory(cfg) {
         try { msgs = decoder.feed(d); } catch (e) { log(`frame decode error: ${e.message}`); return; }
         for (const m of msgs) chain = chain.then(() => handle(m)).catch((e) => log(`handler error: ${e.message}`));
       };
-      s.onEnd = () => shutdown('control stream FIN');
-      s.onReset = () => shutdown('control stream reset');
+      s.onEnd = () => shutdownAfterQueue('control stream FIN');
+      s.onReset = () => shutdownAfterQueue('control stream reset');
       for (const b of pendingSends.splice(0)) s.write(b).catch(() => {});
     };
     qmux.sendHandshake();
@@ -136,6 +147,10 @@ export function createConnectionFactory(cfg) {
         case MSG.CLOSE: { const ch = channels.get(m.channel_id); if (ch) { ch.kill?.(); } return; }
         case MSG.FILE_OP: return handleFileOp(m);
         case MSG.FILE_CHUNK: return (fileWrites.has(m.channel_id) ? handleWriteChunk(m) : channels.get(m.channel_id)?.chunk?.(m));
+        case MSG.ATTACH: return handleAttach(m, false);
+        case MSG.RESUME: return handleAttach(m, true);
+        case MSG.DETACH: return handleDetach(m);
+        case MSG.SESSION_LIST_REQUEST: return handleSessionList();
         case MSG.MCP_DISCOVER: return handleMcpDiscover();
         // Not awaited: the handler chain is serial, and a slow tool must not hold up
         // the next call (or a Close) behind it.
@@ -315,6 +330,118 @@ export function createConnectionFactory(cfg) {
       return send(exitMsg({ channelId, code })).then(() => send(closeMsg({ channelId })));
     }
 
+    // ── Hosted sessions (createWshServer({ sessions })) ───────────────
+
+    /** Who this connection authenticated as: its key, or its username for a password login. */
+    const principalKey = () => state.fingerprint ?? `password:${state.username}`;
+    const ownerRecord = () => ({ username: state.username, fingerprint: state.fingerprint, principal: principalKey() });
+
+    /**
+     * This connection's message-backed attachment to a hosted session: output, Presence and the
+     * final Exit/Close all go through one ordered chain, so a replay is never overtaken by live output.
+     */
+    function virtualAttachment(hosted, channelId, mode) {
+      let out = Promise.resolve();
+      const enqueue = (fn) => { out = out.then(fn).catch(() => {}); return out; };
+      return {
+        connId: cid, channelId, mode, username: state.username, principal: principalKey(),
+        write: (bytes) => enqueue(() => send(sessionData({ channelId, data: bytes }))),
+        notify: (msg) => enqueue(() => send(presenceMsg(msg))),
+        exit: (code) => enqueue(async () => {
+          channels.delete(channelId);
+          await send(exitMsg({ channelId, code }));
+          await send(closeMsg({ channelId }));
+        }),
+        flush: () => out,
+      };
+    }
+
+    /** The `channels` entry for a virtual attachment (an Attach/Resume, or a pty's own channel). */
+    function attachedChannel(hosted, att) {
+      const control = () => att.mode === 'control';
+      const ch = {
+        session: hosted, attachment: att,
+        input: (d) => { if (control()) hosted.handlers.input?.(d); },
+        resize: (c, r) => { if (control()) hosted.handlers.resize?.(c, r); },
+        signal: (name) => { if (control()) hosted.handlers.signal?.(name); },
+        // The client closed the channel: the session's owner ends it, anyone else just leaves it.
+        kill: () => {
+          if (att.principal === hosted.owner.principal && control()) hosted.kill();
+          else ch.detach();
+        },
+        detach: () => { channels.delete(att.channelId); hosted.detach(att); },
+      };
+      channels.set(att.channelId, ch);
+      return ch;
+    }
+
+    async function handleAttach(m, isResume) {
+      const reg = cfg.sessions;
+      const fail = (code, message) => send(errorMsg({ code, message }));
+      if (!reg) return fail(3, `${isResume ? 'resume' : 'attach'} is not enabled on this server (no "sessions" option)`);
+      const s = reg.get(m.session_id);
+      const mine = !!s && s.owner.principal === principalKey();
+      const tokenOk = !!s && m.token !== undefined && reg.checkToken(s, m.token);
+      // Attach: the token OR ownership. Resume: the token AND ownership (the credentialed connection coming back).
+      if (!s || !(isResume ? tokenOk && mine : tokenOk || mine)) {
+        log(`${isResume ? 'resume' : 'attach'} refused for ${String(m.session_id).slice(0, 8)}`);
+        return fail(2, 'unknown session or not authorized');
+      }
+      if ([...channels.values()].some((c) => c.session === s)) return fail(3, 'already attached to this session on this connection');
+      if (s.attachments.size >= MAX_ATTACHMENTS) return fail(3, 'too many attachments to this session');
+      if (channels.size >= MAX_CHANNELS) return fail(3, 'too many open channels');
+
+      let from = s.ring.start;
+      if (isResume) {
+        const last = m.last_seq;
+        if (!Number.isSafeInteger(last) || last < 0) return fail(3, 'last_seq must be a non-negative integer');
+        if (last > s.ring.end) return fail(4, `last_seq ${last} is ahead of the session (it has produced ${s.ring.end} bytes)`);
+        if (last < s.ring.start) {
+          return fail(4, `output gap: this session's retained output starts at seq ${s.ring.start} but last_seq is ${last}; attach for the retained output instead`);
+        }
+        from = last;
+      }
+      const mode = !isResume && /^(readonly|read|view|ro)$/i.test(String(m.mode ?? '')) ? 'readonly' : 'control';
+      const channelId = ++state.nextChannel;
+      const att = virtualAttachment(s, channelId, mode);
+      attachedChannel(s, att);
+
+      // Reply, replay, then (if the process is already over) its exit -- all before any live output,
+      // which only reaches `att` once `s.attach(att)` registers it, after these are queued.
+      const self = { session_id: s.id, mode, username: state.username, channel_id: channelId, seq: from };
+      att.notify({ attachments: [self, ...s.roster()] });
+      const replay = s.ring.read(from);
+      for (let off = 0; off < replay.byteLength; off += REPLAY_CHUNK_BYTES) att.write(replay.subarray(off, off + REPLAY_CHUNK_BYTES));
+      if (s.state === 'exited') att.exit(s.exitCode ?? 0);
+      else s.attach(att);
+      log(`${isResume ? 'resumed' : `attached (${mode})`} session ${s.id.slice(0, 8)} on channel ${channelId} from seq ${from}`);
+    }
+
+    async function handleDetach(m) {
+      const s = cfg.sessions?.get(m.session_id);
+      const entry = s && [...channels.entries()].find(([, c]) => c.session === s);
+      if (!entry) return send(detachFail({ reason: 'not attached to this session on this connection' }));
+      const [channelId, ch] = entry;
+      const flushed = ch.attachment.flush();
+      ch.detach();
+      await flushed;
+      await send(closeMsg({ channelId }));
+      return send(detachOk({ sessionId: s.id }));
+    }
+
+    function handleSessionList() {
+      const now = Date.now();
+      const sessions = (cfg.sessions?.listFor(principalKey()) ?? []).map((s) => ({
+        session_id: s.id,
+        username: s.owner.username,
+        fingerprint_short: (s.owner.fingerprint ?? '').slice(0, 8),
+        created_at_secs: Math.floor(s.createdAt / 1000),
+        idle_secs: Math.max(0, Math.floor((now - s.lastActivity) / 1000)),
+        attached_count: s.attachments.size,
+      }));
+      return send(sessionList({ sessions }));
+    }
+
     async function openExec(m) {
       if (!cfg.execRunner) return send(openFail({ reason: 'exec is not enabled on this server' }));
       const command = String(m.command ?? '').trim();
@@ -322,6 +449,7 @@ export function createConnectionFactory(cfg) {
 
       const channelId = ++state.nextChannel;
       const abort = new AbortController();
+      const hosted = cfg.sessions ? cfg.sessions.create({ owner: ownerRecord(), kind: 'exec', command }) : null;
       let stream = null;
       let primerChecked = false;
       let wq = Promise.resolve();
@@ -331,13 +459,14 @@ export function createConnectionFactory(cfg) {
       const endCbs = [];
       const signalCbs = [];
 
+      const signalTo = (name) => {
+        const n = name.replace(/^SIG/, '').toUpperCase();
+        for (const cb of signalCbs) cb(n);
+        if (/^(INT|TERM|KILL|HUP)$/.test(n) && signalCbs.length === 0) abort.abort();
+      };
       const ch = {
         kill: () => abort.abort(),
-        signal: (name) => {
-          const n = name.replace(/^SIG/, '').toUpperCase();
-          for (const cb of signalCbs) cb(n);
-          if (/^(INT|TERM|KILL|HUP)$/.test(n) && signalCbs.length === 0) abort.abort();
-        },
+        signal: signalTo,
         bind(s) {
           stream = s;
           s.onData = (d) => {
@@ -349,7 +478,8 @@ export function createConnectionFactory(cfg) {
             if (d.byteLength) for (const cb of inputCbs) cb(d);
           };
           s.onEnd = () => { for (const cb of endCbs) cb(); };
-          s.onReset = () => abort.abort();
+          // A hosted session outlives its stream; an unhosted one dies with it.
+          s.onReset = () => { if (!hosted) abort.abort(); };
           const pending = buffered.splice(0);
           wq = wq.then(async () => { for (const b of pending) await s.write(b).catch(() => {}); });
           for (const r of boundWaiters.splice(0)) r();
@@ -361,6 +491,49 @@ export function createConnectionFactory(cfg) {
       let timer = null;
       if (cfg.execOptions.timeoutMs > 0) timer = setTimeout(() => abort.abort(), cfg.execOptions.timeoutMs);
 
+      // Output to the opening connection's data stream (held until the client has opened it).
+      const toStream = (bytes) => {
+        if (!stream) { buffered.push(bytes); return Promise.resolve(); }
+        const s = stream;
+        wq = wq.then(() => s.write(bytes).catch(() => {}));
+        return wq;
+      };
+      // Output is ready but the client's stream may not have been bound yet (a host without
+      // announce support waits for the first byte): give it a bounded chance rather than
+      // dropping the output or hanging forever.
+      const closeStream = async (code) => {
+        if (!stream) await Promise.race([new Promise((r) => boundWaiters.push(r)), new Promise((r) => setTimeout(r, cfg.bindTimeoutMs))]);
+        if (!stream) log(`exec channel ${channelId}: data stream never appeared; output dropped`);
+        await wq;
+        try { await stream?.close(); } catch { /* peer gone */ }
+        await finishChannel(channelId, Number.isInteger(code) ? code : 0);
+      };
+
+      if (hosted) {
+        const att = {
+          connId: cid, channelId, mode: 'control', username: state.username, principal: principalKey(),
+          write: toStream,
+          notify: (msg) => send(presenceMsg(msg)),
+          exit: (code) => closeStream(code),
+          flush: () => wq,
+        };
+        hosted.handlers = {
+          input: (d) => { for (const cb of inputCbs) cb(d); },
+          inputEnd: () => { for (const cb of endCbs) cb(); },
+          signal: signalTo,
+          resize: () => {},
+          kill: () => abort.abort(),
+        };
+        ch.session = hosted;
+        ch.attachment = att;
+        ch.detach = () => {
+          channels.delete(channelId);
+          hosted.detach(att);
+          try { stream?.close().catch(() => {}); } catch { /* gone */ }
+        };
+        hosted.attach(att);
+      }
+
       const io = {
         user: state.username,
         env: m.env && typeof m.env === 'object' && cfg.execOptions.clientEnv !== false ? m.env : {},
@@ -369,9 +542,8 @@ export function createConnectionFactory(cfg) {
         signal: abort.signal,
         write(data) {
           const bytes = toBytes(data);
-          if (!stream) { buffered.push(bytes); return Promise.resolve(); }
-          const s = stream;
-          wq = wq.then(() => s.write(bytes).catch(() => {}));
+          if (!hosted) return toStream(bytes);
+          hosted.push(bytes);
           return wq;
         },
         onInput: (cb) => inputCbs.push(cb),
@@ -381,7 +553,7 @@ export function createConnectionFactory(cfg) {
 
       await send(openOk({
         channelId, dataMode: 'stream', capabilities: ['signal'],
-        sessionId: randomUUID(), token: randomBytes(16),
+        sessionId: hosted?.id ?? randomUUID(), token: hosted?.token ?? randomBytes(16),
       }));
       log(`exec channel ${channelId}: ${command}`);
 
@@ -390,20 +562,15 @@ export function createConnectionFactory(cfg) {
       runExec().catch((e) => log(`exec channel ${channelId}: ${e.message}`));
 
       async function runExec() {
-      let code;
-      try { code = await cfg.execRunner(command, io); } catch (e) {
-        await io.write(`wsh: ${e.message}\n`);
-        code = 1;
-      }
-      if (timer) clearTimeout(timer);
-      // Output is ready but the client's stream may not have been bound yet
-      // (a host without announce support waits for the first byte): give it
-      // a bounded chance rather than dropping the output or hanging forever.
-      if (!stream) await Promise.race([new Promise((r) => boundWaiters.push(r)), new Promise((r) => setTimeout(r, cfg.bindTimeoutMs))]);
-      if (!stream) log(`exec channel ${channelId}: data stream never appeared; output dropped`);
-      await wq;
-      try { await stream?.close(); } catch { /* peer gone */ }
-      await finishChannel(channelId, Number.isInteger(code) ? code : 0);
+        let code;
+        try { code = await cfg.execRunner(command, io); } catch (e) {
+          await io.write(`wsh: ${e.message}\n`);
+          code = 1;
+        }
+        if (timer) clearTimeout(timer);
+        // Hosted: everyone attached (this connection's stream included, if it is still there) hears the exit.
+        if (hosted) { hosted.finish(Number.isInteger(code) ? code : 0); return; }
+        await closeStream(code);
       }
     }
 
@@ -423,13 +590,31 @@ export function createConnectionFactory(cfg) {
       } catch (e) {
         return send(openFail({ reason: `pty spawn failed: ${e.message}` }));
       }
-      const ch = {
+      const ctl = {
         input: (data) => { try { proc.write(Buffer.from(data)); } catch { /* exited */ } },
         resize: (c, r) => { try { proc.resize(c || cols, r || rows); } catch { /* exited */ } },
         signal: (name) => { try { proc.kill(`SIG${name.replace(/^SIG/, '').toUpperCase()}`); } catch { /* exited */ } },
         kill: () => { try { proc.kill(); } catch { /* exited */ } },
       };
-      channels.set(channelId, ch);
+
+      if (cfg.sessions) {
+        const hosted = cfg.sessions.create({ owner: ownerRecord(), kind: 'pty', command: m.command });
+        hosted.handlers = ctl;
+        const att = virtualAttachment(hosted, channelId, 'control');
+        attachedChannel(hosted, att);
+        proc.onData((d) => hosted.push(Uint8Array.from(toBytes(d))));
+        proc.onExit(({ exitCode }) => hosted.finish(exitCode ?? 0));
+        const opened = send(openOk({
+          channelId, dataMode: 'virtual', capabilities: ['resize', 'signal'],
+          sessionId: hosted.id, token: hosted.token,
+        }));
+        hosted.attach(att);
+        await opened;
+        log(`pty channel ${channelId} opened (${cols}x${rows}), session ${hosted.id.slice(0, 8)}`);
+        return;
+      }
+
+      channels.set(channelId, ctl);
       let out = Promise.resolve();
       proc.onData((d) => { out = out.then(() => send(sessionData({ channelId, data: toBytes(d) }))); });
       proc.onExit(({ exitCode }) => { out.then(() => finishChannel(channelId, exitCode ?? 0)); });
@@ -556,7 +741,7 @@ export function createConnectionFactory(cfg) {
 
     return {
       receive(bytes) { if (!state.closed) qmux.receiveBytes(bytes); },
-      close() { shutdown('transport closed'); },
+      close() { shutdownAfterQueue('transport closed'); },
     };
   };
 }

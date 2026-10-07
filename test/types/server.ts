@@ -24,6 +24,8 @@ const mcpOptions: WshServerOptions = {
     timeoutMs: 1000,
   },
 };
+const sessionOptions: WshServerOptions = { sessions: { detachTtlMs: 1000, maxDetached: 4, ringBytes: 4096, sessionSecret: 'x' } };
+const sessionsOn: WshServerOptions = { sessions: true, sessionSecret: new Uint8Array(32) };
 const server: WshServer = createWshServer(options);
 const bound: Promise<{ address: string; port: number }> = server.listen();
 const maybe: { address: string; port: number } | null = server.address();
@@ -33,4 +35,4 @@ const hk: { fingerprint: string; publicKey: Uint8Array; openssh: string } | null
 declare const key: CryptoKey;
 const sig: Promise<Uint8Array> = sign(key, new Uint8Array(1));
 const ok: Promise<boolean> = verify(key, new Uint8Array(64), new Uint8Array(1));
-export { mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };
+export { sessionOptions, sessionsOn, mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };

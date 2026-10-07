@@ -2360,6 +2360,8 @@ impl WshServer {
                             session_id: p.session_id.clone(),
                             mode: p.mode.clone(),
                             username: Some(ctx.username.clone()),
+                            channel_id: None,
+                            seq: None,
                         }],
                     }),
                 }))
@@ -2488,6 +2490,8 @@ impl WshServer {
                             session_id: p.session_id.clone(),
                             mode: "control".into(),
                             username: Some(ctx.username.clone()),
+                            channel_id: None,
+                            seq: None,
                         }],
                     }),
                 }))
@@ -3377,6 +3381,8 @@ impl WshServer {
                                     session_id,
                                     mode: mode.into(),
                                     username: p.device_label.clone(),
+                                    channel_id: None,
+                                    seq: None,
                                 }],
                             }),
                         }))
@@ -3668,6 +3674,8 @@ impl WshServer {
                             session_id: p.session_id.clone(),
                             mode: "copilot".into(),
                             username: Some(format!("copilot:{}", p.model)),
+                            channel_id: None,
+                            seq: None,
                         }],
                     }),
                 }))

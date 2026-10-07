@@ -158,6 +158,17 @@ export interface WshServerMcpOptions {
   timeoutMs?: number;
 }
 
+export interface WshServerSessionsOptions {
+  /** How long a session with nobody attached keeps running (default 300000). `0` kills it the moment its last connection goes. */
+  detachTtlMs?: number;
+  /** Unattended sessions kept at once (default 16); beyond that the longest-detached is killed. */
+  maxDetached?: number;
+  /** Output history kept per session, in bytes (default 1 MiB) -- what a resume can replay. Older output is dropped; a Resume older than it is refused with an "output gap" error. */
+  ringBytes?: number;
+  /** Secret the session tokens are minted with (default: random per process). Fixing it makes tokens verifiable across restarts. */
+  sessionSecret?: string | Uint8Array;
+}
+
 export interface WshServerOptions {
   /** Bind address (default `127.0.0.1`). */
   host?: string;
@@ -177,6 +188,14 @@ export interface WshServerOptions {
   hostKey?: true | { file: string } | CryptoKeyPair;
   /** Enable file ops and uploads/downloads under one directory. Off by default. */
   fs?: WshServerFsOptions;
+  /**
+   * Keep pty/exec sessions alive across disconnects so `resumeSession()` /
+   * `attachSession()` / `detach()` / `listRemoteSessions()` work against them.
+   * `true` for the defaults. Off by default: sessions then die with their connection.
+   */
+  sessions?: true | WshServerSessionsOptions;
+  /** Alias for `sessions.sessionSecret`. */
+  sessionSecret?: string | Uint8Array;
   /** Serve MCP tools (`McpDiscover` / `McpCall`) and advertise `mcp-call-id`. Off by default. */
   mcp?: WshServerMcpOptions;
   /** How long exec output waits for a client that has not yet opened its data stream (default 3000). */

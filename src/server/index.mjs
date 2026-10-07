@@ -14,6 +14,7 @@ import { spawnRunner } from './exec.mjs';
 import { normalizePty } from './pty.mjs';
 import { createFileAccess } from './fs.mjs';
 import { createMcpHost } from './mcp.mjs';
+import { SessionRegistry } from './sessions.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
 
 export { parseAuthorizedKeys, STREAM_ANNOUNCE };
@@ -30,6 +31,11 @@ export { parseAuthorizedKeys, STREAM_ANNOUNCE };
  * @param {{ tools?: object[] | object, client?: object, authorize?: Function, maxConcurrent?: number, timeoutMs?: number }} [options.mcp]
  *   MCP tools served over `McpDiscover` / `McpCall`: `tools` (`{ name, description, inputSchema, call(args, { user, signal }) }`),
  *   and/or `client` (an `@modelcontextprotocol/sdk` Client to proxy). Off unless given.
+ * @param {true | { detachTtlMs?: number, maxDetached?: number, ringBytes?: number, sessionSecret?: string | Uint8Array }} [options.sessions]
+ *   Keep pty/exec sessions alive across disconnects so a client can `resumeSession()` / `attachSession()`
+ *   them: a per-server registry, a ring buffer of the newest `ringBytes` (default 1 MiB) of output, and
+ *   `detachTtlMs` (default 300000; 0 = kill on disconnect) / `maxDetached` (default 16) bounds. Off unless given.
+ * @param {string | Uint8Array} [options.sessionSecret] - Alias for `sessions.sessionSecret`.
  * @param {true | { file: string } | CryptoKeyPair} [options.hostKey] - The server's own Ed25519
  *   identity, advertised (with proof of possession) so clients can pin it. See `src/host-key.mjs`.
  * @param {object} [options.auth.rateLimit] - Password-failure throttle: `{ maxFailures=5, windowMs=60000,
@@ -39,7 +45,7 @@ export { parseAuthorizedKeys, STREAM_ANNOUNCE };
  * @returns {{ listen(): Promise<{address: string, port: number}>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, bindTimeoutMs = 3000, onLog = () => {},
+  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, sessions, sessionSecret, bindTimeoutMs = 3000, onLog = () => {},
 } = {}) {
   let wss = null;
   let bound = null;
@@ -63,6 +69,8 @@ export function createWshServer({
     failureDelayMs: rl.failureDelayMs ?? 250,
   };
   let host_ = null;
+  let registry = null;
+  const sessionOptions = sessions ? (sessions === true ? {} : sessions) : null;
 
   return {
     async listen() {
@@ -75,9 +83,19 @@ export function createWshServer({
       }
       const authorize = await buildAuthorizer(auth);
       host_ = hostKey ? await loadHostKey(hostKey) : null;
+      if (sessionOptions) {
+        const secret = sessionOptions.sessionSecret ?? sessionSecret;
+        registry = new SessionRegistry({
+          secret: secret === undefined ? undefined : Buffer.from(secret),
+          detachTtlMs: sessionOptions.detachTtlMs,
+          maxDetached: sessionOptions.maxDetached,
+          ringBytes: sessionOptions.ringBytes,
+          log: onLog,
+        });
+      }
       const attach = createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, log: onLog,
-        methods, hostKey: host_, rateLimit, mcp: mcpHost,
+        methods, hostKey: host_, rateLimit, mcp: mcpHost, sessions: registry,
       });
 
       wss = new WebSocketServer({ host, port });
@@ -109,6 +127,8 @@ export function createWshServer({
       bound = null;
       for (const client of server.clients) client.terminate();
       await new Promise((resolve) => server.close(resolve));
+      registry?.closeAll();
+      registry = null;
     },
 
     address() {
