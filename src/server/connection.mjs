@@ -19,7 +19,7 @@ import { FrameDecoder, frameEncode } from '../cbor.mjs';
 import {
   MSG, serverHello, challenge, authOk, authFail, openOk, openFail, sessionData,
   exit as exitMsg, close as closeMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
-  presence as presenceMsg, error as errorMsg, sessionList, detachOk, detachFail,
+  presence as presenceMsg, error as errorMsg, sessionList, detachOk, detachFail, reversePeers, reverseReject,
 } from '../messages.gen.mjs';
 import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
@@ -52,6 +52,7 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {{ pubkey: boolean, password: Function | null }} cfg.methods - which auth methods are on
  * @param {object | null} cfg.hostKey - from loadHostKey
  * @param {object | null} cfg.mcp - from createMcpHost
+ * @param {object | null} cfg.relay - a RelayHub (see relay.mjs); null = not a relay
  * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
  * @param {number} cfg.bindTimeoutMs - how long exec output waits for the data stream
@@ -60,12 +61,20 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
 export function createConnectionFactory(cfg) {
   let counter = 0;
 
-  return function attach({ send: sendBytes, remote = {} }) {
+  /**
+   * Attach one connection. Two shapes:
+   *  - bytes (the normal one): `{ send(bytes), remote, closeTransport() }` -> `{ receive(bytes), close() }`, speaking QMux.
+   *  - messages: `{ sendMessage(msg), authenticated, dataStreams }` -> `{ receiveMessage(msg), bindStream(s), close() }`,
+   *    for a transport that already frames messages itself (a relay bridge, WebTransport). `authenticated`
+   *    (`{ username, fingerprint }`) skips the handshake for a peer something else has already authenticated;
+   *    `dataStreams: false` means there are no client-opened streams to bind, so exec output rides SessionData.
+   */
+  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null }) {
     const cid = ++counter;
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
-      sessionId: randomUUID(), nonce: null, username: null, authed: false,
-      closed: false, nextChannel: 0, fingerprint: null,
+      sessionId: randomUUID(), nonce: null, username: authenticated?.username ?? null, authed: !!authenticated,
+      closed: false, nextChannel: 0, fingerprint: authenticated?.fingerprint ?? null,
     };
     /** @type {Map<number, any>} */
     const channels = new Map();
@@ -79,11 +88,16 @@ export function createConnectionFactory(cfg) {
     const pendingSends = [];
     let control = null;
     let chain = Promise.resolve();
+    /** This connection as the relay hub sees it (created on first need). */
+    let relayHandle = null;
 
-    const qmux = new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
+    const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
 
     const send = (msg) => {
       if (state.closed) return Promise.resolve();
+      if (sendMessage) {
+        try { return Promise.resolve(sendMessage(msg)).catch(() => {}); } catch { return Promise.resolve(); }
+      }
       const bytes = frameEncode(msg);
       if (control) return control.write(bytes).catch(() => {});
       pendingSends.push(bytes);
@@ -101,7 +115,10 @@ export function createConnectionFactory(cfg) {
       mcpCalls.clear();
       for (const w of fileWrites.values()) clearTimeout(w.timer);
       fileWrites.clear();
-      try { qmux.destroy(new Error(why)); } catch { /* already gone */ }
+      try { qmux?.destroy(new Error(why)); } catch { /* already gone */ }
+      // The host ending the connection (a relay bridge ending, a refused login) must end the socket too.
+      try { closeTransport?.(); } catch { /* already gone */ }
+      relayHandle && cfg.relay?.drop(relayHandle);
       log(`closed (${why})`);
     }
 
@@ -110,6 +127,7 @@ export function createConnectionFactory(cfg) {
     // first, then the connection is torn down.
     const shutdownAfterQueue = (why) => { chain = chain.then(() => shutdown(why)); };
 
+    if (qmux) {
     qmux.onError = (e) => log(`qmux error: ${e.message}`);
     qmux.onClose = () => shutdownAfterQueue('peer sent CONNECTION_CLOSE');
     qmux.onStreamOpen = (s) => {
@@ -125,6 +143,7 @@ export function createConnectionFactory(cfg) {
       for (const b of pendingSends.splice(0)) s.write(b).catch(() => {});
     };
     qmux.sendHandshake();
+    }
 
     function bindDataStream(s) {
       const channelId = pendingStreams.shift();
@@ -138,6 +157,7 @@ export function createConnectionFactory(cfg) {
     async function handle(m) {
       if (state.closed) return;
       if (!state.authed) return handleAuth(m);
+      if (await handleRelay(m)) return;
       switch (m.type) {
         case MSG.PING: return send(pong({ id: m.id }));
         case MSG.OPEN: return handleOpen(m);
@@ -253,6 +273,56 @@ export function createConnectionFactory(cfg) {
       state.authed = true;
       await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: 3600 }));
       log(`authenticated ${state.username} (password)`);
+    }
+
+    // ── Relay (createWshServer({ relay })) ────────────────────────────
+
+    const RELAY_TYPES = new Set([MSG.REVERSE_REGISTER, MSG.REVERSE_LIST, MSG.REVERSE_CONNECT, MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT, MSG.RELAY_FORWARD]);
+
+    function hubHandle() {
+      relayHandle ??= {
+        send, fingerprint: state.fingerprint, username: state.username,
+        close: () => shutdownAfterQueue('relay bridge ended'),
+      };
+      return relayHandle;
+    }
+
+    /** @returns {Promise<boolean>} true when the message was the relay's and has been dealt with */
+    async function handleRelay(m) {
+      const hub = cfg.relay;
+      if (!hub) {
+        // Not a relay: answer instead of leaving the client to time out.
+        if (m.type === MSG.REVERSE_LIST) { await send(reversePeers({ peers: [] })); return true; }
+        if (m.type === MSG.REVERSE_CONNECT) { await send(reverseReject({ targetFingerprint: String(m.target_fingerprint ?? ''), username: '', reason: 'relay is not enabled on this server' })); return true; }
+        if (m.type === MSG.REVERSE_REGISTER) { await send(errorMsg({ code: 3, message: 'relay is not enabled on this server' })); return true; }
+        return false;
+      }
+      if (!RELAY_TYPES.has(m.type)) {
+        // Anything else a bridged connection sends that may cross a bridge, does.
+        if (!relayHandle) return false;
+        hub.touch(relayHandle);
+        return hub.forward(relayHandle, m);
+      }
+      // Relay roles are keyed by an authenticated key: from_fingerprint means nothing for a password login.
+      if (!state.fingerprint) {
+        await send(errorMsg({ code: 2, message: 'relay operations need a key login' }));
+        return true;
+      }
+      const h = hubHandle();
+      switch (m.type) {
+        case MSG.REVERSE_REGISTER: {
+          const reason = await hub.register(h, m, { username: state.username, fingerprint: state.fingerprint });
+          if (reason) {
+            log(`ReverseRegister refused: ${reason}`);
+            await send(errorMsg({ code: 2, message: `registration refused: ${reason}` }));
+          }
+          return true;
+        }
+        case MSG.REVERSE_LIST: await send(await hub.list({ username: state.username, fingerprint: state.fingerprint })); return true;
+        case MSG.REVERSE_CONNECT: await hub.connect(h, m); return true;
+        case MSG.REVERSE_ACCEPT: case MSG.REVERSE_REJECT: hub.answer(h, m); return true;
+        default: hub.forward(h, m); return true; // a RelayForward the client wrote itself
+      }
     }
 
     // ── MCP ───────────────────────────────────────────────────────────
@@ -486,13 +556,19 @@ export function createConnectionFactory(cfg) {
         },
       };
       channels.set(channelId, ch);
-      pendingStreams.push(channelId);
+      if (dataStreams) pendingStreams.push(channelId);
+      // No client-opened streams on this connection (a relay bridge): stdin arrives as SessionData.
+      else ch.input = (d) => { for (const cb of inputCbs) cb(d); };
 
       let timer = null;
       if (cfg.execOptions.timeoutMs > 0) timer = setTimeout(() => abort.abort(), cfg.execOptions.timeoutMs);
 
       // Output to the opening connection's data stream (held until the client has opened it).
       const toStream = (bytes) => {
+        if (!dataStreams) {
+          wq = wq.then(() => send(sessionData({ channelId, data: bytes })));
+          return wq;
+        }
         if (!stream) { buffered.push(bytes); return Promise.resolve(); }
         const s = stream;
         wq = wq.then(() => s.write(bytes).catch(() => {}));
@@ -502,8 +578,8 @@ export function createConnectionFactory(cfg) {
       // announce support waits for the first byte): give it a bounded chance rather than
       // dropping the output or hanging forever.
       const closeStream = async (code) => {
-        if (!stream) await Promise.race([new Promise((r) => boundWaiters.push(r)), new Promise((r) => setTimeout(r, cfg.bindTimeoutMs))]);
-        if (!stream) log(`exec channel ${channelId}: data stream never appeared; output dropped`);
+        if (dataStreams && !stream) await Promise.race([new Promise((r) => boundWaiters.push(r)), new Promise((r) => setTimeout(r, cfg.bindTimeoutMs))]);
+        if (dataStreams && !stream) log(`exec channel ${channelId}: data stream never appeared; output dropped`);
         await wq;
         try { await stream?.close(); } catch { /* peer gone */ }
         await finishChannel(channelId, Number.isInteger(code) ? code : 0);
@@ -552,7 +628,7 @@ export function createConnectionFactory(cfg) {
       };
 
       await send(openOk({
-        channelId, dataMode: 'stream', capabilities: ['signal'],
+        channelId, dataMode: dataStreams ? 'stream' : 'virtual', capabilities: ['signal'],
         sessionId: hosted?.id ?? randomUUID(), token: hosted?.token ?? randomBytes(16),
       }));
       log(`exec channel ${channelId}: ${command}`);
@@ -740,7 +816,9 @@ export function createConnectionFactory(cfg) {
     }
 
     return {
-      receive(bytes) { if (!state.closed) qmux.receiveBytes(bytes); },
+      receive(bytes) { if (!state.closed) qmux?.receiveBytes(bytes); },
+      receiveMessage(msg) { if (!state.closed) chain = chain.then(() => handle(msg)).catch((e) => log(`handler error: ${e.message}`)); },
+      bindStream: bindDataStream,
       close() { shutdownAfterQueue('transport closed'); },
     };
   };

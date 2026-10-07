@@ -169,6 +169,37 @@ export interface WshServerSessionsOptions {
   sessionSecret?: string | Uint8Array;
 }
 
+/** A peer as the relay's policy callbacks see it. */
+export interface WshRelayPeer {
+  /** Hex SHA-256 of the peer's key. */
+  fingerprint: string;
+  username: string;
+  capabilities: string[];
+}
+
+export interface WshServerRelayOptions {
+  /**
+   * May this authenticated connection register as a peer? `who` is the connection; `record` what it asks to
+   * advertise. Default: no (a relay with no policy admits nobody).
+   */
+  canRegister?: (
+    who: { username: string; fingerprint: string },
+    record: { username: string; capabilities: string[]; peerType: string; shellBackend: string },
+  ) => boolean | Promise<boolean>;
+  /**
+   * May `from` list and connect to `to`? A peer `from` may not connect to is neither listed nor distinguishable
+   * from an absent one. Default: no.
+   */
+  canConnect?: (
+    from: { username: string; fingerprint: string },
+    to: WshRelayPeer,
+  ) => boolean | Promise<boolean>;
+  /** Registered peers at once (default 1024). */
+  maxPeers?: number;
+  /** How long a `ReverseConnect` waits for its peer to answer before the operator is rejected (default 8000). */
+  connectTimeoutMs?: number;
+}
+
 export interface WshServerOptions {
   /** Bind address (default `127.0.0.1`). */
   host?: string;
@@ -196,6 +227,12 @@ export interface WshServerOptions {
   sessions?: true | WshServerSessionsOptions;
   /** Alias for `sessions.sessionSecret`. */
   sessionSecret?: string | Uint8Array;
+  /**
+   * Act as a relay: peers (`createReverseHost`, or any client's `connectReverse()`) register a signed record,
+   * operators list and `reverseConnect()` to them, and traffic is carried between the two as `RelayForward`.
+   * Default deny -- give both `canRegister` and `canConnect`. Off by default.
+   */
+  relay?: WshServerRelayOptions;
   /** Serve MCP tools (`McpDiscover` / `McpCall`) and advertise `mcp-call-id`. Off by default. */
   mcp?: WshServerMcpOptions;
   /** How long exec output waits for a client that has not yet opened its data stream (default 3000). */
@@ -215,6 +252,8 @@ export interface WshServer {
   close(): Promise<void>;
   /** The bound address, or `null` when not listening. */
   address(): WshServerAddress | null;
+  /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */
+  peerFingerprints(): string[];
   /** The advertised host identity; `null` before `listen()` resolves or without a `hostKey`. */
   hostKey(): WshServerHostKey | null;
 }
@@ -226,3 +265,40 @@ export function parseAuthorizedKeys(text: string): Uint8Array[];
 
 /** ServerHello feature: the host discovers client-opened exec data streams itself (no primer byte). */
 export const STREAM_ANNOUNCE: 'stream-announce';
+
+export interface WshReverseHostOptions {
+  /** The relay to register with (`ws://` / `wss://`). */
+  url: string;
+  username: string;
+  /** This host's identity; its fingerprint is what operators connect to. */
+  keyPair: CryptoKeyPair;
+  /** Who may be bridged to this host. Default: nobody. */
+  accept?: (operator: { fingerprint: string; username: string }) => boolean | Promise<boolean>;
+  exec?: true | WshServerExecOptions | WshExecRunner;
+  pty?: WshServerPtyOptions;
+  fs?: WshServerFsOptions;
+  mcp?: WshServerMcpOptions;
+  /** Dial again, with backoff, after the relay connection ends -- which a relay does when a bridge does (default true). */
+  reconnect?: boolean;
+  /** Extra options for the relay connection (`expectHostKey`, `knownHosts`, `trustOnFirstUse`, ...). */
+  connect?: Record<string, unknown>;
+  peerType?: string;
+  onLog?: (line: string) => void;
+}
+
+export interface WshReverseHost {
+  /** Dial the relay and register (rejects if the first attempt fails). Registration is not acknowledged on the wire. */
+  start(): Promise<{ fingerprint: string }>;
+  /** Leave the relay and end any bridged session. */
+  close(): Promise<void>;
+  /** What operators connect to; `null` before `start()`. */
+  readonly fingerprint: string | null;
+  /** Is the relay connection up right now? */
+  readonly connected: boolean;
+}
+
+/**
+ * A host that dials OUT to a relay and serves the operator it bridges to it, with the same exec / pty / fs / mcp
+ * backends `createWshServer` serves direct clients with. For a machine that cannot accept connections.
+ */
+export function createReverseHost(options: WshReverseHostOptions): WshReverseHost;
