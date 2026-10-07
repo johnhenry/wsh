@@ -2,7 +2,7 @@
  * Type-only fixture: `@johnhenry/wsh/server` must resolve by its published
  * subpath (exports map `types` condition) and type the documented surface.
  */
-import { createWshServer, createReverseHost, type WshServer, type WshServerOptions, type WshReverseHost } from '@johnhenry/wsh/server';
+import { createWshServer, createReverseHost, generateSelfSignedCertificate, type WshServer, type WshServerOptions, type WshReverseHost } from '@johnhenry/wsh/server';
 import { sign, verify } from '@johnhenry/wsh';
 
 const options: WshServerOptions = {
@@ -37,6 +37,10 @@ const relayOptions: WshServerOptions = {
 declare const kp: CryptoKeyPair;
 const reverse: WshReverseHost = createReverseHost({ url: 'ws://relay', username: 'host', keyPair: kp, exec: true, accept: ({ fingerprint }) => fingerprint.length > 0 });
 const peers: string[] = createWshServer(relayOptions).peerFingerprints();
+const wtOptions: WshServerOptions = { webTransport: { port: 4433, path: '/wsh', selfSigned: { hosts: ['localhost'], validityDays: 7 } } };
+const wtOwnCert: WshServerOptions = { webTransport: { cert: 'pem', privKey: 'pem', host: '0.0.0.0' } };
+const wtInfo: { url: string; certificateHash: Uint8Array | null } | null = createWshServer(wtOptions).webTransport();
+const selfSigned: { cert: string; privKey: string; hash: Uint8Array; notAfter: Date } = generateSelfSignedCertificate({ validityDays: 3 });
 const server: WshServer = createWshServer(options);
 const bound: Promise<{ address: string; port: number }> = server.listen();
 const maybe: { address: string; port: number } | null = server.address();
@@ -46,4 +50,4 @@ const hk: { fingerprint: string; publicKey: Uint8Array; openssh: string } | null
 declare const key: CryptoKey;
 const sig: Promise<Uint8Array> = sign(key, new Uint8Array(1));
 const ok: Promise<boolean> = verify(key, new Uint8Array(64), new Uint8Array(1));
-export { relayOptions, reverse, peers, sessionOptions, sessionsOn, mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };
+export { wtOptions, wtOwnCert, wtInfo, selfSigned, relayOptions, reverse, peers, sessionOptions, sessionsOn, mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };

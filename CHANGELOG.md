@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.23.0 (2026-10-07)
+
+- **New: `@johnhenry/wsh/server` listens for WebTransport (#70).**
+  `createWshServer({ webTransport: { port, host?, path = '/wsh', cert, privKey, selfSigned, secret? } })`
+  serves HTTP/3 sessions with `@fails-components/webtransport` (imported lazily; an optional
+  peer, along with `@fails-components/webtransport-transport-http3-quiche`) next to the
+  WebSocket listener, with the same auth, `exec`, `pty`, `fs`, `mcp`, `sessions` and `relay`. The
+  control stream is the session's first bidirectional stream (length-prefixed CBOR frames),
+  later client-opened bidirectional streams bind to exec channels in `OpenOk` order, and the host
+  advertises `stream-announce` (a WebTransport stream is visible when it is created, so no
+  primer). `selfSigned: true` generates, with no dependency, a 13-day ECDSA P-256 certificate and
+  `server.webTransport()` returns its SHA-256 (`certificateHash`) for the client's
+  `serverCertificateHashes`; `generateSelfSignedCertificate()` is exported. The certificate is
+  not renewed. `server.close()` closes the WebTransport sessions.
+- **Fixed (client): a WebTransport session that never became ready left `wt.closed`'s
+  rejection unhandled** -- fatal in Node -- on top of the `ready` rejection `connect()` already
+  surfaces. The transport now observes `closed` from the start.
+- **Tests:** `test/server-webtransport.test.mjs` runs the stock client over a real HTTP/3
+  connection (pinned hash, `echo hello`, concurrent exec, stdin, `fileWrite`/`fileRename`, MCP,
+  auth refusal, wrong pin, wrong path, shutdown) and skips with the reason where the native binary
+  cannot load. No spec, codegen or Rust change.
+
 ## 0.22.0 (2026-10-07)
 
 - **New: `@johnhenry/wsh/server` is a relay (#69).** `createWshServer({ relay: {

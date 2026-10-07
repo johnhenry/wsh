@@ -493,6 +493,11 @@ export class WebTransportTransport extends WshTransport {
     const wt = wtOptions ? new WebTransport(url, wtOptions) : new WebTransport(url);
     this.#wt = wt;
 
+    // A session that never becomes ready rejects `closed` as well as `ready`. Nothing
+    // observes `closed` until #monitorClosed (below, after `ready`), so the second
+    // rejection would surface as an unhandled one -- fatal in Node.
+    wt.closed?.catch?.(() => {});
+
     // Wait for the connection to be ready.
     await wt.ready;
 

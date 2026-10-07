@@ -207,3 +207,28 @@ describe('WebTransportTransport passes options to the WebTransport constructor',
     assert.equal(t.state, 'closed');
   });
 });
+
+describe('WebTransportTransport when the session never becomes ready', () => {
+  it('rejects connect() without leaving `closed`\'s rejection unhandled (fatal in Node)', async () => {
+    class NeverReady extends FakeWebTransport {
+      constructor(url, options) {
+        super(url, options);
+        const err = new Error('Opening handshake failed.');
+        this.ready = Promise.reject(err);
+        this.closed = Promise.reject(err);
+      }
+    }
+    globalThis.WebTransport = NeverReady;
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const t = new WebTransportTransport();
+      await assert.rejects(() => t.connect('https://example.test:4433/wsh'), /Opening handshake failed/);
+      await new Promise((r) => setTimeout(r, 50));
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+});
