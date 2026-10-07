@@ -98,13 +98,12 @@ is accepted on the wire but not implemented server-side. See the README's
 
 ## Releases
 
-**npm (`@johnhenry/wsh`):** bump `version` in `package.json`, add the
-`CHANGELOG.md` entry, merge, then `npm version <bump> && git push
---follow-tags` (or push a `v*` tag directly) -- `.github/workflows/publish.yml`
-is deliberately tag-triggered rather than the family's usual `release:
-published` (see the workflow's own header comment), gated on the full JS
-suite, then idempotent (`npm view` pre-flight guard) with `--provenance
---access public`.
+**npm (`@johnhenry/wsh`):** bump `version` in `package.json` and add the
+`CHANGELOG.md` entry in the PR; merge it. `.github/workflows/publish.yml` runs on
+every push to `main`: gated on the full JS suite, it publishes only if that
+version is not on npm yet (`--provenance --access public`), then tags
+`v<version>` and creates the GitHub Release itself. Do not push the tag by
+hand -- the workflow creates it, and pushing it first would only race it.
 
 **Rust binaries (`wsh-cli`/`wsh-server`):** tag `rust-vX.Y.Z` (workspace
 version in `Cargo.toml`, independent of the npm package's version) to

@@ -543,7 +543,7 @@ the host to find it:
 | Current stock client | `@johnhenry/wsh/server` (advertises `stream-announce`) | The client's transport announces the stream with an empty STREAM frame. **No primer is written.** |
 | Current stock client | Host without `stream-announce` (e.g. the Rust `wsh-server`, older vendored hosts) | The client writes a one-byte primer (`0x00`) on the new stream so the host sees it; that host strips it. `primer: false` disables this (then such a host never binds the stream and the output is lost). |
 | A client that primes anyway (older stock client, `primer` forced, other implementations) | `@johnhenry/wsh/server` | **The leading `0x00` is dropped:** if the first data on an exec stream is exactly one `0x00` byte it is discarded, never forwarded to the process's stdin. Only that first chunk is inspected; a later `0x00`, or a first chunk that is longer than one byte, is delivered untouched. The cost: a client whose genuine first stdin chunk is a lone NUL loses it. |
-| A client that neither announces nor primes | `@johnhenry/wsh/server` | The host waits `bindTimeoutMs` (default 3000) for the stream, then drops the output and logs it. |
+| A client that neither announces nor primes (a third-party QMux client; the stock client always does one or the other) | `@johnhenry/wsh/server` | The host waits `bindTimeoutMs` (default 3000) for the stream, then drops the output and logs it. This cannot be fixed host-side: nothing about the stream has been sent, so there is nothing to bind. Such a client must send `QMuxStream.announce()` (an empty STREAM frame) or any first write -- a zero-length `write()` now does the same. |
 
 ## Attach and Resume
 

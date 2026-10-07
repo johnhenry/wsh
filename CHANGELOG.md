@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.23.1 (2026-10-07)
+
+- **Verified and closed: stream-mode sessions invisible to the host until the client writes a
+  byte (#65).** Fixed in two steps already released: 0.18.0 made the stock client's transport
+  announce every stream it opens with an empty STREAM frame (`QMuxStream.announce()`) and made
+  `@johnhenry/wsh/server` advertise `stream-announce` and drop a lone leading `0x00` primer; 0.23.0's
+  WebTransport listener needs neither. The Rust `wsh-server` is not affected: it serves exec
+  channels as `data_mode: 'virtual'` (no second stream), so it has no primer to strip. The one
+  residual case, a third-party client that neither announces nor primes, cannot be solved
+  host-side (nothing is on the wire) and is documented in the README's compatibility table.
+- **Fixed: a zero-length `QMuxStream.write()` on a fresh stream sent nothing** and marked the
+  stream as started, so a later `announce()` was a no-op and the peer still never saw the stream.
+  It now announces the stream (the issue's expected behaviour); on a stream that already sent
+  something it remains a no-op.
+- **Tests:** an un-primed client (`primer: false`, nothing ever written) against the Node host for
+  both `WshClient.exec()` and `openSession()`; QMux-level visibility (opened stream invisible,
+  `announce()` and a zero-length write make it visible without any payload).
+- **Docs:** `AGENTS.md` release section now describes the publish-from-main model.
+
 ## 0.23.0 (2026-10-07)
 
 - **New: `@johnhenry/wsh/server` listens for WebTransport (#70).**

@@ -117,6 +117,51 @@ describe('QMuxConnection: basic stream round trip', () => {
   });
 });
 
+describe('QMuxConnection: stream visibility (#65)', () => {
+  it('an opened stream is invisible to the peer until announce() or a first write', async () => {
+    const { client, server } = makeLinkedPair();
+    client.sendHandshake();
+    server.sendHandshake();
+    const seen = [];
+    const chunks = [];
+    server.onStreamOpen = (s) => { seen.push(s.id); s.onData = (d) => chunks.push(d); };
+
+    const quiet = await client.openStream();
+    await nextTick(5);
+    assert.deepEqual(seen, [], 'nothing was sent, so the host cannot know the stream exists');
+
+    quiet.announce(); // what the stock transport does to every stream it opens
+    await nextTick(5);
+    assert.deepEqual(seen, [quiet.id]);
+    assert.equal(chunks.length, 0, 'the announce carries no payload for a host to strip');
+
+    await quiet.write(textEncoder.encode('x'));
+    await nextTick(5);
+    assert.equal(chunks.length, 1);
+    assert.equal(textDecoder.decode(chunks[0]), 'x');
+  });
+
+  it('a zero-length write announces the stream too (it used to send nothing)', async () => {
+    const { client, server } = makeLinkedPair();
+    client.sendHandshake();
+    server.sendHandshake();
+    const seen = [];
+    const chunks = [];
+    server.onStreamOpen = (s) => { seen.push(s.id); s.onData = (d) => chunks.push(d); };
+
+    const s = await client.openStream();
+    await s.write(new Uint8Array(0));
+    await nextTick(5);
+    assert.deepEqual(seen, [s.id]);
+    assert.equal(chunks.length, 0);
+    await s.write(new Uint8Array(0)); // idempotent: no second open
+    await s.write(textEncoder.encode('y'));
+    await nextTick(5);
+    assert.deepEqual(seen, [s.id]);
+    assert.equal(textDecoder.decode(chunks[0]), 'y');
+  });
+});
+
 describe('QMuxConnection: flow control', () => {
   it('write() blocks when the stream-level window is exhausted and resumes once MAX_STREAM_DATA arrives', async () => {
     const { client, server } = makeLinkedPair({ initialMaxStreamData: 16, initialMaxData: 10_000 });

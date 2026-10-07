@@ -85,6 +85,20 @@ describe('createWshServer', () => {
       } finally { await client.disconnect(); }
     });
 
+    it('#65: an un-primed client (primer: false, nothing ever written) still gets its output', async () => {
+      // The issue's scenario: a stream-mode exec whose client never writes a byte.
+      // The transport's empty-STREAM-frame announce is what lets the host bind it.
+      const { stdout, exitCode } = await WshClient.exec(ctx.url, 'echo hello', { username: 'alice', keyPair, primer: false, timeout: 5000 });
+      assert.equal(dec.decode(stdout), 'hello\n');
+      assert.equal(exitCode, 0);
+      const client = await connect(ctx.url, keyPair);
+      try {
+        const session = await client.openSession({ type: 'exec', command: 'echo hi', primer: false });
+        assert.equal(session.dataMode, 'stream');
+        assert.equal(await collect(session), 'hi\n');
+      } finally { await client.disconnect(); }
+    });
+
     it('drops a lone leading 0x00 from a client that primes anyway', async () => {
       const client = await connect(ctx.url, keyPair);
       try {
