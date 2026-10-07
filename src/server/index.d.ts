@@ -3,6 +3,8 @@
  * root (`@johnhenry/wsh`) never imports it.
  */
 
+import type { RpcChannel } from '@johnhenry/wsh';
+
 /** Who is asking to authenticate. */
 export interface WshServerPrincipal {
   username: string;
@@ -290,10 +292,43 @@ export interface WshServerOptions {
   webTransport?: WshServerWebTransportOptions;
   /** Serve MCP tools (`McpDiscover` / `McpCall`) and advertise `mcp-call-id`. Off by default. */
   mcp?: WshServerMcpOptions;
+  /**
+   * Typed RPC channels (wsh #85): `{ [protocol]: handler }`. Each is advertised as `rpc-protocol:<name>` (plus `rpc` and
+   * `rpc-max-message:<n>`). Built-ins: `'wsh-host': true` (`host.info`, `host.ping`), `'wsh-fs': true` (the server's
+   * `fs`) or `{ root, readOnly?, maxFileBytes? }` (`stat list read write upload download rename mkdir remove`). Anything
+   * else is a function run per opened channel, e.g. `mcp: mcpServerAdapter(server)`. Off by default.
+   */
+  rpc?: Record<string, true | WshServerFsOptions | WshRpcHandler | false | null | undefined>;
+  /** Largest single rpc message (default 1048576). */
+  rpcMaxMessageBytes?: number;
+  /** Concurrent requests per rpc channel before `-32002` (default 64). */
+  rpcMaxInflight?: number;
   /** How long exec output waits for a client that has not yet opened its data stream (default 3000). */
   bindTimeoutMs?: number;
   onLog?: (line: string) => void;
 }
+
+/** Per-channel context handed to an rpc protocol handler. */
+export interface WshRpcContext {
+  protocol: string;
+  channelId: number;
+  user: string | null;
+  fingerprint: string | null;
+  remote: { address?: string; headers?: Record<string, unknown> };
+  /** The exact `ServerHello.features` this connection received. */
+  features: string[];
+  hostFingerprint: string | null;
+  log(line: string): void;
+}
+
+/** Runs once per opened channel; register methods on `channel`. Inbound messages wait until the returned promise settles. */
+export type WshRpcHandler = (channel: RpcChannel, ctx: WshRpcContext) => void | Promise<void>;
+
+/**
+ * Expose an MCP `Server` (`@modelcontextprotocol/sdk`) over an rpc channel: `rpc: { mcp: mcpServerAdapter(server) }`.
+ * An instance serves one channel at a time; pass a factory for one `Server` per channel. The SDK is not imported.
+ */
+export function mcpServerAdapter(serverOrFactory: { connect(transport: any): Promise<void>; close?(): Promise<void> } | ((ctx: WshRpcContext) => any)): WshRpcHandler;
 
 export interface WshServerAddress {
   address: string;

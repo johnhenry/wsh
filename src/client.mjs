@@ -29,6 +29,7 @@ import {
   keyExchange as keyExchangeMsg,
   fileOp as fileOpMsg,
   fileChunk as fileChunkMsg,
+  fileResult as fileResultMsg,
   authorizedKeyAdd as authorizedKeyAddMsg,
   policyEval as policyEvalMsg, policyUpdate as policyUpdateMsg,
   detach as detachMsg,
@@ -40,6 +41,10 @@ import { signChallenge, exportPublicKeyRaw, signPeerRecord, verifyPeerRecord, im
 import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
 import { WshSession } from './session.mjs';
 import { cborDecode } from './cbor.mjs';
+import {
+  RpcChannel, RpcError, RPC_ERROR, RPC_FEATURE, RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE,
+  rpcProtocolFeature, parseRpcFeatures,
+} from './rpc.mjs';
 import {
   HostKeyError, newHostKeyNonce, hostKeyProofMessage, findHostKeyAdvert,
   HOST_KEY_NONCE_PREFIX,
@@ -58,6 +63,7 @@ const STATE_CLOSED        = 'closed';
 
 const DEFAULT_AUTH_TIMEOUT   = 10_000;  // ms
 const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
+const FS_RPC_OPS = new Set(['stat', 'list', 'read', 'write', 'mkdir', 'remove', 'rename']);
 
 /**
  * ServerHello feature advertising that McpResult echoes McpCall's call_id.
@@ -677,10 +683,20 @@ export class WshClient {
    *   stream (without it they never bind the stream and drop all output).
    *   Skipped automatically against a host advertising `stream-announce`; pass
    *   `false` to never send it (e.g. a host that forwards stdin verbatim).
+   * @param {string} [opts.protocol] - For `type: 'rpc'` (wsh #85): the protocol to speak (`mcp`, `wsh-fs`,
+   *   `wsh-host`, or a host-defined name). Carried in `Open.command`. The session's data stream is a CBOR sequence
+   *   of JSON-RPC 2.0 messages -- use {@link WshClient#openRpc} to get an `RpcChannel` over it.
+   *   Throws `RpcError` (`UNSUPPORTED_PROTOCOL`) before sending anything if the host does not advertise it.
+   * @param {(session: WshSession) => void} [opts.attach] - Advanced: called synchronously the moment the data
+   *   stream is bound, before any received byte can be delivered (`openRpc` uses it to set `onData`).
    * @returns {Promise<WshSession>}
    */
-  async openSession({ type = 'pty', command, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT, primer = true } = {}) {
+  async openSession({ type = 'pty', command, protocol, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT, primer = true, attach } = {}) {
     this.#assertAuthenticated('openSession');
+    if (type === 'rpc') {
+      this.#assertRpcProtocol(protocol);
+      command = protocol;
+    }
     const requestedChannelId = this._nextChannelId();
 
     await this.#transport.sendControl(
@@ -696,6 +712,7 @@ export class WshClient {
         mode: 'session',
         kind: type,
         primer,
+        attach,
         requestedChannelId,
         resolve,
         reject,
@@ -707,6 +724,50 @@ export class WshClient {
       }, timeout);
       this.#pendingOpens.push(entry);
     });
+  }
+
+  /** Refuse an `rpc` open the host did not advertise, before any bytes are sent (wsh #85). */
+  #assertRpcProtocol(protocol) {
+    if (typeof protocol !== 'string' || !RPC_PROTOCOL_NAME_RE.test(protocol)) {
+      throw new RpcError(RPC_ERROR.INVALID_PARAMS, 'openSession({ type: "rpc" }) needs a protocol name', undefined, 'INVALID_PROTOCOL');
+    }
+    if (!this.hasFeature(RPC_FEATURE)) {
+      throw new RpcError(RPC_ERROR.UNSUPPORTED_PROTOCOL, `UNSUPPORTED_PROTOCOL: this host does not advertise "${RPC_FEATURE}" channels (cannot open "${protocol}")`, undefined, 'UNSUPPORTED_PROTOCOL');
+    }
+    if (!this.hasFeature(rpcProtocolFeature(protocol))) {
+      throw new RpcError(RPC_ERROR.UNSUPPORTED_PROTOCOL, `UNSUPPORTED_PROTOCOL: this host does not advertise the "${protocol}" rpc protocol`, undefined, 'UNSUPPORTED_PROTOCOL');
+    }
+  }
+
+  /**
+   * Open a typed (object-mode) RPC channel (wsh #85): sugar over `openSession({ type: 'rpc', protocol })` that
+   * returns an {@link RpcChannel} -- JSON-RPC 2.0 over a CBOR sequence on one QMux stream.
+   *
+   * @param {string} protocol - e.g. `'mcp'`, `'wsh-fs'`, `'wsh-host'`
+   * @param {object} [opts]
+   * @param {number} [opts.timeoutMs] - default timeout for every `request()` on the channel
+   * @param {number} [opts.openTimeout] - how long to wait for the host to open the channel
+   * @returns {Promise<RpcChannel>}
+   */
+  async openRpc(protocol, { timeoutMs, openTimeout = DEFAULT_OPEN_TIMEOUT } = {}) {
+    this.#assertAuthenticated('openRpc');
+    const { maxMessageBytes } = parseRpcFeatures(this.#serverFeatures);
+    let channel = null;
+    const session = await this.openSession({
+      type: 'rpc', protocol, timeout: openTimeout,
+      attach: (s) => {
+        channel = new RpcChannel({
+          maxMessageBytes: maxMessageBytes ?? RPC_DEFAULT_MAX_MESSAGE,
+          timeoutMs,
+          write: (bytes) => s.write(bytes),
+          close: () => s.close(),
+        });
+        s.onData = (bytes) => channel.feed(bytes);
+        s.onClose = (err) => channel.handleClose(err ? 'stream-error' : 'channel-closed');
+      },
+    });
+    channel.session = session;
+    return channel;
   }
 
   /**
@@ -1835,6 +1896,12 @@ export class WshClient {
    */
   async fileOperation(op, path, opts = {}, timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('fileOperation');
+    // wsh #85: a host that serves the `wsh-fs` rpc protocol is preferred over the FileOp/FileResult control path.
+    if (this.preferRpcFiles && FS_RPC_OPS.has(op) && this.hasFeature(rpcProtocolFeature('wsh-fs'))) {
+      let rpc = null;
+      try { rpc = await this.#fsChannel(); } catch { /* fall back to FileOp */ }
+      if (rpc) return this.#fileOperationRpc(rpc, op, path, opts, timeout);
+    }
     const channelId = this._nextChannelId();
     // FileOp and FileResult both carry channel_id; each call claims only the
     // result for its own id, so overlapping operations cannot swap replies (#72).
@@ -1878,6 +1945,77 @@ export class WshClient {
       `Timed out waiting for file ${op} result`,
       byChannel
     );
+  }
+
+  /**
+   * Use the `wsh-fs` rpc protocol for `fileStat`/`fileList`/`fileRead`/`fileWrite`/... when the host advertises it
+   * (default `true`); set `false` to always use the FileOp control path. Results keep the FileResult shape either way.
+   */
+  preferRpcFiles = true;
+  #fsRpc = null;
+
+  async #fsChannel() {
+    if (this.#fsRpc) {
+      const existing = await this.#fsRpc.catch(() => null);
+      if (existing && !existing.closed) return existing;
+      this.#fsRpc = null;
+    }
+    const opening = this.openRpc('wsh-fs');
+    this.#fsRpc = opening;
+    try { return await opening; } catch (err) { if (this.#fsRpc === opening) this.#fsRpc = null; throw err; }
+  }
+
+  /** `fileOperation` over `wsh-fs`, mapped back onto the FileResult shape the FileOp path returns. */
+  async #fileOperationRpc(rpc, op, path, opts, timeout) {
+    const channelId = this._nextChannelId();
+    const ok = (metadata = {}, entries = []) => fileResultMsg({ channelId, success: true, metadata, entries });
+    const timeoutMs = timeout;
+    try {
+      switch (op) {
+        case 'stat': return ok(await rpc.request('stat', { path }, { timeoutMs }));
+        case 'list': {
+          const r = await rpc.request('list', { path }, { timeoutMs });
+          return ok({ path: r.path }, r.entries);
+        }
+        case 'read': {
+          const parts = [];
+          const r = await rpc.request('read', { path, offset: opts.offset, length: opts.length ?? FILE_CHUNK_SIZE }, { timeoutMs, onProgress: (c) => { if (c instanceof Uint8Array) parts.push(c); } });
+          const data = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+          let at = 0;
+          for (const p of parts) { data.set(p, at); at += p.byteLength; }
+          return ok({ data, size: r.size });
+        }
+        case 'mkdir': case 'remove':
+          return ok(await rpc.request(op, { path }, { timeoutMs }));
+        case 'rename':
+          if (typeof opts.newPath !== 'string' || !opts.newPath) throw new TypeError('fileRename: newPath is required');
+          return ok(await rpc.request('rename', { path, newPath: opts.newPath }, { timeoutMs }));
+        case 'write': {
+          const data = typeof opts.data === 'string' ? new TextEncoder().encode(opts.data) : opts.data;
+          if (!(data instanceof Uint8Array)) throw new TypeError('fileWrite: data must be a string or Uint8Array');
+          const step = Math.max(256, Math.min(256 * 1024, rpc.maxMessageBytes - 1024));
+          const base = opts.offset === undefined || opts.offset === null ? undefined : Number(opts.offset);
+          let off = 0;
+          do {
+            const end = Math.min(off + step, data.byteLength);
+            const chunk = data.subarray(off, end);
+            // Whole-file replace streams as `upload` (offset 0 truncates, later offsets continue); an explicit
+            // offset writes in place chunk by chunk, never truncating.
+            if (base === undefined) await rpc.request('upload', { path, data: chunk, offset: off || undefined }, { timeoutMs });
+            else await rpc.request('write', { path, data: chunk, offset: base + off }, { timeoutMs });
+            off = end;
+          } while (off < data.byteLength);
+          return ok({ written: data.byteLength });
+        }
+        default: throw new Error(`unsupported file op ${op}`);
+      }
+    } catch (err) {
+      // Host-reported failures keep the FileResult contract (success: false); transport trouble still throws.
+      if (err instanceof RpcError && err.code !== RPC_ERROR.CANCELLED) {
+        return fileResultMsg({ channelId, success: false, errorMessage: err.message });
+      }
+      throw err;
+    }
   }
 
   /** Stat a remote file. */
@@ -2386,6 +2524,7 @@ export class WshClient {
 
       if (dataMode === 'virtual') {
         session._activateVirtual((m) => this.sendRelayControl(m));
+        pending.attach?.(session);
         pending.resolve(session);
         return;
       }
@@ -2397,6 +2536,7 @@ export class WshClient {
       this.#transport.openStream().then(
         async (stream) => {
           session._bind(stream.readable, stream.writable);
+          pending.attach?.(session);
           // The transport has already announced the stream, which is all a
           // current host needs. Older hosts only bind a stream on its first
           // byte, so exec (which has no stdin to send) writes a one-byte

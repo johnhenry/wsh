@@ -15,8 +15,9 @@ import { SessionRegistry } from './sessions.mjs';
 import { RelayHub } from './relay.mjs';
 import { startWebTransport } from './webtransport.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
+import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
 
-export { parseAuthorizedKeys, STREAM_ANNOUNCE };
+export { parseAuthorizedKeys, STREAM_ANNOUNCE, mcpServerAdapter };
 export { createReverseHost } from './reverse-host.mjs';
 export { generateSelfSignedCertificate } from './self-signed.mjs';
 
@@ -45,6 +46,12 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  *   Keep pty/exec sessions alive across disconnects so a client can `resumeSession()` / `attachSession()`
  *   them: a per-server registry, a ring buffer of the newest `ringBytes` (default 1 MiB) of output, and
  *   `detachTtlMs` (default 300000; 0 = kill on disconnect) / `maxDetached` (default 16) bounds. Off unless given.
+ * @param {Record<string, true | object | Function>} [options.rpc] - Typed RPC channels (wsh #85): `{ [protocol]: handler }`.
+ *   Built-ins: `'wsh-host': true`, `'wsh-fs': true` (confined by `fs`) or `{ root, readOnly?, maxFileBytes? }`; anything else is a
+ *   function `(channel, ctx) => void` run per opened channel -- e.g. `mcp: mcpServerAdapter(server)`. Each protocol is
+ *   advertised as `rpc-protocol:<name>`. Off unless given.
+ * @param {number} [options.rpcMaxMessageBytes=1048576] - Largest single rpc message (advertised as `rpc-max-message:<n>`).
+ * @param {number} [options.rpcMaxInflight=64] - Concurrent requests per rpc channel before `-32002`.
  * @param {string | Uint8Array} [options.sessionSecret] - Alias for `sessions.sessionSecret`.
  * @param {true | { file: string } | CryptoKeyPair} [options.hostKey] - The server's own Ed25519
  *   identity, advertised (with proof of possession) so clients can pin it. See `src/host-key.mjs`.
@@ -55,7 +62,7 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  * @returns {{ listen(): Promise<{address: string, port: number}>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, sessions, sessionSecret, relay, webTransport, bindTimeoutMs = 3000, onLog = () => {},
+  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, webTransport, bindTimeoutMs = 3000, onLog = () => {},
 } = {}) {
   let wss = null;
   let bound = null;
@@ -68,6 +75,7 @@ export function createWshServer({
     key: typeof rl.key === 'function' ? rl.key : ({ address }) => String(address ?? 'unknown'),
     failureDelayMs: rl.failureDelayMs ?? 250,
   };
+  const rpcHost = rpc ? createRpcHost(rpc, { files, maxMessageBytes: rpcMaxMessageBytes, maxInflight: rpcMaxInflight }) : null;
   let host_ = null;
   let registry = null;
   let hub = null;
@@ -98,7 +106,7 @@ export function createWshServer({
       if (relay) hub = new RelayHub({ ...relay, log: onLog });
       const attach = createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, log: onLog,
-        methods, hostKey: host_, rateLimit, mcp: mcpHost, sessions: registry, relay: hub,
+        methods, hostKey: host_, rateLimit, mcp: mcpHost, rpc: rpcHost, sessions: registry, relay: hub,
       });
 
       wss = new WebSocketServer({ host, port });

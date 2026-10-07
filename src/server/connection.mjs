@@ -27,6 +27,7 @@ import {
 import { FILE_CHUNK_BYTES } from './fs.mjs';
 import { MAX_ATTACHMENTS } from './sessions.mjs';
 import { MCP_CALL_ID_FEATURE } from '../client.mjs';
+import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -52,6 +53,7 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {{ pubkey: boolean, password: Function | null }} cfg.methods - which auth methods are on
  * @param {object | null} cfg.hostKey - from loadHostKey
  * @param {object | null} cfg.mcp - from createMcpHost
+ * @param {{ protocols: Map<string, Function>, maxMessageBytes: number, maxInflight: number } | null} cfg.rpc - from createRpcHost
  * @param {object | null} cfg.relay - a RelayHub (see relay.mjs); null = not a relay
  * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
@@ -202,6 +204,9 @@ export function createConnectionFactory(cfg) {
         const features = [STREAM_ANNOUNCE];
         if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE);
         if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
+        if (cfg.rpc && dataStreams && cfg.rpc.protocols.size) {
+          features.push(RPC_FEATURE, ...[...cfg.rpc.protocols.keys()].map(rpcProtocolFeature), RPC_MAX_MESSAGE_PREFIX + cfg.rpc.maxMessageBytes);
+        }
         let hostFingerprint;
         if (cfg.hostKey) {
           hostFingerprint = cfg.hostKey.fingerprint;
@@ -211,6 +216,8 @@ export function createConnectionFactory(cfg) {
             features.push(HOST_KEY_PREFIX + toHex(cfg.hostKey.publicKey), HOST_KEY_SIG_PREFIX + toHex(sig));
           }
         }
+        state.features = features;
+        state.hostFingerprint = hostFingerprint ?? null;
         await send(serverHello({ sessionId: state.sessionId, features, hostFingerprint }));
         if (method === 'pubkey') {
           state.nonce = generateNonce();
@@ -390,6 +397,7 @@ export function createConnectionFactory(cfg) {
         case 'exec': return openExec(m);
         case 'pty': return openPty(m);
         case 'file': return openFile(m);
+        case 'rpc': return openRpc(m);
         default: return send(openFail({ reason: `kind "${m.kind}" is not supported by this server` }));
       }
     }
@@ -648,6 +656,60 @@ export function createConnectionFactory(cfg) {
         if (hosted) { hosted.finish(Number.isInteger(code) ? code : 0); return; }
         await closeStream(code);
       }
+    }
+
+    // A typed RPC channel (wsh #85): `Open { kind: 'rpc', command: <protocol> }` is answered like an exec channel's -- OpenOk,
+    // then the client's data stream binds in OpenOk order -- but the stream carries a CBOR sequence of JSON-RPC messages
+    // handled by the protocol's handler, not process I/O.
+    async function openRpc(m) {
+      const rpc = cfg.rpc;
+      const protocol = typeof m.command === 'string' ? m.command : '';
+      const handler = rpc?.protocols.get(protocol);
+      if (!rpc || !dataStreams || !handler) {
+        const why = !rpc || !dataStreams ? 'rpc is not enabled on this server' : `protocol "${protocol}" is not supported by this server`;
+        return send(openFail({ reason: `UNSUPPORTED_PROTOCOL: ${why}` }));
+      }
+      const channelId = ++state.nextChannel;
+      let chan = null;
+      let stream = null;
+      const ch = {
+        // The peer closed the channel (or the connection is going away).
+        kill: () => {
+          channels.delete(channelId);
+          chan?.handleClose('peer-closed');
+          try { stream?.close().catch(() => {}); } catch { /* gone */ }
+        },
+        bind(s) {
+          stream = s;
+          chan = new RpcChannel({
+            maxMessageBytes: rpc.maxMessageBytes,
+            maxInflight: rpc.maxInflight,
+            write: (bytes) => s.write(bytes),
+            // The host ended it: close our end of the stream, then tell the client the channel is over.
+            close: async () => { try { await s.close(); } catch { /* peer gone */ } await finishChannel(channelId, 0); },
+          });
+          s.onData = (d) => chan.feed(d);
+          s.onEnd = () => { void chan.close('stream-end'); };
+          s.onReset = () => chan.handleClose('stream-reset');
+          const ctx = {
+            protocol, channelId, user: state.username, fingerprint: state.fingerprint, remote,
+            features: state.features ?? [], hostFingerprint: state.hostFingerprint,
+            log: (line) => log(`rpc ${protocol} channel ${channelId}: ${line}`),
+          };
+          // Inbound messages wait until the handler (possibly async) has registered its methods.
+          chan.hold();
+          let ready;
+          try { ready = Promise.resolve(handler(chan, ctx)); } catch (e) { ready = Promise.reject(e); }
+          ready.then(() => chan.release(), (e) => {
+            log(`rpc ${protocol} channel ${channelId}: handler failed: ${e?.message ?? e}`);
+            void chan.close('handler-error');
+          });
+        },
+      };
+      channels.set(channelId, ch);
+      pendingStreams.push(channelId);
+      await send(openOk({ channelId, dataMode: 'stream', capabilities: [] }));
+      log(`rpc channel ${channelId}: ${protocol}`);
     }
 
     async function openPty(m) {

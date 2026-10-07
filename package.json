@@ -1,6 +1,6 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
@@ -26,7 +26,8 @@
   "peerDependencies": {
     "@fails-components/webtransport": "^1.6.4",
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
-    "ws": "^8.0.0"
+    "ws": "^8.0.0",
+    "@modelcontextprotocol/sdk": "^1.17.0"
   },
   "peerDependenciesMeta": {
     "@fails-components/webtransport": {
@@ -37,6 +38,9 @@
     },
     "ws": {
       "optional": true
+    },
+    "@modelcontextprotocol/sdk": {
+      "optional": true
     }
   },
   "devDependencies": {
@@ -44,7 +48,8 @@
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
     "@johnhenry/browsermesh-primitives": "^0.2.0",
     "typescript": "^7.0.0",
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "@modelcontextprotocol/sdk": "^1.17.0"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
@@ -57,7 +62,8 @@
     "example:02": "node examples/02-tampered-challenge-fails-authentication.mjs",
     "example:03": "node examples/03-handshake-to-exec-over-in-process-pipe.mjs",
     "example:04": "node examples/04-recording-replays-with-original-timing.mjs",
-    "example:05": "node examples/05-remote-mcp-tools-called-through-bridge.mjs"
+    "example:05": "node examples/05-remote-mcp-tools-called-through-bridge.mjs",
+    "example:06": "node examples/06-rpc-requests-answered-out-of-order.mjs"
   },
   "keywords": [
     "wsh",
