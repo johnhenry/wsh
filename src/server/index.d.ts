@@ -196,6 +196,17 @@ export interface WshServerRelayOptions {
     from: { username: string; fingerprint: string },
     to: WshRelayPeer,
   ) => boolean | Promise<boolean>;
+  /**
+   * Called (not awaited; a throw is logged) when an authenticated operator asks to connect to a peer that is not
+   * registered, with the operator, the fingerprint it asked for and the `ReverseConnect`'s claimed `username`. It
+   * never changes the answer (the operator is still told `no such peer`); it lets the host reach the peer another
+   * way, e.g. a Web Push notification.
+   */
+  onUnreachable?: (
+    from: { username: string; fingerprint: string },
+    targetFingerprint: string,
+    request: { username?: string },
+  ) => unknown;
   /** Registered peers at once (default 1024). */
   maxPeers?: number;
   /**
@@ -323,6 +334,16 @@ export interface WshServerOptions {
    * Default deny -- give both `canRegister` and `canConnect`. Off by default.
    */
   relay?: WshServerRelayOptions;
+  /**
+   * Serve the WebSocket listener over TLS (`wss://`) on the same port; these are the options of `https.createServer`.
+   * The WebTransport listener has its own certificate (`webTransport`). Off (plain `ws://`) by default.
+   */
+  tls?: { cert: string | Uint8Array; key: string | Uint8Array; ca?: string | Uint8Array; passphrase?: string };
+  /**
+   * Handlers for application-defined control messages: one whose `type` is a string (protocol messages are numeric, so
+   * there is no collision) from an authenticated connection is handed to `extensions[type]`. A throw is logged.
+   */
+  extensions?: Record<string, (msg: Record<string, unknown>, ctx: { username: string; fingerprint: string | null; send: (msg: object) => unknown }) => unknown>;
   /**
    * Also listen for WebTransport (HTTP/3 over UDP) clients -- the same auth, exec, pty, fs, mcp, sessions and relay as the
    * WebSocket listener, with real independent streams. Needs the optional peers `@fails-components/webtransport` and

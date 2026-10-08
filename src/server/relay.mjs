@@ -77,8 +77,8 @@ export class RelayHub {
   /** fingerprint -> the highest record seq ever accepted (survives disconnects, bounded). */
   #lastSeq = new Map();
 
-  constructor({ canRegister, canConnect, maxPeers = DEFAULT_MAX_PEERS, maxOperatorsPerPeer = 1, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, log = () => {} } = {}) {
-    for (const [name, fn] of [['canRegister', canRegister], ['canConnect', canConnect]]) {
+  constructor({ canRegister, canConnect, maxPeers = DEFAULT_MAX_PEERS, maxOperatorsPerPeer = 1, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, onUnreachable, log = () => {} } = {}) {
+    for (const [name, fn] of [['canRegister', canRegister], ['canConnect', canConnect], ['onUnreachable', onUnreachable]]) {
       if (fn !== undefined && typeof fn !== 'function') throw new TypeError(`createWshServer: relay.${name} must be a function`);
     }
     if (!Number.isSafeInteger(maxOperatorsPerPeer) || maxOperatorsPerPeer < 1) throw new TypeError('createWshServer: relay.maxOperatorsPerPeer must be a positive integer');
@@ -87,6 +87,7 @@ export class RelayHub {
     this.canConnect = canConnect ?? (() => false);
     this.maxPeers = maxPeers;
     this.connectTimeoutMs = connectTimeoutMs;
+    this.onUnreachable = onUnreachable;
     this.log = log;
   }
 
@@ -209,6 +210,14 @@ export class RelayHub {
   async connect(operator, msg) {
     const reject = (reason) => operator.send(reverseReject({ targetFingerprint: String(msg.target_fingerprint ?? ''), username: msg.username ?? '', reason }));
     const target = this.#find(msg.target_fingerprint);
+    if (!target && this.onUnreachable) {
+      // Tell the host application nobody is registered under that name (it may know another way to reach them, e.g. a
+      // push notification). Fire and forget: it never changes the answer, and a throw is logged, not propagated.
+      try {
+        Promise.resolve(this.onUnreachable({ username: operator.username, fingerprint: operator.fingerprint }, String(msg.target_fingerprint ?? ''), { username: msg.username }))
+          .catch((e) => this.log(`relay onUnreachable threw: ${e.message}`));
+      } catch (e) { this.log(`relay onUnreachable threw: ${e.message}`); }
+    }
     // Unknown, unreachable-by-policy and self look the same to the caller.
     if (!target || target.handle === operator
       || !(await this.#allowed(this.canConnect, { username: operator.username, fingerprint: operator.fingerprint }, {

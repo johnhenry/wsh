@@ -60,14 +60,22 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  *   identity, advertised (with proof of possession) so clients can pin it. See `src/host-key.mjs`.
  * @param {object} [options.auth.rateLimit] - Password-failure throttle: `{ maxFailures=5, windowMs=60000,
  *   lockoutMs=60000, failureDelayMs=250, key(info) }` (`key` defaults to the peer address).
+ * @param {{ cert: string | Buffer, key: string | Buffer, ca?: string | Buffer, passphrase?: string }} [options.tls] - Serve the
+ *   WebSocket listener over TLS (`wss://`) on the same port: the options of `https.createServer`. Off (plain `ws://`) unless given.
+ *   The WebTransport listener has its own certificate (`webTransport.cert` / `selfSigned`).
+ * @param {Record<string, (msg: object, ctx: { username: string, fingerprint: string | null, send: Function }) => unknown>} [options.extensions]
+ *   Handlers for application-defined messages: a control message whose `type` is a *string* (every protocol message
+ *   has a numeric type, so these cannot collide) from an authenticated connection is passed to `extensions[type]`.
+ *   A handler that throws is logged and ignored. Off unless given.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {(line: string) => void} [options.onLog]
  * @returns {{ listen(): Promise<{address: string, port: number}>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, webTransport, bindTimeoutMs = 3000, onLog = () => {},
+  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, webTransport, bindTimeoutMs = 3000, onLog = () => {},
 } = {}) {
   let wss = null;
+  let httpsServer = null;
   let bound = null;
 
   const { execRunner, execOptions, pty: ptyConfig, files, mcp: mcpHost } = buildBackends({ exec, pty, fs, mcp });
@@ -110,12 +118,19 @@ export function createWshServer({
         });
       }
       if (relay) hub = new RelayHub({ ...relay, log: onLog });
+      if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createWshServer: extensions must be an object of handlers');
       const attach = createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, log: onLog,
-        methods, hostKey: host_, rateLimit, mcp: mcpHost, rpc: rpcHost, sessions: registry, relay: hub,
+        methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, sessions: registry, relay: hub,
       });
 
-      wss = new WebSocketServer({ host, port });
+      if (tls) {
+        const { createServer } = await import('node:https');
+        httpsServer = createServer(tls);
+        wss = new WebSocketServer({ server: httpsServer });
+      } else {
+        wss = new WebSocketServer({ host, port });
+      }
       wss.on('connection', (ws, req) => {
         const conn = attach({
           send: (b) => { if (ws.readyState === 1) ws.send(b); },
@@ -130,10 +145,15 @@ export function createWshServer({
         ws.on('error', () => {});
       });
       await new Promise((resolve, reject) => {
-        wss.once('listening', resolve);
-        wss.once('error', reject);
+        if (httpsServer) {
+          httpsServer.once('error', reject);
+          httpsServer.listen(port, host, () => { httpsServer.off('error', reject); resolve(); });
+        } else {
+          wss.once('listening', resolve);
+          wss.once('error', reject);
+        }
       });
-      const a = wss.address();
+      const a = (httpsServer ?? wss).address();
       bound = { address: a.address, port: a.port };
       if (webTransport) {
         try {
@@ -155,6 +175,7 @@ export function createWshServer({
       await wt?.close();
       wt = null;
       await new Promise((resolve) => server.close(resolve));
+      if (httpsServer) { const h = httpsServer; httpsServer = null; await new Promise((resolve) => h.close(resolve)); }
       registry?.closeAll();
       registry = null;
       hub?.closeAll();
