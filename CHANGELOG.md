@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.27.1 (2026-10-08) / Rust `rust-v0.4.0`
+
+- **Rust `wsh-server` serves typed RPC channels (#86).** `Open { kind: "rpc", command: <protocol> }` is accepted on
+  WebSocket (QMux) connections and the `wsh-host` (`host.info`, `host.ping`) and `wsh-fs` (`stat list read write upload
+  download rename mkdir remove`) protocols are served exactly as `@johnhenry/wsh/server` serves them: the same
+  `rpc`, `rpc-protocol:<name>` and `rpc-max-message:<n>` features, the same incremental CBOR-sequence decoder with a
+  size bound, JSON-RPC 2.0 dispatch with the same reserved codes (-32700 .. -32603, -32000 .. -32003) and messages,
+  `$/cancel` and `$/progress`, a per-channel in-flight cap, and `wsh-fs` confined like the JS `fs` option (no `..`,
+  absolute-path or symlink escapes -> -32003, read-only, size limit). Streams bind to channels in `OpenOk` order, a
+  client `Close` for an rpc channel is no longer mistaken for a session `Close`, and a host-initiated end sends
+  `Exit` + `Close`. `kind: "rpc"` is not in the generated `ChannelKind` enum, so it is recognised on the raw control
+  message and the spec and codegen are untouched. New `[rpc]` section in `config.toml`; `wsh-fs` is offered only when
+  `fs_root` is set, and a key limited to a forced command opens no channel (`wsh-fs` needs the file-transfer scope).
+  Not served: the `mcp` protocol (an embedding concern) and the native WebTransport listener. The JS package is
+  unchanged apart from this README note. The Rust workspace is now 0.4.0; the `rust-v0.4.0` tag is left to the
+  maintainer (release workflow is tag-driven).
+- **Tests:** unit tests for the sequence decoder, the engine (cancel, progress, limits, parse errors), `wsh-fs`
+  confinement, and channel binding over a real QMux pair; `npm run test:rust` drives the Rust server with the stock JS
+  client for `host.info`, a chunked `wsh-fs` read, a cancel, the confinement rules, an oversized message, and rpc
+  channels next to an exec session.
+
 ## 0.27.0 (2026-10-07)
 
 - **`@johnhenry/wsh/server`: a `selfSigned` WebTransport certificate is rotated (#81).** It used to

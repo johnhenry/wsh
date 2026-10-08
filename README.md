@@ -723,15 +723,42 @@ whoever supplies the `Server`/`Client`, and the package root stays
 dependency-free and browser-safe.
 
 **Compatibility.** Purely additive. Old clients never open `rpc` sessions; an old
-host (or the Rust `wsh-server`, which has no `rpc` kind yet) does not advertise
-`rpc`, so a new client fails fast with `UNSUPPORTED_PROTOCOL` instead of waiting
-on an `OpenFail`. Only `@johnhenry/wsh/server` serves `rpc` today. Not goals: a
+host does not advertise `rpc`, so a new client fails fast with
+`UNSUPPORTED_PROTOCOL` instead of waiting on an `OpenFail`. `@johnhenry/wsh/server`
+and the Rust `wsh-server` (see below) serve `rpc` today. Not goals: a
 replacement for byte streams (exec/pty are unchanged), a new transport (`rpc`
 rides WebSocket/QMux and WebTransport streams), or an auth change -- an `rpc`
 session is opened on an authenticated connection and per-method authorization is
 the handler's job (`-32003`; `ctx.user` / `ctx.fingerprint` identify the caller).
 Handlers run per channel, so register methods synchronously (or before the
 returned promise settles: inbound messages are held until it does).
+
+**The Rust `wsh-server`** (since `rust-v0.4.0`) serves `wsh-host` and `wsh-fs`
+exactly as the JS server does -- same features, methods, parameters, results,
+error codes and messages, same CBOR-sequence decoder and size bound, same
+`$/cancel` / `$/progress` -- over a WebSocket (QMux) connection. It does not
+serve `mcp` (hosting an MCP server is an embedding concern) and does not offer
+`rpc` on the native WebTransport listener, whose single control stream has no
+client-opened data streams to carry a channel. `wsh-host` is on by default;
+`wsh-fs` is **off until you give it a root** (file access is opt-in), and is
+confined to it the way the JS `fs` option is. In `~/.wsh/config.toml`:
+
+```toml
+[rpc]
+enabled = true            # default; false turns rpc off entirely
+max_message_bytes = 1048576   # advertised as rpc-max-message:<n>; at least 256
+max_inflight = 64         # concurrent requests per channel before -32002
+fs_root = "/srv/files"    # unset (the default): wsh-fs is not offered
+fs_read_only = false
+fs_max_file_bytes = 67108864
+```
+
+Key options apply as they do to other channels: a key restricted to a forced
+command opens no rpc channel, and `wsh-fs` needs the `file-transfer` scope
+(`permit-file-transfer` under `restrict`). `host.info` reports the crate version
+and `hostFingerprint: null` (the Rust server has no host key). The JS client
+needs nothing new: it reads `rpc` from `ServerHello`, and its file helpers prefer
+`wsh-fs` automatically once the server offers it.
 
 ## Attach and Resume
 
@@ -912,7 +939,7 @@ than left to be found.
 | Remove a remote file | `WshClient.fileRemove()` | `file_transfer::remove()`, `wsh sftp`'s `rm` | **Wire-unified**: `FileOp`/`FileResult` (`op: "remove"`) -- refused today by every `wsh-server` release ("not yet implemented"), the same refusal on both sides |
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
-| Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | none yet (a Rust `wsh-server` does not advertise `rpc`; a JS client falls back to `FileOp` for files) | **JS server only, no wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere |
+| Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | Rust `wsh-server` (`rust-v0.4.0`+): `wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set; no client yet in `wsh-client` | **No wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere; the Rust server serves it on WebSocket/QMux only |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side |

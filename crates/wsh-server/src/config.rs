@@ -14,6 +14,8 @@ pub struct ConfigFile {
     pub auth: AuthSection,
     #[serde(default)]
     pub gateway: GatewaySection,
+    #[serde(default)]
+    pub rpc: RpcSection,
 }
 
 /// `[server]` section of the config TOML.
@@ -140,6 +142,66 @@ impl Default for GatewaySection {
     }
 }
 
+/// `[rpc]` section of the config TOML: typed RPC channels (`Open { kind: "rpc" }`, wsh #85 / #86).
+///
+/// `wsh-host` (`host.info`, `host.ping`) is always offered while `enabled`.
+/// `wsh-fs` (file access over rpc) is offered only when `fs_root` is set, and
+/// is confined to that directory exactly as the JS server's `fs` option is.
+///
+/// ```toml
+/// [rpc]
+/// enabled = true
+/// max_message_bytes = 1048576
+/// max_inflight = 64
+/// fs_root = "/srv/files"
+/// fs_read_only = false
+/// fs_max_file_bytes = 67108864
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RpcSection {
+    /// Serve `rpc` channels at all. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Largest single rpc message, advertised as `rpc-max-message:<n>` (at least 256). Default: 1 MiB.
+    #[serde(default = "default_rpc_max_message")]
+    pub max_message_bytes: usize,
+    /// Concurrent requests per channel before `-32002`. Default: 64.
+    #[serde(default = "default_rpc_max_inflight")]
+    pub max_inflight: usize,
+    /// Directory `wsh-fs` is confined to. Unset (the default): `wsh-fs` is not offered.
+    #[serde(default)]
+    pub fs_root: Option<String>,
+    /// Refuse every `wsh-fs` operation that changes anything. Default: `false`.
+    #[serde(default)]
+    pub fs_read_only: bool,
+    /// Largest file `wsh-fs` will read or write in one operation. Default: 64 MiB.
+    #[serde(default = "default_rpc_fs_max_file")]
+    pub fs_max_file_bytes: u64,
+}
+
+impl Default for RpcSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_message_bytes: default_rpc_max_message(),
+            max_inflight: default_rpc_max_inflight(),
+            fs_root: None,
+            fs_read_only: false,
+            fs_max_file_bytes: default_rpc_fs_max_file(),
+        }
+    }
+}
+
+fn default_rpc_max_message() -> usize {
+    crate::rpc::RPC_DEFAULT_MAX_MESSAGE
+}
+fn default_rpc_max_inflight() -> usize {
+    crate::rpc::RPC_DEFAULT_MAX_INFLIGHT
+}
+fn default_rpc_fs_max_file() -> u64 {
+    crate::rpc::fs::DEFAULT_MAX_FILE_BYTES
+}
+
 fn default_gateway_destinations() -> Vec<String> {
     vec!["*".to_string()]
 }
@@ -204,6 +266,18 @@ pub struct ServerConfig {
     pub gateway_enable_reverse_tunnels: bool,
     /// Username → "sha256:<hex>" password hash pairs for password auth.
     pub password_hashes: std::collections::HashMap<String, String>,
+    /// Whether typed rpc channels are served. See [`RpcSection::enabled`].
+    pub rpc_enabled: bool,
+    /// Largest rpc message in bytes. See [`RpcSection::max_message_bytes`].
+    pub rpc_max_message_bytes: usize,
+    /// Concurrent requests per rpc channel. See [`RpcSection::max_inflight`].
+    pub rpc_max_inflight: usize,
+    /// `wsh-fs` root (tilde-expanded); `None` = `wsh-fs` not offered.
+    pub rpc_fs_root: Option<PathBuf>,
+    /// `wsh-fs` read-only switch.
+    pub rpc_fs_read_only: bool,
+    /// `wsh-fs` per-operation size limit.
+    pub rpc_fs_max_file_bytes: u64,
 }
 
 impl ServerConfig {
@@ -252,6 +326,7 @@ impl ServerConfig {
                     server: ServerSection::default(),
                     auth: AuthSection::default(),
                     gateway: GatewaySection::default(),
+                    rpc: RpcSection::default(),
                 }
             }
         } else {
@@ -259,6 +334,7 @@ impl ServerConfig {
                 server: ServerSection::default(),
                 auth: AuthSection::default(),
                 gateway: GatewaySection::default(),
+                rpc: RpcSection::default(),
             }
         };
 
@@ -289,6 +365,12 @@ impl ServerConfig {
             gateway_max_connections: file_config.gateway.max_connections,
             gateway_enable_reverse_tunnels: file_config.gateway.enable_reverse_tunnels,
             password_hashes: file_config.auth.password_hashes,
+            rpc_enabled: file_config.rpc.enabled,
+            rpc_max_message_bytes: file_config.rpc.max_message_bytes,
+            rpc_max_inflight: file_config.rpc.max_inflight,
+            rpc_fs_root: file_config.rpc.fs_root.as_deref().map(expand_tilde_str),
+            rpc_fs_read_only: file_config.rpc.fs_read_only,
+            rpc_fs_max_file_bytes: file_config.rpc.fs_max_file_bytes,
         })
     }
 }
