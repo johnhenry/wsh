@@ -31,6 +31,7 @@ import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } f
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
+import { createGatewaySession } from './gateway.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -44,6 +45,7 @@ export const STREAM_ANNOUNCE = 'stream-announce';
 export function hostFeatures(cfg, { dataStreams = true } = {}) {
   const features = dataStreams ? [STREAM_ANNOUNCE] : [];
   if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE);
+  if (cfg.gateway) features.push('gateway');
   if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
   // End-to-end encryption (#90) is the virtual-mode EncryptedFrame layer, so it is offered where there are no
   // client-opened streams: over a relay bridge.
@@ -83,6 +85,7 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {object | null} cfg.mcp - from createMcpHost
  * @param {{ protocols: Map<string, Function>, maxMessageBytes: number, maxInflight: number } | null} cfg.rpc - from createRpcHost
  * @param {{ signKey: CryptoKey | null, hybrid?: boolean } | null} cfg.e2e - answer KeyExchange and seal virtual-mode traffic (bridged connections only)
+ * @param {object | null} cfg.gateway - from normalizeGateway: TCP/DNS egress for the client (default deny)
  * @param {Record<string, Function> | undefined} cfg.extensions - handlers for application-defined (string-typed) messages
  * @param {object | null} cfg.relay - a RelayHub (see relay.mjs); null = not a relay
  * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
@@ -123,6 +126,8 @@ export function createConnectionFactory(cfg) {
     let chain = Promise.resolve();
     /** This connection as the relay hub sees it (created on first need). */
     let relayHandle = null;
+
+    const gateway = cfg.gateway ? createGatewaySession(cfg.gateway, (m) => send(m), log) : null;
 
     const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
 
@@ -177,6 +182,7 @@ export function createConnectionFactory(cfg) {
       for (const ch of [...channels.values()]) (ch.detach ?? ch.kill)?.call(ch);
       channels.clear();
       responder?.close();
+      gateway?.close();
       e2eSessions.clear();
       for (const c of mcpCalls) c.abort(new Error('connection closed'));
       mcpCalls.clear();
@@ -225,6 +231,7 @@ export function createConnectionFactory(cfg) {
       if (state.closed) return;
       if (!state.authed) return handleAuth(m);
       if (await handleRelay(m)) return;
+      if (gateway && await gateway.handle(m)) return;
       switch (m.type) {
         case MSG.PING: return send(pong({ id: m.id }));
         case MSG.OPEN: return handleOpen(m);

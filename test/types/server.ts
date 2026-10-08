@@ -24,6 +24,7 @@ const mcpOptions: WshServerOptions = {
     timeoutMs: 1000,
   },
 };
+const gatewayOptions: WshServerOptions = { gateway: { allow: ['broker.lan:1883'], maxConnections: 4, socks: '127.0.0.1:9050' } };
 const tlsOptions: WshServerOptions = {
   tls: { cert: 'PEM', key: 'PEM' },
   extensions: { push_subscribe: (msg, { username, fingerprint, send }) => { void [msg, username, fingerprint, send]; } },

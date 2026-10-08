@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.30.0 (2026-10-08)
+
+- **`createWshServer({ gateway })`: the Node server answers the gateway opcodes (0x70-0x7e).** Until now only the Rust
+  `wsh-server` did, so a browser tab using `GatewayBackend` (`@johnhenry/browsermesh-netway`) could not reach a plain-TCP
+  service through a Node host. `gateway: { allow, maxConnections?, connectTimeoutMs?, socks? }` serves `OpenTcp` /
+  `GatewayData` / `GatewayClose` and `ResolveDns` (A/AAAA). Default deny: `allow` is a list of `"*"`, `"host"` (any
+  port) or `"host:port"` patterns matched on the name the client asked for; an empty list reaches nothing. `socks`
+  (`"host:port"` or `{ host, port }`) dials through a SOCKS5 proxy such as a local Tor client, handing it the name
+  unresolved (no DNS leak, `.onion` works); `ResolveDns` is refused in that mode. UDP (`OpenUdp`) and reverse tunnels
+  (`ListenRequest`) get a clean failure. Advertised as the feature `gateway`. The Rust server is unchanged.
+
 ## 0.29.0 (2026-10-08)
 
 - **`createWshServer({ tls })` (wss://).** `tls: { cert, key, ca?, passphrase? }` serves the WebSocket listener over
