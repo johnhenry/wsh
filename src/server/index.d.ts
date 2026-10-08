@@ -340,6 +340,13 @@ export interface WshServerOptions {
    */
   tls?: { cert: string | Uint8Array; key: string | Uint8Array; ca?: string | Uint8Array; passphrase?: string };
   /**
+   * Answer the gateway opcodes (OpenTcp, ResolveDns, GatewayData, GatewayClose) so a client can open TCP connections and
+   * resolve names from this host. Default deny: a destination must match `allow` (`"*"`, `"host"` any port, `"host:port"`).
+   * `socks` dials through a SOCKS5 proxy (e.g. Tor at `127.0.0.1:9050`) with the name left unresolved; `ResolveDns` is then
+   * refused. UDP and reverse tunnels are answered with a failure. Off by default.
+   */
+  gateway?: { allow: string[]; maxConnections?: number; connectTimeoutMs?: number; socks?: string | { host: string; port: number } };
+  /**
    * Handlers for application-defined control messages: one whose `type` is a string (protocol messages are numeric, so
    * there is no collision) from an authenticated connection is handed to `extensions[type]`. A throw is logged.
    */

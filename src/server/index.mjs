@@ -15,6 +15,7 @@ import { SessionRegistry } from './sessions.mjs';
 import { RelayHub } from './relay.mjs';
 import { startWebTransport } from './webtransport.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
+import { normalizeGateway } from './gateway.mjs';
 import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
 
 export { parseAuthorizedKeys, STREAM_ANNOUNCE, mcpServerAdapter };
@@ -67,12 +68,16 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  *   Handlers for application-defined messages: a control message whose `type` is a *string* (every protocol message
  *   has a numeric type, so these cannot collide) from an authenticated connection is passed to `extensions[type]`.
  *   A handler that throws is logged and ignored. Off unless given.
+ * @param {{ allow: string[], maxConnections?: number, connectTimeoutMs?: number, socks?: string | { host: string, port: number } }} [options.gateway]
+ *   Answer the gateway opcodes (OpenTcp, ResolveDns, GatewayData/Close): the client opens TCP connections and resolves
+ *   names from this host. Default deny: a destination must match `allow` (`"*"`, `"host"`, `"host:port"`). `socks` dials
+ *   through a SOCKS5 proxy (Tor) with the name unresolved. UDP and reverse tunnels are refused. Off unless given. See `gateway.mjs`.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {(line: string) => void} [options.onLog]
  * @returns {{ listen(): Promise<{address: string, port: number}>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, webTransport, bindTimeoutMs = 3000, onLog = () => {},
+  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, onLog = () => {},
 } = {}) {
   let wss = null;
   let httpsServer = null;
@@ -94,6 +99,7 @@ export function createWshServer({
   let registry = null;
   let hub = null;
   let wt = null;
+  const gatewayCfg = gateway === undefined ? null : normalizeGateway(gateway);
   const sessionOptions = sessions ? (sessions === true ? {} : sessions) : null;
 
   return {
@@ -121,7 +127,7 @@ export function createWshServer({
       if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createWshServer: extensions must be an object of handlers');
       const attach = createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, log: onLog,
-        methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, sessions: registry, relay: hub,
+        methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, sessions: registry, relay: hub,
       });
 
       if (tls) {

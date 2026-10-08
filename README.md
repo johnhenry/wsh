@@ -186,6 +186,13 @@ restricted host with no shell. `fs.root` confines every path: `..`, absolute
 paths and symlinks pointing out of it are refused -- for `write` and `rename`
 (both paths) exactly as for `read`.
 
+### Gateway (TCP and DNS egress from the host)
+
+`gateway: { allow: ['broker.lan:1883'], socks: '127.0.0.1:9050' }` makes the Node server answer the gateway opcodes, so a
+client (a browser tab via netway's `GatewayBackend`) can open TCP connections and resolve names from the host. Default
+deny; `allow` takes `"*"`, `"host"` or `"host:port"`. `socks` routes every dial through a SOCKS5 proxy (Tor) with the name
+unresolved. UDP and reverse tunnels are refused.
+
 ### TLS (`wss://`) and host extensions
 
 `tls: { cert, key }` (PEM, the options of `https.createServer`) serves the WebSocket listener over TLS on the same
