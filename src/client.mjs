@@ -15,7 +15,7 @@ import {
   hello, auth as authMsg, open as openMsg, close as closeMsg,
   attach as attachMsg, resume as resumeMsg, ping as pingMsg, pong as pongMsg,
   reverseRegister as reverseRegisterMsg, reverseList as reverseListMsg,
-  reverseConnect as reverseConnectMsg,
+  reverseConnect as reverseConnectMsg, relayForward as relayForwardMsg,
   mcpDiscover as mcpDiscoverMsg, mcpCall as mcpCallMsg,
   suspendSession as suspendSessionMsg, restartPty as restartPtyMsg,
   metricsRequest as metricsRequestMsg,
@@ -39,8 +39,9 @@ import {
 } from './messages.mjs';
 import { signChallenge, exportPublicKeyRaw, signPeerRecord, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
 import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
+import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature } from './e2e-exchange.mjs';
 import { WshSession } from './session.mjs';
-import { cborDecode } from './cbor.mjs';
+import { cborDecode, cborEncode } from './cbor.mjs';
 import {
   RpcChannel, RpcError, RPC_ERROR, RPC_FEATURE, RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE,
   rpcProtocolFeature, parseRpcFeatures,
@@ -146,44 +147,6 @@ async function verifyPeerInfoRecord(peer) {
   } catch {
     return false;
   }
-}
-
-/**
- * Lexicographic byte comparison, used by `initiateE2E`'s hybrid mode to
- * deterministically assign the ML-KEM "encapsulator" role without an
- * extra round trip: both sides already have both ephemeral X25519
- * public keys after round 1, so whichever side's own key sorts lower
- * encapsulates.
- * @returns {number} <0 if a<b, >0 if a>b, 0 if equal
- */
-function compareBytes(a, b) {
-  const len = Math.min(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return a.length - b.length;
-}
-
-/**
- * Combine the classical (X25519 ECDH) and post-quantum (ML-KEM-768) key
- * exchange outputs into one AES-256-GCM key via HKDF-SHA256, so the
- * final key is only as weak as the *stronger* of the two if either
- * primitive is ever broken.
- * @param {Uint8Array} x25519Bits - 32-byte ECDH shared secret
- * @param {Uint8Array} kemSharedSecret - 32-byte ML-KEM-768 shared secret
- * @returns {Promise<Uint8Array>} 32 bytes of combined key material
- */
-async function combineHybridSecret(x25519Bits, kemSharedSecret) {
-  const ikm = new Uint8Array(x25519Bits.length + kemSharedSecret.length);
-  ikm.set(x25519Bits, 0);
-  ikm.set(kemSharedSecret, x25519Bits.length);
-  const hkdfKey = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode('wsh-hybrid-e2e-v1') },
-    hkdfKey,
-    256
-  );
-  return new Uint8Array(bits);
 }
 
 /**
@@ -1259,10 +1222,19 @@ export class WshClient {
    * the transport internals directly.
    *
    * @param {object} msg
+   * @param {{ to?: string }} [opts] - `to`: the operator this is for, when this peer serves several
+   *   (`relay-multi-operator`, wsh #89): the message is sent as a `RelayForward` addressed to that
+   *   fingerprint. Leave it out for a peer's only operator.
    * @returns {Promise<void>}
    */
-  async sendRelayControl(msg) {
+  async sendRelayControl(msg, { to } = {}) {
     this.#assertAuthenticated('sendRelayControl');
+    if (to !== undefined) {
+      // A peer serving several operators addresses each message: the relay routes the wrapper to `to`
+      // and re-wraps it with this peer's fingerprint (from_fingerprint here is overwritten, not trusted).
+      if (typeof to !== 'string' || !to) throw new TypeError('sendRelayControl: to must be an operator fingerprint');
+      msg = relayForwardMsg({ fromFingerprint: '', toFingerprint: to, inner: cborEncode(msg) });
+    }
     await this.#transport.sendControl(msg);
   }
 
@@ -1784,12 +1756,19 @@ export class WshClient {
    * agility, not a hard cutover; check the returned `hybrid` flag to see
    * which actually happened.
    *
+   * `KeyExchange` carries only ephemeral keys, so on its own it does not stop a relay that substitutes them.
+   * Pass `verifyPeer` -- the peer's long-term Ed25519 public key, e.g. the `public_key` of the peer record you
+   * listed -- to require that the peer signed its half (a reverse host does: `e2e-sign` in its features); the
+   * exchange is refused with `code: 'E2E_PEER_UNAUTHENTICATED'` if the signature is missing or does not verify.
+   *
    * @param {string} sessionId - Session ID
    * @param {string} [algorithm='X25519'] - 'X25519' or 'X25519+ML-KEM-768'
    * @param {number} [timeout=10000]
-   * @returns {Promise<{sharedSecret: CryptoKey, peerPublicKey: Uint8Array, hybrid: boolean}>}
+   * @param {object} [opts]
+   * @param {Uint8Array | CryptoKey} [opts.verifyPeer] - the peer's Ed25519 public key (raw 32 bytes or imported)
+   * @returns {Promise<{sharedSecret: CryptoKey, peerPublicKey: Uint8Array, hybrid: boolean, peerAuthenticated: boolean}>}
    */
-  async initiateE2E(sessionId, algorithm = 'X25519', timeout = DEFAULT_OPEN_TIMEOUT) {
+  async initiateE2E(sessionId, algorithm = 'X25519', timeout = DEFAULT_OPEN_TIMEOUT, { verifyPeer } = {}) {
     this.#assertAuthenticated('initiateE2E');
     const wantHybrid = algorithm === 'X25519+ML-KEM-768';
 
@@ -1834,6 +1813,22 @@ export class WshClient {
     );
 
     const peerMsg = await peerMsgPromise;
+
+    let peerAuthenticated = false;
+    if (verifyPeer !== undefined) {
+      const ok = await verifyKeyExchangeSignature(verifyPeer, peerMsg.signature, {
+        sessionId, algorithm, initiatorKey: localPub, responderKey: new Uint8Array(peerMsg.public_key ?? []),
+      });
+      if (!ok) {
+        throw Object.assign(
+          new Error(peerMsg.signature === undefined
+            ? 'initiateE2E: the peer did not sign its key exchange (verifyPeer was given)'
+            : 'initiateE2E: the peer\'s key exchange signature does not verify against verifyPeer'),
+          { code: 'E2E_PEER_UNAUTHENTICATED' },
+        );
+      }
+      peerAuthenticated = true;
+    }
 
     // Round 2 has the same shape as round 1, so it needs the same treatment.
     // Whether we encapsulate or decapsulate is decided entirely by data
@@ -1899,7 +1894,7 @@ export class WshClient {
       ['encrypt', 'decrypt']
     );
 
-    return { sharedSecret, peerPublicKey: new Uint8Array(peerMsg.public_key), hybrid: hybridActive };
+    return { sharedSecret, peerPublicKey: new Uint8Array(peerMsg.public_key), hybrid: hybridActive, peerAuthenticated };
   }
 
   // ── Structured File Channel ───────────────────────────────────────
@@ -2476,7 +2471,7 @@ export class WshClient {
    * @param {object} msg
    * @private
    */
-  #handleControl(msg) {
+  #handleControl(msg, from) {
     const type = msg.type;
 
     // Unwrap RelayForward: only deliver the inner message if it came from a
@@ -2502,7 +2497,7 @@ export class WshClient {
         console.warn('[wsh:client] dropping RelayForward wrapping a non-forwardable type:', inner.type);
         return;
       }
-      this.#handleControl(inner);
+      this.#handleControl(inner, msg.from_fingerprint);
       return;
     }
 
@@ -2668,7 +2663,7 @@ export class WshClient {
     // sessions share the same top-level API.
     if (this.onRelayMessage && this._isRelayForwardable(type)) {
       try {
-        this.onRelayMessage(msg);
+        this.onRelayMessage(msg, from);
       } catch (err) {
         console.error('[wsh:client] onRelayMessage handler error:', err);
       }
@@ -2699,6 +2694,15 @@ export class WshClient {
       case MSG.IDLE_WARNING:
         // Respond with a ping to indicate we're still active.
         this.#transport?.sendControl(pingMsg({ id: ++this.#pingId })).catch(() => {});
+        break;
+
+      case MSG.REVERSE_CLOSE:
+        // The relay telling a peer that serves several operators that one of them left (wsh #89).
+        try {
+          this.onReverseClose?.(msg);
+        } catch (err) {
+          console.error('[wsh:client] onReverseClose handler error:', err);
+        }
         break;
 
       case MSG.REVERSE_CONNECT:

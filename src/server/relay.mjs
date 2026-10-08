@@ -12,15 +12,22 @@
  * Nothing is open by default: `canRegister` and `canConnect` both default to
  * "no". `from_fingerprint` is always the sender's own authenticated key, set
  * here and never taken from a payload; only the spec's `forwardable` message
- * types cross a bridge. One bridge per peer at a time, and it lasts as long as
+ * types cross a bridge.
+ *
+ * By default there is one operator per peer, and the bridge lasts as long as
  * both connections: when either ends the hub closes the other, so no
  * half-bridged state (and no processes belonging to a departed operator)
- * outlives it.
+ * outlives it. With `maxOperatorsPerPeer` > 1 a peer that states
+ * `relay-multi-operator` in its ReverseAccept may be bridged to several
+ * operators at once (#89): it addresses each reply with
+ * `RelayForward.to_fingerprint`, and is told with a `ReverseClose` when one
+ * operator leaves (instead of being closed). A peer that never stated it is
+ * still held to one operator, and still closed when its operator leaves.
  */
 
 import { cborEncode, cborDecode } from '../cbor.mjs';
 import { fingerprint as fingerprintOf, importPublicKeyRaw, verifyPeerRecord } from '../auth.mjs';
-import { MSG, isRelayForwardable, relayForward, reversePeers, reverseReject } from '../messages.gen.mjs';
+import { MSG, isRelayForwardable, relayForward, reversePeers, reverseReject, reverseClose } from '../messages.gen.mjs';
 
 export const DEFAULT_MAX_PEERS = 1024;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 8000;
@@ -32,7 +39,16 @@ const MAX_FEATURE_LENGTH = 128;
 const SHORT_PREFIX_MIN = 8;
 
 /** `ReverseReject.reason` for a peer that already has an operator (or a request awaiting its answer). */
+/** `ReverseAccept.features` entry by which a peer says it serves several operators (addresses replies, understands `ReverseClose`). */
+export const MULTI_OPERATOR_FEATURE = 'relay-multi-operator';
+/** `ReverseReject.reason` for a peer that is answering another operator's request right now. */
+export const BUSY_ANSWERING = 'busy: this peer is answering another operator\'s request (retry in a moment)';
+
 export const BUSY_PEER = 'busy: this peer already has an operator (the relay bridges one operator per peer at a time; retry when it leaves)';
+/** `ReverseReject.reason` for a multi-operator peer already at the relay's operator cap. */
+export function busyPeerFull(max) {
+  return `busy: this peer already has its maximum of ${max} operators (retry when one leaves)`;
+}
 /** `ReverseReject.reason` for an operator that already has a bridge, or a request in flight. */
 export const BUSY_OPERATOR = 'busy: you already have a bridge or a pending connect on this relay (one at a time)';
 
@@ -50,17 +66,23 @@ const isStr = (v, max) => typeof v === 'string' && v.length <= max;
 export class RelayHub {
   /** @type {Map<string, { handle: RelayHandle, meta: object }>} */
   #peers = new Map();
-  /** @type {Map<RelayHandle, RelayHandle>} */
-  #pairs = new Map();
+  /** operator -> the peer it is bridged to (an operator has one bridge). @type {Map<RelayHandle, RelayHandle>} */
+  #operatorPeer = new Map();
+  /** peer -> its bridged operators, by the operator's fingerprint. @type {Map<RelayHandle, Map<string, RelayHandle>>} */
+  #peerOperators = new Map();
+  /** peers that stated `relay-multi-operator` in their last ReverseAccept. @type {WeakSet<RelayHandle>} */
+  #multiPeers = new WeakSet();
   /** target handle -> { operator, timer } while a ReverseConnect awaits its answer */
   #pending = new Map();
   /** fingerprint -> the highest record seq ever accepted (survives disconnects, bounded). */
   #lastSeq = new Map();
 
-  constructor({ canRegister, canConnect, maxPeers = DEFAULT_MAX_PEERS, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, log = () => {} } = {}) {
+  constructor({ canRegister, canConnect, maxPeers = DEFAULT_MAX_PEERS, maxOperatorsPerPeer = 1, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, log = () => {} } = {}) {
     for (const [name, fn] of [['canRegister', canRegister], ['canConnect', canConnect]]) {
       if (fn !== undefined && typeof fn !== 'function') throw new TypeError(`createWshServer: relay.${name} must be a function`);
     }
+    if (!Number.isSafeInteger(maxOperatorsPerPeer) || maxOperatorsPerPeer < 1) throw new TypeError('createWshServer: relay.maxOperatorsPerPeer must be a positive integer');
+    this.maxOperatorsPerPeer = maxOperatorsPerPeer;
     this.canRegister = canRegister ?? (() => false);
     this.canConnect = canConnect ?? (() => false);
     this.maxPeers = maxPeers;
@@ -193,13 +215,18 @@ export class RelayHub {
         fingerprint: target.meta.fingerprint, username: target.meta.username, capabilities: target.meta.capabilities,
       }))) return reject('no such peer');
     if (this.#peers.get(target.meta.fingerprint) !== target) return reject('no such peer');
-    // One bridge per peer, and one per operator: a RelayForward names its sender but not its recipient, so a
-    // peer's reply could not be addressed to one of several operators (see the README's relay section).
-    if (this.#pairs.has(target.handle) || this.#pending.has(target.handle)) {
-      return reject(BUSY_PEER);
-    }
-    if (this.#pairs.has(operator) || [...this.#pending.values()].some((p) => p.operator === operator)) {
+    // One bridge per operator. A peer serves one operator unless the relay allows more AND the peer said it can
+    // address them (RelayForward.to_fingerprint) and be told when one leaves (ReverseClose); it also answers one
+    // request at a time, since a ReverseAccept does not name the operator it answers.
+    if (this.bridged(operator) || [...this.#pending.values()].some((p) => p.operator === operator)) {
       return reject(BUSY_OPERATOR);
+    }
+    if (this.#pending.has(target.handle)) return reject(this.maxOperatorsPerPeer > 1 ? BUSY_ANSWERING : BUSY_PEER);
+    const serving = this.#peerOperators.get(target.handle);
+    if (serving?.size) {
+      if (this.maxOperatorsPerPeer < 2 || !this.#multiPeers.has(target.handle)) return reject(BUSY_PEER);
+      if (serving.has(operator.fingerprint)) return reject(BUSY_OPERATOR);
+      if (serving.size >= this.maxOperatorsPerPeer) return reject(busyPeerFull(this.maxOperatorsPerPeer));
     }
     const timer = setTimeout(() => {
       if (this.#pending.get(target.handle)?.operator !== operator) return;
@@ -232,26 +259,39 @@ export class RelayHub {
     }
     p.operator.send(answer);
     if (msg.type === MSG.REVERSE_ACCEPT) {
-      this.#pairs.set(p.operator, peer);
-      this.#pairs.set(peer, p.operator);
+      if (Array.isArray(answer.features) && answer.features.includes(MULTI_OPERATOR_FEATURE)) this.#multiPeers.add(peer);
+      else this.#multiPeers.delete(peer);
+      this.#operatorPeer.set(p.operator, peer);
+      let ops = this.#peerOperators.get(peer);
+      if (!ops) this.#peerOperators.set(peer, ops = new Map());
+      ops.set(p.operator.fingerprint, p.operator);
       this.log(`relay: bridged ${p.operator.fingerprint.slice(0, 12)} <-> ${peer.fingerprint.slice(0, 12)}`);
     }
   }
 
   /** Is `handle` one end of a bridge? */
   bridged(handle) {
-    return this.#pairs.has(handle);
+    return this.#operatorPeer.has(handle) || (this.#peerOperators.get(handle)?.size ?? 0) > 0;
+  }
+
+  /** Fingerprints of the operators bridged to the peer with this fingerprint. */
+  operatorsOf(peerFingerprint) {
+    const peer = this.#peers.get(peerFingerprint)?.handle;
+    return peer ? [...(this.#peerOperators.get(peer)?.keys() ?? [])] : [];
   }
 
   /**
    * Carry a message across `handle`'s bridge. A plain forwardable message is
    * wrapped; a `RelayForward` the client wrote itself is unwrapped, its inner
    * checked, and re-wrapped -- either way `from_fingerprint` is the sender's
-   * authenticated key. Returns false when there is no bridge.
+   * authenticated key. A peer serving several operators names the recipient
+   * with `to_fingerprint` (never set on what is delivered); with one operator
+   * it may leave it out. Returns false when there is no bridge.
    */
   forward(handle, msg) {
-    const partner = this.#pairs.get(handle);
-    if (!partner) return false;
+    const partner = this.#recipient(handle, msg);
+    if (partner === undefined) return false;
+    if (partner === null) return true; // bridged, but the message could not be addressed: dropped (and logged)
     let inner;
     if (msg.type === MSG.RELAY_FORWARD) {
       if (!(msg.inner instanceof Uint8Array) || msg.inner.byteLength > MAX_FORWARD_BYTES) { this.log('relay: dropped an oversized or malformed RelayForward'); return true; }
@@ -270,6 +310,27 @@ export class RelayHub {
     return true;
   }
 
+  /**
+   * Who `msg` from `handle` goes to: the partner handle; `undefined` if `handle` has no bridge (the caller
+   * treats the message as an ordinary one); `null` if it has one but the recipient cannot be determined.
+   */
+  #recipient(handle, msg) {
+    const peer = this.#operatorPeer.get(handle);
+    if (peer) return peer; // an operator has exactly one bridge
+    const operators = this.#peerOperators.get(handle);
+    if (!operators || operators.size === 0) return undefined;
+    const to = msg.type === MSG.RELAY_FORWARD ? msg.to_fingerprint : undefined;
+    if (to !== undefined) {
+      const operator = typeof to === 'string' ? operators.get(to) : undefined;
+      if (operator) return operator;
+      this.log(`relay: dropped a forward from ${handle.fingerprint.slice(0, 12)} addressed to ${typeof to === 'string' ? to.slice(0, 12) : '?'}, which is not one of its operators`);
+      return null;
+    }
+    if (operators.size === 1) return operators.values().next().value;
+    this.log(`relay: dropped an unaddressed forward from ${handle.fingerprint.slice(0, 12)}, which serves ${operators.size} operators (to_fingerprint is required)`);
+    return null;
+  }
+
   /** A connection ended: forget it, and end the bridge it was part of. */
   drop(handle) {
     const entry = this.#peers.get(handle.fingerprint);
@@ -279,11 +340,28 @@ export class RelayHub {
     for (const [target, pend] of this.#pending) {
       if (pend.operator === handle) { clearTimeout(pend.timer); this.#pending.delete(target); }
     }
-    const partner = this.#pairs.get(handle);
-    if (partner) {
-      this.#pairs.delete(handle);
-      this.#pairs.delete(partner);
-      partner.close();
+    // An operator leaving.
+    const peer = this.#operatorPeer.get(handle);
+    if (peer) {
+      this.#operatorPeer.delete(handle);
+      const operators = this.#peerOperators.get(peer);
+      operators?.delete(handle.fingerprint);
+      if (this.maxOperatorsPerPeer > 1 && this.#multiPeers.has(peer)) {
+        // The peer serves others too (or may serve more): tell it which operator left instead of closing it.
+        peer.send(reverseClose({ targetFingerprint: handle.fingerprint, reason: 'operator left' }));
+      } else {
+        this.#peerOperators.delete(peer);
+        peer.close();
+      }
+    }
+    // A peer leaving: every operator bridged to it goes with it.
+    const operators = this.#peerOperators.get(handle);
+    if (operators) {
+      this.#peerOperators.delete(handle);
+      for (const operator of operators.values()) {
+        this.#operatorPeer.delete(operator);
+        operator.close();
+      }
     }
   }
 
@@ -291,7 +369,8 @@ export class RelayHub {
   closeAll() {
     for (const p of this.#pending.values()) clearTimeout(p.timer);
     this.#pending.clear();
-    this.#pairs.clear();
+    this.#operatorPeer.clear();
+    this.#peerOperators.clear();
     this.#peers.clear();
   }
 }

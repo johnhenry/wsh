@@ -198,6 +198,12 @@ export interface WshServerRelayOptions {
   ) => boolean | Promise<boolean>;
   /** Registered peers at once (default 1024). */
   maxPeers?: number;
+  /**
+   * Operators bridged to one peer at once (default 1). Above 1, a peer is held to one operator unless it stated
+   * `relay-multi-operator` in its `ReverseAccept.features` (it then addresses replies with
+   * `RelayForward.to_fingerprint` and is sent a `ReverseClose` when one operator leaves instead of being closed).
+   */
+  maxOperatorsPerPeer?: number;
   /** How long a `ReverseConnect` waits for its peer to answer before the operator is rejected (default 8000). */
   connectTimeoutMs?: number;
 }
@@ -421,6 +427,23 @@ export interface WshReverseHostOptions {
   /** Extra options for the relay connection (`expectHostKey`, `knownHosts`, `trustOnFirstUse`, ...). */
   connect?: Record<string, unknown>;
   peerType?: string;
+  /**
+   * Operators served at once (default 1). Above 1 the host states `relay-multi-operator`, addresses each reply
+   * to its operator and handles `ReverseClose`; each operator gets its own connection state and is passed through
+   * `accept` on its own identity. Needs `reportFeatures` and a relay with `maxOperatorsPerPeer` above 1; any other
+   * relay serves it one operator, as before.
+   */
+  maxOperators?: number;
+  /** State this host's features in `ReverseAccept.features` (default true). */
+  reportFeatures?: boolean;
+  /**
+   * End-to-end encryption for the bridged operator (default on; `false` turns it off). The host answers an
+   * operator's `KeyExchange` for a session it opened, seals that session's output into `EncryptedFrame`s and opens its
+   * input from them. `sign`: sign the reply with `keyPair` so the operator can authenticate this host
+   * (`initiateE2E(..., { verifyPeer })`); `'auto'` (default) signs when the relay's `ServerHello` carries `e2e-sign`.
+   * `hybrid` (default true) offers X25519+ML-KEM-768 when asked and available.
+   */
+  e2e?: false | { sign?: boolean | 'auto'; hybrid?: boolean };
   onLog?: (line: string) => void;
 }
 
@@ -433,6 +456,8 @@ export interface WshReverseHost {
   readonly fingerprint: string | null;
   /** Is the relay connection up right now? */
   readonly connected: boolean;
+  /** Fingerprints of the operators bridged right now. */
+  readonly operators: string[];
 }
 
 /**

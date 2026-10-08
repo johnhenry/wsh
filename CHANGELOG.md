@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.28.0 (2026-10-08)
+
+- **Relay: several operators per peer (#89).** `relay: { maxOperatorsPerPeer: n }` (default 1, so nothing changes
+  until you ask) lets a peer be bridged to up to `n` operators at once; `createReverseHost({ maxOperators: n })` is the
+  other half and serves each operator with its own connection state (channels, processes, files), accepting each on
+  its own identity (`accept` runs per operator). Spec additions, all optional on the wire and regenerated into JS and
+  Rust: `RelayForward.to_fingerprint` (a peer addresses a reply to one operator; the relay routes it, re-wraps it with
+  the peer as sender and never delivers the field), a new `ReverseClose { target_fingerprint, reason? }` (0x57) that
+  the relay sends a multi-operator peer when one operator leaves -- it stays registered instead of being closed -- and
+  the feature `relay-multi-operator`. The opt-in is negotiated, so nothing older breaks: a relay with the option
+  advertises `relay-multi-operator` in its `ServerHello`; a host claims it in `ReverseAccept.features` only after
+  reading that; a peer that never claimed it stays held to one operator and is closed when its operator leaves, as
+  before. A peer answers one `ReverseConnect` at a time (a concurrent one is `busy: ... retry in a moment`); at the
+  cap the reason is `busy: this peer already has its maximum of n operators` (`busyPeerFull(n)`). New client
+  surface: `sendRelayControl(msg, { to })`, `onRelayMessage(msg, fromFingerprint)`, `onReverseClose`, and
+  `reverseClose()` / `relayForward({ toFingerprint })`; `createReverseHost` gains `operators`. The Rust relay is
+  unchanged (still one operator per peer; the new fields parse and are ignored): #93.
+- **`createReverseHost` answers `KeyExchange` and does end-to-end encryption (#90).** For a session it has opened, an
+  operator's `KeyExchange` (X25519, or X25519+ML-KEM-768 when asked) is answered; that session's output is then sealed
+  into `EncryptedFrame`s and its input opened from them (AAD = session id, strict counters, `responder` role tag).
+  Plaintext input for an encrypted session is ignored (a relay cannot inject stdin around the encryption); a replayed,
+  tampered or spliced frame is dropped without consuming a counter. On by default, `e2e: false` turns it off; the host
+  advertises `e2e` / `e2e-sign` in `ReverseAccept.features`. To authenticate the host's half the optional
+  `KeyExchange.signature` (spec) carries an Ed25519 signature over the label, session id, algorithm and both
+  ephemeral keys (`keyExchangeTranscript()`); `client.initiateE2E(sessionId, algorithm, timeout, { verifyPeer })`
+  rejects with `code: 'E2E_PEER_UNAUTHENTICATED'` unless it verifies against the host's key, and reports
+  `peerAuthenticated`. The host signs when the relay says it can carry one (`e2e-sign` in its `ServerHello`, which this
+  relay now sends) -- a Rust relay older than the regenerated types drops a connection that sends the field -- and
+  `e2e: { sign: true | false }` overrides. New exports: `E2E_FEATURE`, `E2E_SIGN_FEATURE`, `keyExchangeTranscript`,
+  `verifyKeyExchangeSignature`; the responder lives in `src/e2e-exchange.mjs`. Direct connections (`createWshServer`)
+  do not offer it: E2E here is the virtual-mode layer a relay bridge uses.
+- **Fixed:** `createReverseHost().close()` left the bridged operators' processes running (the client's own
+  `disconnect()` never calls its `onClose`); it now ends every bridge first.
+- **Changed:** a reverse host now states `e2e` and `e2e-sign` in `ReverseAccept.features`, so `bridgedFeatures` of a
+  host without fs or mcp is `['e2e', 'e2e-sign']` rather than `[]`.
+- **Tests:** `test/relay-multi-operator.test.mjs` (routing, drops, caps, `ReverseClose`, per-operator state, cleanup),
+  `test/reverse-host-e2e.test.mjs` (relay sees only ciphertext, both hybrid roles, signature checks including a relay
+  swapping the host key, plaintext injection / replay / splice / tamper).
+
 ## 0.27.1 (2026-10-08) / Rust `rust-v0.4.0`
 
 - **Rust `wsh-server` serves typed RPC channels (#86).** `Open { kind: "rpc", command: <protocol> }` is accepted on

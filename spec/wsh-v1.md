@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 97
+- **Total message types**: 98
 
 ## Enums
 
@@ -117,6 +117,7 @@ Type: `string`
 | `0x54` | ReverseAccept | reverse |
 | `0x55` | ReverseReject | reverse |
 | `0x56` | RelayForward | reverse |
+| `0x57` | ReverseClose | reverse |
 | `0x5f` | SessionList | session |
 | `0x60` | Detach | session |
 | `0x61` | DetachOk | session |
@@ -687,6 +688,18 @@ Category: **reverse**
 |-------|------|----------|---------|
 | `from_fingerprint` | `string` | yes | — |
 | `inner` | `bytes` | yes | — |
+| `to_fingerprint` | `string` | no | — |
+
+### ReverseClose (`0x57`)
+
+Category: **reverse**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `target_fingerprint` | `string` | yes | — |
+| `reason` | `string` | no | — |
 
 ### SessionList (`0x5f`)
 
@@ -1075,6 +1088,7 @@ Category: **e2e**
 | `session_id` | `string` | yes | — |
 | `kem_public_key` | `bytes` | no | — |
 | `kem_ciphertext` | `bytes` | no | — |
+| `signature` | `bytes` | no | — |
 
 ### EncryptedFrame (`0x8f`)
 

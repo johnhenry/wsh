@@ -18,7 +18,7 @@ import { QMuxConnection } from '../qmux-connection.mjs';
 import { FrameDecoder, frameEncode } from '../cbor.mjs';
 import {
   MSG, serverHello, challenge, authOk, authFail, openOk, openFail, sessionData,
-  exit as exitMsg, close as closeMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
+  exit as exitMsg, close as closeMsg, encryptedFrame as encryptedFrameMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
   presence as presenceMsg, error as errorMsg, sessionList, detachOk, detachFail, reversePeers, reverseReject,
 } from '../messages.gen.mjs';
 import {
@@ -28,6 +28,9 @@ import { FILE_CHUNK_BYTES } from './fs.mjs';
 import { MAX_ATTACHMENTS } from './sessions.mjs';
 import { MCP_CALL_ID_FEATURE } from '../client.mjs';
 import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
+import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
+import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
+import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -42,6 +45,15 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   const features = dataStreams ? [STREAM_ANNOUNCE] : [];
   if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE);
   if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
+  // End-to-end encryption (#90) is the virtual-mode EncryptedFrame layer, so it is offered where there are no
+  // client-opened streams: over a relay bridge.
+  // A relay carries a signed KeyExchange untouched, and (when configured) several operators per peer: peers read
+  // these from its ServerHello before relying on either, since an older relay would drop the connection on them.
+  if (cfg.relay) {
+    features.push(E2E_SIGN_FEATURE);
+    if (cfg.relay.maxOperatorsPerPeer > 1) features.push(MULTI_OPERATOR_FEATURE);
+  }
+  if (cfg.e2e && !dataStreams) features.push(E2E_FEATURE, ...(cfg.e2e.signKey ? [E2E_SIGN_FEATURE] : []));
   if (cfg.rpc && dataStreams && cfg.rpc.protocols.size) {
     features.push(RPC_FEATURE, ...[...cfg.rpc.protocols.keys()].map(rpcProtocolFeature), RPC_MAX_MESSAGE_PREFIX + cfg.rpc.maxMessageBytes);
   }
@@ -70,6 +82,7 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {object | null} cfg.hostKey - from loadHostKey
  * @param {object | null} cfg.mcp - from createMcpHost
  * @param {{ protocols: Map<string, Function>, maxMessageBytes: number, maxInflight: number } | null} cfg.rpc - from createRpcHost
+ * @param {{ signKey: CryptoKey | null, hybrid?: boolean } | null} cfg.e2e - answer KeyExchange and seal virtual-mode traffic (bridged connections only)
  * @param {object | null} cfg.relay - a RelayHub (see relay.mjs); null = not a relay
  * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
@@ -86,8 +99,9 @@ export function createConnectionFactory(cfg) {
    *    for a transport that already frames messages itself (a relay bridge, WebTransport). `authenticated`
    *    (`{ username, fingerprint }`) skips the handshake for a peer something else has already authenticated;
    *    `dataStreams: false` means there are no client-opened streams to bind, so exec output rides SessionData.
+   *    `e2e` overrides `cfg.e2e` for this connection.
    */
-  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null }) {
+  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride }) {
     const cid = ++counter;
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
@@ -111,7 +125,39 @@ export function createConnectionFactory(cfg) {
 
     const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
 
+    // ── End-to-end encryption (#90) ──────────────────────────────────
+    // An operator that sent KeyExchange for one of this connection's sessions gets that session's output sealed
+    // into EncryptedFrames and its input opened from them; plaintext input for it is ignored from then on (a relay
+    // must not be able to inject stdin around the encryption).
+    /** channel id -> the session id its OpenOk named (the AAD of its frames). */
+    const sessionOfChannel = new Map();
+    /** session id -> { key, sendCounter, recvCounter } for sessions with E2E on. */
+    const e2eSessions = new Map();
+    const MAX_E2E_SESSIONS = 64;
+    const e2eConfig = e2eOverride === undefined ? cfg.e2e : e2eOverride;
+    const responder = e2eConfig && !dataStreams ? new E2EResponder({ signKey: e2eConfig.signKey ?? null, hybrid: e2eConfig.hybrid !== false }) : null;
+    /** Outgoing messages in order, once E2E is on (sealing is async; order on the wire must not change). */
+    let outChain = Promise.resolve();
+    const e2eFor = (channelId) => e2eSessions.get(sessionOfChannel.get(channelId));
+
     const send = (msg) => {
+      if (state.closed) return Promise.resolve();
+      if (msg.type === MSG.OPEN_OK && typeof msg.session_id === 'string') sessionOfChannel.set(msg.channel_id, msg.session_id);
+      if (e2eSessions.size === 0) return deliver(msg);
+      // E2E is on for something: everything goes through one chain, so a sealed frame cannot be overtaken
+      // by (or overtake) the Exit that follows it.
+      const done = outChain.then(async () => {
+        const st = msg.type === MSG.SESSION_DATA ? e2eFor(msg.channel_id) : undefined;
+        if (!st) return deliver(msg);
+        const sessionId = sessionOfChannel.get(msg.channel_id);
+        const { nonce, ciphertext } = await sealFrame(st.key, sessionId, ROLE_TAGS.responder, st.sendCounter++, msg.data);
+        return deliver(encryptedFrameMsg({ channelId: msg.channel_id, nonce, ciphertext, sessionId }));
+      });
+      outChain = done.catch(() => {});
+      return done.catch(() => {});
+    };
+
+    const deliver = (msg) => {
       if (state.closed) return Promise.resolve();
       if (sendMessage) {
         try { return Promise.resolve(sendMessage(msg)).catch(() => {}); } catch { return Promise.resolve(); }
@@ -129,6 +175,8 @@ export function createConnectionFactory(cfg) {
       // everything else dies with it.
       for (const ch of [...channels.values()]) (ch.detach ?? ch.kill)?.call(ch);
       channels.clear();
+      responder?.close();
+      e2eSessions.clear();
       for (const c of mcpCalls) c.abort(new Error('connection closed'));
       mcpCalls.clear();
       for (const w of fileWrites.values()) clearTimeout(w.timer);
@@ -179,7 +227,12 @@ export function createConnectionFactory(cfg) {
       switch (m.type) {
         case MSG.PING: return send(pong({ id: m.id }));
         case MSG.OPEN: return handleOpen(m);
-        case MSG.SESSION_DATA: channels.get(m.channel_id)?.input?.(m.data); return;
+        case MSG.SESSION_DATA:
+          if (e2eFor(m.channel_id)) { log(`ignored plaintext SessionData on E2E channel ${m.channel_id}`); return; }
+          channels.get(m.channel_id)?.input?.(m.data);
+          return;
+        case MSG.KEY_EXCHANGE: return handleKeyExchange(m);
+        case MSG.ENCRYPTED_FRAME: return handleEncryptedFrame(m);
         case MSG.RESIZE: channels.get(m.channel_id)?.resize?.(m.cols, m.rows); return;
         case MSG.SIGNAL: channels.get(m.channel_id)?.signal?.(String(m.signal ?? '')); return;
         case MSG.CLOSE: { const ch = channels.get(m.channel_id); if (ch) { ch.kill?.(); } return; }
@@ -195,6 +248,37 @@ export function createConnectionFactory(cfg) {
         case MSG.MCP_CALL: handleMcpCall(m); return;
         default: log(`ignored message type 0x${m.type.toString(16)}`);
       }
+    }
+
+    async function handleKeyExchange(m) {
+      if (!responder) { log('ignored KeyExchange (end-to-end encryption is not enabled here)'); return; }
+      // Only for a session this connection actually has: the id is the AAD of every frame, and it bounds the state kept.
+      const known = typeof m.session_id === 'string' && [...sessionOfChannel.values()].includes(m.session_id);
+      if (!known) { log('ignored KeyExchange for a session this connection does not have'); return; }
+      if (!e2eSessions.has(m.session_id) && e2eSessions.size >= MAX_E2E_SESSIONS) { log('ignored KeyExchange (too many encrypted sessions)'); return; }
+      let result;
+      try { result = await responder.respond(m, send); } catch (e) { log(`KeyExchange refused: ${e.message}`); return; }
+      // Sealing starts after the reply is on its way, so the operator never gets a frame before it has the key.
+      if (result.key) {
+        e2eSessions.set(result.sessionId, { key: result.key, sendCounter: 0, recvCounter: 0 });
+        log(`end-to-end encryption on for session ${result.sessionId.slice(0, 8)}${result.hybrid ? ' (hybrid)' : ''}`);
+      }
+    }
+
+    async function handleEncryptedFrame(m) {
+      const st = e2eSessions.get(m.session_id);
+      // The frame must name the session its channel belongs to, or it could be spliced onto another channel.
+      if (!st || sessionOfChannel.get(m.channel_id) !== m.session_id) { log('dropped an EncryptedFrame for a session without E2E'); return; }
+      let plain;
+      try {
+        plain = await openFrame(st.key, m.session_id, st.recvCounter, { nonce: m.nonce, ciphertext: m.ciphertext, expectedRoleTag: ROLE_TAGS.initiator });
+      } catch (e) {
+        // Garbage (a replay, a tampered or foreign frame) neither reaches the process nor consumes a counter.
+        log(`dropped an EncryptedFrame: ${e.message}`);
+        return;
+      }
+      st.recvCounter += 1;
+      channels.get(m.channel_id)?.input?.(plain);
     }
 
     async function refuse(reason) {
