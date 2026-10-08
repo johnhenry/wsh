@@ -11,6 +11,8 @@ use crate::gateway::GatewayEvent;
 use crate::handshake;
 use crate::mcp::{McpBridge, McpProxy};
 use crate::relay::{wisp, PeerMetadata, PeerRegistry, RelayBroker, WispGuestSession, WispRegistry};
+use crate::rpc::session::{open_fail as rpc_open_fail, peek_rpc_open, RpcSessions};
+use crate::rpc::RpcSettings;
 use crate::session::{AttachError, Attachment, SessionManager};
 use crate::transport::{websocket, webtransport};
 use std::collections::HashMap;
@@ -216,6 +218,8 @@ pub struct WshServer {
     /// Populated on Open{kind: File, command: "upload:<path>"}, written to
     /// as FileChunk messages arrive, removed on the final chunk or Close.
     file_uploads: Arc<RwLock<HashMap<u32, FileUploadState>>>,
+    /// Typed rpc channels (`Open { kind: "rpc" }`); `None` when `[rpc] enabled = false`.
+    rpc: Option<Arc<RpcSettings>>,
 }
 
 /// State for an in-progress file upload (Open{kind: File, command: "upload:..."}).
@@ -278,6 +282,34 @@ impl WshServer {
         let reverse_listener = Arc::new(ReverseListenerManager::new(policy_enforcer));
         let gateway_enabled = config.gateway_enabled;
 
+        // Typed rpc channels (#86). `wsh-fs` needs an explicit root: file access is opt-in.
+        let rpc = if config.rpc_enabled {
+            if config.rpc_max_message_bytes < crate::rpc::RPC_MIN_MAX_MESSAGE {
+                return Err(WshError::Other(format!(
+                    "rpc max_message_bytes must be at least {}",
+                    crate::rpc::RPC_MIN_MAX_MESSAGE
+                )));
+            }
+            let fs = match &config.rpc_fs_root {
+                Some(root) => Some(
+                    crate::rpc::fs::FileAccess::new(
+                        root,
+                        config.rpc_fs_read_only,
+                        config.rpc_fs_max_file_bytes,
+                    )
+                    .map_err(|e| WshError::Other(format!("rpc fs_root {}: {e}", root.display())))?,
+                ),
+                None => None,
+            };
+            Some(Arc::new(RpcSettings {
+                max_message_bytes: config.rpc_max_message_bytes,
+                max_inflight: config.rpc_max_inflight.max(1),
+                fs,
+            }))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             secret,
@@ -313,6 +345,7 @@ impl WshServer {
             next_conn_id: Arc::new(AtomicU64::new(1)),
             next_channel_id: Arc::new(AtomicU32::new(1)),
             file_uploads: Arc::new(RwLock::new(HashMap::new())),
+            rpc,
         })
     }
 
@@ -596,7 +629,7 @@ impl WshServer {
             .iter()
             .map(|k| k.fingerprint.clone())
             .collect();
-        let features = self.build_feature_list();
+        let features = self.build_feature_list(false);
         let hello_result = handshake::handle_hello(&hello, &server_fingerprints, Some(&features))?;
 
         // Send SERVER_HELLO with the real session id, then CHALLENGE. This
@@ -1262,7 +1295,7 @@ impl WshServer {
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QMuxEvent>();
-        let qmux = QMuxConnection::new(
+        let qmux = Arc::new(QMuxConnection::new(
             QMuxConnectionConfig {
                 is_client: false,
                 ..Default::default()
@@ -1271,7 +1304,7 @@ impl WshServer {
                 let _ = outbound_tx.send(bytes.to_vec());
             },
             event_tx,
-        );
+        ));
         qmux.send_handshake()?;
 
         // Frames a single WS binary message can map to 0..N QMux records
@@ -1290,6 +1323,8 @@ impl WshServer {
         }
         let mut state = ConnState::AwaitingHello;
         let mut ctx: Option<ConnectionContext> = None;
+        // Typed rpc channels of this connection (#86); features are filled in at Hello.
+        let mut rpc_sessions = RpcSessions::new(self.rpc.clone(), Vec::new());
 
         // Created eagerly (mirroring `inbound_tx`/`data_tx` below) so it can
         // be a plain, unconditional `select!` arm: nothing holds a clone of
@@ -1395,10 +1430,23 @@ impl WshServer {
                     match event {
                         QMuxEvent::StreamOpen { stream_id } => {
                             debug!(stream_id, "QMux stream opened");
+                            if stream_id != CONTROL_STREAM_ID {
+                                // A client-opened data stream binds to the oldest open rpc channel.
+                                let bound = match &ctx {
+                                    Some(c) => rpc_sessions.on_stream_open(stream_id, &qmux, c.peer_tx.clone()),
+                                    None => false,
+                                };
+                                if !bound {
+                                    let _ = qmux.close_stream(stream_id);
+                                }
+                            }
                         }
 
                         QMuxEvent::StreamData { stream_id, data } => {
                             if stream_id != CONTROL_STREAM_ID {
+                                if rpc_sessions.on_stream_data(stream_id, data) {
+                                    continue;
+                                }
                                 // Session data (PTY/exec output) doesn't
                                 // migrate onto real QMux streams in this
                                 // phase -- it still flows over the control
@@ -1408,10 +1456,35 @@ impl WshServer {
                             }
 
                             for raw in control_decoder.feed_raw(&data) {
+                                // `Open { kind: "rpc" }` is not in the generated `ChannelKind`
+                                // enum (a free string on the wire), so it is recognised before
+                                // the typed decoder would reject it.
+                                if matches!(state, ConnState::Authenticated) {
+                                    if let Some(protocol) = peek_rpc_open(&raw) {
+                                        let ctx_ref = ctx.as_ref().expect("ctx set once Authenticated");
+                                        let reply = self.open_rpc(ctx_ref, &protocol, &mut rpc_sessions);
+                                        let frame = match frame_encode(&reply) {
+                                            Ok(f) => f,
+                                            Err(e) => break 'session Err(e),
+                                        };
+                                        if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
+                                            break 'session Err(e.into());
+                                        }
+                                        continue;
+                                    }
+                                }
                                 let envelope = match decode_envelope(&raw) {
                                     Ok(e) => e,
                                     Err(e) => break 'session Err(e),
                                 };
+                                // A `Close` for an rpc channel is not a session `Close`.
+                                if matches!(state, ConnState::Authenticated) {
+                                    if let Payload::Close(p) = &envelope.payload {
+                                        if rpc_sessions.on_close(p.channel_id) {
+                                            continue;
+                                        }
+                                    }
+                                }
 
                                 match &mut state {
                                     ConnState::AwaitingHello => {
@@ -1427,7 +1500,8 @@ impl WshServer {
                                             .iter()
                                             .map(|k| k.fingerprint.clone())
                                             .collect();
-                                        let features = self.build_feature_list();
+                                        let features = self.build_feature_list(true);
+                                        rpc_sessions = RpcSessions::new(self.rpc.clone(), features.clone());
                                         let hello_result = match handshake::handle_hello(
                                             &hello,
                                             &server_fingerprints,
@@ -1571,6 +1645,7 @@ impl WshServer {
                                                     peer_tx: peer_tx.clone(),
                                                     conn_id: Some(conn_id),
                                                 });
+                                                rpc_sessions.set_user(&result.username);
                                                 state = ConnState::Authenticated;
                                             }
                                             Err(e) => {
@@ -1607,6 +1682,9 @@ impl WshServer {
                         }
 
                         QMuxEvent::StreamEnd { stream_id } => {
+                            if rpc_sessions.on_stream_end(stream_id) {
+                                continue;
+                            }
                             if stream_id == CONTROL_STREAM_ID {
                                 debug!("WebSocket control stream ended (peer closed)");
                                 break 'session Ok(());
@@ -1614,6 +1692,9 @@ impl WshServer {
                         }
 
                         QMuxEvent::StreamReset { stream_id, error_code } => {
+                            if rpc_sessions.on_stream_reset(stream_id) {
+                                continue;
+                            }
                             if stream_id == CONTROL_STREAM_ID {
                                 debug!(?error_code, "WebSocket control stream reset by peer");
                                 break 'session Ok(());
@@ -1907,6 +1988,37 @@ impl WshServer {
         Ok(())
     }
 
+    /// Answer `Open { kind: "rpc", command: <protocol> }` (WebSocket / QMux connections only).
+    ///
+    /// Key options apply as they do to other channels: a key restricted to a
+    /// forced command gets no rpc channels, and `wsh-fs` needs the file-transfer scope.
+    fn open_rpc(
+        &self,
+        ctx: &ConnectionContext,
+        protocol: &str,
+        rpc_sessions: &mut RpcSessions,
+    ) -> Envelope {
+        let key_options = self
+            .authorized_keys
+            .iter()
+            .find(|k| k.fingerprint == ctx.fingerprint)
+            .and_then(|k| k.options.as_deref());
+        let permissions = crate::auth::permissions::KeyPermissions::from_options(
+            ctx.fingerprint.clone(),
+            key_options,
+        );
+        if permissions.forced_command.is_some() {
+            return rpc_open_fail("key is restricted to forced exec command");
+        }
+        let allow_fs = permissions.has_scope(&crate::auth::permissions::SessionScope::FileTransfer);
+        let next = self.next_channel_id.clone();
+        rpc_sessions.open(
+            protocol,
+            move || next.fetch_add(1, Ordering::Relaxed),
+            allow_fs,
+        )
+    }
+
     /// Allocate a unique connection ID, skipping 0 (reserved as sentinel).
     fn alloc_conn_id(&self) -> u64 {
         loop {
@@ -1933,7 +2045,10 @@ impl WshServer {
     }
 
     /// Build the list of features this server advertises based on configuration.
-    fn build_feature_list(&self) -> Vec<String> {
+    /// `data_streams`: the transport can carry client-opened data streams (QMux
+    /// over WebSocket). The native WebTransport path has a single control
+    /// stream, so it must not advertise the stream-based `rpc` channels.
+    fn build_feature_list(&self, data_streams: bool) -> Vec<String> {
         // "mcp-call-id": McpResult echoes McpCall's call_id, so a client may
         // correlate concurrent tool calls. Advertised rather than assumed --
         // McpCallPayload is deny_unknown_fields, so a client must not send
@@ -1951,6 +2066,11 @@ impl WshServer {
         }
         if self.recording_dir.is_some() {
             features.push("recording".to_string());
+        }
+        if data_streams {
+            if let Some(rpc) = &self.rpc {
+                features.extend(rpc.features());
+            }
         }
         features
     }
@@ -4505,6 +4625,12 @@ mod wisp_reverse_connect_e2e_tests {
             gateway_max_connections: 10,
             gateway_enable_reverse_tunnels: false,
             password_hashes: std::collections::HashMap::new(),
+            rpc_enabled: true,
+            rpc_max_message_bytes: crate::rpc::RPC_DEFAULT_MAX_MESSAGE,
+            rpc_max_inflight: 64,
+            rpc_fs_root: None,
+            rpc_fs_read_only: false,
+            rpc_fs_max_file_bytes: 1024,
         }
     }
 

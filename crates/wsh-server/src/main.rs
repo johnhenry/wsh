@@ -9,6 +9,7 @@ mod gateway;
 mod handshake;
 mod mcp;
 mod relay;
+mod rpc;
 mod server;
 mod session;
 mod transport;

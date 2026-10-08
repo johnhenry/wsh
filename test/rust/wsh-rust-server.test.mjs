@@ -150,10 +150,11 @@ import {
   exportPublicKeyRaw,
   hello, auth, reverseRegister, reverseAccept,
   signChallenge, signPeerRecord,
-  FrameDecoder, frameEncode, cborDecode,
+  FrameDecoder, frameEncode, cborDecode, cborEncode,
   QMuxConnection, SerialQueue,
   WebSocketTransport,
   MSG,
+  RpcError, RPC_ERROR, RPC_FEATURE, rpcProtocolFeature,
 } from '../../src/index.mjs';
 import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-components/webtransport';
 import WebSocket from 'ws';
@@ -222,19 +223,27 @@ after(() => {
  *
  * @param {string[]} sshLines - authorized_keys lines (ssh-ed25519 ...)
  * @param {string[]} [extraArgs] - additional CLI flags, e.g. ['--enable-relay']
+ * @param {{ config?: (homeDir: string) => string }} [opts] - `config` returns a config.toml body
+ *   (it may use the scratch home directory), which is passed as `--config`
  * @returns {Promise<RunningServer>}
  */
-async function startServer(sshLines, extraArgs = []) {
+async function startServer(sshLines, extraArgs = [], { config } = {}) {
   const homeDir = mkdtempSync(path.join(tmpdir(), 'wsh-rust-server-test-'));
   const wshDir = path.join(homeDir, '.wsh');
   execFileSync('mkdir', ['-p', wshDir]);
   writeFileSync(path.join(wshDir, 'authorized_keys'), sshLines.join('\n') + '\n');
 
+  let configPath = '/dev/null/does-not-exist';
+  if (config) {
+    configPath = path.join(wshDir, 'config.toml');
+    writeFileSync(configPath, config(homeDir));
+  }
+
   const port = allocPort();
   const logs = [];
   const proc = spawn(
     SERVER_BIN,
-    ['--port', String(port), '--generate-cert', '--config', '/dev/null/does-not-exist', ...extraArgs],
+    ['--port', String(port), '--generate-cert', '--config', configPath, ...extraArgs],
     {
       env: { ...process.env, HOME: homeDir },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1575,5 +1584,220 @@ describe('Rust wsh-server E2E key exchange relay (wsh #18)', () => {
     assert.deepEqual([...decrypted], [...plaintext]);
 
     await session.close();
+  });
+});
+
+// ── Typed RPC channels (wsh #86) ────────────────────────────────────
+//
+// The JS server serves `Open { kind: "rpc" }` (wsh #85); the Rust server does
+// the same, and this drives it with the stock JS client: negotiation, wsh-host,
+// a chunked wsh-fs read, a cancel, and the confinement rules.
+
+describe('Rust wsh-server rpc channels (wsh #86)', () => {
+  const dec = new TextDecoder();
+
+  async function rpcServer({ fs = true, readOnly = false, maxMessage } = {}) {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    const root = { dir: null };
+    const server = await startServer([publicKeySSH], [], {
+      config: (home) => {
+        root.dir = path.join(home, 'files');
+        mkdirSync(root.dir, { recursive: true });
+        const lines = ['[rpc]'];
+        if (fs) lines.push(`fs_root = ${JSON.stringify(root.dir)}`);
+        if (readOnly) lines.push('fs_read_only = true');
+        if (maxMessage) lines.push(`max_message_bytes = ${maxMessage}`);
+        return lines.join('\n') + '\n';
+      },
+    });
+    servers.push(server);
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+    return { server, client, root: root.dir };
+  }
+
+  it('advertises rpc, one rpc-protocol:<name> per protocol and rpc-max-message', async () => {
+    const { client } = await rpcServer({ maxMessage: 8192 });
+    assert.ok(client.hasFeature(RPC_FEATURE));
+    assert.ok(client.hasFeature(rpcProtocolFeature('wsh-host')));
+    assert.ok(client.hasFeature(rpcProtocolFeature('wsh-fs')));
+    assert.ok(client.hasFeature('rpc-max-message:8192'));
+    assert.ok(!client.hasFeature(rpcProtocolFeature('mcp')));
+  });
+
+  it('does not offer wsh-fs unless the operator configured a file root', async () => {
+    const { client } = await rpcServer({ fs: false });
+    assert.ok(client.hasFeature(rpcProtocolFeature('wsh-host')));
+    assert.ok(!client.hasFeature(rpcProtocolFeature('wsh-fs')));
+    await assert.rejects(client.openRpc('wsh-fs'), (e) => e instanceof RpcError && e.code === RPC_ERROR.UNSUPPORTED_PROTOCOL);
+    // a client that skips the feature check is refused by the server
+    client.hasFeature = () => true;
+    await assert.rejects(client.openRpc('wsh-fs'), /UNSUPPORTED_PROTOCOL/);
+    await assert.rejects(client.openRpc('mcp'), /UNSUPPORTED_PROTOCOL/);
+  });
+
+  it('host.info matches the ServerHello this connection received; host.ping answers; unknown methods are -32601', async () => {
+    const { client } = await rpcServer();
+    const rpc = await client.openRpc('wsh-host');
+    const info = await rpc.request('host.info');
+    assert.deepEqual(info.features, client.features);
+    assert.equal(info.user, 'alice');
+    assert.equal(info.protocol, 'wsh-v1');
+    assert.equal(info.hostFingerprint, null);
+    assert.match(info.version, /^\d+\.\d+\.\d+/);
+    assert.deepEqual(info.rpc.protocols, ['wsh-host', 'wsh-fs']);
+    assert.equal(info.rpc.maxMessageBytes, 1024 * 1024);
+    const pong = await rpc.request('host.ping');
+    assert.ok(Math.abs(pong.time - Date.now()) < 60_000);
+    await assert.rejects(rpc.request('host.nope'), (e) => e.code === RPC_ERROR.METHOD_NOT_FOUND);
+    await rpc.close();
+  });
+
+  it('wsh-fs: a chunked read streams $/progress chunks that add up to the file', async () => {
+    const { client, root } = await rpcServer();
+    const original = Buffer.alloc(300_000);
+    for (let i = 0; i < original.length; i++) original[i] = (i * 7) % 251;
+    writeFileSync(path.join(root, 'big.bin'), original);
+    const rpc = await client.openRpc('wsh-fs');
+    const chunks = [];
+    const summary = await rpc.request('read', { path: '/big.bin' }, { onProgress: (c) => chunks.push(Buffer.from(c)) });
+    assert.ok(chunks.length > 1, 'several chunks');
+    assert.ok(chunks.every((c) => c.length <= 64 * 1024));
+    assert.deepEqual(Buffer.concat(chunks), original);
+    assert.deepEqual(summary, { size: 300_000, offset: 0, length: 300_000, eof: true });
+    // a range
+    const part = [];
+    const s2 = await rpc.request('read', { path: 'big.bin', offset: 1000, length: 70_000 }, { onProgress: (c) => part.push(Buffer.from(c)) });
+    assert.deepEqual(Buffer.concat(part), original.subarray(1000, 71_000));
+    assert.deepEqual(s2, { size: 300_000, offset: 1000, length: 70_000, eof: false });
+    await rpc.close();
+  });
+
+  it('wsh-fs: stat, list, write, upload, rename, mkdir, remove, download', async () => {
+    const { client, root } = await rpcServer();
+    writeFileSync(path.join(root, 'a.txt'), 'hello');
+    const rpc = await client.openRpc('wsh-fs');
+    const st = await rpc.request('stat', { path: 'a.txt' });
+    assert.equal(st.name, 'a.txt');
+    assert.equal(st.size, 5);
+    assert.equal(st.type, 'file');
+    assert.equal(typeof st.modified, 'number');
+    assert.deepEqual(await rpc.request('mkdir', { path: 'sub/dir' }), {});
+    assert.deepEqual(await rpc.request('write', { path: 'sub/w.txt', data: new TextEncoder().encode('abc') }), { written: 3 });
+    assert.deepEqual(await rpc.request('write', { path: 'sub/w.txt', offset: 1, data: new TextEncoder().encode('Z') }), { written: 1 });
+    assert.equal(readFileSync(path.join(root, 'sub/w.txt'), 'utf8'), 'aZc');
+    // upload: offset 0 creates (and makes parents), a later offset continues in place
+    assert.deepEqual(await rpc.request('upload', { path: 'up/x.bin', data: Uint8Array.from([1, 2, 3]) }), { written: 3, offset: 0 });
+    assert.deepEqual(await rpc.request('upload', { path: 'up/x.bin', offset: 3, data: Uint8Array.from([4, 5]) }), { written: 2, offset: 3 });
+    assert.deepEqual([...readFileSync(path.join(root, 'up/x.bin'))], [1, 2, 3, 4, 5]);
+    const got = [];
+    const dl = await rpc.request('download', { path: 'up/x.bin' }, { onProgress: (c) => got.push(...c) });
+    assert.deepEqual(got, [1, 2, 3, 4, 5]);
+    assert.equal(dl.eof, true);
+    assert.deepEqual(await rpc.request('rename', { path: 'a.txt', newPath: 'sub/b.txt' }), { renamed: 'a.txt', to: 'sub/b.txt' });
+    const listing = await rpc.request('list', { path: '/' });
+    assert.equal(listing.path, '/');
+    assert.deepEqual(listing.entries.map((e) => `${e.name}:${e.type}`), ['sub:directory', 'up:directory']);
+    assert.deepEqual(await rpc.request('remove', { path: 'sub/b.txt' }), { removed: 'sub/b.txt' });
+    assert.equal(existsSync(path.join(root, 'sub/b.txt')), false);
+    // a missing path, a bad parameter
+    await assert.rejects(rpc.request('stat', { path: 'nope' }), (e) => e.code === RPC_ERROR.INTERNAL && e.message === 'no such file or directory' && e.data?.code === 'ENOENT');
+    await assert.rejects(rpc.request('stat', {}), (e) => e.code === RPC_ERROR.INVALID_PARAMS && /"path" \(string\) is required/.test(e.message));
+    await assert.rejects(rpc.request('write', { path: 'q', data: 'text' }), (e) => e.code === RPC_ERROR.INVALID_PARAMS && /byte string/.test(e.message));
+    await rpc.close();
+  });
+
+  it('wsh-fs: paths and symlinks cannot leave the root (-32003), a read-only root refuses writes', async () => {
+    const { client, server, root } = await rpcServer();
+    const secret = path.join(server.homeDir, 'secret.txt');
+    writeFileSync(secret, 'top secret');
+    symlinkSync(secret, path.join(root, 'link-file'));
+    symlinkSync(server.homeDir, path.join(root, 'link-dir'));
+    const rpc = await client.openRpc('wsh-fs');
+    for (const p of ['../secret.txt', 'a/../../secret.txt', 'link-file', 'link-dir/secret.txt']) {
+      for (const method of ['stat', 'read']) {
+        await assert.rejects(rpc.request(method, { path: p }), (e) => e.code === RPC_ERROR.UNAUTHORIZED && e.message === 'path escapes the file root', `${method} ${p}`);
+      }
+    }
+    await assert.rejects(rpc.request('write', { path: 'link-dir/new.txt', data: Uint8Array.of(1) }), (e) => e.code === RPC_ERROR.UNAUTHORIZED);
+    assert.equal(existsSync(path.join(server.homeDir, 'new.txt')), false);
+    assert.equal(readFileSync(secret, 'utf8'), 'top secret');
+    await rpc.close();
+
+    const ro = await rpcServer({ readOnly: true });
+    writeFileSync(path.join(ro.root, 'a.txt'), 'x');
+    const r2 = await ro.client.openRpc('wsh-fs');
+    assert.equal((await r2.request('stat', { path: 'a.txt' })).size, 1);
+    for (const [method, params] of [['write', { path: 'a.txt', data: Uint8Array.of(1) }], ['mkdir', { path: 'd' }], ['remove', { path: 'a.txt' }], ['rename', { path: 'a.txt', newPath: 'b' }]]) {
+      await assert.rejects(r2.request(method, params), (e) => e.code === RPC_ERROR.UNAUTHORIZED && e.message === 'file root is read-only', method);
+    }
+    await r2.close();
+  });
+
+  it('$/cancel stops a streaming read: the caller gets -32001 at once, the channel stays usable', async () => {
+    const { client, root } = await rpcServer();
+    const size = 24 * 1024 * 1024;
+    writeFileSync(path.join(root, 'huge.bin'), Buffer.alloc(size, 7));
+    const rpc = await client.openRpc('wsh-fs');
+    let received = 0;
+    let call;
+    const first = new Promise((resolve) => {
+      call = rpc.request('read', { path: 'huge.bin' }, {
+        onProgress: (c) => { received += c.byteLength; resolve(); },
+      });
+    });
+    call.catch(() => {});
+    await first;
+    assert.equal(call.cancel(), true);
+    await assert.rejects(call, (e) => e instanceof RpcError && e.code === RPC_ERROR.CANCELLED && e.reason === 'cancelled');
+    // the server stops streaming (flow control bounds how much was already in flight)
+    const at = received;
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(received < size, `cancel stopped the stream (${received} of ${size})`);
+    assert.ok(received - at < size / 2, 'no long tail after the cancel');
+    // and the same channel still answers
+    assert.equal(typeof (await rpc.request('stat', { path: 'huge.bin' })).size, 'number');
+    await rpc.close();
+  });
+
+  it('an oversized message is answered -32600 / message-too-large and the channel is closed', async () => {
+    const { client } = await rpcServer({ maxMessage: 1024 });
+    // Speak the wire directly: the stock RpcChannel would refuse to send this.
+    const session = await client.openSession({ type: 'rpc', protocol: 'wsh-host' });
+    const received = [];
+    session.onData = (d) => received.push(Buffer.from(d));
+    const closed = new Promise((resolve) => { session.onClose = resolve; });
+    await session.write(cborEncode({ jsonrpc: '2.0', id: 1, method: 'host.ping', params: { pad: new Uint8Array(3000) } }));
+    await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error('channel was not closed')), 5000))]);
+    const reply = cborDecode(Buffer.concat(received));
+    assert.equal(reply.id, null);
+    assert.equal(reply.error.code, RPC_ERROR.INVALID_REQUEST);
+    assert.equal(reply.error.data.reason, 'message-too-large');
+    // the connection survives: a fresh channel works
+    const rpc = await client.openRpc('wsh-host');
+    assert.equal(typeof (await rpc.request('host.ping')).time, 'number');
+    await rpc.close();
+  });
+
+  it('channels, exec sessions and several rpc channels coexist on one connection', async () => {
+    const { client } = await rpcServer();
+    const [a, b] = await Promise.all([client.openRpc('wsh-host'), client.openRpc('wsh-fs')]);
+    const [pa, sb] = await Promise.all([a.request('host.ping'), b.request('list', { path: '/' })]);
+    assert.equal(typeof pa.time, 'number');
+    assert.deepEqual(sb.entries, []);
+    const exec = await client.openSession({ type: 'exec', command: 'echo still-works' });
+    const out = [];
+    exec.onData = (d) => out.push(dec.decode(d));
+    await new Promise((resolve) => { exec.onExit = resolve; });
+    assert.match(out.join(''), /still-works/);
+    await a.close();
+    // closing one channel leaves the other (and the connection) alone
+    assert.deepEqual((await b.request('list', { path: '/' })).entries, []);
+    await assert.rejects(a.request('host.ping'), (e) => e.code === RPC_ERROR.CANCELLED);
+    await b.close();
+    const again = await client.openRpc('wsh-host');
+    assert.equal(typeof (await again.request('host.ping')).time, 'number');
+    await again.close();
   });
 });
