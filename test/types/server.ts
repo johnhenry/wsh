@@ -24,6 +24,11 @@ const mcpOptions: WshServerOptions = {
     timeoutMs: 1000,
   },
 };
+const tlsOptions: WshServerOptions = {
+  tls: { cert: 'PEM', key: 'PEM' },
+  extensions: { push_subscribe: (msg, { username, fingerprint, send }) => { void [msg, username, fingerprint, send]; } },
+  relay: { onUnreachable: (from, target, request) => { void [from.fingerprint, target, request.username]; } },
+};
 const sessionOptions: WshServerOptions = { sessions: { detachTtlMs: 1000, maxDetached: 4, ringBytes: 4096, sessionSecret: 'x' } };
 const sessionsOn: WshServerOptions = { sessions: true, sessionSecret: new Uint8Array(32) };
 const relayOptions: WshServerOptions = {

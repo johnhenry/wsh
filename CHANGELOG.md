@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.29.0 (2026-10-08)
+
+- **`createWshServer({ tls })` (wss://).** `tls: { cert, key, ca?, passphrase? }` serves the WebSocket listener over
+  TLS on the same port (the options of `https.createServer`); `close()` releases it. Previously `wss://` needed a
+  TLS-terminating proxy. The WebTransport listener keeps its own certificate (`webTransport`).
+- **`createWshServer({ extensions })`.** Handlers for application-defined control messages: a message whose `type` is
+  a string (protocol messages are numeric, so there is no collision) from an authenticated connection is handed to
+  `extensions[type](msg, { username, fingerprint, send })`; a throw is logged. Lets a host add its own verbs
+  (e.g. a Web Push subscription) without forking the connection handler.
+- **`relay.onUnreachable(from, targetFingerprint, request)`.** Called (not awaited) when an operator asks to connect
+  to a peer that is not registered; the operator still gets `no such peer`. For waking the peer another way.
+
 ## 0.28.0 (2026-10-08)
 
 - **Relay: several operators per peer (#89).** `relay: { maxOperatorsPerPeer: n }` (default 1, so nothing changes

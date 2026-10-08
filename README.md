@@ -186,6 +186,14 @@ restricted host with no shell. `fs.root` confines every path: `..`, absolute
 paths and symlinks pointing out of it are refused -- for `write` and `rename`
 (both paths) exactly as for `read`.
 
+### TLS (`wss://`) and host extensions
+
+`tls: { cert, key }` (PEM, the options of `https.createServer`) serves the WebSocket listener over TLS on the same
+port. `extensions: { [type]: (msg, { username, fingerprint, send }) => void }` handles application-defined control
+messages whose `type` is a string, from authenticated connections only. On a relay,
+`relay: { onUnreachable(from, targetFingerprint, request) }` is told when an operator asked for a peer that is not
+registered (the operator still gets `no such peer`), so the host can reach that peer another way, such as a Web Push.
+
 ### WebTransport listener
 
 The client's ladder prefers WebTransport (`https://`) and falls back to `wss://`;

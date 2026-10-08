@@ -83,6 +83,7 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {object | null} cfg.mcp - from createMcpHost
  * @param {{ protocols: Map<string, Function>, maxMessageBytes: number, maxInflight: number } | null} cfg.rpc - from createRpcHost
  * @param {{ signKey: CryptoKey | null, hybrid?: boolean } | null} cfg.e2e - answer KeyExchange and seal virtual-mode traffic (bridged connections only)
+ * @param {Record<string, Function> | undefined} cfg.extensions - handlers for application-defined (string-typed) messages
  * @param {object | null} cfg.relay - a RelayHub (see relay.mjs); null = not a relay
  * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
@@ -246,7 +247,12 @@ export function createConnectionFactory(cfg) {
         // Not awaited: the handler chain is serial, and a slow tool must not hold up
         // the next call (or a Close) behind it.
         case MSG.MCP_CALL: handleMcpCall(m); return;
-        default: log(`ignored message type 0x${m.type.toString(16)}`);
+        default:
+          if (typeof m.type === 'string' && Object.hasOwn(cfg.extensions ?? {}, m.type) && typeof cfg.extensions[m.type] === 'function') {
+            try { await cfg.extensions[m.type](m, { username: state.username, fingerprint: state.fingerprint, send }); } catch (e) { log(`extension "${m.type}" threw: ${e.message}`); }
+            return;
+          }
+          log(`ignored message type ${typeof m.type === 'number' ? `0x${m.type.toString(16)}` : JSON.stringify(String(m.type)).slice(0, 80)}`);
       }
     }
 
