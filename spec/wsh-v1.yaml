@@ -862,6 +862,12 @@ messages:
             features). The relay forwards the field after bounding it; it
             is the peer's own claim, as everything else in this message.
 
+            One feature is addressed to the relay rather than the operator:
+            "relay-multi-operator" says this peer serves several operators at
+            once -- it addresses its replies with RelayForward.to_fingerprint
+            and understands ReverseClose. Only then does a relay configured
+            for more than one operator per peer admit a second one.
+
     ReverseReject:
       code: 0x55
       description: >
@@ -877,6 +883,28 @@ messages:
         reason:
           type: string
           required: true
+
+    ReverseClose:
+      code: 0x57
+      description: >
+        Sent by the relay to a PEER that serves several operators, when one
+        of them leaves (its connection ended, or it was dropped): the peer
+        should end that operator's bridge and clean up what belongs to it
+        (its channels, processes and trusted-sender entry) while the others
+        carry on. target_fingerprint is the departed operator's key. A relay
+        sends this only to a peer that stated "relay-multi-operator" in
+        ReverseAccept.features and only when it is configured for more than
+        one operator per peer; otherwise the old rule holds -- when the
+        bridge ends the relay closes the peer's connection, and no
+        ReverseClose is sent. It is not forwardable and travels only
+        relay -> peer.
+      fields:
+        target_fingerprint:
+          type: string
+          required: true
+        reason:
+          type: string
+          required: false
 
     RelayForward:
       code: 0x56
@@ -904,6 +932,23 @@ messages:
         inner:
           type: bytes
           required: true
+        to_fingerprint:
+          type: string
+          required: false
+          description: >
+            The operator a PEER's RelayForward is addressed to (peer -> relay
+            only). Needed only when the peer serves several operators at once
+            (the relay is then configured with maxOperatorsPerPeer > 1, and
+            the peer stated "relay-multi-operator" in ReverseAccept.features):
+            the relay routes the forward to that operator's connection and
+            re-wraps it with from_fingerprint set to the peer. Absent: the
+            peer's only operator, which is what every peer wrote before this
+            field existed. The relay never sets it on what it delivers (the
+            receiver already knows who it is), and an operator's RelayForward
+            never needs it (an operator has one bridge, to one peer). A relay
+            or peer that predates the field may reject a RelayForward carrying
+            it, so a peer sends it only after the relay has admitted a second
+            operator -- in practice only to a relay that was configured to.
 
   # ── Gateway subsystem ────────────────────────────────────────────────
   # The gateway subsystem allows clients to tunnel TCP/UDP connections and
@@ -1467,6 +1512,24 @@ messages:
           type: bytes
           required: false
           description: "Hybrid mode round 2 only, encapsulator -> decapsulator: the ML-KEM-768 ciphertext (1088 bytes)."
+        signature:
+          type: bytes
+          required: false
+          description: >
+            Round 1 only, optional: an Ed25519 signature by the sender's
+            long-term identity key, which authenticates the sender's half of
+            an otherwise unauthenticated exchange. It covers the label
+            "wsh-e2e-keyexchange-v1", the session_id, the algorithm, and both
+            sides' ephemeral X25519 public keys (initiator's first, then
+            responder's), each length-prefixed -- so a relay cannot substitute
+            either key without the signer's key. A reverse host signs its
+            reply (it is the responder); the initiating operator verifies it
+            against the host key it connected to (WshClient.initiateE2E
+            { verifyPeer }). A peer that does not sign is simply
+            unauthenticated, as before; a recipient that requires it rejects
+            the exchange. Peers older than this field ignore it (JS) or may
+            reject a KeyExchange carrying it (an older Rust build), so a host
+            signs by default and offers e2e.sign: false for such a relay.
 
     EncryptedFrame:
       code: 0x8f

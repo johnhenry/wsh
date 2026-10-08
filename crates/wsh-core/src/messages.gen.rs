@@ -59,6 +59,7 @@ pub enum MsgType {
     ReverseAccept = 0x54,
     ReverseReject = 0x55,
     RelayForward = 0x56,
+    ReverseClose = 0x57,
 
     SessionList = 0x5f,
     Detach = 0x60,
@@ -185,6 +186,7 @@ impl TryFrom<u8> for MsgType {
             0x54 => Ok(Self::ReverseAccept),
             0x55 => Ok(Self::ReverseReject),
             0x56 => Ok(Self::RelayForward),
+            0x57 => Ok(Self::ReverseClose),
             0x5f => Ok(Self::SessionList),
             0x60 => Ok(Self::Detach),
             0x61 => Ok(Self::DetachOk),
@@ -358,6 +360,7 @@ pub enum Payload {
     ReverseAccept(ReverseAcceptPayload),
     ReverseReject(ReverseRejectPayload),
     RelayForward(RelayForwardPayload),
+    ReverseClose(ReverseClosePayload),
     SessionList(SessionListPayload),
     Detach(DetachPayload),
     DetachOk(DetachOkPayload),
@@ -464,6 +467,7 @@ impl Payload {
             MsgType::ReverseAccept => Ok(Self::ReverseAccept(ciborium::from_reader(cursor)?)),
             MsgType::ReverseReject => Ok(Self::ReverseReject(ciborium::from_reader(cursor)?)),
             MsgType::RelayForward => Ok(Self::RelayForward(ciborium::from_reader(cursor)?)),
+            MsgType::ReverseClose => Ok(Self::ReverseClose(ciborium::from_reader(cursor)?)),
             MsgType::SessionList => Ok(Self::SessionList(ciborium::from_reader(cursor)?)),
             MsgType::Detach => Ok(Self::Detach(ciborium::from_reader(cursor)?)),
             MsgType::DetachOk => Ok(Self::DetachOk(ciborium::from_reader(cursor)?)),
@@ -937,6 +941,16 @@ pub struct RelayForwardPayload {
     pub from_fingerprint: String,
     #[serde(with = "serde_bytes")]
     pub inner: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseClosePayload {
+    pub target_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1236,6 +1250,8 @@ pub struct KeyExchangePayload {
     pub kem_public_key: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
     pub kem_ciphertext: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

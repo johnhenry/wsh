@@ -63,6 +63,7 @@ export const MSG = Object.freeze({
   REVERSE_ACCEPT:    0x54,
   REVERSE_REJECT:    0x55,
   RELAY_FORWARD:     0x56,
+  REVERSE_CLOSE:     0x57,
 
   // Session
   SESSION_LIST:      0x5f,
@@ -510,12 +511,16 @@ export function reverseReject({ targetFingerprint, username, reason } = {}) {
   };
 }
 
-export function relayForward({ fromFingerprint, inner } = {}) {
-  return {
-    type: MSG.RELAY_FORWARD,
-    from_fingerprint: fromFingerprint,
-    inner,
-  };
+export function relayForward({ fromFingerprint, inner, toFingerprint } = {}) {
+  const msg = { type: MSG.RELAY_FORWARD, from_fingerprint: fromFingerprint, inner };
+  if (toFingerprint !== undefined) msg.to_fingerprint = toFingerprint;
+  return msg;
+}
+
+export function reverseClose({ targetFingerprint, reason } = {}) {
+  const msg = { type: MSG.REVERSE_CLOSE, target_fingerprint: targetFingerprint };
+  if (reason !== undefined) msg.reason = reason;
+  return msg;
 }
 
 export function sessionList({ sessions } = {}) {
@@ -762,11 +767,12 @@ export function copilotDetach({ sessionId, reason } = {}) {
   return msg;
 }
 
-export function keyExchange({ algorithm, publicKey, sessionId, kemPublicKey, kemCiphertext } = {}) {
+export function keyExchange({ algorithm, publicKey, sessionId, kemPublicKey, kemCiphertext, signature } = {}) {
   const msg = { type: MSG.KEY_EXCHANGE, algorithm, session_id: sessionId };
   if (publicKey !== undefined) msg.public_key = publicKey;
   if (kemPublicKey !== undefined) msg.kem_public_key = kemPublicKey;
   if (kemCiphertext !== undefined) msg.kem_ciphertext = kemCiphertext;
+  if (signature !== undefined) msg.signature = signature;
   return msg;
 }
 

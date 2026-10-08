@@ -274,4 +274,79 @@ mod tests {
         assert!(matches!(decoded.msg_type, MsgType::ReverseList));
         assert!(matches!(decoded.payload, Payload::ReverseList(_)));
     }
+
+    // wsh #89 / #90: the optional fields and the new message the JS relay and host use. The Rust relay does not act
+    // on them (tracked in #93), but it must parse them, and a message without them must still parse.
+    #[test]
+    fn relay_forward_to_fingerprint_is_optional_both_ways() {
+        use crate::messages::{Envelope, MsgType, Payload, RelayForwardPayload};
+        let with = Envelope {
+            msg_type: MsgType::RelayForward,
+            payload: Payload::RelayForward(RelayForwardPayload {
+                from_fingerprint: "peer".into(),
+                inner: vec![1, 2, 3],
+                to_fingerprint: Some("operator".into()),
+            }),
+        };
+        let framed = frame_encode(&with).unwrap();
+        match decode_envelope(&framed[4..]).unwrap().payload {
+            Payload::RelayForward(p) => assert_eq!(p.to_fingerprint.as_deref(), Some("operator")),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        // A forward written before the field existed (no to_fingerprint key at all) still decodes.
+        let without = Envelope {
+            msg_type: MsgType::RelayForward,
+            payload: Payload::RelayForward(RelayForwardPayload {
+                from_fingerprint: "peer".into(),
+                inner: vec![],
+                to_fingerprint: None,
+            }),
+        };
+        let framed = frame_encode(&without).unwrap();
+        assert!(
+            !framed.windows(14).any(|w| w == b"to_fingerprint"),
+            "the absent field is not on the wire"
+        );
+        match decode_envelope(&framed[4..]).unwrap().payload {
+            Payload::RelayForward(p) => assert_eq!(p.to_fingerprint, None),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reverse_close_and_key_exchange_signature_round_trip() {
+        use crate::messages::{
+            Envelope, KeyExchangePayload, MsgType, Payload, ReverseClosePayload,
+        };
+        let close = Envelope {
+            msg_type: MsgType::ReverseClose,
+            payload: Payload::ReverseClose(ReverseClosePayload {
+                target_fingerprint: "operator".into(),
+                reason: None,
+            }),
+        };
+        let framed = frame_encode(&close).unwrap();
+        let decoded = decode_envelope(&framed[4..]).unwrap();
+        assert_eq!(decoded.msg_type, MsgType::ReverseClose);
+        assert!(
+            matches!(decoded.payload, Payload::ReverseClose(p) if p.target_fingerprint == "operator")
+        );
+
+        let signed = Envelope {
+            msg_type: MsgType::KeyExchange,
+            payload: Payload::KeyExchange(KeyExchangePayload {
+                algorithm: "X25519".into(),
+                public_key: Some(vec![7; 32]),
+                session_id: "s".into(),
+                kem_public_key: None,
+                kem_ciphertext: None,
+                signature: Some(vec![9; 64]),
+            }),
+        };
+        let framed = frame_encode(&signed).unwrap();
+        match decode_envelope(&framed[4..]).unwrap().payload {
+            Payload::KeyExchange(p) => assert_eq!(p.signature, Some(vec![9; 64])),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
 }

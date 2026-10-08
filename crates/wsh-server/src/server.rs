@@ -2205,6 +2205,7 @@ impl WshServer {
                                     payload: Payload::RelayForward(RelayForwardPayload {
                                         from_fingerprint: ctx.fingerprint.clone(),
                                         inner,
+                                        to_fingerprint: None,
                                     }),
                                 };
                                 let _ = sender.try_send(wrapped);

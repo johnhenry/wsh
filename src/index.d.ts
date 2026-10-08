@@ -616,6 +616,14 @@ export function reverseReject(opts?: {
 export function relayForward(opts?: {
   fromFingerprint?: string;
   inner?: Uint8Array;
+  /** Peer -> relay: the operator this is for, when the peer serves several (wsh #89). */
+  toFingerprint?: string;
+}): WshMessage;
+
+/** Relay -> peer: one operator of a multi-operator peer left (wsh #89). */
+export function reverseClose(opts?: {
+  targetFingerprint?: string;
+  reason?: string;
 }): WshMessage;
 
 /** Message types a relay may forward inside a RelayForward wrapper. */
@@ -851,6 +859,8 @@ export function keyExchange(opts?: {
   sessionId?: string;
   kemPublicKey?: Uint8Array;
   kemCiphertext?: Uint8Array;
+  /** Round 1 only: the sender's Ed25519 signature over the exchange (see the spec's KeyExchange). */
+  signature?: Uint8Array;
 }): WshMessage;
 
 export function encryptedFrame(opts?: {
@@ -1909,6 +1919,27 @@ export interface WshPeerInfo {
   verified: boolean;
 }
 
+/** Host feature: it answers `KeyExchange` and seals/opens `EncryptedFrame`s (a reverse host with `e2e` on). */
+export const E2E_FEATURE: 'e2e';
+/** Host feature: it signs its `KeyExchange` reply, so `initiateE2E(..., { verifyPeer })` can authenticate it. */
+export const E2E_SIGN_FEATURE: 'e2e-sign';
+
+/** The bytes a responder signs in `KeyExchange.signature`. */
+export function keyExchangeTranscript(t: {
+  sessionId: string;
+  /** The initiator's `algorithm` string. */
+  algorithm: string;
+  initiatorKey: Uint8Array;
+  responderKey: Uint8Array;
+}): Uint8Array;
+
+/** Verify a responder's `KeyExchange.signature` against its long-term Ed25519 public key. */
+export function verifyKeyExchangeSignature(
+  peerIdentity: Uint8Array | CryptoKey,
+  signature: Uint8Array | undefined,
+  transcript: Parameters<typeof keyExchangeTranscript>[0],
+): Promise<boolean>;
+
 /** Result from WshClient.initiateE2E(). */
 export interface WshE2EResult {
   /** Non-extractable AES-256-GCM key derived from the exchange. */
@@ -1921,6 +1952,8 @@ export interface WshE2EResult {
    * requested but the peer didn't support it (automatic fallback).
    */
   hybrid: boolean;
+  /** True when `verifyPeer` was given and the peer's signature over the exchange verified. */
+  peerAuthenticated: boolean;
 }
 
 /**
@@ -2005,7 +2038,13 @@ export class WshClient {
    * In reverse mode, the relay bridge forwards messages from the CLI peer
    * to this browser client.
    */
-  onRelayMessage: ((msg: WshMessage) => void) | null;
+  onRelayMessage: ((msg: WshMessage, fromFingerprint?: string) => void) | null;
+
+  /**
+   * Called on a peer that serves several operators when the relay reports that one left (`ReverseClose`,
+   * wsh #89): end that operator's bridge and clean up what belongs to it.
+   */
+  onReverseClose: ((msg: WshMessage) => void) | null;
 
   /**
    * Called when a gateway-subsystem control message arrives (opcodes 0x70-0x7f).
@@ -2169,7 +2208,7 @@ export class WshClient {
   /**
    * Send a control message over the authenticated relay connection.
    */
-  sendRelayControl(msg: WshMessage): Promise<void>;
+  sendRelayControl(msg: WshMessage, opts?: { to?: string }): Promise<void>;
 
   /**
    * Send a raw control message on the authenticated connection.
@@ -2202,7 +2241,15 @@ export class WshClient {
    * fallback to classical if the peer doesn't support it). Experimental
    * -- the derived key is not yet wired to any actual encryption.
    */
-  initiateE2E(sessionId: string, algorithm?: 'X25519' | 'X25519+ML-KEM-768', timeout?: number): Promise<WshE2EResult>;
+  initiateE2E(
+    sessionId: string,
+    algorithm?: 'X25519' | 'X25519+ML-KEM-768',
+    timeout?: number,
+    opts?: {
+      /** The peer's long-term Ed25519 public key; the exchange is refused (`E2E_PEER_UNAUTHENTICATED`) unless it signed its half. */
+      verifyPeer?: Uint8Array | CryptoKey;
+    },
+  ): Promise<WshE2EResult>;
 
   /**
    * Mark a peer fingerprint as an accepted reverse-connect bridge partner.

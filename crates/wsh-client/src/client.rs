@@ -697,6 +697,7 @@ impl WshClient {
                 session_id: session_id.to_string(),
                 kem_public_key: local_kem_public_bytes,
                 kem_ciphertext: None,
+                signature: None,
             }),
         };
 
@@ -750,6 +751,7 @@ impl WshClient {
                         session_id: session_id.to_string(),
                         kem_public_key: None,
                         kem_ciphertext: Some(ciphertext.to_vec()),
+                        signature: None,
                     }),
                 };
                 self.send_fire_and_forget(round2).await?;
@@ -2579,6 +2581,7 @@ mod tests {
                 session_id: "sess-interop".to_string(),
                 kem_public_key: Some(vec![0xCD; 1184]),
                 kem_ciphertext: None,
+                signature: None,
             }),
         };
         let encoded = wsh_core::codec::frame_encode(&round1).unwrap();
@@ -2602,6 +2605,7 @@ mod tests {
                 session_id: "sess-interop".to_string(),
                 kem_public_key: None,
                 kem_ciphertext: Some(vec![0xEF; 1088]),
+                signature: None,
             }),
         };
         let encoded = wsh_core::codec::frame_encode(&round2).unwrap();

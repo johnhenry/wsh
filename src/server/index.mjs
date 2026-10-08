@@ -39,10 +39,12 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  *   SHA-256 through `webTransport()` / `certificateHashes()` for the client's `serverCertificateHashes`, and rotates it
  *   before it expires (`rotateCertificate()`). Needs the optional peers
  *   `@fails-components/webtransport` and `@fails-components/webtransport-transport-http3-quiche`. Off unless given.
- * @param {{ canRegister?: Function, canConnect?: Function, maxPeers?: number, connectTimeoutMs?: number }} [options.relay]
+ * @param {{ canRegister?: Function, canConnect?: Function, maxPeers?: number, maxOperatorsPerPeer?: number, connectTimeoutMs?: number }} [options.relay]
  *   Act as a relay: peers register (`ReverseRegister`, a signed record), operators list and connect to them
  *   (`ReverseList` / `ReverseConnect`) and traffic is carried between them as `RelayForward`. Default deny:
  *   `canRegister(who, record)` and `canConnect(from, to)` must both be given and return true. See `createReverseHost`.
+ *   One operator per peer unless `maxOperatorsPerPeer` is raised -- and then only for peers that state
+ *   `relay-multi-operator` (`createReverseHost({ maxOperators })`).
  * @param {true | { detachTtlMs?: number, maxDetached?: number, ringBytes?: number, sessionSecret?: string | Uint8Array }} [options.sessions]
  *   Keep pty/exec sessions alive across disconnects so a client can `resumeSession()` / `attachSession()`
  *   them: a per-server registry, a ring buffer of the newest `ringBytes` (default 1 MiB) of output, and
@@ -76,6 +78,9 @@ export function createWshServer({
     key: typeof rl.key === 'function' ? rl.key : ({ address }) => String(address ?? 'unknown'),
     failureDelayMs: rl.failureDelayMs ?? 250,
   };
+  if (relay && relay.maxOperatorsPerPeer !== undefined && (!Number.isSafeInteger(relay.maxOperatorsPerPeer) || relay.maxOperatorsPerPeer < 1)) {
+    throw new TypeError('createWshServer: relay.maxOperatorsPerPeer must be a positive integer');
+  }
   const rpcHost = rpc ? createRpcHost(rpc, { files, maxMessageBytes: rpcMaxMessageBytes, maxInflight: rpcMaxInflight }) : null;
   let host_ = null;
   let registry = null;
