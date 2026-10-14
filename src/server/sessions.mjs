@@ -20,7 +20,8 @@ import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 export const DEFAULT_RING_BYTES = 1024 * 1024;
 export const DEFAULT_DETACH_TTL_MS = 300_000;
 export const DEFAULT_MAX_DETACHED = 16;
-export const MAX_ATTACHMENTS = 16;
+import { MAX_ATTACHMENTS } from './constants.mjs';
+export { MAX_ATTACHMENTS };
 
 const NO_EXPIRY = Buffer.alloc(8, 0xff);
 

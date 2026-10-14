@@ -14,7 +14,8 @@ import { constants as fsc } from 'node:fs';
 import path from 'node:path';
 
 export const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
-export const FILE_CHUNK_BYTES = 64 * 1024;
+import { FILE_CHUNK_BYTES } from './constants.mjs';
+export { FILE_CHUNK_BYTES };
 
 /**
  * @param {{ root: string, readOnly?: boolean, maxFileBytes?: number }} opts

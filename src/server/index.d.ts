@@ -402,9 +402,32 @@ export interface WshServerAddress {
   port: number;
 }
 
+/**
+ * An already-accepted WebSocket-like duplex: `send(bytes)`, `close(code?)`, `readyState` (1 = open), and either Node-style
+ * `on(event, fn)` or `addEventListener(event, fn)`. A `ws` socket, a browser/Worker `WebSocket`, or a test double.
+ */
+export interface WshAcceptableSocket {
+  send(data: Uint8Array): void;
+  close(code?: number): void;
+  readonly readyState: number;
+  on?(event: string, listener: (...args: any[]) => void): unknown;
+  addEventListener?(event: string, listener: (ev: any) => void): unknown;
+}
+
+export interface WshAcceptOptions {
+  /** What the embedder knows of the peer; `address` keys the password-failure throttle. */
+  remote?: { address?: string; headers?: Record<string, unknown> };
+}
+
 export interface WshServer {
   /** Start listening. Requires the `ws` package. */
   listen(): Promise<WshServerAddress>;
+  /**
+   * Serve a pre-upgraded transport -- a socket your own HTTP server, Worker or test already accepted -- with this
+   * server's auth, features and sessions, so no listener of wsh's own is needed (`listen()` is optional).
+   * Resolves once the connection is attached; the handle's `close()` drops it. `close()` of the server drops all of them.
+   */
+  accept(socket: WshAcceptableSocket, options?: WshAcceptOptions): Promise<{ close(): void }>;
   /** Drop every connection and stop listening. */
   close(): Promise<void>;
   /** The bound address, or `null` when not listening. */

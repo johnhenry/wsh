@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.31.0 (2026-10-14)
+
+- **`@johnhenry/wsh/memory`: a browser-safe in-memory host (#99).** `createMemoryHost({ auth, exec, mcp, extensions })` runs
+  the real connection handler (handshake, auth, exec channels, MCP tools, extensions) over an in-memory socket pair, so a
+  wsh host can run in a page or Worker with no Node, for demos and tests. `host.connect(credentials)` /
+  `host.createClient()` give a client wired to it; `host.WebSocket`, `host.accept(socket)` and `createSocketPair()` are the
+  pieces. `exec` is a function (there is no shell); `pty`, `fs`, `gateway`, `relay`, `sessions`, `rpc`, `hostKey` and
+  WebTransport stay Node-only. To make this possible the connection handler no longer imports `node:crypto`/`node:fs`/
+  `node:net` at load (limits moved to `server/constants.mjs`, the gateway loads `node:net`/`node:dns` on first use);
+  behaviour is unchanged. `WebSocketTransport` takes an optional `{ WebSocket }` constructor to dial with.
+- **`WshClient` signs with a page-held signer (#100).** `connect()`, `WshClient.exec()` and `connectReverse()` accept
+  `signer: { publicKey, sign(data) }` (raw 32-byte key or public `CryptoKey`; sync or async `sign`) instead of `keyPair`;
+  passing both is a `TypeError`. New helpers `resolveSigner`, `signChallengeWith`, `signPeerRecordWith`. `keyPair` is
+  unchanged. `createReverseHost` still needs a `keyPair` (it also uses the private key for end-to-end encryption).
+- **`createWshServer().accept(socket, { remote })` takes a pre-upgraded transport (#101).** An already-accepted
+  WebSocket-like duplex (a `ws` socket, a browser/Worker `WebSocket`, a test double) is served with the same auth,
+  features, rate limit and session registry as `listen()`, so an embedder that owns the HTTP server no longer needs a
+  per-session loopback listener (which any local process could connect to). `listen()` is now optional, may be mixed
+  with `accept()`, and `close()` drops accepted sockets too.
+- **Docs: the recording export is asciicast-v2-shaped, not an asciicast file (#102).** README and `recording.mjs` now say
+  the same thing: one JSON document (not NDJSON) with a `sessionId` field, `width`/`height` that follow the latest resize,
+  and `open`/`exit` events, so `asciinema play` cannot read it as-is. The README gives the short conversion to a real
+  `.cast` file (tested in `test/recording-format.test.mjs`). No behaviour change.
+
 ## 0.30.0 (2026-10-08)
 
 - **`createWshServer({ gateway })`: the Node server answers the gateway opcodes (0x70-0x7e).** Until now only the Rust

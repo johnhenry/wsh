@@ -2,8 +2,14 @@
  * Session recording and playback for wsh PTY sessions.
  *
  * Records all terminal I/O with timestamps for later replay.
- * The export format is compatible with the asciicast v2 structure
- * used by asciinema, enabling interop with standard terminal players.
+ * The export (`toJSON()`) is asciicast-v2-*shaped*, not an asciicast v2 file: the header
+ * fields (`version: 2`, `width`, `height`, `timestamp`, `env`) and the `[seconds, code, data]`
+ * events with the `o` / `i` / `r` codes are asciicast's, but it is one JSON document (asciicast
+ * v2 is newline-delimited JSON: a header line, then one event per line), the header carries
+ * wsh's own `sessionId`, `width`/`height` follow the latest resize rather than the start size,
+ * and the lifecycle events `open` / `exit` have no asciicast code. `asciinema play` therefore
+ * cannot read it as-is. The README ("Session recording") shows the short conversion to a real
+ * `.cast` file (header line + the `o`/`i`/`r` events); `fromJSON()` reads this document shape.
  */
 
 // ── SessionRecorder ──────────────────────────────────────────────────
@@ -66,16 +72,17 @@ export class SessionRecorder {
   /**
    * Export the recording as a JSON-serializable object.
    *
-   * The format is compatible with asciicast v2:
+   * The shape follows asciicast v2 but this is NOT a playable asciicast file (see the file header):
    *   - version: 2
-   *   - width, height: terminal dimensions at start
+   *   - width, height: terminal dimensions as of the latest resize (asciicast: at start)
    *   - timestamp: Unix epoch seconds when recording started
-   *   - env: optional environment metadata
-   *   - events: array of [time_seconds, event_type, data]
+   *   - env: environment metadata
+   *   - sessionId: wsh's own field
+   *   - events: array of [time_seconds, event_type, data] -- one JSON document, not one line per event
    *
-   * Event types in asciicast:
-   *   "o" = output, "i" = input, "r" = resize
-   * We extend with: "open", "exit" for session lifecycle.
+   * Event types from asciicast:
+   *   "o" = output, "i" = input, "r" = resize ("COLSxROWS")
+   * Not in asciicast, so dropped by the conversion in the README: "open", "exit" (session lifecycle).
    *
    * @returns {object}
    */
@@ -111,7 +118,8 @@ export class SessionRecorder {
   }
 
   /**
-   * Import a recording from JSON (as produced by toJSON or parsed from asciicast).
+   * Import a recording from the JSON document `toJSON()` produces. An asciicast v2 `.cast` file is not read directly:
+   * parse its lines and gather them into `{ ...header, events }` first.
    *
    * @param {object | string} json - Recording object or JSON string
    * @returns {SessionRecorder}

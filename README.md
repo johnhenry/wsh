@@ -61,22 +61,39 @@ Or via CDN:
 - **Reverse mode** -- register as a peer (via a signed peer record) and accept incoming connections through a relay
 - **File transfer** -- scp-like upload/download as `FileChunk` control messages in 64KB chunks
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
-- **Session recording** -- own JSON schema (not asciicast v2 -- see note below) recording and playback with seek/pause/resume
+- **Session recording** -- own JSON schema (asciicast-v2-shaped, not a playable asciicast file -- see note below) recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
 - **98 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
 
-> **Session recording is not asciicast v2.** Both `SessionRecorder`
-> implementations capture more than asciicast v2's three event codes
-> (`o`/`i`/`r`) can represent -- session lifecycle events (`open`/`exit` in
-> JS; `Start`/`Exit`/`Snapshot` in Rust) have no asciicast v2 equivalent,
-> and dropping them wasn't worth it just to match the format. The JS and
-> Rust recorders also use two different, mutually incompatible schemas from
-> each other (neither is asciicast v2's newline-delimited-JSON shape).
-> `RecordingExport`'s `format: "asciicast"` option is accepted on the wire
-> but not yet implemented server-side -- requesting it currently returns
-> the same custom JSONL as `format: "jsonl"`. If interop with standard
-> asciicast players (`asciinema play`, etc.) is wanted, that needs a real
-> (lossy -- lifecycle events would be dropped) export path, not a rename.
+> **Session recording is asciicast-v2-shaped, but not an asciicast file.**
+> The JS `SessionRecorder.toJSON()` export borrows asciicast v2's vocabulary --
+> `version: 2`, `width`, `height`, `timestamp`, `env`, and events as
+> `[seconds, "o" | "i" | "r", data]` -- so it is easy to convert, but it is not
+> something `asciinema play` can read as-is:
+>
+> - it is **one JSON document** with an `events` array; asciicast v2 is
+>   newline-delimited JSON (a header line, then one event per line);
+> - the header carries wsh's own `sessionId`, and `width`/`height` follow the
+>   latest resize rather than the size at the start;
+> - session lifecycle events (`open`, `exit`) use codes asciicast v2 does not
+>   define (the Rust recorder also has `Start`/`Exit`/`Snapshot`, and uses a
+>   different, incompatible schema from the JS one);
+> - `RecordingExport`'s `format: "asciicast"` option is accepted on the wire but
+>   not implemented server-side -- it returns the same custom JSONL as
+>   `format: "jsonl"`.
+>
+> To play a JS recording in asciinema, write the header and the `o`/`i`/`r`
+> events out as lines (lossy: lifecycle events are dropped):
+>
+> ```js
+> const { version, width, height, timestamp, env, events } = recorder.toJSON();
+> const cast = [JSON.stringify({ version, width, height, timestamp, env }),
+>   ...events.filter((e) => 'oir'.includes(e[1])).map((e) => JSON.stringify(e))].join('\n') + '\n';
+> // write `cast` to session.cast, then: asciinema play session.cast
+> ```
+>
+> A first-class `.cast` exporter is not provided; the conversion above is the
+> supported path (it is covered by `test/recording-format.test.mjs`).
 
 ## Wire Protocol: QMux
 
@@ -200,6 +217,50 @@ port. `extensions: { [type]: (msg, { username, fingerprint, send }) => void }` h
 messages whose `type` is a string, from authenticated connections only. On a relay,
 `relay: { onUnreachable(from, targetFingerprint, request) }` is told when an operator asked for a peer that is not
 registered (the operator still gets `no such peer`), so the host can reach that peer another way, such as a Web Push.
+
+### Pre-upgraded transports: `accept()`
+
+`createWshServer()` normally opens its own listener. If your application already owns the HTTP server (or Worker, or
+test harness) and has upgraded the connection itself, hand the socket over instead of bridging it to a per-session
+loopback listener (which any local process could also connect to):
+
+```js
+const wsh = createWshServer({ auth: { authorizedKeys }, exec: true });   // no listen()
+wss.on('connection', (ws, req) => wsh.accept(ws, { remote: { address: req.socket.remoteAddress } }));
+```
+
+`accept(socket, { remote })` takes any WebSocket-like duplex (`send`, `close`, `readyState`, and `on` or
+`addEventListener`): a `ws` socket, a browser/Worker `WebSocket`, a test double. It applies the same auth, features,
+rate limit and session registry as `listen()`'s connections, may be mixed with `listen()`, and resolves to
+`{ close() }`. `remote.address` keys the password-failure throttle (sockets without one share a key). `server.close()`
+drops every accepted socket.
+
+### In-memory host (`@johnhenry/wsh/memory`)
+
+A browser-safe host for demos and tests: no sockets, no ports, no Node (nothing in its import graph is `node:*` or `ws`).
+
+```js
+import { createMemoryHost } from '@johnhenry/wsh/memory';
+
+const host = createMemoryHost({
+  auth: { authorizedKeys: [rawPublicKey] },                       // same shapes as createWshServer
+  exec: async (command, io) => { await io.write(`ran ${command}\n`); return 0; },
+});
+const client = await host.connect({ username: 'demo', keyPair });   // or { signer } / { password }
+const session = await client.openSession({ type: 'exec', command: 'hi' });
+session.onData = (d) => console.log(new TextDecoder().decode(d));   // "ran hi"
+```
+
+It is the real connection handler speaking QMux over an in-memory socket pair, so the client code you test is the code
+you ship. `host.createClient()` / `host.WebSocket` / `host.accept(socket)` / `createSocketPair()` are the lower-level pieces.
+Supported: `auth`, `exec` (a function; there is no shell), `mcp`, `extensions`. Not available in memory: `pty`, `fs`,
+`gateway`, `relay`, `sessions`, `rpc`, `hostKey` and WebTransport (use `@johnhenry/wsh/server`).
+
+### Signing with a page-held signer
+
+`connect()`, `WshClient.exec()` and `connectReverse()` take `signer: { publicKey, sign(data) }` instead of `keyPair`
+(not both): `publicKey` is the raw 32-byte Ed25519 key or a public `CryptoKey`, `sign` returns the 64-byte signature
+(sync or async). For keys that live in a wallet, a hardware token or another realm and are not a `CryptoKeyPair`.
 
 ### WebTransport listener
 
@@ -936,7 +997,7 @@ so options the platform gains later need no change here.
 | `WshMcpBridge` | Remote MCP tool discovery and invocation |
 | `RpcChannel` / `RpcError` | Typed RPC channel (JSON-RPC 2.0 over a CBOR sequence): `client.openRpc(protocol)`; `RPC_FEATURE`, `rpcProtocolFeature(name)`, `RPC_ERROR`, `CborSequenceDecoder` |
 | `mcpClientTransport()` / `mcpServerAdapter()` (`/server`) | MCP SDK `Transport` over an `rpc` channel |
-| `SessionRecorder` | Record PTY I/O with timestamps (own schema, not asciicast v2) |
+| `SessionRecorder` | Record PTY I/O with timestamps (asciicast-v2-shaped JSON; convert to play in asciinema, see the note under Session recording) |
 | `SessionPlayer` | Replay recordings with original timing |
 | `generateKeyPair()` | Create Ed25519 key pair via Web Crypto |
 | `sign(privateKey, message)` / `verify(publicKey, signature, message)` | Raw Ed25519 sign / verify. This positional order (WebCrypto's) is the one canonical form across wsh, raijin and browsermesh |
@@ -1003,7 +1064,7 @@ than left to be found.
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side; several operators per peer and the signed `KeyExchange` are JS-relay only for now |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
-| Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast v2) | none | **JS-only** -- no current Rust consumer needs playback; the format itself (asciicast v2) is not proprietary if one is added later |
+| Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |
 | Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | N/A -- Rust dials a cert its own TLS stack already trusts, or `--generate-cert`'s self-signed cert out of band | **Deliberately not unified** -- this is a browser-specific WebTransport API shape, not a wire-protocol concept |
 
 ### Build and test

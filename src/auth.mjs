@@ -160,6 +160,65 @@ export async function sign(privateKey, data) {
 }
 
 /**
+ * A page-held signer: an object that can sign but need not expose a private key.
+ * `publicKey` is the raw 32-byte Ed25519 key (or a `CryptoKey`); `sign(data)` returns the
+ * 64-byte signature, synchronously or not. For keys held by a wallet, a hardware token, a
+ * Worker, or anything else that is not a `CryptoKeyPair`.
+ *
+ * @typedef {{ publicKey: Uint8Array | CryptoKey, sign: (data: Uint8Array) => Uint8Array | Promise<Uint8Array> }} WshSigner
+ */
+
+/**
+ * Turn `{ keyPair }` or `{ signer }` into one `{ publicKeyRaw, sign }` pair, or `null` when neither is given.
+ * Throws a TypeError for both together or for a malformed signer.
+ *
+ * @param {{ keyPair?: CryptoKeyPair, signer?: WshSigner }} credentials
+ * @returns {Promise<{ publicKeyRaw: Uint8Array, sign: (data: Uint8Array) => Promise<Uint8Array> } | null>}
+ */
+export async function resolveSigner({ keyPair, signer } = {}) {
+  if (keyPair && signer) throw new TypeError('pass either keyPair or signer, not both');
+  if (keyPair) {
+    return { publicKeyRaw: await exportPublicKeyRaw(keyPair.publicKey), sign: (data) => sign(keyPair.privateKey, data) };
+  }
+  if (!signer) return null;
+  if (typeof signer !== 'object' || typeof signer.sign !== 'function') {
+    throw new TypeError('signer must be { publicKey, sign(data) }');
+  }
+  let publicKeyRaw;
+  if (signer.publicKey instanceof Uint8Array) publicKeyRaw = signer.publicKey;
+  else if (signer.publicKey && typeof signer.publicKey === 'object' && signer.publicKey.type === 'public') publicKeyRaw = await exportPublicKeyRaw(signer.publicKey);
+  if (!publicKeyRaw || publicKeyRaw.byteLength !== 32) {
+    throw new TypeError('signer.publicKey must be a raw 32-byte Ed25519 key or a public CryptoKey');
+  }
+  return {
+    publicKeyRaw,
+    sign: async (data) => {
+      const sig = await signer.sign(data);
+      if (!(sig instanceof Uint8Array) || sig.byteLength !== 64) throw new TypeError('signer.sign() must return a 64-byte Ed25519 signature');
+      return sig;
+    },
+  };
+}
+
+/**
+ * `signChallenge` for a resolved signer (see `resolveSigner`).
+ * @returns {Promise<{ signature: Uint8Array, publicKeyRaw: Uint8Array }>}
+ */
+export async function signChallengeWith(signer, sessionId, nonce, opts) {
+  const transcript = await buildTranscript(sessionId, nonce, opts);
+  return { signature: await signer.sign(transcript), publicKeyRaw: signer.publicKeyRaw };
+}
+
+/**
+ * `signPeerRecord` for a resolved signer (see `resolveSigner`).
+ * @returns {Promise<{ signature: Uint8Array, publicKeyRaw: Uint8Array }>}
+ */
+export async function signPeerRecordWith(signer, record) {
+  const transcript = await buildPeerRecordTranscript(record);
+  return { signature: await signer.sign(transcript), publicKeyRaw: signer.publicKeyRaw };
+}
+
+/**
  * Verify an Ed25519 signature.
  * @param {CryptoKey} publicKey
  * @param {Uint8Array} signature
