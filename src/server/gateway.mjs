@@ -22,9 +22,14 @@
  * the host would have to resolve the name itself.
  */
 
-import net from 'node:net';
-import dns from 'node:dns/promises';
 import { MSG, gatewayOk, gatewayFail, gatewayClose, gatewayData, dnsResult, listenFail } from '../messages.gen.mjs';
+
+// Loaded on first use so that importing the connection handler (which serves the gateway opcodes)
+// does not pull `node:net` into a browser bundle (see `src/memory-host.mjs`).
+let netModule = null;
+let dnsModule = null;
+const loadNet = async () => (netModule ??= (await import('node:net')).default);
+const loadDns = async () => (dnsModule ??= (await import('node:dns/promises')).default);
 
 /** Numeric codes of GatewayFail (the same table `@johnhenry/browsermesh-netway` decodes). */
 export const GATEWAY_FAIL = Object.freeze({
@@ -62,7 +67,8 @@ export function destinationAllowed(allow, host, port) {
  * Resolves with the connected socket, or rejects with an Error carrying `.code`
  * (a GATEWAY_FAIL value).
  */
-export function socksConnect(proxy, host, port, { timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS } = {}) {
+export async function socksConnect(proxy, host, port, { timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS } = {}) {
+  const net = await loadNet();
   return new Promise((resolve, reject) => {
     const name = Buffer.from(host, 'utf8');
     const fail = (code, message, sock) => { sock?.destroy(); const e = new Error(message); e.code = code; reject(e); };
@@ -161,6 +167,7 @@ export function createGatewaySession(cfg, send, log = () => {}) {
     pending.add(id);
     let sock;
     try {
+      const net = await loadNet();
       if (cfg.socks) sock = await socksConnect(cfg.socks, m.host, m.port, { timeoutMs: cfg.connectTimeoutMs });
       else {
         sock = await new Promise((resolve, reject) => {
@@ -202,7 +209,7 @@ export function createGatewaySession(cfg, send, log = () => {}) {
     try {
       const family = m.record_type === 'AAAA' ? 6 : m.record_type === 'A' || m.record_type === undefined ? 4 : 0;
       if (!family) return fail(id, GATEWAY_FAIL.DNS_FAILED, `unsupported record type ${String(m.record_type).slice(0, 8)}`);
-      const addresses = (await dns.lookup(m.name, { family, all: true })).map((a) => a.address);
+      const addresses = (await (await loadDns()).lookup(m.name, { family, all: true })).map((a) => a.address);
       return reply(dnsResult({ gatewayId: id, addresses }));
     } catch (e) {
       return fail(id, GATEWAY_FAIL.DNS_FAILED, String(e.code === 'ENOTFOUND' ? 'name not found' : e.message).slice(0, 200));

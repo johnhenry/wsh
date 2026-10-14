@@ -37,7 +37,7 @@ import {
   sessionGrant as sessionGrantMsg, sessionRevoke as sessionRevokeMsg,
   isRelayForwardable,
 } from './messages.mjs';
-import { signChallenge, exportPublicKeyRaw, signPeerRecord, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
+import { resolveSigner, signChallengeWith, signPeerRecordWith, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
 import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
 import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature } from './e2e-exchange.mjs';
 import { WshSession } from './session.mjs';
@@ -467,7 +467,8 @@ export class WshClient {
    * @param {string} url - Server URL (https:// for WebTransport, wss:// or ws:// for WebSocket)
    * @param {object} opts
    * @param {string} opts.username - Username for authentication
-   * @param {CryptoKeyPair} [opts.keyPair] - Ed25519 key pair for pubkey auth
+   * @param {CryptoKeyPair} [opts.keyPair]
+   * @param {import('./auth.mjs').WshSigner} [opts.signer] - Page-held signer `{ publicKey, sign(data) }` instead of `keyPair`.
    * @param {string} [opts.password] - Password for password auth
    * @param {'wt'|'ws'|'auto'} [opts.transport] - Force a specific transport
    * @param {object} [opts.webTransport] - Options forwarded to the
@@ -493,15 +494,16 @@ export class WshClient {
    * @param {Function} [opts.onHostKey] - Per-connect `onHostKey`.
    * @returns {Promise<string>} The server-assigned session ID
    */
-  async connect(url, { username, keyPair, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, ...hostKeyOpts } = {}) {
+  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, ...hostKeyOpts } = {}) {
     if (this.#state !== STATE_DISCONNECTED && this.#state !== STATE_CLOSED) {
       throw new Error(`Client already ${this.#state}`);
     }
     if (!username) {
       throw new Error('username is required');
     }
-    if (!keyPair && !password) {
-      throw new Error('Either keyPair or password is required for authentication');
+    const cred = await resolveSigner({ keyPair, signer });
+    if (!cred && !password) {
+      throw new Error('Either keyPair, signer or password is required for authentication');
     }
 
     this.#state = STATE_CONNECTING;
@@ -519,7 +521,7 @@ export class WshClient {
       this.#state = STATE_CONNECTED;
 
       // ── Auth handshake ────────────────────────────────────────────
-      const authMethod = keyPair ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
+      const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
       await transport.sendControl(
         hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce] })
@@ -568,9 +570,8 @@ export class WshClient {
           // Sign the challenge. Challenge.session_id (not the one from
           // ServerHello) is authoritative for the transcript — see the
           // comment in the CHALLENGE-first branch below for why.
-          const { signature, publicKeyRaw } = await signChallenge(
-            keyPair.privateKey,
-            keyPair.publicKey,
+          const { signature, publicKeyRaw } = await signChallengeWith(
+            cred,
             challengeMsg.session_id,
             challengeMsg.nonce,
             { username }
@@ -595,7 +596,7 @@ export class WshClient {
       } else if (firstResponse.type === MSG.CHALLENGE) {
         // Some servers skip SERVER_HELLO and go straight to CHALLENGE.
         await this.#verifyHostKey(null, hostCtx);
-        if (authMethod !== AUTH_METHOD.PUBKEY || !keyPair) {
+        if (authMethod !== AUTH_METHOD.PUBKEY || !cred) {
           throw new Error('Server sent CHALLENGE but no key pair was provided');
         }
 
@@ -607,9 +608,8 @@ export class WshClient {
         // tempSessionId as a fallback for this.#sessionId below in case
         // AUTH_OK's own session_id is ever absent.
         tempSessionId = firstResponse.session_id;
-        const { signature, publicKeyRaw } = await signChallenge(
-          keyPair.privateKey,
-          keyPair.publicKey,
+        const { signature, publicKeyRaw } = await signChallengeWith(
+          cred,
           firstResponse.session_id,
           firstResponse.nonce,
           { username }
@@ -996,18 +996,19 @@ export class WshClient {
    * @param {object} opts
    * @param {string} opts.username
    * @param {CryptoKeyPair} [opts.keyPair]
+   * @param {import('./auth.mjs').WshSigner} [opts.signer] - Page-held signer `{ publicKey, sign(data) }` instead of `keyPair`.
    * @param {string} [opts.password]
    * @param {number} [opts.timeout=60000] - Overall timeout in ms
    * @param {boolean} [opts.primer=true] - See `openSession({ primer })`
    * @returns {Promise<{stdout: Uint8Array, exitCode: number}>}
    */
-  static async exec(url, command, { username, keyPair, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, ...hostKeyOpts } = {}) {
+  static async exec(url, command, { username, keyPair, signer, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, ...hostKeyOpts } = {}) {
     const client = new WshClient();
     const chunks = [];
     let exitCode = -1;
 
     try {
-      await client.connect(url, { username, keyPair, password, ...hostKeyOpts });
+      await client.connect(url, { username, keyPair, signer, password, ...hostKeyOpts });
 
       const session = await client.openSession({ type: 'exec', command, primer });
 
@@ -1056,6 +1057,7 @@ export class WshClient {
    * @param {object} opts
    * @param {string} opts.username
    * @param {CryptoKeyPair} [opts.keyPair]
+   * @param {import('./auth.mjs').WshSigner} [opts.signer] - Page-held signer `{ publicKey, sign(data) }` instead of `keyPair`.
    * @param {string} [opts.password]
    * @param {object} [opts.expose] - Capabilities to expose { shell, exec, fs, tools }
    * @param {string} [opts.peerType]
@@ -1069,6 +1071,7 @@ export class WshClient {
   async connectReverse(url, {
     username,
     keyPair,
+    signer,
     password,
     webTransport,
     expose = {},
@@ -1081,7 +1084,7 @@ export class WshClient {
     ...hostKeyOpts
   } = {}) {
     // Authenticate normally first.
-    const sessionId = await this.connect(url, { username, keyPair, password, webTransport, ...hostKeyOpts });
+    const sessionId = await this.connect(url, { username, keyPair, signer, password, webTransport, ...hostKeyOpts });
 
     // Build capabilities list from expose options.
     const capabilities = [];
@@ -1091,10 +1094,9 @@ export class WshClient {
     if (expose.tools) capabilities.push('tools');
 
     // Export public key for peer identification.
+    const cred = await resolveSigner({ keyPair, signer });
     let publicKey = null;
-    if (keyPair) {
-      publicKey = await exportPublicKeyRaw(keyPair.publicKey);
-    }
+    if (cred) publicKey = cred.publicKeyRaw;
 
     const effectiveShellBackend = shellBackend || (expose.shell ? 'virtual-shell' : 'exec-only');
     const record = {
@@ -1118,8 +1120,8 @@ export class WshClient {
     // (see auth.mjs's "Signed peer records" section). Only possible with
     // a real identity key, same precondition `publicKey` already had.
     let recordSignature;
-    if (keyPair) {
-      ({ signature: recordSignature } = await signPeerRecord(keyPair.privateKey, keyPair.publicKey, record));
+    if (cred) {
+      ({ signature: recordSignature } = await signPeerRecordWith(cred, record));
     }
 
     // Register as a reverse peer.
@@ -2360,18 +2362,20 @@ export class WshClient {
    * @param {object} opts
    * @param {string} opts.username
    * @param {CryptoKeyPair} [opts.keyPair]
+   * @param {import('./auth.mjs').WshSigner} [opts.signer] - Page-held signer `{ publicKey, sign(data) }` instead of `keyPair`.
    * @param {string} [opts.password]
    * @param {number} [opts.timeout]
    * @returns {Promise<string>} Session ID
    * @private
    */
-  async #performAuth({ username, keyPair, password, timeout = DEFAULT_AUTH_TIMEOUT, url, ...hostKeyOpts } = {}) {
+  async #performAuth({ username, keyPair, signer, password, timeout = DEFAULT_AUTH_TIMEOUT, url, ...hostKeyOpts } = {}) {
     if (!username) throw new Error('username is required');
-    if (!keyPair && !password) throw new Error('Either keyPair or password is required');
+    const cred = await resolveSigner({ keyPair, signer });
+    if (!cred && !password) throw new Error('Either keyPair, signer or password is required');
 
     this.#hostKey = null;
     try {
-      const authMethod = keyPair ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
+      const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
       await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce] }));
       const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
@@ -2409,8 +2413,8 @@ export class WshClient {
             return this.#sessionId;
           }
 
-          const { signature, publicKeyRaw } = await signChallenge(
-            keyPair.privateKey, keyPair.publicKey, challengeMsg.session_id, challengeMsg.nonce, { username }
+          const { signature, publicKeyRaw } = await signChallengeWith(
+            cred, challengeMsg.session_id, challengeMsg.nonce, { username }
           );
 
           await this.#transport.sendControl(authMsg({
@@ -2422,7 +2426,7 @@ export class WshClient {
           }));
         }
       } else if (firstResponse.type === MSG.CHALLENGE) {
-        if (!keyPair) throw new Error('Server sent CHALLENGE but no key pair provided');
+        if (!cred) throw new Error('Server sent CHALLENGE but no key pair provided');
         await this.#verifyHostKey(null, hostCtx);
 
         // Challenge carries session_id directly — see connect()'s
@@ -2430,8 +2434,8 @@ export class WshClient {
         // this.#sessionId below in case AUTH_OK's own session_id is ever
         // absent.
         tempSessionId = firstResponse.session_id;
-        const { signature, publicKeyRaw } = await signChallenge(
-          keyPair.privateKey, keyPair.publicKey, firstResponse.session_id, firstResponse.nonce, { username }
+        const { signature, publicKeyRaw } = await signChallengeWith(
+          cred, firstResponse.session_id, firstResponse.nonce, { username }
         );
 
         await this.#transport.sendControl(authMsg({

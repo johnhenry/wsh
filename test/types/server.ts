@@ -60,3 +60,8 @@ declare const key: CryptoKey;
 const sig: Promise<Uint8Array> = sign(key, new Uint8Array(1));
 const ok: Promise<boolean> = verify(key, new Uint8Array(64), new Uint8Array(1));
 export { wtRotation, pins, rotated, wtOptions, wtOwnCert, wtInfo, selfSigned, relayOptions, reverse, peers, sessionOptions, sessionsOn, mcpOptions, bound, maybe, closed, sig, ok, pwOptions, hk };
+
+// accept(): serve a pre-upgraded socket (#101)
+declare const upgraded: import('@johnhenry/wsh/server').WshAcceptableSocket;
+const acceptServer: WshServer = createWshServer({ auth: { authorizedKeys: 'ssh-ed25519 AAAA' } });
+void acceptServer.accept(upgraded, { remote: { address: '10.0.0.1', headers: {} } }).then((h) => h.close());

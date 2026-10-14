@@ -1109,6 +1109,38 @@ export function signChallenge(
 ): Promise<{ signature: Uint8Array; publicKeyRaw: Uint8Array }>;
 
 /**
+ * A signer that need not expose a private key: a wallet, a hardware token, a Worker.
+ * `publicKey` is the raw 32-byte Ed25519 key or a public `CryptoKey`; `sign` returns the 64-byte signature.
+ */
+export interface WshSigner {
+  publicKey: Uint8Array | CryptoKey;
+  sign(data: Uint8Array): Uint8Array | Promise<Uint8Array>;
+}
+
+/** A `keyPair` or `signer` normalized to a raw public key and an async `sign`; `null` when neither is given. */
+export interface WshResolvedSigner {
+  publicKeyRaw: Uint8Array;
+  sign(data: Uint8Array): Promise<Uint8Array>;
+}
+
+/** Normalize `{ keyPair }` or `{ signer }`. Throws a TypeError for both together or a malformed signer. */
+export function resolveSigner(credentials?: { keyPair?: CryptoKeyPair; signer?: WshSigner }): Promise<WshResolvedSigner | null>;
+
+/** `signChallenge` for a signer resolved by `resolveSigner`. */
+export function signChallengeWith(
+  signer: WshResolvedSigner,
+  sessionId: string,
+  nonce: Uint8Array,
+  opts?: WshTranscriptOptions,
+): Promise<{ signature: Uint8Array; publicKeyRaw: Uint8Array }>;
+
+/** `signPeerRecord` for a signer resolved by `resolveSigner`. */
+export function signPeerRecordWith(
+  signer: WshResolvedSigner,
+  record: WshPeerRecord,
+): Promise<{ signature: Uint8Array; publicKeyRaw: Uint8Array }>;
+
+/**
  * Server-side: verify a client's challenge response.
  */
 export function verifyChallenge(
@@ -1385,7 +1417,10 @@ export class SerialQueue<T = unknown> {
  * Provides the same interface as WebTransportTransport so that upper
  * layers (session, client) work identically over either transport.
  */
-export class WebSocketTransport extends WshTransport {}
+export class WebSocketTransport extends WshTransport {
+  /** `WebSocket`: a constructor to dial with instead of the global one (a test double, `createMemoryHost().WebSocket`). */
+  constructor(options?: { WebSocket?: new (url: string) => any });
+}
 
 /**
  * @deprecated The old hand-rolled 5-byte mux's frame-type byte values.
@@ -1772,6 +1807,8 @@ export interface WshHostKeyOptions {
 export interface WshConnectOptions extends WshHostKeyOptions {
   username: string;
   keyPair?: CryptoKeyPair;
+  /** A page-held signer instead of `keyPair` (not both). */
+  signer?: WshSigner;
   password?: string;
   transport?: 'wt' | 'ws';
   /**
@@ -1845,6 +1882,8 @@ export interface WshResumeSessionOptions {
 export interface WshConnectReverseOptions {
   username: string;
   keyPair?: CryptoKeyPair;
+  /** A page-held signer instead of `keyPair` (not both). */
+  signer?: WshSigner;
   password?: string;
   /** Forwarded to the underlying `connect()` -- see `WshConnectOptions`. */
   webTransport?: WshWebTransportOptions;
@@ -1871,6 +1910,8 @@ export interface WshConnectReverseOptions {
 export interface WshExecOptions extends WshHostKeyOptions {
   username: string;
   keyPair?: CryptoKeyPair;
+  /** A page-held signer instead of `keyPair` (not both). */
+  signer?: WshSigner;
   password?: string;
   timeout?: number;
   /** See {@link WshOpenSessionOptions.primer}. */
@@ -2542,7 +2583,7 @@ export interface SessionRecordingEntry {
   data: unknown;
 }
 
-/** Asciicast v2 export format. */
+/** The `toJSON()` export: asciicast-v2-shaped (not a playable asciicast file -- one JSON document, plus `sessionId` and `open`/`exit` events). */
 export interface SessionRecordingJSON {
   version: 2;
   width: number;
@@ -2580,7 +2621,7 @@ export class SessionRecorder {
   record(type: SessionRecordingEventType | string, data: unknown): void;
 
   /**
-   * Export the recording as a JSON-serializable object (asciicast v2 format).
+   * Export the recording as a JSON-serializable object (asciicast-v2-shaped; see the README for converting it to a `.cast` file).
    */
   toJSON(): SessionRecordingJSON;
 

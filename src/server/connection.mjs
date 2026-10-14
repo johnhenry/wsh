@@ -13,7 +13,6 @@
  * dropped rather than forwarded to the process's stdin.
  */
 
-import { randomUUID } from 'node:crypto';
 import { QMuxConnection } from '../qmux-connection.mjs';
 import { FrameDecoder, frameEncode } from '../cbor.mjs';
 import {
@@ -24,8 +23,7 @@ import {
 import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
-import { FILE_CHUNK_BYTES } from './fs.mjs';
-import { MAX_ATTACHMENTS } from './sessions.mjs';
+import { FILE_CHUNK_BYTES, MAX_ATTACHMENTS } from './constants.mjs';
 import { MCP_CALL_ID_FEATURE } from '../client.mjs';
 import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
@@ -70,6 +68,7 @@ const REPLAY_CHUNK_BYTES = 32 * 1024;
 const USERNAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
 const enc = new TextEncoder();
 
+const randomUUID = () => crypto.randomUUID();
 const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n));
 const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
 
@@ -831,7 +830,7 @@ export function createConnectionFactory(cfg) {
         const args = m.command ? ['-c', String(m.command)] : [];
         proc = p.spawn(p.shell, args, {
           name: p.term, cols, rows, cwd: p.cwd,
-          env: { ...(p.env ?? process.env), TERM: p.term, ...(m.env && typeof m.env === 'object' ? m.env : {}) },
+          env: { ...(p.env ?? globalThis.process?.env), TERM: p.term, ...(m.env && typeof m.env === 'object' ? m.env : {}) },
         });
       } catch (e) {
         return send(openFail({ reason: `pty spawn failed: ${e.message}` }));

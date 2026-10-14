@@ -47,6 +47,7 @@ export {
   generateKeyPair, exportPublicKeyRaw, exportPublicKeySSH,
   importPublicKeyRaw, exportPrivateKeyPKCS8, importPrivateKeyPKCS8,
   sign, verify, buildTranscript, signChallenge, verifyChallenge,
+  resolveSigner, signChallengeWith, signPeerRecordWith,
   buildPeerRecordTranscript, signPeerRecord, verifyPeerRecord,
   fingerprint, shortFingerprint, generateNonce,
   podId, fingerprintToPodId, podIdToFingerprint,

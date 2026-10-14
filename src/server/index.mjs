@@ -17,6 +17,7 @@ import { startWebTransport } from './webtransport.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
 import { normalizeGateway } from './gateway.mjs';
 import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
+import { bindSocket } from './socket.mjs';
 
 export { parseAuthorizedKeys, STREAM_ANNOUNCE, mcpServerAdapter };
 export { createReverseHost } from './reverse-host.mjs';
@@ -74,7 +75,7 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  *   through a SOCKS5 proxy (Tor) with the name unresolved. UDP and reverse tunnels are refused. Off unless given. See `gateway.mjs`.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {(line: string) => void} [options.onLog]
- * @returns {{ listen(): Promise<{address: string, port: number}>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
+ * @returns {{ listen(): Promise<{address: string, port: number}>, accept(socket: object, options?: object): Promise<{ close(): void }>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
   host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, onLog = () => {},
@@ -102,15 +103,13 @@ export function createWshServer({
   const gatewayCfg = gateway === undefined ? null : normalizeGateway(gateway);
   const sessionOptions = sessions ? (sessions === true ? {} : sessions) : null;
 
-  return {
-    async listen() {
-      if (wss) throw new Error('createWshServer: already listening');
-      let WebSocketServer;
-      try {
-        ({ WebSocketServer } = await import('ws'));
-      } catch (err) {
-        throw new Error('@johnhenry/wsh/server needs the "ws" package: npm install ws', { cause: err });
-      }
+  /** Sockets handed to `accept()` that are still open. */
+  const accepted = new Set();
+  /** The connection factory, built once on first use (`listen()` or `accept()`) and torn down by `close()`. */
+  let ready = null;
+
+  function start() {
+    ready ??= (async () => {
       const authorize = await buildAuthorizer(auth);
       host_ = hostKey ? await loadHostKey(hostKey) : null;
       if (sessionOptions) {
@@ -125,10 +124,25 @@ export function createWshServer({
       }
       if (relay) hub = new RelayHub({ ...relay, log: onLog });
       if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createWshServer: extensions must be an object of handlers');
-      const attach = createConnectionFactory({
+      return createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, sessions: registry, relay: hub,
       });
+    })();
+    ready.catch(() => { ready = null; });
+    return ready;
+  }
+
+  return {
+    async listen() {
+      if (wss) throw new Error('createWshServer: already listening');
+      let WebSocketServer;
+      try {
+        ({ WebSocketServer } = await import('ws'));
+      } catch (err) {
+        throw new Error('@johnhenry/wsh/server needs the "ws" package: npm install ws', { cause: err });
+      }
+      const attach = await start();
 
       if (tls) {
         const { createServer } = await import('node:https');
@@ -172,20 +186,45 @@ export function createWshServer({
       return bound;
     },
 
+    /**
+     * Serve a pre-upgraded transport: an already-accepted WebSocket-like duplex (see `socket.mjs`) that the embedder's
+     * own HTTP server, Worker or test upgraded. Same auth, features and session registry as `listen()`'s connections, and
+     * no listener of this server's own is needed -- `accept()` works without `listen()`, and with both.
+     * `remote: { address, headers }` is what the embedder knows of the peer (`address` keys the password-failure throttle).
+     * `close()` drops every accepted socket. Resolves once the connection is attached.
+     *
+     * @param {object} socket - `send`, `close`, `readyState`, and `on` or `addEventListener`
+     * @param {{ remote?: { address?: string, headers?: object } }} [options]
+     * @returns {Promise<{ close(): void }>}
+     */
+    async accept(socket, options = {}) {
+      const handle = await bindSocket(socket, start(), options);
+      const entry = { socket, handle };
+      accepted.add(entry);
+      const forget = () => accepted.delete(entry);
+      if (typeof socket.addEventListener === 'function') socket.addEventListener('close', forget);
+      else socket.on('close', forget);
+      return handle;
+    },
+
     async close() {
-      if (!wss) return;
+      for (const entry of [...accepted]) entry.handle.close();
+      accepted.clear();
       const server = wss;
       wss = null;
       bound = null;
-      for (const client of server.clients) client.terminate();
-      await wt?.close();
-      wt = null;
-      await new Promise((resolve) => server.close(resolve));
-      if (httpsServer) { const h = httpsServer; httpsServer = null; await new Promise((resolve) => h.close(resolve)); }
+      if (server) {
+        for (const client of server.clients) client.terminate();
+        await wt?.close();
+        wt = null;
+        await new Promise((resolve) => server.close(resolve));
+        if (httpsServer) { const h = httpsServer; httpsServer = null; await new Promise((resolve) => h.close(resolve)); }
+      }
       registry?.closeAll();
       registry = null;
       hub?.closeAll();
       hub = null;
+      ready = null;
     },
 
     address() {

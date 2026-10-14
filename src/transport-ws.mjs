@@ -97,6 +97,9 @@ class QMuxStreamAdapter {
   }
 }
 
+/** `WebSocket.OPEN` (spelled out so a substitute constructor need not define it). */
+const WS_OPEN = 1;
+
 // ── WebSocket transport ──────────────────────────────────────────────
 
 /**
@@ -133,6 +136,19 @@ export class WebSocketTransport extends WshTransport {
    */
   #inbox = new SerialQueue((raw) => this.#handleControlBytes(raw));
 
+  /** @type {typeof WebSocket} */
+  #WebSocket;
+
+  /**
+   * @param {object} [options]
+   * @param {typeof WebSocket} [options.WebSocket] - A WebSocket constructor to dial with instead of the global one: a
+   *   test double, or the in-memory host's (`createMemoryHost().WebSocket`, see `memory-host.mjs`).
+   */
+  constructor({ WebSocket: Impl } = {}) {
+    super();
+    this.#WebSocket = Impl;
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────
 
   /** @override */
@@ -149,7 +165,7 @@ export class WebSocketTransport extends WshTransport {
         .replace(/^https:\/\//, 'wss://')
         .replace(/^http:\/\//, 'ws://');
 
-      const ws = new WebSocket(wsUrl);
+      const ws = new (this.#WebSocket ?? WebSocket)(wsUrl);
       ws.binaryType = 'arraybuffer';
       this.#ws = ws;
 
@@ -316,7 +332,7 @@ export class WebSocketTransport extends WshTransport {
    * @param {Uint8Array} data
    */
   #send(data) {
-    if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
+    if (!this.#ws || this.#ws.readyState !== WS_OPEN) {
       throw new Error('WebSocket is not open');
     }
     this.#ws.send(data);

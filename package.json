@@ -1,6 +1,6 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
@@ -12,6 +12,10 @@
     "./server": {
       "types": "./src/server/index.d.ts",
       "import": "./src/server/index.mjs"
+    },
+    "./memory": {
+      "types": "./src/memory-host.d.ts",
+      "import": "./src/memory-host.mjs"
     }
   },
   "types": "./src/index.d.ts",

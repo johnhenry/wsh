@@ -17,7 +17,7 @@ export function normalizePty(pty) {
   }
   return {
     spawn: pty.spawn,
-    shell: pty.shell ?? process.env.SHELL ?? '/bin/sh',
+    shell: pty.shell ?? globalThis.process?.env?.SHELL ?? '/bin/sh',
     cwd: pty.cwd,
     env: pty.env,
     term: pty.term ?? 'xterm-256color',
