@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.33.0 / Rust `rust-v0.5.0`
+
+- **Exec on plain pipes with a stdin EOF, for the Rust `wsh-server` (#105).** The Rust server runs exec on a PTY, which
+  echoes and rewrites input and cannot signal end of input, so `exec({ stdin })` and `closeStdin()` failed there. It now
+  advertises a new `ServerHello` feature, `exec-pipes`. A client that sees it may open an exec channel with the new
+  optional `Open.stdio = "pipes"`: the command then runs on plain pipes (byte-exact stdin and stdout, no echo, no
+  `\n` -> `\r\n`), and `OpenOk` adds `stderr_channel_id` (the command's stderr arrives as `SessionData` on that
+  channel, ahead of `Exit`) and the `stdin-eof` capability (a zero-length `SessionData` from the client closes the
+  command's stdin). stderr is not kept for Attach/Resume replay. Spec: `Open.stdio` and `OpenOk.stderr_channel_id`
+  (regenerated into all three outputs).
+- **JS client.** `WshClient.exec(url, cmd, { stdin })` uses pipes automatically when the host advertises `exec-pipes`,
+  and then also returns `stderr`; `exec(..., { stdio: 'pipes' | 'pty' })` and `openSession({ type: 'exec', stdio })`
+  choose explicitly (`'pipes'` throws before sending anything if the host lacks the feature). `WshSession.onStderr`,
+  `.stderrChannelId` and `closeStdin()` work on such a session. Exports `EXEC_PIPES_FEATURE`.
+- **Compatibility.** Negotiated, never assumed (the Rust `Open` decoder rejects unknown fields): a new client against an
+  older Rust server never sends `stdio` and still gets the clear "needs a stream-mode session or a host advertising
+  exec-pipes" error rather than a hang; an older client against a new server never asks for pipes and gets the PTY
+  exactly as before, as do `pty`/shell sessions and `exec` without `stdin`. `@johnhenry/wsh/server` is unchanged (its
+  stdin-stream EOF needs no negotiation). The Rust workspace is now 0.5.0.
+- **Tests:** `test/exec-pipes-negotiation.test.mjs` (new client + old host, old client + new host, empty writes are not
+  EOF) and a Rust-suite block (`cat`, `wc -c`, empty and 8 MiB stdin, binary round trip, stdout/stderr apart, exit code,
+  `sh -s`, explicit `closeStdin()`, PTY unchanged).
+
 ## 0.32.0
 
 - **`WshClient.exec(url, cmd, { stdin })` and `WshSession.closeStdin()` (#104).** `stdin` is a string, `Uint8Array`,

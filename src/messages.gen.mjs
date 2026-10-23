@@ -240,19 +240,21 @@ export function authFail({ reason } = {}) {
   };
 }
 
-export function open({ kind, command, cols, rows, env } = {}) {
+export function open({ kind, command, cols, rows, env, stdio } = {}) {
   const msg = { type: MSG.OPEN, kind };
   if (command !== undefined) msg.command = command;
   if (cols !== undefined) msg.cols = cols;
   if (rows !== undefined) msg.rows = rows;
   if (env !== undefined) msg.env = env;
+  if (stdio !== undefined) msg.stdio = stdio;
   return msg;
 }
 
-export function openOk({ channelId, streamIds = [], dataMode = "stream", capabilities = [], sessionId, token } = {}) {
+export function openOk({ channelId, streamIds = [], dataMode = "stream", capabilities = [], sessionId, token, stderrChannelId } = {}) {
   const msg = { type: MSG.OPEN_OK, channel_id: channelId, stream_ids: streamIds, data_mode: dataMode, capabilities };
   if (sessionId !== undefined) msg.session_id = sessionId;
   if (token !== undefined) msg.token = token;
+  if (stderrChannelId !== undefined) msg.stderr_channel_id = stderrChannelId;
   return msg;
 }
 

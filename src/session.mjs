@@ -174,6 +174,14 @@ export class WshSession {
   onData = null;
 
   /**
+   * Called when stderr data arrives, for a session opened with `stdio: 'pipes'`
+   * (a host advertising `exec-pipes` keeps stderr apart from stdout). Always
+   * null-safe to leave unset: it only ever fires for such sessions.
+   * @type {function(Uint8Array): void|null}
+   */
+  onStderr = null;
+
+  /**
    * Called when the remote process exits.
    * @type {function(number): void|null}
    */
@@ -246,10 +254,12 @@ export class WshSession {
    */
   constructor(
     transport, channelId, streamIds, kind,
-    { dataMode = 'stream', capabilities = [], sessionId, resumeToken } = {}
+    { dataMode = 'stream', capabilities = [], sessionId, resumeToken, stderrChannelId } = {}
   ) {
     this.#transport = transport;
     this.channelId = channelId;
+    /** Channel id carrying stderr for a `stdio: 'pipes'` session, else undefined. */
+    this.stderrChannelId = Number.isSafeInteger(stderrChannelId) ? stderrChannelId : undefined;
     this.#streamIds = streamIds;
     this.kind = kind;
     this.id = String(channelId);
@@ -536,6 +546,12 @@ export class WshSession {
       if (this.#virtualBackend === null) {
         throw new Error('Session not yet activated — virtual backend unavailable');
       }
+      if (this.#stdinClosed) {
+        throw new Error('Cannot write to a session whose stdin is closed');
+      }
+      // A zero-length SessionData is the EOF signal on a pipes session; an empty
+      // write must never be mistaken for it.
+      if (this.#capabilities.includes('stdin-eof') && (typeof data === 'string' ? data.length === 0 : data.byteLength === 0)) return;
       if (this.#e2eKey !== null) {
         const bytes = typeof data === 'string' ? textEncoder.encode(data) : data;
         const counter = this.#e2eSendCounter++;
@@ -586,8 +602,21 @@ export class WshSession {
   async closeStdin() {
     if (this.#stdinClosed) return;
     if (this.#state === STATE_CLOSED) return;
+    if (this.#dataMode === 'virtual' && this.#capabilities.includes('stdin-eof')) {
+      // Pipes exec on a host that granted `stdio: 'pipes'`: a zero-length
+      // SessionData is the EOF (spec Open.stdio / OpenOk.stderr_channel_id).
+      if (this.#virtualBackend === null) {
+        throw new Error('Session not yet activated — virtual backend unavailable');
+      }
+      if (this.#e2eKey !== null) {
+        throw new Error('closeStdin() is not supported on an end-to-end encrypted virtual session');
+      }
+      this.#stdinClosed = true;
+      await this.#virtualBackend.write(new Uint8Array(0));
+      return;
+    }
     if (this.#dataMode !== 'stream') {
-      throw new Error('closeStdin() needs a stream-mode session; this session\'s host carries stdin as control messages, which have no EOF');
+      throw new Error('closeStdin() needs a stream-mode session or a host advertising "exec-pipes"; this session\'s host carries stdin as control messages, which have no EOF');
     }
     if (this.#stdinWriter === null) {
       throw new Error('Session not yet bound — stdin writer unavailable');
@@ -715,6 +744,16 @@ export class WshSession {
   _handleControlMessage(msg) {
     switch (msg.type) {
       case MSG.SESSION_DATA: {
+        if (this.stderrChannelId !== undefined && msg.channel_id === this.stderrChannelId) {
+          if (msg.data && msg.data.byteLength > 0) {
+            try {
+              this.onStderr?.(msg.data);
+            } catch (err) {
+              console.error('[wsh:session] onStderr handler error:', err);
+            }
+          }
+          break;
+        }
         if (msg.data && msg.data.byteLength > 0) {
           this.#virtualBackend?.pushData(msg.data);
           try {

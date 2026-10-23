@@ -380,6 +380,7 @@ impl WshClient {
                 cols,
                 rows,
                 env,
+                stdio: None,
             }),
         };
 
@@ -1918,6 +1919,7 @@ mod tests {
                         capabilities: vec!["resize".into(), "signal".into()],
                         session_id: Some("sess-31".into()),
                         token: Some(vec![9u8; 40]),
+                        stderr_channel_id: None,
                     }),
                 })
                 .unwrap();

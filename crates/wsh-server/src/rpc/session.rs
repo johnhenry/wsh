@@ -71,6 +71,7 @@ fn open_ok(channel_id: u32) -> Envelope {
             capabilities: vec![],
             session_id: None,
             token: None,
+            stderr_channel_id: None,
         }),
     }
 }

@@ -244,6 +244,8 @@ export const MCP_CALL_ID_FEATURE: 'mcp-call-id';
  * one-byte primer against it.
  */
 export const STREAM_ANNOUNCE_FEATURE: 'stream-announce';
+/** ServerHello feature: the host runs `exec` on plain pipes (stderr apart, stdin EOF) when asked with `stdio: 'pipes'`. */
+export const EXEC_PIPES_FEATURE: 'exec-pipes';
 
 // ── Typed (object-mode) RPC channels -- wsh #85 ────────────────────────
 
@@ -1633,6 +1635,12 @@ export class WshSession {
   /** Called when stdout/stderr data arrives. */
   onData: ((data: Uint8Array) => void) | null;
 
+  /** stderr of a `stdio: 'pipes'` exec session (the host keeps it apart from stdout). */
+  onStderr: ((data: Uint8Array) => void) | null;
+
+  /** Channel id carrying stderr for a `stdio: 'pipes'` session, else undefined. */
+  readonly stderrChannelId: number | undefined;
+
   /** Called when the remote process exits. */
   onExit: ((code: number) => void) | null;
 
@@ -1849,6 +1857,12 @@ export interface WshOpenSessionOptions {
    * never sends it.
    */
   primer?: boolean;
+  /**
+   * `exec` only: `'pipes'` runs the command on plain pipes (no echo, stderr on
+   * `session.onStderr`, `closeStdin()` works) and throws unless the host
+   * advertises `exec-pipes`. `'pty'` or omitted: the host's native mode.
+   */
+  stdio?: 'pty' | 'pipes';
 }
 
 /**
@@ -1929,12 +1943,20 @@ export interface WshExecOptions extends WshHostKeyOptions {
    * stream-mode host (`@johnhenry/wsh/server`).
    */
   stdin?: string | Uint8Array | ReadableStream<Uint8Array | string> | AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>;
+  /**
+   * Default: with `stdin`, plain pipes when the host advertises `exec-pipes`,
+   * else the host's native mode; without `stdin`, the host's native mode.
+   * `'pipes'` throws if the host lacks `exec-pipes`; `'pty'` never asks for pipes.
+   */
+  stdio?: 'pty' | 'pipes';
 }
 
 /** Result from WshClient.exec(). */
 export interface WshExecResult {
   stdout: Uint8Array;
   exitCode: number;
+  /** Present only when the command ran on plain pipes (`exec-pipes`). */
+  stderr?: Uint8Array;
 }
 
 /** Session list entry. */

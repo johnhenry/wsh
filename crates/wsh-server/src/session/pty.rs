@@ -187,7 +187,7 @@ fn build_command_builder(command: Option<&str>) -> WshResult<CommandBuilder> {
     Ok(builder)
 }
 
-fn command_spec(command: Option<&str>, shell: &str) -> WshResult<(String, Vec<String>)> {
+pub(super) fn command_spec(command: Option<&str>, shell: &str) -> WshResult<(String, Vec<String>)> {
     match command {
         Some(command) => {
             let trimmed = command.trim();

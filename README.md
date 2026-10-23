@@ -182,10 +182,14 @@ const { stdout } = await WshClient.exec(url, 'wc -c', { username, keyPair, stdin
 On an open exec session, `await session.write(data); await session.closeStdin()` sends EOF without closing the
 session: output keeps arriving and `onExit` / `onClose` fire as usual. Without `stdin`, `exec` never touches stdin.
 
-EOF is the end of the session's stdin data stream, so it needs a **stream-mode** host: `@johnhenry/wsh/server` (any
-version, nothing to upgrade server-side). The Rust `wsh-server` runs exec on a PTY with stdin carried as control
-messages (`data_mode: virtual`) and has no EOF message; `closeStdin()` throws there and `exec({ stdin })` rejects
-rather than silently hanging (tracked in #105).
+EOF is either the end of the session's stdin data stream (a **stream-mode** host: `@johnhenry/wsh/server`, any
+version) or, on a virtual-mode host, a zero-length `SessionData`. The Rust `wsh-server` from `rust-v0.5.0` supports the
+second form: it advertises the `exec-pipes` feature, and a client that sees it opens the exec channel with
+`stdio: 'pipes'` (`exec({ stdin })` does this by itself), so the command runs on plain pipes -- byte-exact input, no
+echo, stderr kept apart (`session.onStderr`, and `stderr` in the `exec()` result) -- and `closeStdin()` works. Against
+an older Rust server (no `exec-pipes`; its exec is a PTY) nothing is sent that it would reject, and `closeStdin()` /
+`exec({ stdin })` fail with a clear error instead of hanging. `exec` without `stdin`, `pty` sessions and shells keep
+the PTY.
 
 ## Node Server
 
@@ -1053,7 +1057,7 @@ instead of dragging its own toolchain and CI job into an unrelated
 browser-app repo. It was previously deleted from clawser by accident
 (2026-03-14) and restored (2026-07-05) before this move.
 
-Four crates, workspace-versioned at `0.1.0`:
+Four crates, workspace-versioned (currently `0.5.0`):
 
 | Crate | Kind | Description |
 |-------|------|--------------|
@@ -1077,6 +1081,7 @@ than left to be found.
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
 | Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | Rust `wsh-server` (`rust-v0.4.0`+): `wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set; no client yet in `wsh-client` | **No wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere; the Rust server serves it on WebSocket/QMux only |
+| Exec stdin + EOF, separate stderr | `exec({ stdin })`, `session.closeStdin()`, `session.onStderr` | none yet in `wsh-client` | **Wire-unified, negotiated** (#105): `Open.stdio = "pipes"` + `OpenOk.stderr_channel_id` + zero-length `SessionData` as EOF, offered by the `exec-pipes` `ServerHello` feature. `@johnhenry/wsh/server` needs none of it (stream-mode EOF); the Rust `wsh-server` (`rust-v0.5.0`+) runs such an exec on pipes, everything else on the PTY |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side; several operators per peer and the signed `KeyExchange` are JS-relay only for now |

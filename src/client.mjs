@@ -81,6 +81,7 @@ export const MCP_CALL_ID_FEATURE = 'mcp-call-id';
  * one-byte "primer" -- against such a host it would reach the process's stdin.
  */
 export const STREAM_ANNOUNCE_FEATURE = 'stream-announce';
+export const EXEC_PIPES_FEATURE = 'exec-pipes';
 
 /**
  * Reject a missing argument that maps to a `required: true` wire field.
@@ -713,8 +714,17 @@ export class WshClient {
    *   stream is bound, before any received byte can be delivered (`openRpc` uses it to set `onData`).
    * @returns {Promise<WshSession>}
    */
-  async openSession({ type = 'pty', command, protocol, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT, primer = true, attach } = {}) {
+  async openSession({ type = 'pty', command, protocol, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT, primer = true, attach, stdio } = {}) {
     this.#assertAuthenticated('openSession');
+    if (stdio !== undefined && stdio !== 'pty' && stdio !== 'pipes') {
+      throw new TypeError('openSession: stdio must be "pty" or "pipes"');
+    }
+    if (stdio === 'pipes') {
+      if (type !== 'exec') throw new TypeError('openSession: stdio "pipes" is only for type "exec"');
+      if (!this.hasFeature(EXEC_PIPES_FEATURE)) {
+        throw new Error(`openSession: this host does not advertise "${EXEC_PIPES_FEATURE}" (exec on plain pipes with stdin EOF); it runs exec on a PTY, which cannot signal end of input`);
+      }
+    }
     if (type === 'rpc') {
       this.#assertRpcProtocol(protocol);
       command = protocol;
@@ -722,7 +732,7 @@ export class WshClient {
     const requestedChannelId = this._nextChannelId();
 
     await this.#transport.sendControl(
-      openMsg({ kind: type, command, cols, rows, env })
+      openMsg({ kind: type, command, cols, rows, env, stdio: stdio === 'pipes' ? 'pipes' : undefined })
     );
 
     // Registered as a dedicated pending-open (not the generic
@@ -1038,21 +1048,32 @@ export class WshClient {
    * @param {boolean} [opts.primer=true] - See `openSession({ primer })`
    * @param {string|Uint8Array|ReadableStream|AsyncIterable|Iterable} [opts.stdin] - Input for the
    *   command. It is written, then stdin is closed (EOF), so `cat`, `wc -c` and `sh -s` finish.
-   *   Omitted: stdin is never touched (unchanged behaviour). Needs a stream-mode host.
-   * @returns {Promise<{stdout: Uint8Array, exitCode: number}>}
+   *   Omitted: stdin is never touched (unchanged behaviour). Needs a stream-mode host or a host
+   *   advertising `exec-pipes` (the Rust `wsh-server` from `rust-v0.5.0`); against any other
+   *   virtual-mode host it fails with a clear error rather than hanging.
+   * @param {'pipes'|'pty'} [opts.stdio] - Where the command runs. Default: with `stdin`, plain pipes
+   *   when the host advertises `exec-pipes` (no echo, stderr kept apart, EOF), else the host's native
+   *   mode; without `stdin`, the host's native mode (a PTY on the Rust server), exactly as before.
+   *   `'pipes'` throws if the host does not advertise `exec-pipes`; `'pty'` never asks for pipes.
+   * @returns {Promise<{stdout: Uint8Array, exitCode: number, stderr?: Uint8Array}>} `stderr` is present
+   *   only when the command ran on pipes.
    */
-  static async exec(url, command, { username, keyPair, signer, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, stdin, ...hostKeyOpts } = {}) {
+  static async exec(url, command, { username, keyPair, signer, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, stdin, stdio, ...hostKeyOpts } = {}) {
     if (stdin !== undefined) assertStdinSource(stdin);
+    if (stdio !== undefined && stdio !== 'pipes' && stdio !== 'pty') throw new TypeError('exec: stdio must be "pipes" or "pty"');
     const client = new WshClient();
     const chunks = [];
+    const errChunks = [];
     let exitCode = -1;
+    let piped = false;
 
     try {
       await client.connect(url, { username, keyPair, signer, password, ...hostKeyOpts });
+      piped = stdio === 'pipes' || (stdio === undefined && stdin !== undefined && client.hasFeature(EXEC_PIPES_FEATURE));
 
       // The first stdin byte (or the EOF itself) announces the data stream to a
       // legacy host, so the primer byte is only needed when there is no stdin.
-      const session = await client.openSession({ type: 'exec', command, primer: stdin === undefined ? primer : false });
+      const session = await client.openSession({ type: 'exec', command, primer: stdin === undefined ? primer : false, stdio: piped ? 'pipes' : undefined });
 
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -1061,6 +1082,10 @@ export class WshClient {
 
         session.onData = (data) => {
           chunks.push(data);
+        };
+
+        session.onStderr = (data) => {
+          errChunks.push(data);
         };
 
         session.onExit = (code) => {
@@ -1084,16 +1109,18 @@ export class WshClient {
       await client.disconnect().catch(() => {});
     }
 
-    // Concatenate output chunks.
-    const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
-    const stdout = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      stdout.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
+    const concat = (parts) => {
+      const out = new Uint8Array(parts.reduce((sum, c) => sum + c.byteLength, 0));
+      let offset = 0;
+      for (const chunk of parts) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return out;
+    };
 
-    return { stdout, exitCode };
+    const stdout = concat(chunks);
+    return piped ? { stdout, exitCode, stderr: concat(errChunks) } : { stdout, exitCode };
   }
 
   // ── Reverse mode ────────────────────────────────────────────────────
@@ -2596,9 +2623,12 @@ export class WshClient {
           // different connection.
           sessionId: msg.session_id,
           resumeToken: msg.token,
+          stderrChannelId: msg.stderr_channel_id,
         }
       );
       this.#sessions.set(serverChannelId, session);
+      // stderr of a pipes session arrives on its own channel id; route it to the same session.
+      if (session.stderrChannelId !== undefined) this.#sessions.set(session.stderrChannelId, session);
 
       if (dataMode === 'virtual') {
         session._activateVirtual((m) => this.sendRelayControl(m));
@@ -2705,6 +2735,7 @@ export class WshClient {
       // Remove session from tracking if it's closed.
       if (type === MSG.CLOSE) {
         this.#sessions.delete(channelId);
+        if (session.stderrChannelId !== undefined) this.#sessions.delete(session.stderrChannelId);
       }
       return;
     }

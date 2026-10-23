@@ -1,6 +1,7 @@
 //! Session management: PTY lifecycle, ring buffer, recording.
 
 pub mod manager;
+pub mod pipes;
 pub mod pty;
 pub mod recording;
 pub mod ring_buffer;

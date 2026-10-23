@@ -268,6 +268,7 @@ Category: **channel**
 | `cols` | `u16` | no | — |
 | `rows` | `u16` | no | — |
 | `env` | `map<string,string>` | no | — |
+| `stdio` | `string` | no | — |
 
 ### OpenOk (`0x11`)
 
@@ -283,6 +284,7 @@ Category: **channel**
 | `capabilities` | `string[]` | no | `[]` |
 | `session_id` | `string` | no | — |
 | `token` | `bytes` | no | — |
+| `stderr_channel_id` | `u32` | no | — |
 
 ### OpenFail (`0x12`)
 
