@@ -170,6 +170,23 @@ arrives on it, so against a host that does not advertise `stream-announce`
 the client writes a one-byte primer for you (a host that strips it, as those
 hosts do). Pass `primer: false` to never send it.
 
+### Stdin and EOF
+
+`stdin` feeds the command and then closes its write side, so `cat`, `wc -c` and `sh -s` finish:
+
+```js
+const { stdout } = await WshClient.exec(url, 'wc -c', { username, keyPair, stdin: new Uint8Array(1000) });
+// stdin: a string, a Uint8Array, a ReadableStream, or an (async) iterable of strings / bytes
+```
+
+On an open exec session, `await session.write(data); await session.closeStdin()` sends EOF without closing the
+session: output keeps arriving and `onExit` / `onClose` fire as usual. Without `stdin`, `exec` never touches stdin.
+
+EOF is the end of the session's stdin data stream, so it needs a **stream-mode** host: `@johnhenry/wsh/server` (any
+version, nothing to upgrade server-side). The Rust `wsh-server` runs exec on a PTY with stdin carried as control
+messages (`data_mode: virtual`) and has no EOF message; `closeStdin()` throws there and `exec({ stdin })` rejects
+rather than silently hanging (tracked in #105).
+
 ## Node Server
 
 `@johnhenry/wsh/server` is a Node host for the same protocol, over WebSocket

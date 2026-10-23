@@ -485,6 +485,20 @@ describe('Rust wsh-server direct-host exec sessions', () => {
     assert.equal(exitCode, 0);
   });
 
+  it('closeStdin() on this virtual-mode host fails loudly instead of pretending to send EOF (#104)', async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    const server = await startServer([publicKeySSH]);
+    servers.push(server);
+
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+
+    const session = await client.openSession({ type: 'exec', command: 'sleep 1' });
+    await assert.rejects(session.closeStdin(), /stream-mode/);
+    await session.close();
+  });
+
   it('reports a non-zero exit code for a failing command', async () => {
     const { kp, publicKeySSH } = await makeKeyPair();
     const server = await startServer([publicKeySSH]);
