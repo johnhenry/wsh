@@ -612,6 +612,8 @@ pub struct OpenPayload {
     pub rows: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdio: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -628,6 +630,8 @@ pub struct OpenOkPayload {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
     pub token: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_channel_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -874,7 +874,11 @@ impl WshServer {
         tokio::spawn(async move {
             let (reader, child_handle) = match sessions
                 .with_session(&session_id, |session| {
-                    Ok((session.pty.reader(), session.pty.child_handle()))
+                    let pty = session
+                        .io
+                        .as_pty()
+                        .ok_or_else(|| wsh_core::WshError::Other("not a PTY session".into()))?;
+                    Ok((pty.reader(), pty.child_handle()))
                 })
                 .await
             {
@@ -926,6 +930,101 @@ impl WshServer {
             .unwrap_or(-1);
 
             info!(session_id = %session_id, code, "PTY session ended");
+            sessions.finish(&session_id, code).await;
+        });
+    }
+
+    /// Output pump for an exec session on plain pipes: stdout feeds the
+    /// session output (ring buffer, `seq`, every attachment), stderr goes to
+    /// the opener on its own channel. Exit is reported only after both pipes
+    /// have drained (bounded wait, so a background process that inherited the
+    /// pipes cannot hold the exit hostage), so no output is lost behind it.
+    fn spawn_pipe_output_pump(&self, session_id: String) {
+        use tokio::io::AsyncReadExt;
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            let parts = sessions
+                .with_session(&session_id, |s| match &s.io {
+                    crate::session::pipes::SessionIo::Pipes(p) => Ok(p.take_parts()),
+                    _ => Ok(None),
+                })
+                .await
+                .ok()
+                .flatten();
+            let Some(mut parts) = parts else {
+                warn!(session_id = %session_id, "pipe output pump: no pipes at startup");
+                return;
+            };
+
+            let out_task = {
+                let sessions = sessions.clone();
+                let sid = session_id.clone();
+                let mut stdout = parts.stdout;
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        match stdout.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if !sessions.push_output(&sid, &buf[..n]).await {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+            };
+            let err_task = {
+                let sessions = sessions.clone();
+                let sid = session_id.clone();
+                let mut stderr = parts.stderr;
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        match stderr.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if !sessions.push_stderr(&sid, &buf[..n]).await {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+            };
+
+            // Wait for the process; a kill request (or the session being
+            // dropped) ends it early.
+            let status = loop {
+                tokio::select! {
+                    status = parts.child.wait() => break status.ok(),
+                    msg = parts.kill_rx.recv() => {
+                        let _ = parts.child.start_kill();
+                        if msg.is_none() {
+                            break parts.child.wait().await.ok();
+                        }
+                    }
+                }
+            };
+            let code = status
+                .map(|st| {
+                    use std::os::unix::process::ExitStatusExt;
+                    st.code()
+                        .or_else(|| st.signal().map(|s| 128 + s))
+                        .unwrap_or(-1)
+                })
+                .unwrap_or(-1);
+
+            // Everything the command wrote is already in the pipes; give the
+            // readers a moment to deliver it.
+            let drain = std::time::Duration::from_millis(1500);
+            let _ = tokio::time::timeout(drain, async {
+                let _ = out_task.await;
+                let _ = err_task.await;
+            })
+            .await;
+
+            info!(session_id = %session_id, code, "pipes session ended");
             sessions.finish(&session_id, code).await;
         });
     }
@@ -1390,8 +1489,42 @@ impl WshServer {
                 Some(envelope) = peer_rx.recv() => {
                     match frame_encode(&envelope) {
                         Ok(frame) => {
-                            if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
-                                break 'session Err(e.into());
+                            // A write can wait for flow-control credit, and the
+                            // client's credit arrives on this very socket. While
+                            // it waits, keep serving the socket (flush outbound
+                            // records, feed inbound bytes into QMux); otherwise
+                            // output larger than the window, e.g. a command that
+                            // echoes a big stdin, deadlocks both ends. Inbound
+                            // control messages queue in `event_rx` meanwhile.
+                            let write = qmux.write_stream(CONTROL_STREAM_ID, &frame);
+                            tokio::pin!(write);
+                            loop {
+                                tokio::select! {
+                                    res = &mut write => {
+                                        if let Err(e) = res {
+                                            break 'session Err(e.into());
+                                        }
+                                        break;
+                                    }
+                                    Some(bytes) = outbound_rx.recv() => {
+                                        if let Err(e) = websocket::ws_send_raw(&mut conn.ws_stream, &bytes).await {
+                                            break 'session Err(e);
+                                        }
+                                    }
+                                    ws_result = websocket::ws_recv_raw(&mut conn.ws_stream) => {
+                                        match ws_result {
+                                            Ok(Some(data)) => qmux.receive_bytes(&data),
+                                            Ok(None) => {
+                                                debug!("WebSocket session ended (peer closed)");
+                                                break 'session Ok(());
+                                            }
+                                            Err(e) => {
+                                                debug!(error = %e, "WebSocket session ended");
+                                                break 'session Err(e);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(e) => break 'session Err(e),
@@ -2057,6 +2190,10 @@ impl WshServer {
             "mcp".to_string(),
             "mcp-call-id".to_string(),
             "file-transfer".to_string(),
+            // `Open { kind: exec, stdio: "pipes" }` runs the command on plain
+            // pipes (separate stderr, stdin EOF); see spec Open.stdio. Advertised
+            // rather than assumed: OpenPayload is deny_unknown_fields.
+            "exec-pipes".to_string(),
         ];
         if self.gateway_enabled {
             features.push("gateway".to_string());
@@ -2682,6 +2819,21 @@ impl WshServer {
                     }
                 }
 
+                let pipes = match p.stdio.as_deref() {
+                    None | Some("pty") => false,
+                    Some("pipes") if p.kind == ChannelKind::Exec => true,
+                    Some(other) => {
+                        return Ok(Some(Envelope {
+                            msg_type: MsgType::OpenFail,
+                            payload: Payload::OpenFail(OpenFailPayload {
+                                reason: format!(
+                                    "unsupported stdio {other:?} for this channel kind (only exec accepts \"pipes\")"
+                                ),
+                            }),
+                        }));
+                    }
+                };
+
                 match p.kind {
                     ChannelKind::Pty | ChannelKind::Exec => {
                         let effective_command_owned = permissions
@@ -2699,6 +2851,7 @@ impl WshServer {
                                 rows,
                                 p.env.as_ref(),
                                 self.recording_dir.as_deref(),
+                                pipes,
                             )
                             .await
                         {
@@ -2755,6 +2908,23 @@ impl WshServer {
                                 // is tools/wsh-server.mjs.
                                 let data_mode = SessionDataMode::Virtual;
 
+                                // Pipes sessions carry stderr on a second channel
+                                // id, announced in OpenOk.
+                                let stderr_channel_id = if pipes {
+                                    let id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
+                                    let opener = channel_id;
+                                    let _ = self
+                                        .sessions
+                                        .with_session_mut(&session_id, |s| {
+                                            s.stderr_route = Some((opener, id));
+                                            Ok(())
+                                        })
+                                        .await;
+                                    Some(id)
+                                } else {
+                                    None
+                                };
+
                                 // Mint the session-scoped HMAC token here, at the
                                 // only point a PTY/exec session_id actually comes
                                 // into existence (clawser #48: previously no code
@@ -2783,9 +2953,14 @@ impl WshServer {
                                         channel_id,
                                         stream_ids: vec![],
                                         data_mode,
-                                        capabilities: vec![],
+                                        capabilities: if pipes {
+                                            vec!["stdin-eof".to_string()]
+                                        } else {
+                                            vec![]
+                                        },
                                         session_id: Some(session_id.clone()),
                                         token: Some(session_token),
+                                        stderr_channel_id,
                                     }),
                                 });
                                 if let Err(e) = self
@@ -2810,7 +2985,11 @@ impl WshServer {
                                     }));
                                 }
                                 Self::spawn_attachment_forwarder(att_rx, ctx.peer_tx.clone());
-                                self.spawn_pty_output_pump(session_id.clone());
+                                if pipes {
+                                    self.spawn_pipe_output_pump(session_id.clone());
+                                } else {
+                                    self.spawn_pty_output_pump(session_id.clone());
+                                }
                                 Ok(None)
                             }
                             Err(e) => Ok(Some(Envelope {
@@ -2858,6 +3037,7 @@ impl WshServer {
                                             // session -- session_id/token are pty/exec-only.
                                             session_id: None,
                                             token: None,
+                                            stderr_channel_id: None,
                                         }),
                                     }))
                                 }
@@ -2886,6 +3066,7 @@ impl WshServer {
                                             capabilities: vec![],
                                             session_id: None,
                                             token: None,
+                                            stderr_channel_id: None,
                                         }),
                                     }))
                                 }
@@ -2959,7 +3140,7 @@ impl WshServer {
                     let data = p.data.clone();
                     if let Err(e) = self
                         .sessions
-                        .with_session(&sid, |session| session.pty.write_blocking(&data))
+                        .with_session(&sid, |session| session.io.write_input(&data))
                         .await
                     {
                         warn!(channel_id = p.channel_id, session_id = %sid, error = %e, "PTY write failed");
@@ -3410,9 +3591,14 @@ impl WshServer {
                     .sessions
                     .with_session_mut(&p.session_id, |session| {
                         // Kill the old PTY process
-                        let _ = session.pty.kill();
+                        let Some(old) = session.io.as_pty() else {
+                            return Err(wsh_core::WshError::Other(
+                                "cannot restart a pipes (non-PTY) exec session".into(),
+                            ));
+                        };
+                        let _ = old.kill();
                         // Get current size
-                        let (cols, rows) = session.pty.size();
+                        let (cols, rows) = old.size();
                         // Spawn new PTY with same size
                         let new_pty = crate::session::pty::PtyHandle::spawn(
                             p.command.as_deref(),
@@ -3420,7 +3606,7 @@ impl WshServer {
                             rows,
                             None,
                         )?;
-                        session.pty = new_pty;
+                        session.io = crate::session::pipes::SessionIo::Pty(new_pty);
                         session.last_activity = std::time::Instant::now();
                         Ok(())
                     })

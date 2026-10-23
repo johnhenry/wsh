@@ -134,7 +134,7 @@
 //      only CHALLENGE, and use the client's documented "pending" literal
 //      session-id fallback for transcript verification.
 
-import { describe, it, before, after, afterEach } from 'node:test';
+import { describe, it, before, after, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, symlinkSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
@@ -613,6 +613,146 @@ describe('Rust wsh-server real PTY sessions', () => {
       session.onClose = resolve;
       session.onExit = () => {};
     });
+  });
+});
+
+// ── exec on plain pipes: stdin EOF, separate stderr (#105) ──────────
+//
+// `Open.stdio = "pipes"` (feature `exec-pipes`): the command runs on plain
+// pipes, stdout and stderr stay apart, input is byte-exact (no echo, no
+// \n -> \r\n), and a zero-length SessionData closes stdin. Interactive PTY
+// sessions and an exec opened without `stdio` keep the PTY.
+
+describe('Rust wsh-server exec on pipes with stdin EOF (#105)', () => {
+  const dec = new TextDecoder();
+  // The server rate-limits auth attempts per source, so each test gets its own.
+  let pipeServer;
+  let pipeKey;
+  beforeEach(async () => {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    pipeKey = kp;
+    pipeServer = await startServer([publicKeySSH]);
+    servers.push(pipeServer);
+  });
+
+  const run = (cmd, opts = {}) =>
+    WshClient.exec(pipeServer.url, cmd, { username: 'alice', keyPair: pipeKey, timeout: 60000, ...opts });
+
+  it('advertises exec-pipes', async () => {
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(pipeServer.url, { username: 'alice', keyPair: pipeKey });
+    assert.ok(client.hasFeature('exec-pipes'));
+  });
+
+  it('cat: "a\\nb\\n" comes back byte-exact with exit 0 (no echo, no CRLF)', async () => {
+    const { stdout, stderr, exitCode } = await run('cat', { stdin: 'a\nb\n' });
+    assert.equal(dec.decode(stdout), 'a\nb\n');
+    assert.equal(stderr.byteLength, 0);
+    assert.equal(exitCode, 0);
+  });
+
+  it('wc -c counts exactly 1000 bytes', async () => {
+    const { stdout, exitCode } = await run('wc -c', { stdin: new Uint8Array(1000) });
+    assert.equal(dec.decode(stdout).trim(), '1000');
+    assert.equal(exitCode, 0);
+  });
+
+  it('empty stdin delivers EOF', async () => {
+    const { stdout, exitCode } = await run('wc -c', { stdin: '' });
+    assert.equal(dec.decode(stdout).trim(), '0');
+    assert.equal(exitCode, 0);
+  });
+
+  it('binary stdin round-trips unchanged', async () => {
+    const bytes = Uint8Array.from({ length: 1024 }, (_, i) => i % 256);
+    const { stdout } = await run('cat', { stdin: bytes });
+    assert.deepEqual(Buffer.from(stdout), Buffer.from(bytes));
+  });
+
+  it('several MiB of stdin pass through a command that streams it back', async () => {
+    const size = 8 * 1024 * 1024;
+    const bytes = new Uint8Array(size);
+    for (let i = 0; i < size; i++) bytes[i] = (i * 31 + (i >> 8)) & 0xff;
+    const { stdout, exitCode } = await run('cat', { stdin: bytes });
+    assert.equal(exitCode, 0);
+    assert.equal(stdout.byteLength, size);
+    assert.ok(Buffer.from(stdout).equals(Buffer.from(bytes)), 'large stdin must come back unchanged');
+  });
+
+  it('output larger than the flow-control window no longer deadlocks the connection (PTY and pipes)', async () => {
+    const viaPty = await run('head -c 4000000 /dev/zero');
+    assert.equal(viaPty.stdout.byteLength, 4000000);
+    const viaPipes = await run('head -c 4000000 /dev/zero', { stdin: '' });
+    assert.equal(viaPipes.stdout.byteLength, 4000000);
+  });
+
+  it('stdout and stderr are separate, and the exit code is the command\'s', async () => {
+    const { stdout, stderr, exitCode } = await run('cat >/dev/null; echo to-out; echo to-err >&2; exit 5', { stdin: 'ignored\n' });
+    assert.equal(dec.decode(stdout), 'to-out\n');
+    assert.equal(dec.decode(stderr), 'to-err\n');
+    assert.equal(exitCode, 5);
+  });
+
+  it('`sh -s` runs a script supplied on stdin', async () => {
+    const { stdout, exitCode } = await run('sh -s', { stdin: 'echo from-stdin\nexit 4\n' });
+    assert.equal(dec.decode(stdout), 'from-stdin\n');
+    assert.equal(exitCode, 4);
+  });
+
+  it('openSession({ stdio: "pipes" }) + closeStdin(): EOF without closing the session', async () => {
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(pipeServer.url, { username: 'alice', keyPair: pipeKey });
+    const session = await client.openSession({ type: 'exec', command: 'cat; echo done >&2', stdio: 'pipes' });
+    assert.equal(session.dataMode, 'virtual');
+    assert.ok(session.capabilities.includes('stdin-eof'));
+    const out = [];
+    const err = [];
+    let exitCode = null;
+    const closed = new Promise((resolve) => {
+      session.onData = (d) => out.push(d);
+      session.onStderr = (d) => err.push(d);
+      session.onExit = (c) => { exitCode = c; };
+      session.onClose = resolve;
+    });
+    await session.write('part1,');
+    await session.write('part2\n');
+    await session.closeStdin();
+    await closed;
+    assert.equal(Buffer.concat(out.map((c) => Buffer.from(c))).toString(), 'part1,part2\n');
+    assert.equal(Buffer.concat(err.map((c) => Buffer.from(c))).toString(), 'done\n');
+    assert.equal(exitCode, 0);
+  });
+
+  it('exec without stdin still runs on a PTY, exactly as before', async () => {
+    const { stdout, stderr, exitCode } = await run('echo pty-still');
+    assert.equal(dec.decode(stdout), 'pty-still\r\n');
+    assert.equal(stderr, undefined);
+    assert.equal(exitCode, 0);
+  });
+
+  it('an interactive PTY session is unchanged: echoes input and rewrites newlines', async () => {
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(pipeServer.url, { username: 'alice', keyPair: pipeKey });
+    const session = await client.openSession({ type: 'pty', command: 'cat' });
+    assert.deepEqual(session.capabilities.includes('stdin-eof'), false);
+    assert.equal(session.stderrChannelId, undefined);
+    const chunks = [];
+    session.onData = (d) => chunks.push(d);
+    await new Promise((r) => setTimeout(r, 200));
+    await session.write('pty-line\n');
+    const deadline = Date.now() + 5000;
+    let text = '';
+    while (Date.now() < deadline && !text.includes('pty-line\r\n')) {
+      text = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString();
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.match(text, /pty-line\r\n/);
+    await assert.rejects(session.closeStdin(), /exec-pipes/);
+    await session.write(new Uint8Array([0x04]));
+    await new Promise((resolve) => { session.onClose = resolve; session.onExit = () => {}; });
   });
 });
 

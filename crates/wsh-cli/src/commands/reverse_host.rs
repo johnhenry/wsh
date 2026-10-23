@@ -557,6 +557,7 @@ impl ReverseHostRuntime {
                     // session_id/token to mint.
                     session_id: None,
                     token: None,
+                    stderr_channel_id: None,
                 }),
             })
             .await
@@ -996,6 +997,7 @@ impl ReverseHostRuntime {
                     capabilities,
                     session_id: None,
                     token: None,
+                    stderr_channel_id: None,
                 }),
             })
             .await

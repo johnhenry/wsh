@@ -75,7 +75,7 @@ export {
 // Session + Client
 export { WshSession } from './session.mjs';
 export { WshVirtualSessionBackend, normalizeSessionData } from './virtual-session.mjs';
-export { WshClient, MCP_CALL_ID_FEATURE, STREAM_ANNOUNCE_FEATURE } from './client.mjs';
+export { WshClient, MCP_CALL_ID_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE } from './client.mjs';
 
 // End-to-end key exchange (responder side, feature names, signed transcript) -- wsh #90
 export { E2E_FEATURE, E2E_SIGN_FEATURE, keyExchangeTranscript, verifyKeyExchangeSignature } from './e2e-exchange.mjs';

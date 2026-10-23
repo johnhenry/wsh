@@ -3,6 +3,7 @@
 //! Tracks all active sessions, handles creation, attachment, detachment,
 //! and garbage collection of expired/idle sessions.
 
+use super::pipes::{PipeHandle, SessionIo};
 use super::pty::PtyHandle;
 use super::recording::{RecordingEvent, SessionRecorder};
 use super::ring_buffer::RingBuffer;
@@ -62,8 +63,10 @@ pub struct Session {
     pub fingerprint: String,
     /// Permissions granted to this session.
     pub permissions: KeyPermissions,
-    /// The PTY backing this session.
-    pub pty: PtyHandle,
+    /// What runs the process: a PTY, or plain pipes for `stdio: "pipes"` exec.
+    pub io: SessionIo,
+    /// Pipes sessions only: (opener's channel id, channel id carrying stderr).
+    pub stderr_route: Option<(u32, u32)>,
     /// Ring buffer for output replay on reattach.
     pub ring_buffer: RingBuffer,
     /// Session recorder (writes to disk).
@@ -127,6 +130,7 @@ impl SessionManager {
         rows: u16,
         env: Option<&std::collections::HashMap<String, String>>,
         recording_dir: Option<&std::path::Path>,
+        pipes: bool,
     ) -> WshResult<String> {
         // Pre-check with read lock (fast rejection for common case)
         {
@@ -141,7 +145,11 @@ impl SessionManager {
 
         // Spawn PTY and prepare session (outside lock)
         let session_id = generate_session_id();
-        let pty = PtyHandle::spawn(command, cols, rows, env)?;
+        let io = if pipes {
+            SessionIo::Pipes(PipeHandle::spawn(command, env)?)
+        } else {
+            SessionIo::Pty(PtyHandle::spawn(command, cols, rows, env)?)
+        };
 
         let recorder = if let Some(dir) = recording_dir {
             let path = dir.join(format!("{session_id}.jsonl"));
@@ -162,7 +170,8 @@ impl SessionManager {
             username,
             fingerprint,
             permissions,
-            pty,
+            io,
+            stderr_route: None,
             ring_buffer: RingBuffer::new(DEFAULT_RING_BUFFER_SIZE),
             recorder,
             created_at: now,
@@ -396,6 +405,27 @@ impl SessionManager {
         true
     }
 
+    /// stderr of a pipes session: delivered only to the opener's connection,
+    /// on the stderr channel, and not retained for replay. Returns `false`
+    /// once the session no longer exists.
+    pub async fn push_stderr(&self, session_id: &str, data: &[u8]) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        session.last_activity = Instant::now();
+        if let Some((opener, stderr_channel)) = session.stderr_route {
+            for a in session
+                .attachments
+                .iter()
+                .filter(|a| a.channel_id == opener)
+            {
+                let _ = a.tx.send(session_data(stderr_channel, data));
+            }
+        }
+        true
+    }
+
     /// The process ended. Everyone attached hears Exit + Close and the record
     /// is dropped; if nobody is attached it lingers (with the exit code) so a
     /// later Attach/Resume can still replay the output and report the exit.
@@ -606,6 +636,7 @@ mod tests {
                 24,
                 None,
                 None,
+                false,
             )
             .await
             .unwrap();

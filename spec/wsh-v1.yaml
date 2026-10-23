@@ -201,6 +201,17 @@ messages:
         env:
           type: "map<string,string>"
           required: false
+        stdio:
+          type: string
+          required: false
+          description: >
+            Only for `exec` channels. `"pipes"` asks the host to run the
+            command on plain pipes instead of a PTY: no echo, no terminal
+            rewriting of input, stdout and stderr kept apart, and an EOF
+            signal for stdin (a zero-length SessionData from the client).
+            Send it only to a host that advertises the `exec-pipes` feature
+            in ServerHello.features; an older host rejects the unknown field.
+            Omitted (or `"pty"`) is the historical PTY behaviour.
 
     OpenOk:
       code: 0x11
@@ -239,6 +250,17 @@ messages:
             back; Attach accepts it as an alternative to (not a replacement
             for) ownership/ACL-grant authorization -- see Attach's
             description for the reasoning.
+        stderr_channel_id:
+          type: u32
+          required: false
+          description: >
+            Present only when the host granted `Open.stdio = "pipes"`. The
+            command's stderr arrives as SessionData on this channel id (the
+            channel_id field itself carries stdout), always before the
+            channel's Exit. The OpenOk then also lists `stdin-eof` in
+            `capabilities`: a zero-length SessionData from the client on
+            `channel_id` closes the command's stdin. stderr is not retained
+            for Attach/Resume replay.
 
     OpenFail:
       code: 0x12
