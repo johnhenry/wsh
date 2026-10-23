@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.32.0
+
+- **`WshClient.exec(url, cmd, { stdin })` and `WshSession.closeStdin()` (#104).** `stdin` is a string, `Uint8Array`,
+  `ReadableStream` or (async) iterable; it is written in bounded chunks and stdin is then closed (EOF), so `cat`,
+  `wc -c` and `sh -s` work. `session.closeStdin()` does the same on an open exec session without closing the session
+  (idempotent; later `write()` rejects). Without `stdin`, nothing changes. No server or wire change: a client-opened
+  stdin stream ending was already EOF for `@johnhenry/wsh/server`. Stream-mode hosts only; the Rust `wsh-server`
+  (virtual mode, no EOF message) makes `closeStdin()` throw (#105). With `stdin` the primer byte is skipped (the first
+  stdin byte or the EOF announces the stream).
+
 ## 0.31.0 (2026-10-14)
 
 - **`@johnhenry/wsh/memory`: a browser-safe in-memory host (#99).** `createMemoryHost({ auth, exec, mcp, extensions })` runs

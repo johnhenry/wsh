@@ -1701,6 +1701,13 @@ export class WshSession {
   write(data: Uint8Array | string): Promise<void>;
 
   /**
+   * Send EOF on stdin without closing the session: output keeps arriving and
+   * `onExit`/`onClose` fire as usual. Idempotent; `write()` rejects afterwards.
+   * Stream-mode sessions only (throws on a virtual-mode session).
+   */
+  closeStdin(): Promise<void>;
+
+  /**
    * Opt in to end-to-end encryption for this session's data plane
    * (virtual-mode sessions only). `sharedSecret` must come from a fresh
    * `WshClient.initiateE2E()` call on the *current* connection --
@@ -1916,6 +1923,12 @@ export interface WshExecOptions extends WshHostKeyOptions {
   timeout?: number;
   /** See {@link WshOpenSessionOptions.primer}. */
   primer?: boolean;
+  /**
+   * Input for the command: written, then stdin is closed (EOF), so `cat`,
+   * `wc -c` and `sh -s` finish. Omitted: stdin is not touched. Needs a
+   * stream-mode host (`@johnhenry/wsh/server`).
+   */
+  stdin?: string | Uint8Array | ReadableStream<Uint8Array | string> | AsyncIterable<Uint8Array | string> | Iterable<Uint8Array | string>;
 }
 
 /** Result from WshClient.exec(). */

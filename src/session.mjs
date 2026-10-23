@@ -95,6 +95,9 @@ export class WshSession {
    */
   #stdinWriter = null;
 
+  /** True once `closeStdin()` has sent EOF on the stdin stream (#104). */
+  #stdinClosed = false;
+
   /** @type {WshVirtualSessionBackend|null} */
   #virtualBackend = null;
 
@@ -548,6 +551,9 @@ export class WshSession {
     if (this.#stdinWriter === null) {
       throw new Error('Session not yet bound — stdin writer unavailable');
     }
+    if (this.#stdinClosed) {
+      throw new Error('Cannot write to a session whose stdin is closed');
+    }
 
     const bytes = typeof data === 'string' ? textEncoder.encode(data) : data;
 
@@ -561,6 +567,34 @@ export class WshSession {
     }
 
     await this.#stdinWriter.write(bytes);
+  }
+
+  /**
+   * Close the write side of the session (send EOF on stdin) without closing
+   * the session: the process sees end-of-input (`cat` finishes, `sh -s` runs
+   * what it read), its output keeps arriving, and `onExit`/`onClose` fire as
+   * usual. Bytes still batched by write-coalescing are flushed first. Safe to
+   * call more than once; later `write()` calls reject.
+   *
+   * Stream-mode sessions only (the `stdin` data stream ends, which every
+   * `@johnhenry/wsh/server` host treats as EOF). A virtual-mode session has
+   * no separate stdin stream and no EOF message, so this throws there
+   * (the Rust `wsh-server` is such a host, see the README).
+   *
+   * @returns {Promise<void>}
+   */
+  async closeStdin() {
+    if (this.#stdinClosed) return;
+    if (this.#state === STATE_CLOSED) return;
+    if (this.#dataMode !== 'stream') {
+      throw new Error('closeStdin() needs a stream-mode session; this session\'s host carries stdin as control messages, which have no EOF');
+    }
+    if (this.#stdinWriter === null) {
+      throw new Error('Session not yet bound — stdin writer unavailable');
+    }
+    this.#stdinClosed = true;
+    if (this.#streamCoalescer) await this.#streamCoalescer.flush();
+    await this.#stdinWriter.close();
   }
 
   /**
@@ -1021,7 +1055,8 @@ export class WshSession {
    */
   #releaseStreams() {
     try {
-      this.#stdinWriter?.close();
+      // Already closed after closeStdin(): the rejection is expected.
+      this.#stdinWriter?.close()?.catch?.(() => {});
     } catch {
       // Ignore.
     }

@@ -173,6 +173,42 @@ async function normalizeExpectedHostKey(v) {
 
 // ── Client class ──────────────────────────────────────────────────────
 
+const STDIN_CHUNK = 64 * 1024;
+
+function assertStdinSource(stdin) {
+  if (typeof stdin === 'string' || stdin instanceof Uint8Array) return;
+  if (stdin && (typeof stdin.getReader === 'function' || typeof stdin[Symbol.asyncIterator] === 'function' || typeof stdin[Symbol.iterator] === 'function')) return;
+  throw new TypeError('exec: stdin must be a string, Uint8Array, ReadableStream or (async) iterable of those');
+}
+
+/** Write `stdin` to `session` in bounded chunks, then close the write side (EOF). */
+async function pumpStdin(session, stdin) {
+  const send = async (chunk) => {
+    if (typeof chunk === 'string') chunk = new TextEncoder().encode(chunk);
+    if (!(chunk instanceof Uint8Array)) throw new TypeError('exec: stdin chunks must be strings or Uint8Arrays');
+    for (let i = 0; i < chunk.byteLength; i += STDIN_CHUNK) {
+      await session.write(chunk.subarray(i, i + STDIN_CHUNK));
+    }
+  };
+  if (typeof stdin === 'string' || stdin instanceof Uint8Array) {
+    await send(stdin);
+  } else if (typeof stdin.getReader === 'function') {
+    const reader = stdin.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        await send(value);
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+  } else {
+    for await (const chunk of stdin) await send(chunk);
+  }
+  await session.closeStdin();
+}
+
 export class WshClient {
 
   /** @type {'disconnected'|'connecting'|'connected'|'authenticated'|'closed'} */
@@ -1000,9 +1036,13 @@ export class WshClient {
    * @param {string} [opts.password]
    * @param {number} [opts.timeout=60000] - Overall timeout in ms
    * @param {boolean} [opts.primer=true] - See `openSession({ primer })`
+   * @param {string|Uint8Array|ReadableStream|AsyncIterable|Iterable} [opts.stdin] - Input for the
+   *   command. It is written, then stdin is closed (EOF), so `cat`, `wc -c` and `sh -s` finish.
+   *   Omitted: stdin is never touched (unchanged behaviour). Needs a stream-mode host.
    * @returns {Promise<{stdout: Uint8Array, exitCode: number}>}
    */
-  static async exec(url, command, { username, keyPair, signer, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, ...hostKeyOpts } = {}) {
+  static async exec(url, command, { username, keyPair, signer, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, stdin, ...hostKeyOpts } = {}) {
+    if (stdin !== undefined) assertStdinSource(stdin);
     const client = new WshClient();
     const chunks = [];
     let exitCode = -1;
@@ -1010,7 +1050,9 @@ export class WshClient {
     try {
       await client.connect(url, { username, keyPair, signer, password, ...hostKeyOpts });
 
-      const session = await client.openSession({ type: 'exec', command, primer });
+      // The first stdin byte (or the EOF itself) announces the data stream to a
+      // legacy host, so the primer byte is only needed when there is no stdin.
+      const session = await client.openSession({ type: 'exec', command, primer: stdin === undefined ? primer : false });
 
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -1029,6 +1071,13 @@ export class WshClient {
           clearTimeout(timer);
           resolve();
         };
+
+        if (stdin !== undefined) {
+          pumpStdin(session, stdin).catch((err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        }
       });
 
     } finally {
