@@ -2783,7 +2783,7 @@ export class WshMcpBridge {
   call(
     toolName: string,
     args?: Record<string, unknown>,
-    opts?: { timeout?: number },
+    opts?: { timeout?: number; signal?: AbortSignal },
   ): Promise<WshMcpCallResult>;
 
   /**

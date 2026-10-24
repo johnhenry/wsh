@@ -6,12 +6,31 @@
  * remote server. Tool specs are cached after discovery for efficient reuse.
  */
 
-import { MSG, mcpDiscover, mcpCall } from './messages.mjs';
+import { MSG, mcpDiscover, mcpCall, mcpCancel } from './messages.mjs';
 import { waitForControlMessage } from './control-listener.mjs';
-import { MCP_CALL_ID_FEATURE } from './client.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE } from './client.mjs';
 
 /** Default timeout for MCP operations (15 seconds). */
 const MCP_TIMEOUT_MS = 15_000;
+
+function abortError(signal) {
+  const e = new DOMException('The operation was aborted', 'AbortError');
+  if (signal.reason !== undefined) e.cause = signal.reason;
+  return e;
+}
+
+/** Settle with `promise`, or reject with an AbortError the moment `signal` fires. */
+function raceAbort(signal, promise) {
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+      (e) => { signal.removeEventListener('abort', onAbort); reject(e); },
+    );
+  });
+}
 
 export class WshMcpBridge {
   /** @type {object} WshClient reference. */
@@ -107,9 +126,12 @@ export class WshMcpBridge {
    * @param {object} [args={}] - Arguments to pass to the tool
    * @param {object} [opts]
    * @param {number} [opts.timeout] - Timeout in ms (default 15s)
+   * @param {AbortSignal} [opts.signal] - Abort the call. Rejects with an `AbortError`; against a host advertising
+   *   `mcp-cancel` the tool is told to stop too. An already-aborted signal sends nothing.
    * @returns {Promise<{ success: boolean, output: *, error?: string }>}
    */
-  async call(toolName, args = {}, { timeout = MCP_TIMEOUT_MS } = {}) {
+  async call(toolName, args = {}, { timeout = MCP_TIMEOUT_MS, signal } = {}) {
+    if (signal?.aborted) throw abortError(signal);
     if (!toolName || typeof toolName !== 'string') {
       throw new Error('toolName is required');
     }
@@ -121,14 +143,16 @@ export class WshMcpBridge {
       );
     }
 
-    if (this.#correlates()) return this.#callOnce(toolName, args, timeout);
+    if (this.#correlates()) return this.#callOnce(toolName, args, timeout, signal);
 
+    // Uncorrelated: an aborted caller stops waiting, but keeps its queue slot until the reply (or timeout) so the
+    // late reply cannot be handed to the next call.
     const run = this.#queue.then(
-      () => this.#callOnce(toolName, args, timeout),
-      () => this.#callOnce(toolName, args, timeout),
+      () => (signal?.aborted ? Promise.reject(abortError(signal)) : this.#callOnce(toolName, args, timeout)),
+      () => (signal?.aborted ? Promise.reject(abortError(signal)) : this.#callOnce(toolName, args, timeout)),
     );
     this.#queue = run.then(() => undefined, () => undefined);
-    return run;
+    return signal ? raceAbort(signal, run) : run;
   }
 
   /** True when the connected server echoes call_id. @private */
@@ -137,7 +161,7 @@ export class WshMcpBridge {
   }
 
   /** @private */
-  async #callOnce(toolName, args, timeout) {
+  async #callOnce(toolName, args, timeout, signal) {
     const callId = this.#correlates()
       ? `bridge-${++this.#callCounter}-${Date.now()}`
       : undefined;
@@ -146,7 +170,7 @@ export class WshMcpBridge {
       mcpCall({ tool: toolName, arguments: args, callId })
     );
 
-    const response = await this._waitForMessage(
+    const waiting = this._waitForMessage(
       (msg) => {
         // ERROR carries no call_id and cannot be attributed to one call;
         // it is taken by whichever call is waiting.
@@ -157,6 +181,18 @@ export class WshMcpBridge {
       },
       timeout
     );
+    let response;
+    try {
+      response = signal ? await raceAbort(signal, waiting) : await waiting;
+    } catch (e) {
+      if (signal?.aborted && e?.name === 'AbortError') {
+        waiting.catch(() => {}); // its own timeout still fires; nobody is listening
+        if (callId !== undefined && this.#client?.hasFeature?.(MCP_CANCEL_FEATURE) === true) {
+          Promise.resolve(this.#client.sendControl(mcpCancel({ callId }))).catch(() => {});
+        }
+      }
+      throw e;
+    }
 
     if (response.type === MSG.ERROR) {
       return {
