@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.34.1
+
+- **`WshMcpBridge.call(tool, args, { signal })` (#108).** Same contract as `client.callTool`: an already-aborted signal
+  sends nothing; aborting rejects with an `AbortError` and, against a host advertising `mcp-cancel`, sends `McpCancel`.
+
 ## 0.34.0
 
 - **`AbortSignal` for `upload`, `download` and `callTool` (#108).** `upload(blob, path, { signal })`,

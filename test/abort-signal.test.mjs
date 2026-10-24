@@ -5,7 +5,7 @@ import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWshServer } from '@johnhenry/wsh/server';
-import { WshClient, generateKeyPair, exportPublicKeySSH, MCP_CANCEL_FEATURE } from '@johnhenry/wsh';
+import { WshClient, WshMcpBridge, generateKeyPair, exportPublicKeySSH, MCP_CANCEL_FEATURE } from '@johnhenry/wsh';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (fn, ms = 3000) => {
@@ -157,6 +157,28 @@ describe('AbortSignal on upload / download / callTool (#108)', () => {
       assert.deepEqual(await b, { k: 'v' });
       ac.abort();
       await assert.rejects(a, isAbort);
+    });
+  });
+
+  describe('WshMcpBridge.call', () => {
+    it('already-aborted signal sends nothing', async () => {
+      events.length = 0;
+      const ac = new AbortController(); ac.abort();
+      await assert.rejects(new WshMcpBridge(client).call('hang', {}, { signal: ac.signal }), isAbort);
+      await sleep(50);
+      assert.ok(!events.includes('hang-started'));
+    });
+
+    it('abort mid-call rejects with AbortError and the server handler is told to stop', async () => {
+      events.length = 0;
+      const bridge = new WshMcpBridge(client);
+      const ac = new AbortController();
+      const p = bridge.call('hang', {}, { signal: ac.signal, timeout: 10_000 });
+      assert.ok(await until(() => events.includes('hang-started')));
+      ac.abort();
+      await assert.rejects(p, isAbort);
+      assert.ok(await until(() => events.includes('hang-aborted')));
+      assert.equal((await bridge.call('echo', { success: true, output: 'x' })).output, 'x');
     });
   });
 
