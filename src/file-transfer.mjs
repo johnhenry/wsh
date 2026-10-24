@@ -54,7 +54,7 @@ export class WshFileTransfer {
    * @param {number} [opts.timeout] - Timeout in ms for server responses
    * @returns {Promise<{ success: boolean, bytesTransferred: number }>}
    */
-  async upload(data, remotePath, { onProgress, timeout = RESPONSE_TIMEOUT_MS } = {}) {
+  async upload(data, remotePath, { onProgress, timeout = RESPONSE_TIMEOUT_MS, signal } = {}) {
     if (typeof this.#client.upload !== 'function') {
       throw new Error('WshFileTransfer requires a client exposing upload() (e.g. WshClient)');
     }
@@ -68,6 +68,7 @@ export class WshFileTransfer {
         onProgress?.(value);
       },
       timeout,
+      signal,
     });
     const bytes = data instanceof Uint8Array ? data.byteLength : data.byteLength ?? data.length ?? 0;
     return { success: true, bytesTransferred: bytes };
@@ -87,11 +88,11 @@ export class WshFileTransfer {
    * @param {number} [opts.timeout] - Timeout in ms for server responses
    * @returns {Promise<Uint8Array>} File content
    */
-  async download(remotePath, { onProgress, timeout = RESPONSE_TIMEOUT_MS } = {}) {
+  async download(remotePath, { onProgress, timeout = RESPONSE_TIMEOUT_MS, signal } = {}) {
     if (typeof this.#client.download !== 'function') {
       throw new Error('WshFileTransfer requires a client exposing download() (e.g. WshClient)');
     }
-    return await this.#client.download(remotePath, { onProgress, timeout });
+    return await this.#client.download(remotePath, { onProgress, timeout, signal });
   }
 
   /**

@@ -51,6 +51,7 @@ pub enum MsgType {
     McpTools = 0x41,
     McpCall = 0x42,
     McpResult = 0x43,
+    McpCancel = 0x44,
 
     ReverseRegister = 0x50,
     ReverseList = 0x51,
@@ -179,6 +180,7 @@ impl TryFrom<u8> for MsgType {
             0x41 => Ok(Self::McpTools),
             0x42 => Ok(Self::McpCall),
             0x43 => Ok(Self::McpResult),
+            0x44 => Ok(Self::McpCancel),
             0x50 => Ok(Self::ReverseRegister),
             0x51 => Ok(Self::ReverseList),
             0x52 => Ok(Self::ReversePeers),
@@ -248,7 +250,7 @@ impl TryFrom<u8> for MsgType {
 pub fn is_relay_forwardable(t: MsgType) -> bool {
     matches!(
         t,
-        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::FileResult | MsgType::FileChunk | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff | MsgType::KeyExchange | MsgType::EncryptedFrame
+        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::McpCancel | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::FileResult | MsgType::FileChunk | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff | MsgType::KeyExchange | MsgType::EncryptedFrame
     )
 }
 
@@ -353,6 +355,7 @@ pub enum Payload {
     McpTools(McpToolsPayload),
     McpCall(McpCallPayload),
     McpResult(McpResultPayload),
+    McpCancel(McpCancelPayload),
     ReverseRegister(ReverseRegisterPayload),
     ReverseList(ReverseListPayload),
     ReversePeers(ReversePeersPayload),
@@ -460,6 +463,7 @@ impl Payload {
             MsgType::McpTools => Ok(Self::McpTools(ciborium::from_reader(cursor)?)),
             MsgType::McpCall => Ok(Self::McpCall(ciborium::from_reader(cursor)?)),
             MsgType::McpResult => Ok(Self::McpResult(ciborium::from_reader(cursor)?)),
+            MsgType::McpCancel => Ok(Self::McpCancel(ciborium::from_reader(cursor)?)),
             MsgType::ReverseRegister => Ok(Self::ReverseRegister(ciborium::from_reader(cursor)?)),
             MsgType::ReverseList => Ok(Self::ReverseList(ciborium::from_reader(cursor)?)),
             MsgType::ReversePeers => Ok(Self::ReversePeers(ciborium::from_reader(cursor)?)),
@@ -846,6 +850,12 @@ pub struct McpResultPayload {
     pub result: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCancelPayload {
+    pub call_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

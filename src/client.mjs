@@ -16,7 +16,7 @@ import {
   attach as attachMsg, resume as resumeMsg, ping as pingMsg, pong as pongMsg,
   reverseRegister as reverseRegisterMsg, reverseList as reverseListMsg,
   reverseConnect as reverseConnectMsg, relayForward as relayForwardMsg,
-  mcpDiscover as mcpDiscoverMsg, mcpCall as mcpCallMsg,
+  mcpDiscover as mcpDiscoverMsg, mcpCall as mcpCallMsg, mcpCancel as mcpCancelMsg,
   suspendSession as suspendSessionMsg, restartPty as restartPtyMsg,
   metricsRequest as metricsRequestMsg,
   guestInvite as guestInviteMsg, guestJoin as guestJoinMsg, guestRevoke as guestRevokeMsg,
@@ -74,6 +74,20 @@ const FS_RPC_OPS = new Set(['stat', 'list', 'read', 'write', 'mkdir', 'remove', 
  * degrade -- it makes the server reject the call.
  */
 export const MCP_CALL_ID_FEATURE = 'mcp-call-id';
+
+/**
+ * ServerHello feature advertising that the host understands `McpCancel` (stop an in-flight `McpCall`).
+ * Negotiated rather than assumed: McpCancelPayload is `deny_unknown_fields` on the Rust side, so an older
+ * server would reject it. Implies `mcp-call-id` (the cancel names a call by its id).
+ */
+export const MCP_CANCEL_FEATURE = 'mcp-cancel';
+
+/** An `AbortError` for `signal`, with the signal's reason as `cause`. */
+function abortError(signal) {
+  const e = new DOMException('The operation was aborted', 'AbortError');
+  if (signal && 'reason' in signal && signal.reason !== undefined) e.cause = signal.reason;
+  return e;
+}
 
 /**
  * ServerHello feature: the host discovers a client-opened exec data stream
@@ -804,7 +818,7 @@ export class WshClient {
 
   /**
    * List locally tracked sessions with their current state.
-   * @returns {Array<{channelId: number, kind: string, state: string}>}
+   * @returns {Array<{channelId: number, kind: string, state: string, sessionId?: string}>}
    */
   listSessions() {
     const result = [];
@@ -813,9 +827,28 @@ export class WshClient {
         channelId,
         kind: session.kind,
         state: session.state,
+        sessionId: session.sessionId,
       });
     }
     return result;
+  }
+
+  /**
+   * The live {@link WshSession} this client opened, by `channelId` (as listed by
+   * {@link WshClient#listSessions}) or by the server `sessionId`. Unlike the plain objects
+   * `listSessions()` returns, it can `write()`, `resize()`, `closeStdin()` and `close()`.
+   * `undefined` when there is no such session (never opened, or already closed by the host).
+   *
+   * @param {number|string} id
+   * @returns {WshSession|undefined}
+   */
+  getSession(id) {
+    if (typeof id === 'number') return this.#sessions.get(id);
+    if (typeof id !== 'string' || !id) return undefined;
+    for (const session of this.#sessions.values()) {
+      if (session.sessionId === id) return session;
+    }
+    return undefined;
   }
 
   /**
@@ -1420,42 +1453,86 @@ export class WshClient {
    * @param {string} remotePath - Destination path on the server
    * @param {object} [opts]
    * @param {function(number): void} [opts.onProgress] - Progress callback (bytes sent)
+   * @param {AbortSignal} [opts.signal] - Abort the transfer. Rejects with an `AbortError` and closes the file
+   *   channel. An already-aborted signal opens nothing. The host buffers the upload and writes the file only once
+   *   the final chunk has arrived, so aborting before then leaves the destination untouched -- nothing partial is
+   *   ever on disk. If the abort lands after the final chunk was sent, the host may still complete the write
+   *   (the promise rejects regardless).
    */
-  async upload(blob, remotePath, { onProgress } = {}) {
+  async upload(blob, remotePath, { onProgress, signal } = {}) {
     this.#assertAuthenticated('upload');
-    const session = await this.openSession({ type: 'file', command: `upload:${remotePath}` });
+    if (signal?.aborted) throw abortError(signal);
+    const session = await this.#openAbortable(signal, { type: 'file', command: `upload:${remotePath}` });
+    const stop = () => { session.close().catch(() => {}); };
+    signal?.addEventListener('abort', stop, { once: true });
+    try {
+      return await this.#uploadOn(session, blob, onProgress, signal);
+    } catch (e) {
+      if (signal?.aborted) throw abortError(signal);
+      throw e;
+    } finally {
+      signal?.removeEventListener('abort', stop);
+      await session.close().catch(() => {});
+    }
+  }
+
+  /**
+   * openSession(), but a signal that fires while the host is still answering rejects at once and closes the
+   * session when it does open (nothing is leaked).
+   * @private
+   */
+  async #openAbortable(signal, opts) {
+    if (!signal) return this.openSession(opts);
+    const opening = this.openSession(opts);
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(abortError(signal));
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([opening, aborted]);
+    } catch (e) {
+      opening.then((s) => s.close(), () => {}).catch(() => {});
+      throw e;
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /** @private */
+  async #uploadOn(session, blob, onProgress, signal) {
     const data = blob instanceof Blob
       ? new Uint8Array(await blob.arrayBuffer())
       : blob;
     const total = data.byteLength;
 
-    try {
-      let sent = 0;
-      do {
-        const end = Math.min(sent + FILE_CHUNK_SIZE, total);
-        await this.#transport.sendControl(fileChunkMsg({
-          channelId: session.channelId,
-          offset: sent,
-          data: data.subarray(sent, end),
-          isFinal: end >= total,
-          totalSize: total,
-        }));
-        sent = end;
-        onProgress?.(sent);
-      } while (sent < total);
+    let sent = 0;
+    do {
+      // Checked before every chunk: a closed channel must not be written to.
+      if (signal?.aborted) throw abortError(signal);
+      const end = Math.min(sent + FILE_CHUNK_SIZE, total);
+      await this.#transport.sendControl(fileChunkMsg({
+        channelId: session.channelId,
+        offset: sent,
+        data: data.subarray(sent, end),
+        isFinal: end >= total,
+        totalSize: total,
+      }));
+      sent = end;
+      onProgress?.(sent);
+    } while (sent < total);
+    if (signal?.aborted) throw abortError(signal);
 
-      // The server confirms completion the same way an exec session
-      // signals it finished: Exit with a code, then Close. Resolve on
-      // whichever arrives first.
-      const code = await new Promise((resolve) => {
-        session.onExit = (c) => { session.onExit = null; resolve(c); };
-        session.onClose = () => resolve(null);
-      });
-      if (code !== 0) {
-        throw new Error(`Upload failed with exit code ${code ?? 'unknown'}`);
-      }
-    } finally {
-      await session.close().catch(() => {});
+    // The server confirms completion the same way an exec session
+    // signals it finished: Exit with a code, then Close. Resolve on
+    // whichever arrives first.
+    const code = await new Promise((resolve) => {
+      session.onExit = (c) => { session.onExit = null; resolve(c); };
+      session.onClose = () => resolve(null);
+      if (session.state === 'closed') resolve(null);
+    });
+    if (code !== 0) {
+      throw new Error(`Upload failed with exit code ${code ?? 'unknown'}`);
     }
   }
 
@@ -1472,11 +1549,16 @@ export class WshClient {
    * @param {object} [opts]
    * @param {function({received: number, total: number}): void} [opts.onProgress]
    * @param {number} [opts.timeout=10000] - Timeout in ms waiting for the channel to open
+   * @param {AbortSignal} [opts.signal] - Abort the transfer. Rejects with an `AbortError` and closes the file
+   *   channel (the host stops sending). An already-aborted signal opens nothing.
    * @returns {Promise<Uint8Array>} File contents
    */
-  async download(remotePath, { onProgress, timeout = DEFAULT_OPEN_TIMEOUT } = {}) {
+  async download(remotePath, { onProgress, timeout = DEFAULT_OPEN_TIMEOUT, signal } = {}) {
     this.#assertAuthenticated('download');
-    const session = await this.openSession({ type: 'file', command: `download:${remotePath}`, timeout });
+    if (signal?.aborted) throw abortError(signal);
+    const session = await this.#openAbortable(signal, { type: 'file', command: `download:${remotePath}`, timeout });
+    const stop = () => { session.close().catch(() => {}); };
+    signal?.addEventListener('abort', stop, { once: true });
 
     try {
       let data = null;
@@ -1484,6 +1566,7 @@ export class WshClient {
 
       while (true) {
         const chunk = await session._readFileChunk();
+        if (signal?.aborted) throw abortError(signal);
         if (chunk === null) {
           throw new Error('Download failed: connection closed before the transfer completed (truncated)');
         }
@@ -1501,7 +1584,11 @@ export class WshClient {
           return data;
         }
       }
+    } catch (e) {
+      if (signal?.aborted) throw abortError(signal);
+      throw e;
     } finally {
+      signal?.removeEventListener('abort', stop);
       await session.close().catch(() => {});
     }
   }
@@ -1541,31 +1628,47 @@ export class WshClient {
    * @param {object} [args={}] - Tool arguments. Defaults to `{}` rather
    *   than being omitted: `McpCall.arguments` is a required wire field,
    *   and a tool that takes no arguments is an ordinary thing to call.
-   * @param {number} [timeout=30000]
+   * @param {number|{timeout?: number, signal?: AbortSignal}} [options=30000] - A timeout in ms, or
+   *   `{ timeout, signal }`. When `signal` fires the call rejects with an `AbortError`; against a host
+   *   advertising `mcp-cancel` (see {@link MCP_CANCEL_FEATURE}) it also sends `McpCancel`, so the tool
+   *   handler's own signal fires. An already-aborted signal sends nothing. Against an older host the
+   *   call is only abandoned locally and the tool runs to completion (its reply is discarded).
    * @returns {Promise<*>} Tool result
    */
-  async callTool(name, args = {}, timeout = 30_000) {
+  async callTool(name, args = {}, options = 30_000) {
     this.#assertAuthenticated('callTool');
     requireArgs('callTool', { name });
+    const { timeout = 30_000, signal } = typeof options === 'number' ? { timeout: options } : (options ?? {});
+    if (signal?.aborted) throw abortError(signal);
 
     if (this.hasFeature(MCP_CALL_ID_FEATURE)) {
-      return this.#callToolCorrelated(name, args, timeout);
+      return this.#callToolCorrelated(name, args, timeout, signal);
     }
     // No correlation available: serialise so a concurrent caller cannot be
-    // handed someone else's result.
+    // handed someone else's result. An aborted call stops waiting at once, but
+    // keeps its queue slot until its reply (or timeout): with no call_id on the
+    // wire, that late reply would otherwise be handed to the next call.
     const run = this.#mcpQueue.then(
-      () => this.#callToolCorrelated(name, args, timeout),
-      () => this.#callToolCorrelated(name, args, timeout),
+      () => this.#callToolCorrelated(name, args, timeout, undefined, signal),
+      () => this.#callToolCorrelated(name, args, timeout, undefined, signal),
     );
     this.#mcpQueue = run.then(() => undefined, () => undefined);
-    return run;
+    if (!signal) return run;
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(abortError(signal));
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try { return await Promise.race([run, aborted]); } finally { signal.removeEventListener('abort', onAbort); }
   }
 
   /**
    * Send one McpCall and wait for the McpResult that answers it.
+   * `signal` aborts the wait (correlated path); `skipIfAborted` is the queued path's start-gate.
    * @private
    */
-  async #callToolCorrelated(name, args, timeout) {
+  async #callToolCorrelated(name, args, timeout, signal, skipIfAborted) {
+    if (skipIfAborted?.aborted) throw abortError(skipIfAborted);
     const correlate = this.hasFeature(MCP_CALL_ID_FEATURE);
     // Only sent when the peer understands it: McpCallPayload is
     // deny_unknown_fields on the Rust side, so an unsolicited call_id would
@@ -1576,7 +1679,7 @@ export class WshClient {
       mcpCallMsg({ tool: name, arguments: args, callId })
     );
 
-    const response = await this.#waitForMessage(
+    const wait = this.#waitForMessage(
       [MSG.MCP_RESULT],
       timeout,
       `Timed out waiting for MCP tool result (${name})`,
@@ -1585,9 +1688,18 @@ export class WshClient {
       callId === undefined
         ? undefined
         : (msg) => msg.call_id === undefined || msg.call_id === callId,
+      signal,
     );
-
-    return response.result;
+    try {
+      const response = await wait;
+      return response.result;
+    } catch (e) {
+      if (signal?.aborted && e?.name === 'AbortError' && callId !== undefined && this.hasFeature(MCP_CANCEL_FEATURE)) {
+        // Best effort: the caller has already given up.
+        this.#transport.sendControl(mcpCancelMsg({ callId })).catch(() => {});
+      }
+      throw e;
+    }
   }
 
   // ── Suspend / Restart ───────────────────────────────────────────────
@@ -2900,20 +3012,34 @@ export class WshClient {
    * @returns {Promise<object>}
    * @private
    */
-  #waitForMessage(types, timeout, timeoutMessage, match) {
+  #waitForMessage(types, timeout, timeoutMessage, match, signal) {
     const typeArr = Array.isArray(types) ? types : [types];
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         // Remove this waiter.
         this.#removeWaiter(key, waiter);
+        signal?.removeEventListener('abort', onAbort);
         reject(new Error(timeoutMessage));
       }, timeout);
+      const onAbort = () => {
+        clearTimeout(timer);
+        this.#removeWaiter(key, waiter);
+        reject(abortError(signal));
+      };
+      if (signal) {
+        if (signal.aborted) { clearTimeout(timer); reject(abortError(signal)); return; }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       // `match` lets a waiter claim only the reply that belongs to it --
       // correlation, rather than "first waiter of this type wins". Waiters
       // without one match on type alone, as before.
-      const waiter = { resolve, reject, timer, types: typeArr, match };
+      const waiter = {
+        resolve: (v) => { signal?.removeEventListener('abort', onAbort); resolve(v); },
+        reject: (e) => { signal?.removeEventListener('abort', onAbort); reject(e); },
+        timer, types: typeArr, match,
+      };
 
       // For multi-type waiting, use a synthetic key.
       const key = typeArr.length === 1

@@ -738,6 +738,23 @@ messages:
             MUST echo it when the call carried one; omitting it forces
             the caller back on type-only matching.
 
+    McpCancel:
+      code: 0x44
+      description: >
+        Ask the server to stop an in-flight McpCall (the caller aborted).
+        Only sent to a server advertising the `mcp-cancel` feature, which
+        also advertises `mcp-call-id`: McpCancelPayload is
+        deny_unknown_fields on the Rust side, so an older server would
+        reject it. Best effort and idempotent -- a call that already
+        finished, or an unknown call_id, is ignored. The server aborts the
+        tool handler's signal and still answers the call with an McpResult
+        (a failure), which a caller that gave up simply discards.
+      fields:
+        call_id:
+          type: string
+          required: true
+          description: The call_id of the McpCall to stop.
+
   reverse:
     ReverseRegister:
       code: 0x50
@@ -2174,4 +2191,4 @@ relay:
   # exchange, so it protects against a relay that only observes, not one that
   # substitutes keys; peers who need that must authenticate the derived key
   # themselves (see the README's Security model).
-  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff, KeyExchange, EncryptedFrame]
+  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, McpCancel, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff, KeyExchange, EncryptedFrame]

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.34.0
+
+- **`AbortSignal` for `upload`, `download` and `callTool` (#108).** `upload(blob, path, { signal })`,
+  `download(path, { signal })` and `callTool(name, args, { timeout, signal })` (a number is still a timeout) reject with
+  an `AbortError` (`cause` is `signal.reason`) and close the file channel they opened. An already-aborted signal starts
+  nothing. `WshFileTransfer` passes `signal` through.
+- **Partial uploads.** The JS server buffers an upload and writes the file only when the final chunk arrives, so an
+  abort (or any close) before then writes nothing and leaves an existing destination untouched. The server now logs
+  `upload <path>: closed before completion, nothing written` (and the same for downloads, where it also stops sending).
+  An abort that lands after the final chunk was sent may still complete the write.
+- **`McpCancel` (0x44), feature `mcp-cancel`.** An aborted `callTool` sends it so the server stops the tool: the
+  handler's `ctx.signal` fires and the call is answered with a failure result the caller discards. Negotiated like
+  `mcp-call-id`: the client sends it only to a host advertising `mcp-cancel`, so older hosts (and the Rust
+  `wsh-server`, which does not advertise it yet) are unaffected; there the call is only abandoned locally. Implemented
+  in `@johnhenry/wsh/server`. Spec: `McpCancel` (regenerated into all three outputs). Exports `MCP_CANCEL_FEATURE`,
+  `mcpCancel`.
+- **`client.getSession(id)`.** Returns the live `WshSession` this client opened, by `channelId` or server `sessionId`,
+  so a caller that only holds the id from `listSessions()` can `write()` / `closeStdin()` / `close()` it.
+  `listSessions()` entries now also carry `sessionId`.
+
 ## 0.33.0 / Rust `rust-v0.5.0`
 
 - **Exec on plain pipes with a stdin EOF, for the Rust `wsh-server` (#105).** The Rust server runs exec on a PTY, which

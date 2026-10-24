@@ -238,6 +238,9 @@ export const PROTOCOL_VERSION: 'wsh-v1';
  */
 export const MCP_CALL_ID_FEATURE: 'mcp-call-id';
 
+/** ServerHello feature: the host understands `McpCancel` (stop an in-flight `McpCall`). Implies `mcp-call-id`. */
+export const MCP_CANCEL_FEATURE: 'mcp-cancel';
+
 /**
  * ServerHello feature: the host discovers a client-opened exec data stream
  * without help (the transport announces it), so the client writes no
@@ -556,6 +559,11 @@ export function mcpCall(opts?: {
   tool?: string;
   arguments?: Record<string, unknown>;
   /** Correlates this call with its McpResult. Omitted from the message entirely when undefined. */
+  callId?: string;
+}): WshMessage;
+
+export function mcpCancel(opts?: {
+  /** The `call_id` of the McpCall to stop. */
   callId?: string;
 }): WshMessage;
 
@@ -1964,6 +1972,8 @@ export interface WshSessionInfo {
   channelId: number;
   kind: string;
   state: string;
+  /** The server's session id, when the host assigned one (pty / exec). */
+  sessionId?: string;
 }
 
 /** Peer information from reverse list. */
@@ -2170,6 +2180,12 @@ export class WshClient {
   listSessions(): WshSessionInfo[];
 
   /**
+   * The live session this client opened, by `channelId` or server `sessionId` -- one that can `write()`,
+   * `resize()`, `closeStdin()` and `close()`. `undefined` when there is none.
+   */
+  getSession(id: number | string): WshSession | undefined;
+
+  /**
    * Attach to an existing remote session (collaborative or read-only).
    * Authorization is satisfied by EITHER `opts.token` OR the caller
    * already owning/being ACL-granted access to `targetSessionId`
@@ -2342,7 +2358,11 @@ export class WshClient {
   /**
    * Upload a blob to a remote path.
    */
-  upload(blob: Blob | Uint8Array, remotePath: string, opts?: { onProgress?: (bytesSent: number) => void }): Promise<void>;
+  upload(blob: Blob | Uint8Array, remotePath: string, opts?: {
+    onProgress?: (bytesSent: number) => void;
+    /** Rejects with an `AbortError` and closes the file channel; an already-aborted signal opens nothing. */
+    signal?: AbortSignal;
+  }): Promise<void>;
 
   /**
    * Download a file from a remote path.
@@ -2352,6 +2372,8 @@ export class WshClient {
     opts?: {
       onProgress?: (progress: { received: number; total: number }) => void;
       timeout?: number;
+      /** Rejects with an `AbortError` and closes the file channel; an already-aborted signal opens nothing. */
+      signal?: AbortSignal;
     },
   ): Promise<Uint8Array>;
 
@@ -2363,7 +2385,12 @@ export class WshClient {
   /**
    * Call an MCP tool on the remote server.
    */
-  callTool(name: string, args: Record<string, unknown>, timeout?: number): Promise<unknown>;
+  callTool(
+    name: string,
+    args?: Record<string, unknown>,
+    /** A timeout in ms, or `{ timeout, signal }`. An aborted call rejects with an `AbortError`; against a host advertising `mcp-cancel` the tool handler's signal fires too. */
+    options?: number | { timeout?: number; signal?: AbortSignal },
+  ): Promise<unknown>;
 
   /**
    * Connect using an externally created transport.
@@ -2584,6 +2611,7 @@ export class WshFileTransfer {
     opts?: {
       onProgress?: (progress: WshFileUploadProgress) => void;
       timeout?: number;
+      signal?: AbortSignal;
     },
   ): Promise<WshFileUploadResult>;
 
@@ -2595,6 +2623,7 @@ export class WshFileTransfer {
     opts?: {
       onProgress?: (progress: WshFileDownloadProgress) => void;
       timeout?: number;
+      signal?: AbortSignal;
     },
   ): Promise<Uint8Array>;
 

@@ -54,6 +54,7 @@ export const MSG = Object.freeze({
   MCP_TOOLS:         0x41,
   MCP_CALL:          0x42,
   MCP_RESULT:        0x43,
+  MCP_CANCEL:        0x44,
 
   // Reverse
   REVERSE_REGISTER:  0x50,
@@ -459,6 +460,13 @@ export function mcpResult({ result, callId } = {}) {
   const msg = { type: MSG.MCP_RESULT, result };
   if (callId !== undefined) msg.call_id = callId;
   return msg;
+}
+
+export function mcpCancel({ callId } = {}) {
+  return {
+    type: MSG.MCP_CANCEL,
+    call_id: callId,
+  };
 }
 
 export function reverseRegister({ username, capabilities = [], peerType = "host", shellBackend = "pty", supportsAttach = false, supportsReplay = false, supportsEcho = false, supportsTermSync = false, publicKey, seq, recordSignature } = {}) {
@@ -947,6 +955,7 @@ export const RELAY_FORWARDABLE = new Set([
   MSG.MCP_TOOLS,
   MSG.MCP_CALL,
   MSG.MCP_RESULT,
+  MSG.MCP_CANCEL,
   MSG.REVERSE_ACCEPT,
   MSG.REVERSE_REJECT,
   MSG.GUEST_JOIN,
