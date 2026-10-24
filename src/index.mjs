@@ -15,7 +15,7 @@ export {
   open, openOk, openFail, resize, signal, exit, close, sessionData, error, ping, pong,
   attach, resume, rename, idleWarning, shutdown, snapshot,
   presence, controlChanged, metrics,
-  mcpDiscover, mcpTools, mcpCall, mcpResult,
+  mcpDiscover, mcpTools, mcpCall, mcpResult, mcpCancel,
   reverseRegister, reverseList, reversePeers, reverseConnect, reverseAccept, reverseReject,
   relayForward, reverseClose, RELAY_FORWARDABLE, isRelayForwardable,
   openTcp, openUdp, resolveDns, gatewayOk, gatewayFail, gatewayClose,
@@ -75,7 +75,7 @@ export {
 // Session + Client
 export { WshSession } from './session.mjs';
 export { WshVirtualSessionBackend, normalizeSessionData } from './virtual-session.mjs';
-export { WshClient, MCP_CALL_ID_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE } from './client.mjs';
+export { WshClient, MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE } from './client.mjs';
 
 // End-to-end key exchange (responder side, feature names, signed transcript) -- wsh #90
 export { E2E_FEATURE, E2E_SIGN_FEATURE, keyExchangeTranscript, verifyKeyExchangeSignature } from './e2e-exchange.mjs';

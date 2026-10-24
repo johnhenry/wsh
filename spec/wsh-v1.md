@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 98
+- **Total message types**: 99
 
 ## Enums
 
@@ -110,6 +110,7 @@ Type: `string`
 | `0x41` | McpTools | mcp |
 | `0x42` | McpCall | mcp |
 | `0x43` | McpResult | mcp |
+| `0x44` | McpCancel | mcp |
 | `0x50` | ReverseRegister | reverse |
 | `0x51` | ReverseList | reverse |
 | `0x52` | ReversePeers | reverse |
@@ -598,6 +599,16 @@ Category: **mcp**
 |-------|------|----------|---------|
 | `result` | `json` | yes | — |
 | `call_id` | `string` | no | — |
+
+### McpCancel (`0x44`)
+
+Category: **mcp**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `call_id` | `string` | yes | — |
 
 ### ReverseRegister (`0x50`)
 

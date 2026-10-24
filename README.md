@@ -63,7 +63,7 @@ Or via CDN:
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
 - **Session recording** -- own JSON schema (asciicast-v2-shaped, not a playable asciicast file -- see note below) recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
-- **98 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
+- **99 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
 
 > **Session recording is asciicast-v2-shaped, but not an asciicast file.**
 > The JS `SessionRecorder.toJSON()` export borrows asciicast v2's vocabulary --
@@ -606,6 +606,20 @@ await session.write('ls\n');                // and it is the same process
   only the owner re-attaches as a controller; everyone else needs the token.
   Sessions are in-memory: a server restart ends them all.
 
+### Cancelling transfers and tool calls
+
+```js
+const ac = new AbortController();
+const p = client.upload(bytes, 'big.bin', { signal: ac.signal });
+ac.abort();                       // p rejects with an AbortError and the file channel is closed
+await client.download('big.bin', { signal });
+await client.callTool('search', { q: 'x' }, { timeout: 30_000, signal });
+const pty = client.getSession(client.listSessions()[0].channelId); // live session: write() / close()
+```
+
+An aborted upload writes nothing (the server writes the file only when the last chunk arrives). An aborted `callTool`
+also sends `McpCancel` to a host advertising `mcp-cancel`, so the tool handler's `ctx.signal` fires.
+
 ### MCP tools
 
 `createWshServer({ mcp })` answers `McpDiscover` and `McpCall`, so the stock
@@ -1033,7 +1047,7 @@ so options the platform gains later need no change here.
 
 | Export | Description |
 |--------|-------------|
-| `MSG` | 98 message type constants (hex opcodes) |
+| `MSG` | 99 message type constants (hex opcodes) |
 | `CHANNEL_KIND` | Channel types: `pty`, `exec`, `meta`, `file`, `tcp`, `udp`, `job` |
 | `AUTH_METHOD` | Auth methods: `pubkey`, `password` |
 | `cborEncode` / `cborDecode` | CBOR codec (maps, arrays, strings, ints, bytes, bools, null, floats) |

@@ -24,7 +24,7 @@ import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES, MAX_ATTACHMENTS } from './constants.mjs';
-import { MCP_CALL_ID_FEATURE } from '../client.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE } from '../client.mjs';
 import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
@@ -42,7 +42,7 @@ export const STREAM_ANNOUNCE = 'stream-announce';
  */
 export function hostFeatures(cfg, { dataStreams = true } = {}) {
   const features = dataStreams ? [STREAM_ANNOUNCE] : [];
-  if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE);
+  if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE);
   if (cfg.gateway) features.push('gateway');
   if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
   // End-to-end encryption (#90) is the virtual-mode EncryptedFrame layer, so it is offered where there are no
@@ -117,6 +117,8 @@ export function createConnectionFactory(cfg) {
     const fileWrites = new Map();
     /** AbortControllers of in-flight MCP calls: aborted on disconnect, counted for the cap. */
     const mcpCalls = new Set();
+    /** call_id -> AbortController, for McpCancel. */
+    const mcpById = new Map();
     /** Channel ids awaiting their client-opened data stream, in OpenOk order. */
     const pendingStreams = [];
     const decoder = new FrameDecoder();
@@ -185,6 +187,7 @@ export function createConnectionFactory(cfg) {
       e2eSessions.clear();
       for (const c of mcpCalls) c.abort(new Error('connection closed'));
       mcpCalls.clear();
+      mcpById.clear();
       for (const w of fileWrites.values()) clearTimeout(w.timer);
       fileWrites.clear();
       try { qmux?.destroy(new Error(why)); } catch { /* already gone */ }
@@ -253,6 +256,7 @@ export function createConnectionFactory(cfg) {
         // Not awaited: the handler chain is serial, and a slow tool must not hold up
         // the next call (or a Close) behind it.
         case MSG.MCP_CALL: handleMcpCall(m); return;
+        case MSG.MCP_CANCEL: if (typeof m.call_id === 'string') mcpById.get(m.call_id)?.abort(new Error('cancelled by the caller')); return;
         default:
           if (typeof m.type === 'string' && Object.hasOwn(cfg.extensions ?? {}, m.type) && typeof cfg.extensions[m.type] === 'function') {
             try { await cfg.extensions[m.type](m, { username: state.username, fingerprint: state.fingerprint, send }); } catch (e) { log(`extension "${m.type}" threw: ${e.message}`); }
@@ -465,6 +469,7 @@ export function createConnectionFactory(cfg) {
 
       const abort = new AbortController();
       mcpCalls.add(abort);
+      if (callId !== undefined) mcpById.set(callId, abort);
       (async () => {
         const name = typeof m.tool === 'string' ? m.tool : '';
         const tool = name ? await cfg.mcp.find(name, state.username, principal()) : null;
@@ -493,7 +498,7 @@ export function createConnectionFactory(cfg) {
         }
       })()
         .catch((e) => log(`mcp call ${m.tool}: ${e.message}`))
-        .finally(() => mcpCalls.delete(abort));
+        .finally(() => { mcpCalls.delete(abort); if (callId !== undefined && mcpById.get(callId) === abort) mcpById.delete(callId); });
     }
 
     // ── Open ──────────────────────────────────────────────────────────
@@ -881,10 +886,12 @@ export function createConnectionFactory(cfg) {
       if (direction === 'download') {
         let data;
         try { data = await cfg.files.readWhole(filePath); } catch (e) { return send(openFail({ reason: e.message })); }
-        channels.set(channelId, { kill: () => channels.delete(channelId) });
+        let cancelled = false;
+        channels.set(channelId, { kill: () => { if (channels.delete(channelId)) { cancelled = true; log(`download ${filePath}: closed before completion`); } } });
         await send(openOk({ channelId, dataMode: 'virtual', capabilities: [] }));
         let off = 0;
         do {
+          if (cancelled) return;
           const end = Math.min(off + FILE_CHUNK_BYTES, data.byteLength);
           await send(fileChunk({ channelId, offset: off, data: data.subarray(off, end), isFinal: end >= data.byteLength, totalSize: data.byteLength }));
           off = end;
@@ -893,7 +900,9 @@ export function createConnectionFactory(cfg) {
         return;
       }
 
-      const ch = { buf: null, kill: () => channels.delete(channelId) };
+      // Closed before the final chunk: the buffered bytes are dropped and nothing is written, so an
+      // aborted upload leaves the destination exactly as it was (the write itself is whole-file, see writeWhole).
+      const ch = { buf: null, kill: () => { if (channels.delete(channelId)) log(`upload ${filePath}: closed before completion, nothing written`); } };
       channels.set(channelId, ch);
       const done = async (code, why) => {
         if (why) log(`upload ${filePath}: ${why}`);
