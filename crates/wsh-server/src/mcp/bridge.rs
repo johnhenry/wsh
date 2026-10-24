@@ -29,6 +29,22 @@ pub struct CliToolDefinition {
     pub timeout_secs: u64,
 }
 
+/// SIGKILLs a tool's whole process group when dropped (a cancelled or timed-out call).
+/// Disarmed (set to `None`) once the shell has been waited on.
+struct KillGroupOnDrop(Option<u32>);
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0 {
+            // SAFETY: kill(2) with a negative pid signals that process group; no memory is touched.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// MCP bridge that wraps CLI tools.
 pub struct McpBridge {
     tools: HashMap<String, CliToolDefinition>,
@@ -139,16 +155,29 @@ impl McpBridge {
             cmd.env(key, value);
         }
 
+        // Own process group + kill-on-drop: a cancelled call (its future dropped) takes
+        // the shell *and* whatever it spawned with it, rather than orphaning them.
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let child = cmd.spawn().map_err(WshError::Io)?;
+        let mut group = KillGroupOnDrop(child.id());
+
         // Execute with optional timeout
         let output = if tool.timeout_secs > 0 {
             let duration = std::time::Duration::from_secs(tool.timeout_secs);
-            tokio::time::timeout(duration, cmd.output())
+            tokio::time::timeout(duration, child.wait_with_output())
                 .await
                 .map_err(|_| WshError::Timeout)?
                 .map_err(WshError::Io)?
         } else {
-            cmd.output().await.map_err(WshError::Io)?
+            child.wait_with_output().await.map_err(WshError::Io)?
         };
+        // Exited and reaped: the pid may be reused, so never signal it now.
+        group.0 = None;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();

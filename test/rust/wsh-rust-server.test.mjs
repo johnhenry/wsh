@@ -148,13 +148,13 @@ import {
   generateKeyPair,
   exportPublicKeySSH,
   exportPublicKeyRaw,
-  hello, auth, reverseRegister, reverseAccept,
+  hello, auth, reverseRegister, reverseAccept, mcpCall, mcpCancel,
   signChallenge, signPeerRecord,
   FrameDecoder, frameEncode, cborDecode, cborEncode,
   QMuxConnection, SerialQueue,
   WebSocketTransport,
   MSG,
-  RpcError, RPC_ERROR, RPC_FEATURE, rpcProtocolFeature,
+  RpcError, RPC_ERROR, RPC_FEATURE, rpcProtocolFeature, MCP_CANCEL_FEATURE, MCP_CALL_ID_FEATURE,
 } from '../../src/index.mjs';
 import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-components/webtransport';
 import WebSocket from 'ws';
@@ -1953,5 +1953,141 @@ describe('Rust wsh-server rpc channels (wsh #86)', () => {
     const again = await client.openRpc('wsh-host');
     assert.equal(typeof (await again.request('host.ping')).time, 'number');
     await again.close();
+  });
+});
+
+// ── MCP cancellation (wsh #110) ─────────────────────────────────────
+
+describe('Rust wsh-server McpCancel (wsh #110)', () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (fn, ms = 5000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { if (await fn()) return true; await sleep(20); }
+    return false;
+  };
+  // A process that has exited but not been reaped (zombie) counts as stopped.
+  const alive = (pid) => {
+    try { return !/^\d+ \(.*\) [ZX] /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; }
+  };
+  const readPid = (file) => (existsSync(file) ? Number(readFileSync(file, 'utf8').trim()) : NaN);
+
+  async function mcpServer() {
+    const { kp, publicKeySSH } = await makeKeyPair();
+    const server = await startServer([publicKeySSH], [], {
+      config: () => [
+        '[[mcp.tools]]',
+        'name = "hang"',
+        'description = "runs until it is stopped"',
+        // $! is the sleep, $$ the shell: both must be gone after a cancel, and "finished" never written.
+        'command = "sleep 30 & echo $! > {sleeppid}; echo $$ > {shpid}; wait; echo finished > {done}"',
+        'parameters = { sleeppid = "file", shpid = "file", done = "file" }',
+        '',
+        '[[mcp.tools]]',
+        'name = "slow"',
+        'description = "finishes by itself"',
+        'command = "sleep 1; echo survived-{tag}"',
+        'parameters = { tag = "label" }',
+        '',
+        '[[mcp.tools]]',
+        'name = "quick"',
+        'description = "returns at once"',
+        'command = "echo quick-{tag}"',
+        'parameters = { tag = "label" }',
+        '',
+      ].join('\n'),
+    });
+    servers.push(server);
+    const client = new WshClient();
+    clients.push(client);
+    await client.connect(server.url, { username: 'alice', keyPair: kp });
+    const results = [];
+    client.addControlListener((m) => { if (m.type === MSG.MCP_RESULT) results.push(m); });
+    const dir = mkdtempSync(path.join(tmpdir(), 'wsh-mcp-cancel-'));
+    return { server, client, results, dir };
+  }
+
+  it('advertises mcp-cancel (with mcp-call-id) once cancellation works', async () => {
+    const { client } = await mcpServer();
+    assert.ok(client.hasFeature(MCP_CANCEL_FEATURE));
+    assert.ok(client.hasFeature(MCP_CALL_ID_FEATURE));
+  });
+
+  it('stops a long-running tool mid-way: its processes die and exactly one cancelled reply arrives', async () => {
+    const { client, results, dir } = await mcpServer();
+    const f = (n) => path.join(dir, n);
+    const ac = new AbortController();
+    const call = client.callTool('hang', { sleeppid: f('sleep.pid'), shpid: f('sh.pid'), done: f('done') }, { timeout: 20000, signal: ac.signal });
+    call.catch(() => {});
+    assert.ok(await until(() => existsSync(f('sleep.pid')) && existsSync(f('sh.pid'))), 'the tool started');
+    const sleepPid = readPid(f('sleep.pid'));
+    const shPid = readPid(f('sh.pid'));
+    assert.ok(alive(sleepPid) && alive(shPid), 'running before the cancel');
+
+    ac.abort();
+    await assert.rejects(call, (e) => e.name === 'AbortError');
+    assert.ok(await until(() => results.length >= 1), 'the server answered the cancelled call');
+    assert.ok(await until(() => !alive(sleepPid) && !alive(shPid)), 'the tool and the child it spawned were killed');
+    await sleep(400);
+    assert.equal(results.length, 1, 'exactly one reply');
+    assert.deepEqual(results[0].result, { success: false, error: 'cancelled by the caller' });
+    assert.match(results[0].call_id, /^mcp-/);
+    assert.ok(!existsSync(f('done')), 'the tool did not run to completion');
+  });
+
+  it('cancelling one call leaves a concurrent call (and the connection) alone', async () => {
+    const { client, results, dir } = await mcpServer();
+    const f = (n) => path.join(dir, n);
+    const ac = new AbortController();
+    const doomed = client.callTool('hang', { sleeppid: f('sleep.pid'), shpid: f('sh.pid'), done: f('done') }, { timeout: 20000, signal: ac.signal });
+    doomed.catch(() => {});
+    const survivor = client.callTool('slow', { tag: 'one' }, { timeout: 20000 });
+    assert.ok(await until(() => existsSync(f('sleep.pid'))));
+    ac.abort();
+    await assert.rejects(doomed, (e) => e.name === 'AbortError');
+    const out = await survivor;
+    assert.match(out.stdout, /survived-one/);
+    assert.equal(out.exit_code, 0);
+    assert.equal(results.length, 2, 'one cancelled reply and one real result');
+    assert.equal(results.filter((r) => r.result?.error === 'cancelled by the caller').length, 1);
+    // still serving afterwards
+    assert.match((await client.callTool('quick', { tag: 'after' })).stdout, /quick-after/);
+  });
+
+  it('a call in flight does not block the connection: other calls complete while it runs', async () => {
+    const { client, dir } = await mcpServer();
+    const f = (n) => path.join(dir, n);
+    const ac = new AbortController();
+    const hung = client.callTool('hang', { sleeppid: f('sleep.pid'), shpid: f('sh.pid'), done: f('done') }, { timeout: 20000, signal: ac.signal });
+    hung.catch(() => {});
+    assert.ok(await until(() => existsSync(f('sh.pid'))));
+    assert.match((await client.callTool('quick', { tag: 'meanwhile' }, { timeout: 5000 })).stdout, /quick-meanwhile/);
+    ac.abort();
+    await assert.rejects(hung, (e) => e.name === 'AbortError');
+  });
+
+  it('an unknown or already-finished call_id is a no-op', async () => {
+    const { client, results } = await mcpServer();
+    await client.sendControl(mcpCancel({ callId: 'never-issued' }));
+    assert.match((await client.callTool('quick', { tag: 'x' })).stdout, /quick-x/);
+    assert.equal(results.length, 1, 'no reply for the unknown id');
+
+    const finishedId = results[0].call_id;
+    assert.ok(finishedId);
+    await client.sendControl(mcpCancel({ callId: finishedId }));
+    await sleep(300);
+    assert.equal(results.length, 1, 'no reply for a finished call');
+    assert.match((await client.callTool('quick', { tag: 'y' })).stdout, /quick-y/);
+  });
+
+  it('a client that never sends McpCancel (and one that sends no call_id at all) behaves as before', async () => {
+    const { client, results } = await mcpServer();
+    assert.match((await client.callTool('slow', { tag: 'plain' }, 10000)).stdout, /survived-plain/);
+    results.length = 0;
+    await client.sendControl(mcpCall({ tool: 'quick', arguments: { tag: 'legacy' } }));
+    assert.ok(await until(() => results.length >= 1));
+    await sleep(200);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].call_id, undefined, 'no call_id echoed when none was sent');
+    assert.match(results[0].result.stdout, /quick-legacy/);
   });
 });

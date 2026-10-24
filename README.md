@@ -618,7 +618,9 @@ const pty = client.getSession(client.listSessions()[0].channelId); // live sessi
 ```
 
 An aborted upload writes nothing (the server writes the file only when the last chunk arrives). An aborted `callTool`
-also sends `McpCancel` to a host advertising `mcp-cancel`, so the tool handler's `ctx.signal` fires.
+also sends `McpCancel` to a host advertising `mcp-cancel`, so the tool handler's `ctx.signal` fires. The Rust `wsh-server`
+advertises it from `rust-v0.6.0`: it drops the call's task and kills the tool's process group, and offers CLI tools
+from `[[mcp.tools]]` entries in its `config.toml`.
 
 ### MCP tools
 

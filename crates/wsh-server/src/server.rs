@@ -45,6 +45,9 @@ struct ConnectionContext {
     peer_tx: mpsc::Sender<Envelope>,
     /// Connection ID from peer registry (set when registered as reverse peer).
     conn_id: Option<u64>,
+    /// In-flight `McpCall`s, by call_id, so `McpCancel` can stop them. Dropping the
+    /// context (connection closed) aborts whatever is still running.
+    mcp_calls: crate::mcp::McpCalls,
 }
 
 /// A share link entry for session sharing.
@@ -260,7 +263,23 @@ impl WshServer {
         let wisp_registry = Arc::new(WispRegistry::new());
 
         // MCP
-        let mcp_bridge = Arc::new(RwLock::new(McpBridge::new()));
+        let mut bridge = McpBridge::new();
+        for t in &config.mcp_tools {
+            bridge.register(crate::mcp::bridge::CliToolDefinition {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                command: t.command.clone(),
+                parameters: t.parameters.clone(),
+                working_dir: t.working_dir.as_deref().map(|d| {
+                    crate::config::expand_tilde_str(d)
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+                env: t.env.clone(),
+                timeout_secs: t.timeout_secs,
+            });
+        }
+        let mcp_bridge = Arc::new(RwLock::new(bridge));
         let mcp_proxy = Arc::new(RwLock::new(McpProxy::new()));
 
         // Recording directory
@@ -764,6 +783,7 @@ impl WshServer {
                     token: result.token.clone(),
                     peer_tx,
                     conn_id: Some(conn_id),
+                    mcp_calls: Default::default(),
                 };
 
                 // Session message loop
@@ -1777,6 +1797,7 @@ impl WshServer {
                                                     token: result.token.clone(),
                                                     peer_tx: peer_tx.clone(),
                                                     conn_id: Some(conn_id),
+                                                    mcp_calls: Default::default(),
                                                 });
                                                 rpc_sessions.set_user(&result.username);
                                                 state = ConnState::Authenticated;
@@ -2189,6 +2210,10 @@ impl WshServer {
         let mut features = vec![
             "mcp".to_string(),
             "mcp-call-id".to_string(),
+            // `McpCancel` stops an in-flight `McpCall` (it runs as its own task,
+            // keyed by call_id). Implies mcp-call-id: McpCancelPayload is
+            // deny_unknown_fields, so only a client that saw this sends it.
+            "mcp-cancel".to_string(),
             "file-transfer".to_string(),
             // `Open { kind: exec, stdio: "pipes" }` runs the command on plain
             // pipes (separate stderr, stdin EOF); see spec Open.stdio. Advertised
@@ -3275,24 +3300,36 @@ impl WshServer {
                 }))
             }
             (MsgType::McpCall, Payload::McpCall(p)) => {
-                // Try bridge first, then proxy
-                let bridge = self.mcp_bridge.read().await;
-                if bridge.has_tool(&p.tool) {
-                    let result = bridge.call(p).await;
-                    Ok(Some(Envelope {
+                let bridge = self.mcp_bridge.clone();
+                let proxy = self.mcp_proxy.clone();
+                let call = p.clone();
+                let run = async move {
+                    // Try bridge first, then proxy
+                    let bridge = bridge.read().await;
+                    if bridge.has_tool(&call.tool) {
+                        bridge.call(&call).await
+                    } else {
+                        drop(bridge);
+                        proxy.read().await.call(&call).await
+                    }
+                };
+                match &p.call_id {
+                    // A correlated call runs as its own task: the message loop is not
+                    // held up, and McpCancel can reach it. The reply goes out through
+                    // the connection's peer channel when the task finishes.
+                    Some(id) => {
+                        ctx.mcp_calls.spawn(id.clone(), ctx.peer_tx.clone(), run);
+                        Ok(None)
+                    }
+                    // No call_id: nothing could address it, and a client that sends none
+                    // has no way to tell replies apart, so keep the in-order inline reply.
+                    None => Ok(Some(Envelope {
                         msg_type: MsgType::McpResult,
-                        payload: Payload::McpResult(result),
-                    }))
-                } else {
-                    drop(bridge);
-                    let proxy = self.mcp_proxy.read().await;
-                    let result = proxy.call(p).await;
-                    Ok(Some(Envelope {
-                        msg_type: MsgType::McpResult,
-                        payload: Payload::McpResult(result),
-                    }))
+                        payload: Payload::McpResult(run.await),
+                    })),
                 }
             }
+            (MsgType::McpCancel, Payload::McpCancel(p)) => Ok(ctx.mcp_calls.cancel(&p.call_id)),
 
             // ── Gateway messages ────────────────────────────────────
             (MsgType::OpenTcp, Payload::OpenTcp(p)) => {
@@ -4818,6 +4855,7 @@ mod wisp_reverse_connect_e2e_tests {
             rpc_fs_root: None,
             rpc_fs_read_only: false,
             rpc_fs_max_file_bytes: 1024,
+            mcp_tools: Vec::new(),
         }
     }
 

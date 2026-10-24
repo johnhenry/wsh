@@ -16,6 +16,46 @@ pub struct ConfigFile {
     pub gateway: GatewaySection,
     #[serde(default)]
     pub rpc: RpcSection,
+    #[serde(default)]
+    pub mcp: McpSection,
+}
+
+/// `[mcp]` section: command-line tools offered over `McpDiscover` / `McpCall`.
+///
+/// ```toml
+/// [[mcp.tools]]
+/// name = "disk-free"
+/// description = "Free space under a path"
+/// command = "df -h {path}"
+/// parameters = { path = "directory to inspect" }
+/// timeout_secs = 10
+/// ```
+///
+/// Default: no tools. A tool runs `sh -c <command>` with each `{arg}` replaced by the
+/// call's argument of that name, so only register commands you are happy for every
+/// authenticated client to run.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpSection {
+    #[serde(default)]
+    pub tools: Vec<McpToolSection>,
+}
+
+/// One `[[mcp.tools]]` entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpToolSection {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub command: String,
+    #[serde(default)]
+    pub parameters: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Seconds before the call fails; 0 (the default) = no limit.
+    #[serde(default)]
+    pub timeout_secs: u64,
 }
 
 /// `[server]` section of the config TOML.
@@ -278,6 +318,8 @@ pub struct ServerConfig {
     pub rpc_fs_read_only: bool,
     /// `wsh-fs` per-operation size limit.
     pub rpc_fs_max_file_bytes: u64,
+    /// CLI tools offered over MCP. See [`McpSection`].
+    pub mcp_tools: Vec<McpToolSection>,
 }
 
 impl ServerConfig {
@@ -327,6 +369,7 @@ impl ServerConfig {
                     auth: AuthSection::default(),
                     gateway: GatewaySection::default(),
                     rpc: RpcSection::default(),
+                    mcp: McpSection::default(),
                 }
             }
         } else {
@@ -335,6 +378,7 @@ impl ServerConfig {
                 auth: AuthSection::default(),
                 gateway: GatewaySection::default(),
                 rpc: RpcSection::default(),
+                mcp: McpSection::default(),
             }
         };
 
@@ -371,6 +415,7 @@ impl ServerConfig {
             rpc_fs_root: file_config.rpc.fs_root.as_deref().map(expand_tilde_str),
             rpc_fs_read_only: file_config.rpc.fs_read_only,
             rpc_fs_max_file_bytes: file_config.rpc.fs_max_file_bytes,
+            mcp_tools: file_config.mcp.tools,
         })
     }
 }
@@ -381,7 +426,7 @@ fn expand_tilde(path: &Path) -> PathBuf {
     expand_tilde_str(&s)
 }
 
-fn expand_tilde_str(s: &str) -> PathBuf {
+pub(crate) fn expand_tilde_str(s: &str) -> PathBuf {
     if s.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(&s[2..]);

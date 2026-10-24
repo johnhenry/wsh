@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.34.2 / Rust `rust-v0.6.0`
+
+- **Rust `wsh-server` implements `McpCancel` and advertises `mcp-cancel` (#110).** A `McpCall` that carries a `call_id`
+  now runs as its own task instead of inline in the message loop, so a slow tool no longer holds up the connection and a
+  cancel can reach it. `McpCancel { call_id }` aborts that task: the tool's future is dropped and the CLI bridge kills the
+  tool's whole process group (the shell and anything it spawned). The call is answered once, with
+  `{ success: false, error: "cancelled by the caller" }` (the same reply `@johnhenry/wsh/server` sends). An unknown or
+  already-finished id is ignored; a call is never answered twice; calls are independent, and closing the connection
+  aborts whatever is still running. A call without a `call_id` (an older client) still runs inline and is answered in
+  order, exactly as before. The server now advertises `mcp-cancel` (with `mcp-call-id`), so the stock client starts
+  sending cancels to it; clients that never send `McpCancel` are unaffected.
+- **`[[mcp.tools]]` in the Rust server's `config.toml`.** The CLI-tool bridge existed but nothing could register a tool
+  from the binary. Each entry (`name`, `description`, `command`, `parameters`, `working_dir`, `env`, `timeout_secs`)
+  offers `sh -c <command>` with `{arg}` placeholders filled from the call's arguments. No tools by default. Only
+  register commands every authenticated client may run.
+- The JS package is unchanged apart from README/CHANGELOG. The Rust workspace is now 0.6.0.
+- **Tests:** a Rust-suite block (cancel mid-way: the tool and its child process die, no completion marker, exactly one
+  reply; a concurrent call survives; unknown and finished ids; a call in flight does not block others; no-`call_id` and
+  never-cancelling clients).
+
 ## 0.34.1
 
 - **`WshMcpBridge.call(tool, args, { signal })` (#108).** Same contract as `client.callTool`: an already-aborted signal
@@ -18,7 +38,7 @@
 - **`McpCancel` (0x44), feature `mcp-cancel`.** An aborted `callTool` sends it so the server stops the tool: the
   handler's `ctx.signal` fires and the call is answered with a failure result the caller discards. Negotiated like
   `mcp-call-id`: the client sends it only to a host advertising `mcp-cancel`, so older hosts (and the Rust
-  `wsh-server`, which does not advertise it yet) are unaffected; there the call is only abandoned locally. Implemented
+  `wsh-server` before `rust-v0.6.0`, which did not advertise it) are unaffected; there the call is only abandoned locally. Implemented
   in `@johnhenry/wsh/server`. Spec: `McpCancel` (regenerated into all three outputs). Exports `MCP_CANCEL_FEATURE`,
   `mcpCancel`.
 - **`client.getSession(id)`.** Returns the live `WshSession` this client opened, by `channelId` or server `sessionId`,
