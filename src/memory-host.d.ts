@@ -1,9 +1,29 @@
-import type { WshClient } from './index.js';
+import type { WshClient, RpcChannel } from './index.js';
 import type { WshSigner } from './index.js';
 import type {
   WshServerAuthOptions, WshServerPrincipal, WshServerMcpOptions, WshExecRunner, WshServerOptions,
   WshAcceptableSocket, WshAcceptOptions,
 } from './server/index.js';
+
+export interface WshMemorySessionsOptions {
+  /** How long a session nobody is attached to keeps running (default 300000; 0 = kill at once). */
+  detachTtlMs?: number;
+  /** Unattended sessions kept at once (default 16); beyond that the longest-detached is killed. */
+  maxDetached?: number;
+  /** Output history kept per session, i.e. what a resume can replay (default 1048576 bytes). */
+  ringBytes?: number;
+}
+
+/** What an rpc handler is told about its channel. */
+export interface WshMemoryRpcContext {
+  protocol: string;
+  channelId: number;
+  user: string | null;
+  fingerprint: string | null;
+  features: string[];
+  log(line: string): void;
+  [key: string]: unknown;
+}
 
 export interface WshMemoryHostOptions {
   /** As for `createWshServer`. Omitted = refuse everyone. */
@@ -12,6 +32,17 @@ export interface WshMemoryHostOptions {
   exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: boolean };
   mcp?: WshServerMcpOptions;
   extensions?: WshServerOptions['extensions'];
+  /** Typed RPC channels: one handler per protocol, called once per opened channel to register methods. Handler functions only (the `wsh-host` / `wsh-fs` built-ins need Node). Off unless given. */
+  rpc?: Record<string, ((channel: RpcChannel, ctx: WshMemoryRpcContext) => void | Promise<void>) | false | null | undefined>;
+  /** Largest single rpc message (default 1048576; at least 256). */
+  rpcMaxMessageBytes?: number;
+  /** Concurrent requests per rpc channel before `-32002` (default 64). */
+  rpcMaxInflight?: number;
+  /**
+   * Keep exec sessions alive across disconnects so `resumeSession()` / `attachSession()` work, with the same
+   * defaults as `createWshServer`. `true` for the defaults. Off unless given.
+   */
+  sessions?: true | WshMemorySessionsOptions;
   bindTimeoutMs?: number;
   onLog?: (line: string) => void;
 }
