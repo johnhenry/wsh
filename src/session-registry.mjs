@@ -89,6 +89,8 @@ export class HostedSession {
   /** @type {Set<Attachment>} */
   attachments = new Set();
   state = 'attached';
+  /** Set by `dispose()`: a disposed session never arms a timer again. */
+  disposed = false;
   exitCode = null;
   createdAt = Date.now();
   lastActivity = Date.now();
@@ -156,6 +158,7 @@ export class HostedSession {
 
   /** Forget the session (and stop it if it is still running). */
   dispose() {
+    this.disposed = true;
     this.#clearTimer();
     this.registry._forget(this);
     if (this.state !== 'exited') {
@@ -165,6 +168,7 @@ export class HostedSession {
   }
 
   #markDetached() {
+    if (this.disposed) return;
     this.detachedAt = Date.now();
     if (this.state !== 'exited') this.state = 'detached';
     this.#clearTimer();

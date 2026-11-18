@@ -42,7 +42,7 @@ export interface WshMemoryHostOptions {
    * Keep exec sessions alive across disconnects so `resumeSession()` / `attachSession()` work, with the same
    * defaults as `createWshServer`. `true` for the defaults. Off unless given.
    */
-  sessions?: true | WshMemorySessionsOptions;
+  sessions?: true | false | null | WshMemorySessionsOptions;
   bindTimeoutMs?: number;
   onLog?: (line: string) => void;
 }

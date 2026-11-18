@@ -25,6 +25,28 @@ function record(session) {
   return rec;
 }
 
+/**
+ * A timer spy: `setTimeout` calls with exactly `delay` are held here instead of scheduled, so a test fires them by hand
+ * (no sleeping) and can count what is still pending. Everything else uses the real timers.
+ */
+function spyTimers(delay) {
+  const realSet = globalThis.setTimeout; const realClear = globalThis.clearTimeout;
+  const pending = new Map();
+  let n = 0;
+  globalThis.setTimeout = (fn, ms, ...a) => {
+    if (ms !== delay) return realSet(fn, ms, ...a);
+    const h = { id: ++n, unref() {} };
+    pending.set(h, fn);
+    return h;
+  };
+  globalThis.clearTimeout = (h) => { if (pending.has(h)) pending.delete(h); else realClear(h); };
+  return {
+    pending,
+    fireAll() { for (const [h, fn] of [...pending]) { pending.delete(h); fn(); } },
+    restore() { globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear; },
+  };
+}
+
 describe('createMemoryHost rpc', () => {
   let keyPair; let raw;
   const hosts = [];
@@ -71,6 +93,35 @@ describe('createMemoryHost rpc', () => {
     assert.ok(!c2.hasFeature(RPC_FEATURE));
     await assert.rejects(c2.openRpc('calc'), (e) => e.code === RPC_ERROR.UNSUPPORTED_PROTOCOL);
     await c2.disconnect();
+  });
+
+  it('enforces rpcMaxInflight: the request over the cap gets -32002', async () => {
+    const releases = [];
+    const host = make({
+      rpc: { slow: (channel) => { channel.onRequest('wait', () => new Promise((r) => releases.push(r))); } },
+      rpcMaxInflight: 2,
+    });
+    const client = await host.connect({ username: 'alice', keyPair });
+    try {
+      const rpc = await client.openRpc('slow');
+      const a = rpc.request('wait', {}); const b = rpc.request('wait', {});
+      await until(() => releases.length === 2, 'two requests in flight');
+      await assert.rejects(rpc.request('wait', {}), (e) => e instanceof RpcError && e.code === -32002);
+      releases.forEach((r) => r('ok'));
+      assert.equal(await a, 'ok'); assert.equal(await b, 'ok');
+    } finally { await client.disconnect(); }
+  });
+
+  it('enforces rpcMaxMessageBytes: an oversize request is refused and the host stays up', async () => {
+    const host = make({ rpc: { echo: (channel) => { channel.onRequest('echo', (p) => p); } }, rpcMaxMessageBytes: 512 });
+    const client = await host.connect({ username: 'alice', keyPair });
+    try {
+      const rpc = await client.openRpc('echo');
+      assert.deepEqual(await rpc.request('echo', { s: 'small' }), { s: 'small' });
+      await assert.rejects(rpc.request('echo', { s: 'x'.repeat(2000) }));
+      const again = await client.openRpc('echo');
+      assert.deepEqual(await again.request('echo', { s: 'still up' }), { s: 'still up' });
+    } finally { await client.disconnect(); }
   });
 
   it('honours rpcMaxMessageBytes and validates the option', async () => {
@@ -203,24 +254,29 @@ describe('createMemoryHost sessions', () => {
   });
 
   it('an expired session (detachTtlMs) can no longer be resumed; detachTtlMs: 0 expires it at once', async () => {
-    const { runner } = controlled();
-    const host = make({ exec: runner, sessions: { detachTtlMs: 80 } });
-    const c1 = await connect(host);
-    const s1 = await c1.openSession({ type: 'exec', command: 'a' });
-    await until(() => s1.seq > 0, 'output');
-    await drop(c1);
-    await sleep(250);
-    const c2 = await connect(host);
-    await assert.rejects(c2.resumeSession(s1.sessionId, s1.resumeToken, { lastSeq: s1.seq }), /Failed to resume: unknown session/);
+    const spy = spyTimers(777_001);
+    try {
+      const { runner } = controlled();
+      const host = make({ exec: runner, sessions: { detachTtlMs: 777_001 } });
+      const c1 = await connect(host);
+      const s1 = await c1.openSession({ type: 'exec', command: 'a' });
+      await until(() => s1.seq > 0, 'output');
+      await drop(c1);
+      await until(() => spy.pending.size === 1, 'the detach timer');
+      spy.fireAll();                       // the TTL elapses
+      const c2 = await connect(host);
+      await assert.rejects(c2.resumeSession(s1.sessionId, s1.resumeToken, { lastSeq: s1.seq }), /Failed to resume: unknown session/);
+    } finally { spy.restore(); }
 
-    const zero = make({ exec: runner, sessions: { detachTtlMs: 0 } });
+    const zero = make({ exec: controlled().runner, sessions: { detachTtlMs: 0 } });
     const c3 = await connect(zero);
     const s3 = await c3.openSession({ type: 'exec', command: 'a' });
     await until(() => s3.seq > 0, 'output');
     await drop(c3);
-    await sleep(30);
     const c4 = await connect(zero);
-    await assert.rejects(c4.resumeSession(s3.sessionId, s3.resumeToken, { lastSeq: s3.seq }), /Failed to resume/);
+    await until(async () => {
+      try { await c4.resumeSession(s3.sessionId, s3.resumeToken, { lastSeq: s3.seq }); return false; } catch (e) { return /Failed to resume/.test(e.message); }
+    }, 'the session to be gone');
   });
 
   it('bounds the replay buffer: a resume past the ring is a gap, an attach gets the retained tail', async () => {
@@ -240,10 +296,11 @@ describe('createMemoryHost sessions', () => {
     await until(() => r1.text === 'ready\n', 'ready');
     const lastSeq = s1.seq;
     await drop(c1);
-    await sleep(20);
     go();
-    await sleep(100);
     const c2 = await connect(host);
+    await until(async () => {
+      try { await c2.resumeSession(s1.sessionId, s1.resumeToken, { lastSeq: 9999 }); return false; } catch (e) { return /ahead of the session \(it has produced 206 bytes\)/.test(e.message); }
+    }, 'all 206 bytes produced');
     await assert.rejects(c2.resumeSession(s1.sessionId, s1.resumeToken, { lastSeq }), /Failed to resume: output gap: .*starts at seq 142.*last_seq is 6/);
     const { session } = await c2.attachSession(s1.sessionId, { token: s1.resumeToken });
     assert.equal(session.seq, 142, '206 bytes produced, 64 kept');
@@ -254,7 +311,9 @@ describe('createMemoryHost sessions', () => {
 
   it('bounds the session count: beyond maxDetached the longest-detached session is dropped', async () => {
     const { runner } = controlled();
-    const host = make({ exec: runner, sessions: { maxDetached: 2, detachTtlMs: 60_000 } });
+    const spy = spyTimers(777_002);
+    try {
+    const host = make({ exec: runner, sessions: { maxDetached: 2, detachTtlMs: 777_002 } });
     const opened = [];
     for (let i = 0; i < 3; i++) {
       const c = await connect(host);
@@ -262,26 +321,51 @@ describe('createMemoryHost sessions', () => {
       await until(() => s.seq > 0, 'output');
       opened.push(s);
       await drop(c);
-      await sleep(20);
+      await until(() => spy.pending.size === i + 1 || i >= 2, 'the session to be marked detached');
     }
     const c = await connect(host);
     await assert.rejects(c.resumeSession(opened[0].sessionId, opened[0].resumeToken, { lastSeq: opened[0].seq }), /Failed to resume/);
     assert.ok((await c.resumeSession(opened[1].sessionId, opened[1].resumeToken, { lastSeq: opened[1].seq })).session);
     const c2 = await connect(host);
     assert.ok((await c2.resumeSession(opened[2].sessionId, opened[2].resumeToken, { lastSeq: opened[2].seq })).session);
+    } finally { spy.restore(); }
   });
 
-  it('closing the host ends its sessions, and the options are validated', async () => {
-    const { runner } = controlled();
-    const host = make({ exec: runner, sessions: true });
-    const c1 = await connect(host);
-    const s1 = await c1.openSession({ type: 'exec', command: 'a' });
-    await until(() => s1.seq > 0, 'output');
-    await host.close();
+  it('closing the host leaves no live session and no pending timer, even for sessions closing after it', async () => {
+    const spy = spyTimers(777_003);
+    try {
+      const signals = [];
+      const runner = async (command, io) => {
+        await io.write('up\n');
+        await new Promise((resolve) => io.signal.addEventListener('abort', resolve, { once: true }));
+        signals.push(io.signal.aborted);
+        return 0;
+      };
+      const host = make({ exec: runner, sessions: { detachTtlMs: 777_003 } });
+      const c1 = await connect(host);
+      const s1 = await c1.openSession({ type: 'exec', command: 'a' });
+      const c2 = await connect(host);
+      const s2 = await c2.openSession({ type: 'exec', command: 'b' });
+      await until(() => s1.seq > 0 && s2.seq > 0, 'output');
+      await drop(c2);
+      await until(() => spy.pending.size === 1, 'one detached session with a timer');
+      await host.close();
+      // Connections tear down asynchronously after close(): let them finish detaching their sessions.
+      await until(() => c1.state !== 'authenticated', 'the attached client to be cut off');
+      await until(() => signals.length === 2, 'both runners to be stopped');
+      await new Promise((r) => setImmediate(r));
+      assert.equal(spy.pending.size, 0, 'no TTL timer survives close()');
+      await assert.rejects(host.accept(host.socketPair()[1]), /closed/);
+      assert.deepEqual(signals, [true, true], 'both sessions were stopped (their io.signal aborted), attached or not');
+    } finally { spy.restore(); }
+  });
+
+  it('validates the sessions options; false and null mean off', () => {
     assert.throws(() => createMemoryHost({ sessions: { ringBytes: 0 } }), /ringBytes/);
     assert.throws(() => createMemoryHost({ sessions: { maxDetached: -1 } }), /maxDetached/);
     assert.throws(() => createMemoryHost({ sessions: { detachTtlMs: -5 } }), /detachTtlMs/);
     assert.throws(() => createMemoryHost({ sessions: [] }), /sessions must be/);
+    createMemoryHost({ sessions: false }); createMemoryHost({ sessions: null });
   });
 
   it('stays exec-free: sessions without `exec` open nothing', async () => {
