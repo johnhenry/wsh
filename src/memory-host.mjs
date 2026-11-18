@@ -6,8 +6,10 @@
  * It is the real protocol end to end -- the same connection handler `createWshServer` runs (handshake, Ed25519 or
  * password auth, exec channels, MCP tools, extensions), speaking QMux over a pair of in-memory WebSocket-like
  * sockets -- so what a client does here is what it does against a server. It serves what a browser can: `exec` as a
- * function you provide (there is no shell), `mcp` tools, `extensions`. Not available: `pty`, `fs`, `gateway`, `relay`,
- * `sessions`, `rpc`, `hostKey`, WebTransport (they need Node; use `@johnhenry/wsh/server`).
+ * function you provide (there is no shell), `mcp` tools, `extensions`, typed `rpc` channels (handler functions you
+ * provide) and `sessions` (detach / attach / resume of exec sessions, output replayed from an in-memory ring buffer).
+ * Not available: `pty`, `fs`, `gateway`, `relay`, `hostKey`, WebTransport, the `wsh-host` / `wsh-fs` rpc built-ins
+ * (they need Node; use `@johnhenry/wsh/server`).
  *
  * ```js
  * import { createMemoryHost } from '@johnhenry/wsh/memory';
@@ -25,6 +27,8 @@ import { createConnectionFactory } from './server/connection.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
 import { createMcpHost } from './server/mcp.mjs';
 import { bindSocket } from './server/socket.mjs';
+import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
+import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -90,6 +94,31 @@ export function createSocketPair() {
   return [a, b];
 }
 
+/** Validate the `rpc` option into the table the connection handler reads (`createRpcHost` in `server/rpc.mjs` minus the Node-only built-ins). */
+function createRpcTable(rpc, maxMessageBytes, maxInflight) {
+  if (typeof rpc !== 'object' || Array.isArray(rpc)) throw new TypeError('createMemoryHost: rpc must be an object of { [protocol]: handler }');
+  if (!(maxMessageBytes >= 256)) throw new TypeError('createMemoryHost: rpcMaxMessageBytes must be at least 256');
+  if (!Number.isSafeInteger(maxInflight) || maxInflight < 1) throw new TypeError('createMemoryHost: rpcMaxInflight must be a positive integer');
+  const protocols = new Map();
+  for (const [name, handler] of Object.entries(rpc)) {
+    if (handler === undefined || handler === false || handler === null) continue;
+    if (!RPC_PROTOCOL_NAME_RE.test(name)) throw new TypeError(`createMemoryHost: rpc protocol name ${JSON.stringify(name)} is not allowed (letters, digits, ".", "_", "-")`);
+    if (typeof handler !== 'function') throw new TypeError(`createMemoryHost: rpc[${JSON.stringify(name)}] needs a handler function (channel, ctx) => void (the wsh-host / wsh-fs built-ins need Node; use @johnhenry/wsh/server)`);
+    protocols.set(name, handler);
+  }
+  return { protocols, maxMessageBytes, maxInflight };
+}
+
+function createRegistry(sessions, log) {
+  const o = sessions === true ? {} : sessions;
+  if (typeof o !== 'object' || Array.isArray(o)) throw new TypeError('createMemoryHost: sessions must be true or { detachTtlMs, maxDetached, ringBytes }');
+  const { detachTtlMs = DEFAULT_DETACH_TTL_MS, maxDetached = DEFAULT_MAX_DETACHED, ringBytes = DEFAULT_RING_BYTES } = o;
+  if (!(Number.isFinite(detachTtlMs) && detachTtlMs >= 0)) throw new TypeError('createMemoryHost: sessions.detachTtlMs must be a non-negative number');
+  if (!Number.isSafeInteger(maxDetached) || maxDetached < 0) throw new TypeError('createMemoryHost: sessions.maxDetached must be a non-negative integer');
+  if (!Number.isSafeInteger(ringBytes) || ringBytes < 1) throw new TypeError('createMemoryHost: sessions.ringBytes must be a positive integer');
+  return new SessionRegistry({ detachTtlMs, maxDetached, ringBytes, log });
+}
+
 /**
  * @param {object} [options]
  * @param {object | Function} [options.auth] - As for `createWshServer`. Omitted = refuse everyone.
@@ -97,15 +126,26 @@ export function createSocketPair() {
  *   `run(command, io) => Promise<exitCode>` (see `ExecIo` in `server/exec.mjs`): the host has no shell, so there is no `true`.
  * @param {{ tools?: object[] | object, client?: object, authorize?: Function, maxConcurrent?: number, timeoutMs?: number }} [options.mcp]
  * @param {Record<string, Function>} [options.extensions] - Handlers for application-defined messages, as for `createWshServer`.
+ * @param {Record<string, Function>} [options.rpc] - Typed RPC channels: `{ [protocol]: (channel, ctx) => void | Promise<void> }`,
+ *   a handler per protocol that registers methods on an `RpcChannel`. Off unless given. Handler functions only (no built-ins).
+ * @param {number} [options.rpcMaxMessageBytes=1048576] - Largest single rpc message (advertised as `rpc-max-message:<n>`; at least 256).
+ * @param {number} [options.rpcMaxInflight=64] - Concurrent requests per rpc channel before `-32002`.
+ * @param {true | { detachTtlMs?: number, maxDetached?: number, ringBytes?: number }} [options.sessions]
+ *   Keep exec sessions alive across disconnects so a client can `resumeSession()` / `attachSession()`: as for
+ *   `createWshServer`, with the same defaults (300000 ms detached, 16 detached sessions, 1 MiB of replayable output
+ *   per session). Off unless given: sessions then die with their connection. There is no `sessionSecret`: session
+ *   tokens are random per session.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, mcp, extensions, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
+export function createMemoryHost({ auth, exec, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
   if (exec === true) throw new TypeError('createMemoryHost: exec must be a function (run(command, io)); there is no shell to run `true` with');
   if (exec !== undefined && typeof exec !== 'function' && typeof exec?.run !== 'function') {
     throw new TypeError('createMemoryHost: exec must be a function or { run }');
   }
   if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createMemoryHost: extensions must be an object of handlers');
+  const rpcHost = rpc === undefined || rpc === null ? null : createRpcTable(rpc, rpcMaxMessageBytes, rpcMaxInflight);
+  const registry = sessions === undefined || sessions === null || sessions === false ? null : createRegistry(sessions, onLog);
   const execOptions = typeof exec === 'function' || !exec ? {} : exec;
   const execRunner = typeof exec === 'function' ? exec : exec?.run ?? null;
   const rl = auth?.rateLimit ?? {};
@@ -119,7 +159,7 @@ export function createMemoryHost({ auth, exec, mcp, extensions, bindTimeoutMs = 
 
   const ready = buildAuthorizer(auth).then((authorize) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: null, files: null, bindTimeoutMs, log: onLog,
-    methods, hostKey: null, rateLimit, extensions, mcp: mcpHost, rpc: null, gateway: null, sessions: null, relay: null,
+    methods, hostKey: null, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: null, sessions: registry, relay: null,
   }));
   ready.catch(() => {});
 
@@ -169,6 +209,7 @@ export function createMemoryHost({ auth, exec, mcp, extensions, bindTimeoutMs = 
       closed = true;
       for (const handle of accepted) handle.close();
       accepted.clear();
+      registry?.closeAll();
     },
   };
   return host;

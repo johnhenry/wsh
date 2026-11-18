@@ -274,8 +274,23 @@ session.onData = (d) => console.log(new TextDecoder().decode(d));   // "ran hi"
 
 It is the real connection handler speaking QMux over an in-memory socket pair, so the client code you test is the code
 you ship. `host.createClient()` / `host.WebSocket` / `host.accept(socket)` / `createSocketPair()` are the lower-level pieces.
-Supported: `auth`, `exec` (a function; there is no shell), `mcp`, `extensions`. Not available in memory: `pty`, `fs`,
-`gateway`, `relay`, `sessions`, `rpc`, `hostKey` and WebTransport (use `@johnhenry/wsh/server`).
+Supported: `auth`, `exec` (a function; there is no shell), `mcp`, `extensions`, `rpc` and `sessions` (below). Not
+available in memory: `pty`, `fs`, `gateway`, `relay`, `hostKey`, WebTransport and the `wsh-host` / `wsh-fs` rpc
+built-ins (use `@johnhenry/wsh/server`).
+
+**`rpc`** takes handler functions only, `rpc: { calc: (channel, ctx) => channel.onRequest('add', ({ a, b }) => a + b) }`
+(the `RpcChannel` is the one `@johnhenry/wsh/server` hands its handlers), with `rpcMaxMessageBytes` (default 1 MiB) and
+`rpcMaxInflight` (default 64). Clients use `client.openRpc('calc')` unchanged.
+
+**`sessions`** (`true` or `{ detachTtlMs, maxDetached, ringBytes }`) keeps *exec* sessions alive across a dropped link
+or `client.detach()`, so `resumeSession()` / `attachSession()` work unchanged: the same Attach / Resume / Detach
+messages, `seq` counted in output bytes, and the same errors (unknown or expired session, bad token, `last_seq` ahead
+of the session, an output gap). The limits and defaults are the server's: 300000 ms detached before a session is
+dropped, at most 16 detached sessions (the longest-detached is dropped first), 1 MiB of replayable output per session
+(a resume older than the ring is refused as a gap; `attachSession` gets the retained tail). The session list lives in
+the page's memory, so it ends with the page or `host.close()`. Differences from the server: no `pty`, no
+`sessionSecret` (tokens are random per session instead of HMAC-signed, so they cannot be checked across restarts), and
+the host still runs no command by itself: sessions only wrap whatever `exec` function you pass.
 
 ### Signing with a page-held signer
 

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.35.0
+
+- **`createMemoryHost({ rpc, sessions })`: typed RPC channels and detach/resume without Node (viaframe#592).** Both used
+  to be `null` in the memory host ("need Node"), so a browser frame could not host either.
+  - `rpc: { [protocol]: (channel, ctx) => void }` registers handlers on the stock `RpcChannel`; `rpcMaxMessageBytes`
+    (default 1 MiB) and `rpcMaxInflight` (default 64) as for `createWshServer`. Handler functions only: the `wsh-host`
+    / `wsh-fs` built-ins and `mcpServerAdapter` stay in `@johnhenry/wsh/server`.
+  - `sessions: true | { detachTtlMs, maxDetached, ringBytes }` keeps exec sessions across a dropped link or `detach()`
+    and serves `resumeSession()` / `attachSession()` / `listRemoteSessions()` through the same connection handler, so
+    the wire behaviour and the existing clients are unchanged. Limits and defaults are the server's (300000 ms, 16
+    detached, 1 MiB replay ring per session). Tokens are random per session (no `sessionSecret`).
+  - The session store (`ByteRing`, `HostedSession`, `SessionRegistry`) moved from `src/server/sessions.mjs` to the
+    Node-free `src/session-registry.mjs`; `server/sessions.mjs` re-exports it and adds the HMAC tokens, so the server's
+    behaviour and exports are unchanged. Without the new options the memory host behaves as before, and nothing new
+    runs host commands: sessions only wrap the `exec` function the caller passes.
+- **Tests:** `test/memory-host-rpc-sessions.test.mjs` (rpc round trip, negotiation and option validation; drop then
+  resume replaying only the missed output and the exit; detach/resume; unknown, expired, bad-token, other-principal and
+  ahead-of-session resumes refused; the ring bound and the `maxDetached` bound; option validation; exec-free).
+
 ## 0.34.2 / Rust `rust-v0.6.0`
 
 - **Rust `wsh-server` implements `McpCancel` and advertises `mcp-cancel` (#110).** A `McpCall` that carries a `call_id`
