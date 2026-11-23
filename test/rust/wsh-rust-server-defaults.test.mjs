@@ -6,6 +6,7 @@
 // JS client. Every server runs with HOME in a scratch directory.
 
 import { describe, it, before, after } from 'node:test';
+import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';

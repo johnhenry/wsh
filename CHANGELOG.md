@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Test: `npm run test:rust` can no longer hang a CI job (#152)
+
+No product change; neither the npm package nor the Rust binaries change.
+
+- **The hang was a test artefact, not a protocol defect.** In the large-transfer test of `wsh -L ...:endpoint=NAME` the fake daemon was Node's `http` server on a `Duplex.fromWeb` socket. Under CPU load (about 1 run in 80) that server stopped: `res.writableNeedDrain` stayed true on a socket that had nothing buffered, so `req.pipe(res)` waited for a `drain` that never came, the host stopped consuming, never returned `GatewayCredit`, and `wsh` correctly waited for credit. `wsh` was idle, credit windows and the QMux windows were consistent, and the same http fixture between two JS peers or on the raw transport passed hundreds of runs; with raw web-stream endpoints the Rust client passed 900 of 900 runs under the same load. rust-v0.8.0/0.9.0 and npm 0.37/0.38 are not affected. The test now uses raw `bulk` and `echo` endpoints.
+- Every file under `test/rust/` imports `test/rust/helpers/guard.mjs`: its child processes are tracked and killed when the file ends, on exit or on a signal, and `npm run test:rust` passes `--test-timeout=180000`, so a hung test fails in seconds naming itself.
+- The CI `browser` and `rust` jobs have `timeout-minutes` (25 and 40).
+
 ## Rust `rust-v0.9.0`
 
 ### Rust: host identity, channel binding and operator proof (#145, part 3: steps 1-4)
