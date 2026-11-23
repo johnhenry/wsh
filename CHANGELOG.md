@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.38.1
 
 ### JS: `operator-proof` is offered only to a peer that advertises it (npm change)
 
