@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.37.0 / Rust `rust-v0.7.0`
 
 ### Rust: identity parity, part 1 (#145)
 
