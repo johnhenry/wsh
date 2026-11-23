@@ -3493,6 +3493,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wsh-client",
  "wsh-core",
  "wtransport",
 ]

@@ -114,6 +114,20 @@ impl SealGate {
         };
     }
 
+    /// The HOST side of a sealed session (wsh #155): this connection's `KeyExchange` is answered
+    /// here by `responder` (which holds the host key and the proven login key), and once the key
+    /// exists the session is sealed. With `must`, nothing else but the keepalive is heard until
+    /// then (`sealSession: 'require'`); without it a plain peer is served plainly and may seal
+    /// whenever it likes (`'offer'`).
+    pub fn begin_session_responder(&self, session_id: String, must: bool, responder: E2eResponder) {
+        *self.mode.lock().expect("seal gate") = Mode::Pending {
+            session_id,
+            must,
+            scope: Scope::Session,
+            responder: Some(Box::new(responder)),
+        };
+    }
+
     /// The scope of the bridge being set up or sealed, if any.
     pub fn scope(&self) -> Option<Scope> {
         match &*self.mode.lock().expect("seal gate") {
@@ -131,8 +145,56 @@ impl SealGate {
         match &mut *mode {
             Mode::Off => Gated::deliver(msg),
             Mode::Failed => Gated::default(),
-            Mode::Pending { session_id, .. } => {
-                if plain_ok || is_setup(&msg, session_id) {
+            Mode::Pending {
+                session_id,
+                must,
+                scope,
+                responder,
+            } => {
+                if is_setup(&msg, session_id) {
+                    // The host side answers the key exchange itself, here, so the key is in place
+                    // before the next frame is read (the initiator sends its first frame at once).
+                    let Some(responder) = responder else {
+                        return Gated::deliver(msg); // the initiator: a waiter takes it
+                    };
+                    let Payload::KeyExchange(k) = &msg.payload else {
+                        return Gated::default();
+                    };
+                    return match responder.respond(k) {
+                        Ok(r) => {
+                            let replies = r
+                                .replies
+                                .into_iter()
+                                .map(|k| Envelope {
+                                    msg_type: MsgType::KeyExchange,
+                                    payload: Payload::KeyExchange(k),
+                                })
+                                .collect();
+                            if let Some(key) = r.key {
+                                tracing::info!(hybrid = r.hybrid, "session sealed");
+                                let (session, scope) = (session_id.clone(), *scope);
+                                *mode = Mode::Sealed(SealedBridge::with_scope(
+                                    key,
+                                    session,
+                                    RoleTag::Responder,
+                                    scope,
+                                ));
+                                self.sealed.notify_one();
+                            }
+                            Gated {
+                                deliver: None,
+                                replies,
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("the sealed session's key exchange was refused: {e}");
+                            *mode = Mode::Failed;
+                            self.failed.notify_one();
+                            Gated::default()
+                        }
+                    };
+                }
+                if plain_ok || !*must {
                     Gated::deliver(msg)
                 } else {
                     tracing::warn!(msg_type = ?msg.msg_type, "dropping a plaintext message before the session is sealed");
@@ -452,6 +514,137 @@ mod tests {
             host.outgoing(frame_encode(&close(3)).unwrap()).is_none(),
             "nothing leaves a failed bridge"
         );
+    }
+
+    /// Round 1 of a classical exchange from an initiator holding `secret`.
+    fn round_one(session: &str, secret: &x25519_dalek::EphemeralSecret) -> Envelope {
+        let public = x25519_dalek::PublicKey::from(secret);
+        Envelope {
+            msg_type: MsgType::KeyExchange,
+            payload: Payload::KeyExchange(KeyExchangePayload {
+                algorithm: "X25519".into(),
+                public_key: Some(public.as_bytes().to_vec()),
+                session_id: session.into(),
+                kem_public_key: None,
+                kem_ciphertext: None,
+                signature: None,
+            }),
+        }
+    }
+
+    fn host_gate(must: bool) -> SealGate {
+        let g = SealGate::default();
+        g.begin_session_responder(
+            "sid".into(),
+            must,
+            crate::e2e::E2eResponder::new(None, false, None, None),
+        );
+        g
+    }
+
+    #[test]
+    fn a_host_that_requires_sealing_hears_only_the_key_exchange_and_the_keepalive_until_it_is_sealed(
+    ) {
+        let g = host_gate(true);
+        assert!(
+            g.incoming_direct(close(1)).deliver.is_none(),
+            "plain is dropped"
+        );
+        assert!(
+            g.incoming_direct(ping()).deliver.is_some(),
+            "the keepalive is heard"
+        );
+        assert!(
+            g.incoming_direct(kex("other")).deliver.is_none(),
+            "a key exchange of another session is not this one's"
+        );
+        assert!(!g.is_sealed());
+    }
+
+    #[test]
+    fn a_host_that_only_offers_serves_a_plain_peer_and_seals_when_asked() {
+        let g = host_gate(false);
+        assert!(
+            g.incoming_direct(close(1)).deliver.is_some(),
+            "a plain peer is served"
+        );
+        let f = frame_encode(&close(2)).unwrap();
+        assert_eq!(g.outgoing(f.clone()), Some(f), "and spoken to plainly");
+        let secret = x25519_dalek::EphemeralSecret::random();
+        let gated = g.incoming_direct(round_one("sid", &secret));
+        assert!(gated.deliver.is_none(), "the exchange is consumed");
+        assert_eq!(gated.replies.len(), 1);
+        assert!(g.is_sealed());
+        assert_eq!(g.scope(), Some(Scope::Session));
+    }
+
+    #[test]
+    fn a_host_session_is_sealed_both_ways_once_the_exchange_is_done() {
+        let g = host_gate(true);
+        let secret = x25519_dalek::EphemeralSecret::random();
+        let gated = g.incoming_direct(round_one("sid", &secret));
+        let Payload::KeyExchange(reply) = &gated.replies[0].payload else {
+            panic!("a key exchange reply");
+        };
+        let theirs: [u8; 32] = reply.public_key.clone().unwrap().try_into().unwrap();
+        let key = *secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(theirs))
+            .as_bytes();
+        let mut initiator =
+            SealedBridge::with_scope(key, "sid".into(), RoleTag::Initiator, Scope::Session);
+        // what the initiator seals opens at the host, and a replay of it closes the session
+        let frame = initiator.seal(&close(9)).unwrap();
+        let opened = g.incoming_direct(frame.clone()).deliver.unwrap();
+        assert!(matches!(
+            opened.payload,
+            Payload::Close(ClosePayload { channel_id: 9 })
+        ));
+        assert!(g.incoming_direct(frame).deliver.is_none());
+        assert!(g.has_failed(), "a replayed frame ends the session");
+        // plain is not heard, and nothing leaves a failed session
+        assert!(g.incoming_direct(close(1)).deliver.is_none());
+        assert!(g.outgoing(frame_encode(&close(3)).unwrap()).is_none());
+    }
+
+    #[test]
+    fn a_host_session_seals_what_it_sends_and_leaves_the_keepalive_plain() {
+        let g = host_gate(true);
+        let secret = x25519_dalek::EphemeralSecret::random();
+        let gated = g.incoming_direct(round_one("sid", &secret));
+        let Payload::KeyExchange(reply) = &gated.replies[0].payload else {
+            panic!("a key exchange reply");
+        };
+        // the reply itself leaves as it is (the initiator has no key yet) ...
+        let reply_frame = frame_encode(&gated.replies[0]).unwrap();
+        assert_eq!(g.outgoing(reply_frame.clone()), Some(reply_frame));
+        // ... everything else is a frame
+        let out = g.outgoing(frame_encode(&close(5)).unwrap()).unwrap();
+        assert_eq!(
+            decode_envelope(&out[4..]).unwrap().msg_type,
+            MsgType::EncryptedFrame
+        );
+        let p = frame_encode(&ping()).unwrap();
+        assert_eq!(g.outgoing(p.clone()), Some(p));
+        let _ = reply;
+    }
+
+    #[test]
+    fn a_key_exchange_that_does_not_verify_ends_the_session() {
+        let g = SealGate::default();
+        let initiator = crate::e2e::InitiatorAuth {
+            public_key: [7; 32],
+            require: true,
+        };
+        g.begin_session_responder(
+            "sid".into(),
+            true,
+            crate::e2e::E2eResponder::new(None, false, Some([1; 32]), Some(initiator)),
+        );
+        let secret = x25519_dalek::EphemeralSecret::random();
+        // no initiator signature, and the host demands one
+        let gated = g.incoming_direct(round_one("sid", &secret));
+        assert!(gated.deliver.is_none() && gated.replies.is_empty());
+        assert!(g.has_failed());
     }
 
     #[test]

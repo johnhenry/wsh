@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Rust `wsh-server`: seal a whole session end to end, `[server] seal_session` (#155 stage c, part 2; Rust change)
+
+The Rust server can now be the responder of the sealed session of stage b, so a relay that only copies bytes (a pipe relay, a
+TLS-terminating proxy) cannot read or alter a session with it: control messages, exec/pty data and gateway data all travel as
+`EncryptedFrame`s once the key exists. Lands in the next `rust-v` release; no wire change (stage b's features and messages).
+
+- **`[server] seal_session = "off" | "offer" | "require"`**, default `off`: nothing is advertised and no released client is affected
+  (not a breaking change). `offer` and `require` need `[server] host_key` (refused at start otherwise). On a WebSocket connection the
+  server advertises `e2e-session` (and `e2e-session-required` with `require`); after a KEY login it answers the signed key exchange (it
+  verifies the login key's signature over both ephemeral keys and its own identity, signs the reply with the host key, hybrid
+  X25519+ML-KEM-768), and from then on every control message but ping/pong is a frame both ways. A frame that does not open (flipped
+  bit, replay, reorder) closes the connection; a plain message after the key exchange is dropped.
+- **`offer`** serves a client that never asks exactly as before; **`require`** serves nothing in the clear: a plain message before the
+  key exists is answered with an error and the connection is closed, a password login is refused ("needs a key login"), and
+  **WebTransport connections and WISP guest tunnels are refused** (a sealed session is a WebSocket one; there is no unsealed back door
+  to a `require` server). WebTransport on an `offer` server is served as before and does not list `e2e-session`.
+- **Typed rpc channels (`wsh-fs`, ...) are not offered while `seal_session` is on** (they ride client-opened data streams, which are
+  not frames); the server logs a warning at start. This is the one thing `offer` takes away from a client that does not seal.
+- Implementation: `wsh-server` now depends on `wsh-client` for `SealGate`, `E2eResponder` and the sealed bridge (one implementation, the
+  one the CLI uses); `SealGate::begin_session_responder` is new, and `incoming_direct` answers a responder's key exchange. Every write to
+  the control stream of an authenticated WebSocket connection goes through `write_control` (the gate), in order.
+- README: the sealed-session section, the capability matrix and the Security model. Not covered, as for the JS host: the handshake
+  before login, sizes and timing, a denial of service; `offer` is not a downgrade guarantee (only a client that insists, `--sealed` /
+  `sealSession: true`, is guaranteed; against `require` a stripped client is refused but what it sent before was readable).
+- Tests: `test/rust/wsh-session-seal-server.test.mjs` (the real `wsh-server` behind a recording / tampering relay, driven by the JS
+  client and by the Rust CLI: no plaintext marker or destination on the wire, flipped bit both ways, replay, plain injection both ways,
+  bad key-exchange signatures, stripped features, an old client against `offer`, `require` refusing an old client, a password login and
+  WebTransport); `seal_gate.rs` and `config.rs` unit tests. Each new rule was broken once and its test seen to fail.
+
 ### JS client: seal a whole session end to end, `connect(url, { sealSession })` (#155 stage c, part 1; npm change)
 
 Stage a (#157) sealed the Rust bridge and stage b (#158) gave the JS host `sealSession: 'offer' | 'require'` and the Rust CLI the

@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 wsh-core = { path = "../wsh-core" }
+# The sealed session (#155) is the one implementation the CLI already uses: `seal_gate`, `e2e` and `bridge_seal`.
+wsh-client = { path = "../wsh-client" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
