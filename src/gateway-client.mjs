@@ -9,11 +9,12 @@
  */
 
 import {
-  MSG, openTcp as openTcpMsg, openUdp as openUdpMsg, openUnix as openUnixMsg, openEndpoint as openEndpointMsg, listenUnix as listenUnixMsg,
+  MSG, openTcp as openTcpMsg, openUdp as openUdpMsg, listenRequest as listenRequestMsg, openUnix as openUnixMsg, openEndpoint as openEndpointMsg, listenUnix as listenUnixMsg,
   listenClose as listenCloseMsg, inboundAccept as inboundAcceptMsg, inboundReject as inboundRejectMsg,
   gatewayData as gatewayDataMsg, gatewayCredit as gatewayCreditMsg, gatewayClose as gatewayCloseMsg,
 } from './messages.mjs';
 import { GatewayChannel, GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
+import { UdpFlow, decodeDatagram } from './gateway-datagram.mjs';
 
 const ID_BASE = 0x40000000;
 const ID_LIMIT = 0xffffffff;
@@ -54,9 +55,20 @@ export class GatewayConnections {
    * @param {(msg: object) => Promise<void>} o.send
    * @param {(feature: string) => boolean} o.hasFeature
    */
-  constructor({ send, hasFeature }) {
+  constructor({ send, hasFeature, datagrams = () => null }) {
     this.#send = send;
     this.#hasFeature = hasFeature;
+    this.#datagrams = datagrams;
+  }
+
+  #datagrams;
+  /** @type {Map<number, UdpFlow>} */
+  #udp = new Map();
+
+  /** A WebTransport datagram arrived: [gateway_id][payload]. A flow we do not have is dropped, as a stray datagram is. */
+  handleDatagram(bytes) {
+    const d = decodeDatagram(bytes);
+    if (d) this.#udp.get(d.id)?.deliverDatagram(d.payload);
   }
 
   #id() {
@@ -68,8 +80,8 @@ export class GatewayConnections {
     if (!this.#hasFeature(feature)) throw new GatewayError(`this host does not support ${what} (it did not advertise "${feature}")`, 0);
   }
 
-  /** @param {{ datagram?: boolean }} [kind] a datagram flow has no half-close: the peer's close ends it */
-  #makeChannel(id, { datagram = false } = {}) {
+  /** @param {{ datagram?: boolean, onData?: (bytes: Uint8Array) => void }} [kind] a datagram flow has no half-close: the peer's close ends it */
+  #makeChannel(id, { datagram = false, onData } = {}) {
     const channel = new GatewayChannel({
       id,
       credit: this.#hasFeature(GATEWAY_CREDIT_FEATURE),
@@ -77,16 +89,19 @@ export class GatewayConnections {
       // our side closes too, so a connection nobody closes does not stay in the table forever.
       graceMs: CLIENT_GRACE_MS,
       onRemoteClose: datagram ? () => channel.destroy() : undefined,
+      onData,
       sendData: (data) => this.#send(gatewayDataMsg({ gatewayId: id, data })),
       sendCredit: (n) => this.#send(gatewayCreditMsg({ gatewayId: id, bytes: n })),
       sendClose: (reason) => this.#send(gatewayCloseMsg({ gatewayId: id, reason })),
-      onClose: () => { this.#channels.delete(id); },
+      onClose: () => { this.#channels.delete(id); this.#udp.delete(id); },
     });
     this.#channels.set(id, channel);
     return channel;
   }
 
   #duplex(channel) {
+    const flow = this.#udp.get(channel.id);
+    if (flow) return flow;
     const { readable, writable } = channel.streams();
     return { readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise };
   }
@@ -94,7 +109,9 @@ export class GatewayConnections {
   async #open(build, { timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}, kind) {
     if (signal?.aborted) throw signal.reason ?? new DOMException('aborted', 'AbortError');
     const id = this.#id();
-    const channel = this.#makeChannel(id, kind);
+    let flow;
+    const channel = this.#makeChannel(id, { ...kind, onData: kind?.udp ? (b) => flow.deliverReliable(b) : undefined });
+    if (kind?.udp) { flow = new UdpFlow({ id, channel, ...kind.udp }); this.#udp.set(id, flow); }
     const done = new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.#opening.delete(id); channel.abandon(); reject(new GatewayError('the host did not answer the open request in time', 5)); }, timeoutMs);
       timer.unref?.();
@@ -148,7 +165,45 @@ export class GatewayConnections {
   async openUdp(host, port, opts) {
     this.#need('gateway', 'UDP egress');
     if (typeof host !== 'string' || !host || !Number.isInteger(port)) throw new TypeError('openUdp: host and port are required');
-    return this.#open((id) => openUdpMsg({ gatewayId: id, host, port }), opts, { datagram: true });
+    if (opts?.oversize !== undefined && opts.oversize !== 'reliable' && opts.oversize !== 'drop') throw new TypeError('openUdp: oversize must be "reliable" or "drop"');
+    // Whether this flow uses datagrams is fixed at open: both ends negotiated it for the connection.
+    const datagrams = this.#datagrams();
+    return this.#open((id) => openUdpMsg({ gatewayId: id, host, port }), opts, {
+      datagram: true,
+      udp: { datagrams, oversize: opts?.oversize },
+    });
+  }
+
+  /**
+   * Ask the host to listen on a TCP port (a reverse tunnel) and hand each inbound connection to `onConnection(duplex, { peer, peerPort })`.
+   * @param {number} port @param {{ bindAddr?: string, onConnection: Function, timeoutMs?: number }} opts
+   * @returns {Promise<{ port: number, close: () => Promise<void> }>}
+   */
+  async listenTcp(port, { bindAddr, onConnection, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+    this.#need('gateway', 'reverse tunnels (ListenRequest)');
+    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new TypeError('listenTcp: port must be an integer 0-65535');
+    if (typeof onConnection !== 'function') throw new TypeError('listenTcp: onConnection is required');
+    const id = this.#id();
+    const entry = { onConnection, path: '', closed: false, actualPort: 0 };
+    const answered = new Promise((resolve, reject) => {
+      entry.resolve = resolve; entry.reject = reject;
+      entry.timer = setTimeout(() => { this.#listeners.delete(id); reject(new GatewayError('the host did not answer the listen request in time', 5)); }, timeoutMs);
+      entry.timer.unref?.();
+    });
+    this.#listeners.set(id, entry);
+    try {
+      await this.#send(listenRequestMsg({ listenerId: id, port, ...(bindAddr === undefined ? {} : { bindAddr }) }));
+      await answered;
+    } catch (e) { this.#listeners.delete(id); throw e; }
+    return {
+      port: entry.actualPort,
+      close: async () => {
+        if (entry.closed) return;
+        entry.closed = true;
+        this.#listeners.delete(id);
+        await this.#send(listenCloseMsg({ listenerId: id })).catch(() => {});
+      },
+    };
   }
 
   /**
@@ -214,7 +269,7 @@ export class GatewayConnections {
         c.remoteClosed(m.reason);
         return true;
       }
-      case MSG.LISTEN_OK: { const l = this.#listeners.get(m.listener_id); if (!l?.resolve) return false; clearTimeout(l.timer); l.resolve(); l.resolve = undefined; return true; }
+      case MSG.LISTEN_OK: { const l = this.#listeners.get(m.listener_id); if (!l?.resolve) return false; clearTimeout(l.timer); l.actualPort = m.actual_port; l.resolve(); l.resolve = undefined; return true; }
       case MSG.LISTEN_FAIL: {
         const l = this.#listeners.get(m.listener_id);
         if (!l?.reject) return false;
@@ -232,7 +287,7 @@ export class GatewayConnections {
         const channel = this.#makeChannel(id);
         const duplex = this.#duplex(channel);
         void this.#send(inboundAcceptMsg({ channelId: m.channel_id, gatewayId: id })).then(() => {
-          try { l.onConnection(duplex, { peer: m.peer_addr }); } catch { channel.destroy('handler error'); }
+          try { l.onConnection(duplex, { peer: m.peer_addr, peerPort: m.peer_port }); } catch { channel.destroy('handler error'); }
         }, () => channel.abandon());
         return true;
       }

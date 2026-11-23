@@ -1182,6 +1182,23 @@ messages:
         Sent by the client to request a UDP socket through the gateway.
         The server binds a local UDP socket for relaying datagrams to the
         specified host:port and replies with GatewayOk or GatewayFail.
+        The flow is to ONE destination, fixed here: replies are accepted
+        only from that address and port, so it is never a relay to
+        arbitrary peers.
+
+        Payloads travel as GatewayData (one per datagram) on the control
+        stream, unless the transport is WebTransport and BOTH ends listed
+        the feature "gateway-datagram" (the client in Hello.features, the
+        host in ServerHello.features). Then each payload is a WebTransport
+        datagram instead: the whole datagram is the 4-byte big-endian
+        gateway_id of the flow followed by the UDP payload (no other
+        header). Such a flow is not metered by GatewayCredit and nothing
+        is retransmitted; a datagram that names an unknown gateway_id, or
+        is shorter than 4 bytes, is dropped. A payload that does not fit
+        the transport's maxDatagramSize minus 4 is sent as GatewayData on
+        the control stream instead (a host may be configured to drop it).
+        GatewayOk, GatewayFail and GatewayClose always use the control
+        stream.
       fields:
         gateway_id:
           type: u32
@@ -1332,6 +1349,15 @@ messages:
         Sent by the client to ask the server to open a listening socket
         on the given port and bind address.  The server replies with
         ListenOk (including the actual bound port) or ListenFail.
+        Reverse tunnels are policy-controlled by the host: off unless the
+        operator enables them, bound to an address the OPERATOR chooses
+        (loopback by default; bind_addr is a request the host may ignore),
+        and limited to an allowed set of ports (a port below 1024 only if
+        listed). Each inbound connection is announced with InboundOpen
+        (peer_addr and peer_port are the remote end) and, once the client
+        answers InboundAccept{gateway_id}, flows as GatewayData /
+        GatewayCredit / GatewayClose on that gateway_id. A host that
+        serves this lists "gateway" in ServerHello.features.
       fields:
         listener_id:
           type: u32

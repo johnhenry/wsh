@@ -284,6 +284,11 @@ export function createWshServer({
       return wt.rotateCertificate(options);
     },
 
+    /** Counters of the gateway's UDP flows and reverse listeners (drops by cause, oversize handling), or `null` without a gateway. */
+    gatewayStats() {
+      return gatewayCfg ? JSON.parse(JSON.stringify(gatewayCfg.stats)) : null;
+    },
+
     /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */
     peerFingerprints() {
       return hub ? hub.peerFingerprints() : [];

@@ -255,11 +255,70 @@ limit and sends `ttl: 0`. Before 0.36 it sent an unenforced 3600. The Rust
 `gateway: { allow: ['broker.lan:1883'], allowPrivate: ['10.0.0.0/8'], socks: '127.0.0.1:9050' }` makes the Node server
 answer the gateway opcodes, so a client (a browser tab via netway's `GatewayBackend`, or `client.openTcp()`) can open TCP
 connections and resolve names from the host. Default deny; `allow` takes `"*"`, `"host"` or `"host:port"`. `socks` routes
-every dial through a SOCKS5 proxy (Tor) with the name unresolved. TCP reverse tunnels are refused. `OpenUdp` is served
-(`client.openUdp(host, port)`: one chunk is one datagram, same destination policy, idle flows closed after `udpIdleMs`,
-default 60 s, not available through `socks`), but over the reliable control stream: it is ordered and retransmitted, and a
-datagram the client cannot take fast enough is dropped by the host. **WebTransport datagrams (the real UDP semantics) are
-not implemented yet (#124).**
+every dial through a SOCKS5 proxy (Tor) with the name unresolved. `OpenUdp` and TCP reverse tunnels are served too, each
+with its own bounds; both are described below.
+
+#### UDP (`client.openUdp`), and WebTransport datagrams (#98, #124)
+
+`client.openUdp(host, port)` opens a UDP flow to ONE destination, fixed when it is opened. The destination goes through the
+same name rule and resolved-address policy as TCP (a loopback or private address needs `allowPrivate` or an IP-literal
+`allow` entry, and `allow: []` is still default deny), the host's socket is `connect()`ed to the resolved address so the
+kernel delivers nothing to it from any other address or port, and `socks` refuses UDP. The result has `send(bytes) =>
+Promise<boolean>`, `readable`, `writable`, `close()`, `transport`, `maxDatagramSize` and `stats`. **Datagram semantics:** a
+payload may be dropped (a rate limit, transport back-pressure, a receive queue that is full) and nothing says which; a
+slow reader loses the newest datagrams past 128 queued, it does not make anyone buffer.
+
+- **Over WebTransport, when both ends list `gateway-datagram`**, payloads are WebTransport datagrams: a 4-byte big-endian
+  flow id (the `gateway_id` of the `OpenUdp`) and the payload, nothing else. They are not ordered and not retransmitted, so
+  loss on one flow does not delay another, and `GatewayCredit` does not apply to them. `OpenUdp`, `GatewayOk`/`GatewayFail`
+  and `GatewayClose` stay on the control stream. The client lists `gateway-datagram` in `Hello.features` when its transport
+  has datagrams (WebTransport: browsers and `@fails-components/webtransport`); the host lists it in `ServerHello.features`
+  when it is on WebTransport, its gateway serves UDP and `udp.datagrams` is not `false`.
+- **The size limit is read, not assumed.** `maxDatagramSize` comes from the transport (`WebTransport.datagrams.maxDatagramSize`,
+  which the platform defines as the largest datagram you may write; the host side uses the same property of the session, and
+  senders use `createWritable()` where present and the deprecated `writable` otherwise). It is about 1.2 KB on a QUIC path
+  (1207 payload bytes on a loopback test connection) and can change, so it is read again for every payload. A payload bigger than
+  `maxDatagramSize - 4` is **sent on the reliable control stream by default**, in both directions, rather than lost: real
+  UDP semantics would drop it (or IP would fragment it), but a tunnel that cannot carry a 1252-byte QUIC Initial or an
+  unfragmented big DNS answer is not useful, and the cost (that one payload is ordered and retransmitted) is stated, counted
+  (`oversizeReliable`) and bounded by the same rate limits. For strict semantics set `udp: { oversize: 'drop' }` on the host
+  (an oversize reply is dropped and counted in `oversizeDropped`) and `openUdp(h, p, { oversize: 'drop' })` on the client
+  (`send()` rejects with a `RangeError`, the sender's error). A payload over 65507 bytes is always a `RangeError`.
+- **Over WebSocket, or against a host without the feature (every released host), or with `udp.datagrams: false`**, one
+  `GatewayData` is one datagram on the reliable control stream as before: ordered, retransmitted, credit-metered. `flow.transport` says
+  which path a flow uses.
+- **Bounds** (`gateway.udp`, all with defaults): `maxFlows` 16 per client; `packetsPerSecondPerFlow` 500 and
+  `packetsPerSecondPerClient` 2000, as token buckets over both directions; `bytesPerSecondPerClient` 4 MiB/s over both
+  directions; a flow idle for `udpIdleMs` (default 60 s) is closed. A datagram over a limit is dropped and counted, never
+  queued. `server.gatewayStats().udp` has the counters (`datagramsFromClient`, `datagramsToClient`, `rateDropped`,
+  `oversizeReliable`, `oversizeDropped`, `unknownFlow`, ...).
+
+#### TCP reverse tunnels (`client.listenTcp`, #98)
+
+`gateway: { allow: [], reverse: { ... } }` lets a client ask the HOST to listen on a TCP port and be handed every connection
+made to it (OpenSSH `-R`). This puts a port of the host on a network, so it is **off unless `reverse` is given** (a
+separate switch from outbound use: `allow` has no say in it) and bounded:
+
+```js
+createWshServer({ auth, gateway: { allow: [], reverse: {
+  bindAddr: '127.0.0.1',        // what the host binds, default loopback; the client's bind_addr is IGNORED unless listed in...
+  allowBindAddrs: [],           // ...the addresses a client may pick (IP literals only). The default ListenRequest bind_addr, "0.0.0.0", is never honoured unless you list it.
+  ports: [0, '1024-65535'],     // what a client may ask for (the default shown). A list you give REPLACES it: a port below 1024 only if you name it.
+  maxListeners: 4, maxConnectionsPerListener: 16, backlog: 8, idleMs: 300000,
+} } });
+const l = await client.listenTcp(0, { onConnection: (duplex, { peer, peerPort }) => { /* web streams with backpressure */ } });
+console.log(l.port);            // the port the host bound (the actual port for 0)
+await l.close();
+```
+
+Each inbound connection is announced with `InboundOpen` (the real peer address and port), the client answers
+`InboundAccept { gateway_id }` (or `InboundReject`), and data then flows exactly like any gateway connection, with the same
+credit rules. Every refusal says why in the `ListenFail` text (`reverse tunnels are not enabled on this gateway`, `port 80
+is not allowed by the reverse-tunnel policy (ports below 1024 must be listed ...)`, `too many reverse listeners (limit 4)`,
+`address in use`). A connection over `maxConnectionsPerListener`, or over the client's `maxConnections`, is closed without
+being announced; accepted connections idle for `idleMs` are closed; a connection nobody accepts within 30 s is dropped;
+listeners and their connections close when the client goes away. The host advertises `gateway` (it lists no separate
+feature for reverse tunnels, matching the Rust server), so against a host that has them off the answer is the `ListenFail`.
 
 **The address is checked, not just the name.** The host resolves a name once, refuses every resolved address that is not
 globally routable (loopback, private, link-local, CGNAT, ULA, multicast, reserved, and IPv4 addresses wrapped as
@@ -1416,6 +1475,8 @@ than left to be found.
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
 | Unix-domain socket forwarding, both directions; named endpoints (#120) | `client.openUnix()`, `listenUnix()`, `forwardUnix()` (Node: `-L`/`-R` shapes with unix and TCP ends mixed), `openEndpoint()`; host: `gateway: { unix, endpoints }`, `createMemoryHost({ endpoints })` | none yet (`wsh -L` / `-R` with sockets are not implemented) | **JS only for now.** Wire: `OpenUnix`, `OpenEndpoint`, `ListenUnix` behind the `gateway-unix` / `gateway-endpoints` host features; the Rust server and CLI must implement them (message handling, the path policy, `-L`/`-R` flags) as described under [Gateway](#unix-domain-sockets-streamlocal-and-named-endpoints) |
 | Gateway flow control (#123) | credit per connection (`GatewayCredit`, feature `gateway-credit`); host caps for peers without it | none: the Rust forwarder has bounded in-process queues but no per-connection credit and no per-client byte cap | **JS only for now** (negotiated, so a Rust peer on either side keeps today's unmetered behaviour) |
+| TCP reverse tunnels (`ListenRequest`, #98) | `@johnhenry/wsh/server` `gateway.reverse` (off by default; loopback unless the operator lists addresses; port allow-list, nothing below 1024 unless named; bounded listeners/connections/backlog/idle); client `listenTcp(port, { onConnection })` | `wsh-server` `[gateway] enable_reverse_tunnels` + `reverse_bind_addr` (off by default, loopback, client `bind_addr` ignored); no port allow-list; no per-listener connection, backlog or idle bounds beyond `max_connections` | **Wire-unified** (`ListenRequest`/`ListenOk`/`ListenFail`/`InboundOpen`/`InboundAccept`; the JS host sends the real `peer_addr`/`peer_port`). **Rust still needs**: a port allow-list and per-client listener / per-listener connection / idle bounds to match the JS host, and credit (`gateway-credit`) on accepted connections |
+| UDP (`OpenUdp`) as WebTransport datagrams (#124) | `client.openUdp()` over WebTransport when both ends list `gateway-datagram`: payloads are datagrams (4-byte flow id + payload), read from `maxDatagramSize`; oversize goes on the control stream (or drops); bounds: flows, packet and byte rates, idle; policy as TCP. Host: `gateway.udp`; Playwright test from Chromium | `wsh-server` serves `OpenUdp` over the reliable control stream only (one `GatewayData` per datagram); no datagrams, no rate bounds | **JS only for now** (negotiated by `gateway-datagram`, so a Rust peer keeps the reliable path). **Rust must implement**: list `gateway-datagram` in `ServerHello.features` on a WebTransport connection, accept/send datagrams `[gateway_id u32 BE][payload]` for `OpenUdp` flows when the client listed it (ignore the id of an unknown flow), read `maxDatagramSize` and send a bigger payload as `GatewayData` (or drop, by config), `connect()` the UDP socket to the checked address, and the same rate/flow bounds |
 | Gateway destination policy by resolved address | `@johnhenry/wsh/server` `gateway`: resolved address checked, `allowPrivate` | fixed in the Rust release after `rust-v0.6.0`: a loopback/private/link-local/ULA/CGNAT/unspecified/multicast address is refused after resolution unless a rule names it, and the server connects to the address it checked | **Same rule on both sides** (a Rust server released before that still has the name-only check) |
 | Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | none: the Rust relay neither carries `ReverseChallenge`/`ReverseProof` nor lists the feature, and the Rust agent/client send and answer neither | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); the Rust types are regenerated (and `ReverseConnect.features` is `None` there) but no Rust peer implements it yet |
 | Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | none: no Rust host offers one and the Rust client signs with an empty binding | **Wire-unified, negotiated** (`channel-binding:<kind>` features); a Rust client logging in to a JS host that requires it is refused |
@@ -1530,8 +1591,35 @@ out explicitly below rather than left to be discovered.
   IP-literal rule); the connection is made to that checked address, and `ResolveDns` answers are filtered the same way.
   Unix-domain sockets (`gateway.unix`) and named endpoints (`gateway.endpoints`) are off unless configured, are listed
   paths or names only, and sockets the host creates are `0600`.
+- **TCP reverse tunnels (`gateway.reverse`) are off unless configured, bind where the operator says, and cap what they open.**
+  A reverse listener is a port of the HOST that other machines can connect to, with the authenticated client on the other
+  end of every connection. The host binds `reverse.bindAddr` (default `127.0.0.1`) and ignores the address the client
+  asks for unless the operator listed it; ports come from an allow-list (default 0 and 1024-65535; privileged ports only
+  if named); listeners per client, connections per listener, the listen backlog and idle time are bounded, and listeners
+  die with the client's connection.
+- **UDP flows are one destination, rate-limited in both directions.** An `OpenUdp` flow has the same destination and
+  resolved-address policy as TCP, is `connect()`ed to the one address it passed (so no other source reaches the client
+  through it), and is bounded by flows per client, packets per second per flow and per client, bytes per second per client
+  and an idle timeout. The byte limit is the amplification bound: a small query to an open resolver or a UDP service
+  that answers big (DNS, NTP, memcached-style services) can return no more than `bytesPerSecondPerClient` (4 MiB/s by
+  default) to the client, and the same budget caps what the client can make the host send. Datagrams over a limit are
+  dropped and counted (`server.gatewayStats()`).
 
 **What is still yours:**
+
+- **What a reverse listener exposes.** Whoever can reach the bound port can talk to whatever the client behind it serves,
+  as the client, with no authentication of their own: wsh authenticates the operator that asks for the listener, not the
+  peers that connect to it. `bindAddr: '0.0.0.0'` (or an `allowBindAddrs` entry that does the same) puts that on every
+  interface of the host, so firewall it and keep `ports` narrow. The client sees each peer's address (`InboundOpen`) and
+  can reject it, but behind a NAT or proxy that address is not the real source. The Rust server's defaults are the
+  same (loopback, off) but it has no port allow-list.
+- **UDP is not authenticated or private beyond the tunnel.** `allow: ['*']` with a public resolver lets every authorized
+  client send UDP to the internet from the host's address (a DNS-sized query, or a spoofed-looking flood limited only by
+  the packet rates above); the bounds make that slow, not impossible, and an origin that answers many large datagrams
+  to one small one is bounded by `bytesPerSecondPerClient`, not eliminated. WebTransport datagrams can be dropped,
+  reordered and duplicated by the network, and are only as private as the QUIC connection that carries them (a
+  datagram flow is not covered by E2E sealing, which is for sessions). A payload that did not fit a datagram travels on the
+  reliable stream by default (see the README section above).
 
 - **What the gateway does NOT protect against.** A name that resolves to a *public* address is dialled as the client
   asked, so `allow: ['*']` is an open proxy to the internet for every authorized client. Through `socks` the proxy
