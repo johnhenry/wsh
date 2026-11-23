@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### `wsh-mcp`: a stdio bridge so MCP clients can reach an MCP server behind a wsh host (#127, partial; JS only)
+
+An MCP client that launches a command and speaks MCP over stdio can now use the tools of a server behind a Node host or a memory host. The
+package gains a `bin`, **`wsh-mcp`**, and a module, `@johnhenry/wsh/mcp-stdio` (`runMcpStdioBridge`, `loadIdentity`, `McpBridgeError`).
+**Nothing changes for anyone who does not run it**: no wire change, no new feature string, no default changed, the package root and the
+browser bundles are untouched.
+
+- `wsh-mcp [options] [user@]<url>`: connects (a `ws://`, `wss://` or `https://` URL), logs in with an Ed25519 key (`--identity`, default
+  `~/.wsh/keys/default.pem`, the file `wsh keygen` writes; a PKCS#8 PEM works too), opens the host's `mcp` rpc channel (`--channel NAME`
+  for another) and passes the JSON-RPC messages both ways, one per line, verbatim (ids, notifications, progress, `notifications/cancelled`).
+  `--host-key` pins the host (it warns on stderr when unpinned). stdout carries MCP messages only.
+- A host that offers no such channel is a clear error (exit 2) that lists the channels it does offer and how to serve one. Other exit
+  statuses: 0 the client closed stdin, 1 the host was lost for good.
+- After a dropped connection it reconnects (`--reconnect-attempts`, default 5 from 500 ms, doubling; `--no-reconnect` exits instead),
+  re-sends the client's `initialize` / `initialized` to the new channel without telling the client, answers a request that was in flight
+  with a JSON-RPC error (`-32603`) and delivers, once it is back, what the client sent meanwhile (at most 200 messages). Serve a factory
+  (`mcpServerAdapter(() => makeServer())`) so a second channel is served.
+- A malformed line is answered with a JSON-RPC error (`-32700` / `-32600`) and the bridge goes on; a message over 8 MiB is refused.
+- **Not done, and why:** the issue also asks for `wsh mcp` in the Rust CLI. `wsh-client` has no rpc channel (README capability matrix), so a
+  Rust `wsh mcp` is a client feature of its own; not built here. `--target` is not offered: rpc channels are not per target on any host
+  (#121), and `wsh-mcp --target` says so.
+- **A released peer:** the bridge speaks the `rpc` channel (#85) that a JS host serves since 0.25.0 (mcp over rpc as a host option: `mcpServerAdapter`); a released Rust
+  `wsh-server` offers no `mcp` rpc channel (only `wsh-host` / `wsh-fs`), so `wsh-mcp` to it exits 2 with that message.
+- Tests: `test/mcp-stdio.test.mjs` runs the command as a child process with the SDK's `StdioClientTransport` against a Node host and a
+  memory host, and covers the no-channel, refused-login, pinned-host-key, reconnect, signal and size-limit cases.
+
 ## 0.43.0 / Rust `rust-v0.14.0`
 
 ### Execution targets: `Open.target`, target discovery, `wsh --target` (#121; JS and Rust change)

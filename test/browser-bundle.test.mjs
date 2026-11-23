@@ -14,7 +14,8 @@ describe('browser entry points (#115, #128)', () => {
     const bundled = new Set(ENTRY_POINTS.filter((p) => p.entry).map((p) => p.name));
     // ./server needs Node. ./pipe-relay is a RELAY (it listens on a socket through `ws` and node:http, imported
     // dynamically in `listen()`): it runs in Node, a browser page is a host or an operator behind it, never the relay.
-    const expected = Object.keys(pkg.exports).filter((k) => k !== './server' && k !== './pipe-relay');
+    // ./mcp-stdio (#127) is the `wsh-mcp` bridge: it reads a key file and speaks stdio, so it is Node-only.
+    const expected = Object.keys(pkg.exports).filter((k) => k !== './server' && k !== './pipe-relay' && k !== './mcp-stdio');
     assert.deepEqual([...bundled].sort(), expected.sort());
     assert.equal(pkg.sideEffects, false);
   });
