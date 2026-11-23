@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.41.0 / Rust `rust-v0.12.0`
 
 ### Shares carry each folder's root path: `ShareOffer.paths`, `fs.root`, `--share-hide-path` (#164) (npm change)
 
