@@ -98,6 +98,29 @@ struct Cli {
     #[arg(long = "require-channel-binding", global = true)]
     require_channel_binding: bool,
 
+    /// Reverse host (`wsh reverse`, `wsh agent run`): make every operator prove who it is with its
+    /// own key instead of taking the relay's word for it, and refuse one that cannot.
+    #[arg(long = "require-operator-proof", global = true)]
+    require_operator_proof: bool,
+
+    /// Reverse host: serve only this operator (at least 8 hex digits of its fingerprint).
+    /// Repeatable. Without `--require-operator-proof` it is matched against what the relay says.
+    #[arg(long = "allow-operator", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
+    allow_operators: Vec<String>,
+
+    /// `wsh reverse-connect`: always offer to prove this operator's identity to the peer (needed
+    /// for a peer that does not advertise `operator-proof`, such as a JS host).
+    #[arg(long = "operator-proof", global = true)]
+    operator_proof: bool,
+
+    /// `wsh reverse-connect`: never offer proof (for a released reverse host that cannot decode it).
+    #[arg(
+        long = "no-operator-proof",
+        global = true,
+        conflicts_with = "operator_proof"
+    )]
+    no_operator_proof: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -345,6 +368,15 @@ async fn main() {
         accept_new_host_key: cli.accept_new_host_key,
         require_host_key: cli.require_host_key,
         require_channel_binding: cli.require_channel_binding,
+        require_operator_proof: cli.require_operator_proof,
+        allow_operators: cli.allow_operators.clone(),
+        operator_proof: if cli.operator_proof {
+            commands::common::OperatorProofMode::Always
+        } else if cli.no_operator_proof {
+            commands::common::OperatorProofMode::Never
+        } else {
+            commands::common::OperatorProofMode::Auto
+        },
     });
 
     if let Some(via) = cli.via.clone() {

@@ -340,11 +340,29 @@ pub fn apply_via(mut resolved: ResolvedTarget, via: &str) -> Result<ResolvedTarg
 
 /// What the operator asked of host identity on the command line (`--accept-new-host-key`,
 /// `--require-host-key`, `--require-channel-binding`).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct IdentityPolicy {
     pub accept_new_host_key: bool,
     pub require_host_key: bool,
     pub require_channel_binding: bool,
+    /// Reverse host: ask operators to prove who they are, and refuse one that cannot.
+    pub require_operator_proof: bool,
+    /// Reverse host: the operators it serves (fingerprints or prefixes of at least 8 digits).
+    pub allow_operators: Vec<String>,
+    /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
+    pub operator_proof: OperatorProofMode,
+}
+
+/// Whether `wsh reverse-connect` offers to prove its identity to the peer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OperatorProofMode {
+    /// Offer it when the relay carries it AND the peer registered the `operator-proof`
+    /// capability: a released reverse host cannot decode the extra field.
+    #[default]
+    Auto,
+    /// Offer it whenever the relay carries it (a JS host, which has no such capability to see).
+    Always,
+    Never,
 }
 
 static IDENTITY: std::sync::OnceLock<IdentityPolicy> = std::sync::OnceLock::new();
@@ -354,9 +372,37 @@ pub fn set_identity_policy(p: IdentityPolicy) {
     let _ = IDENTITY.set(p);
 }
 
+/// The identity flags of this process.
+pub fn identity_policy() -> IdentityPolicy {
+    IDENTITY.get().cloned().unwrap_or_default()
+}
+
+/// Put the reverse-host identity policy and key into the options of a reverse host.
+pub fn apply_host_policy(
+    options: &mut crate::commands::reverse_host::ReverseHostOptions,
+    key: &ed25519_dalek::SigningKey,
+) -> Result<()> {
+    let p = identity_policy();
+    options.require_operator_proof = p.require_operator_proof;
+    for a in &p.allow_operators {
+        if a.len() < 8 || !a.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!("--allow-operator takes at least 8 hex digits of an operator fingerprint, got `{a}`");
+        }
+    }
+    options.allowed_operators = p
+        .allow_operators
+        .iter()
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
+    options.identity = Some(crate::commands::reverse_host::IdentityKey(
+        std::sync::Arc::new(key.clone()),
+    ));
+    Ok(())
+}
+
 /// Put the process-wide identity policy into a connection config.
 pub fn apply_identity_policy(config: &mut ConnectConfig) {
-    let p = IDENTITY.get().copied().unwrap_or_default();
+    let p = identity_policy();
     config.require_host_key = p.require_host_key;
     config.require_channel_binding = p.require_channel_binding;
     config.first_use = if p.accept_new_host_key {

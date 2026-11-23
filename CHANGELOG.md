@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Rust: host identity, channel binding and operator proof (#145, part 3: steps 1-4)
+
+Rust workspace plus one relay-side fix; the npm package is unchanged. Everything new is negotiated by the existing feature
+strings (`host-key-nonce:`, `host-key:`, `host-key-sig:`, `channel-binding:host`, `channel-binding-required`,
+`operator-proof`), so released peers (npm 0.36-0.38, rust-v0.6-0.8) keep working.
+
+- **Breaking (CLI): a first use of a host key now needs a yes.** The Rust CLI used to record any key a host presented, on
+  first use, silently. It now records only a key the host PROVED it holds (it sends `host-key-nonce:`, checks
+  `host-key`/`host-key-sig` before any credential), and a first use is refused unless you answer yes at a terminal or pass
+  `--accept-new-host-key` (scripts, `wsh agent`). A CHANGED key is always refused. **To get the old behaviour back for a
+  script, add `--accept-new-host-key`.** A host that presents no proof (every `wsh-server` before this, and any host with no
+  key) is still connected to, nothing is recorded for it, and `--require-host-key` refuses it. The `fingerprints[0]` guess
+  is no longer recorded; an entry an old client recorded that way keeps working only while the host still sends no
+  `host_fingerprint`, and a host that has a pinned key but proves none now is refused as a downgrade.
+- `--require-channel-binding`; the client binds its login to the proven host key (kind `host`) whenever the host offers it and
+  honours `channel-binding-required`. `cert-hash` and `tls-exporter` are not in Rust.
+- `wsh-server`: `[server] host_key = "<path>"` (PKCS#8 PEM like the Node host; created 0600 on first start; a key other users
+  can read is refused) gives it `ServerHello.host_fingerprint` and the proof; `require_channel_binding = true` (needs
+  `host_key`) refuses an unbound login. **Off by default**: turning `host_key` on makes a released Rust client that pinned
+  `fingerprints[0]` report the host key as changed.
+- Operator proof in reverse mode: the Rust relay lists `operator-proof` and carries `ReverseChallenge`, `ReverseProof` and
+  `ReverseConnect.features`; **the relay now stamps the operator's authenticated login name into the forwarded
+  `ReverseConnect.username`** (it forwarded what the client wrote). `wsh reverse-connect` answers the host's challenge
+  (`--operator-proof`, `--no-operator-proof`; by default only when the peer registered the `operator-proof` capability, since a
+  released Rust host cannot decode `ReverseConnect.features`); `wsh reverse` and `wsh agent run` issue the challenge, verify the
+  proof before accepting, and take `--require-operator-proof` and `--allow-operator <fingerprint>`. A reattach by the same
+  operator now also needs the same `from_fingerprint`. **Not done: the sealed bridge (`e2e-sealed`) and signed `KeyExchange`
+  halves**, so proof says who connected, not that later plain messages came from them.
+
 ### Rust: identity parity, part 1 (#145)
 
 Rust workspace only (`wsh`, `wsh-server`, `wsh-client`); no message or field was added to the wire, and the npm package is

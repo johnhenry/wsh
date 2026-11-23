@@ -11,6 +11,7 @@ pub mod host_key;
 pub mod identity;
 pub mod keys;
 pub mod messages;
+pub mod operator_proof;
 pub mod peer_record;
 pub mod qmux;
 pub mod qmux_connection;

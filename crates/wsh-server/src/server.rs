@@ -2211,6 +2211,8 @@ impl WshServer {
         }
         if self.config.enable_relay {
             features.push("reverse".to_string());
+            // ReverseChallenge / ReverseProof and ReverseConnect.features are carried (wsh #117).
+            features.push(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE.to_string());
         }
         if self.recording_dir.is_some() {
             features.push("recording".to_string());
@@ -2268,6 +2270,13 @@ impl WshServer {
         } else {
             Some(session_id)
         }
+    }
+
+    /// `ReverseConnect.features` as the relay copies it: at most 8 entries of at most 64 bytes each;
+    /// anything else is dropped (the peer then sees an operator that claims nothing).
+    fn bounded_features(features: Option<&[String]>) -> Option<Vec<String>> {
+        let f = features?;
+        (f.len() <= 8 && f.iter().all(|s| !s.is_empty() && s.len() <= 64)).then(|| f.to_vec())
     }
 
     /// Check whether a message type should be forwarded through a relay bridge
@@ -2502,6 +2511,63 @@ impl WshServer {
                     payload: Payload::ReversePeers(ReversePeersPayload { peers }),
                 }))
             }
+            // ── Operator proof (#117): carried, not interpreted ───────
+            // The peer signed its challenge and the operator its proof, so the relay can
+            // neither forge nor profit from reading them; it only keeps the two ends of a
+            // PENDING request talking, and stamps who sent each.
+            (MsgType::ReverseChallenge, Payload::ReverseChallenge(p)) => {
+                if let Some(conn_id) = ctx.conn_id {
+                    if p.public_key.len() <= 64
+                        && p.signature.len() <= 128
+                        && p.nonce.len() <= 64
+                        && p.session_id.len() <= 256
+                        && p.operator_fingerprint.len() <= 256
+                    {
+                        let partner = self.pending_relay_pairs.read().await.get(&conn_id).copied();
+                        if let Some(partner) = partner {
+                            let fwd = Envelope {
+                                msg_type: MsgType::ReverseChallenge,
+                                payload: Payload::ReverseChallenge(ReverseChallengePayload {
+                                    // the answering peer, not whatever it wrote
+                                    target_fingerprint: ctx.fingerprint.clone(),
+                                    ..p.clone()
+                                }),
+                            };
+                            if let Some(tx) = self.peer_senders.read().await.get(&partner) {
+                                let _ = tx.try_send(fwd);
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            (MsgType::ReverseProof, Payload::ReverseProof(p)) => {
+                if let Some(conn_id) = ctx.conn_id {
+                    if p.public_key.len() <= 64
+                        && p.signature.len() <= 128
+                        && p.nonce.len() <= 64
+                        && p.session_id.len() <= 256
+                        && p.username.len() <= 64
+                    {
+                        let partner = self.pending_relay_pairs.read().await.get(&conn_id).copied();
+                        if let Some(partner) = partner {
+                            let fwd = Envelope {
+                                msg_type: MsgType::ReverseProof,
+                                payload: Payload::ReverseProof(ReverseProofPayload {
+                                    // the relay speaks for the operator's identity
+                                    from_fingerprint: Some(ctx.fingerprint.clone()),
+                                    ..p.clone()
+                                }),
+                            };
+                            if let Some(tx) = self.peer_senders.read().await.get(&partner) {
+                                let _ = tx.try_send(fwd);
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+
             (MsgType::ReverseConnect, Payload::ReverseConnect(p)) => {
                 match self
                     .relay_broker
@@ -2517,9 +2583,13 @@ impl WshServer {
                                 msg_type: MsgType::ReverseConnect,
                                 payload: Payload::ReverseConnect(ReverseConnectPayload {
                                     target_fingerprint: p.target_fingerprint.clone(),
-                                    username: p.username.clone(),
+                                    // The relay speaks for the operator: its authenticated login name,
+                                    // not whatever the client wrote (wsh #117; the proof names it).
+                                    username: ctx.username.clone(),
                                     from_fingerprint: ctx.fingerprint.clone(),
-                                    features: None,
+                                    // What the OPERATOR says it can do (#117), bounded; the
+                                    // relay decides nothing by it and drops a claim it cannot bound.
+                                    features: Self::bounded_features(p.features.as_deref()),
                                 }),
                             };
                             if target_tx.try_send(fwd).is_err() {

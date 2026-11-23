@@ -591,6 +591,57 @@ impl WshClient {
         self.send_control_message(envelope).await
     }
 
+    /// `ReverseConnect` with operator proof (wsh #117, #145): the peer may answer with a signed
+    /// `ReverseChallenge` before it accepts; this verifies it (it names the peer asked for and
+    /// THIS operator's fingerprint, so a relay that rewrote `from_fingerprint` shows) and
+    /// answers with a `ReverseProof` signed by `operator`, which is also the login key.
+    ///
+    /// `request.features` should list `operator-proof` only when `operator` is given and the relay
+    /// listed the feature in its `ServerHello`. Returns the peer's `ReverseAccept` or `ReverseReject`.
+    pub async fn reverse_connect(
+        &self,
+        request: ReverseConnectPayload,
+        operator: Option<(&ed25519_dalek::SigningKey, &str)>,
+    ) -> WshResult<Envelope> {
+        let target = request.target_fingerprint.clone();
+        let (accept_rx, reject_rx, mut challenge_rx) = (
+            self.register_waiter(MsgType::ReverseAccept).await,
+            self.register_waiter(MsgType::ReverseReject).await,
+            self.register_waiter(MsgType::ReverseChallenge).await,
+        );
+        self.send_control_message(Envelope {
+            msg_type: MsgType::ReverseConnect,
+            payload: Payload::ReverseConnect(request),
+        })
+        .await?;
+        tokio::pin!(accept_rx, reject_rx);
+        let deadline = time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+        let mut answered = false;
+        loop {
+            tokio::select! {
+                r = &mut accept_rx => return r.map_err(|_| WshError::Transport("response channel dropped".into())),
+                r = &mut reject_rx => return r.map_err(|_| WshError::Transport("response channel dropped".into())),
+                challenge = &mut challenge_rx, if !answered => {
+                    answered = true;
+                    let challenge = challenge.map_err(|_| WshError::Transport("response channel dropped".into()))?;
+                    let (Some((key, username)), Payload::ReverseChallenge(msg)) = (operator, &challenge.payload) else {
+                        continue;
+                    };
+                    let own = wsh_core::fingerprint(&key.verifying_key().to_bytes());
+                    let verified = wsh_core::operator_proof::verify_challenge(msg, &target, &own)?;
+                    let proof = wsh_core::operator_proof::create_proof(key, &verified, username);
+                    self.send_control_message(Envelope {
+                        msg_type: MsgType::ReverseProof,
+                        payload: Payload::ReverseProof(proof),
+                    })
+                    .await?;
+                }
+                _ = &mut deadline => return Err(WshError::Timeout),
+            }
+        }
+    }
+
     /// Send a control message and wait for a specific response type (public API).
     ///
     /// Used by modules like `mcp` and `file_transfer` that need request-response
@@ -1992,8 +2043,9 @@ impl WshClient {
                     }
                 }
 
-                // Incoming reverse connection request (unsolicited from relay)
-                MsgType::ReverseConnect => {
+                // Incoming reverse connection request (unsolicited from relay), and the
+                // operator's proof that follows a challenge this peer issued (#117).
+                MsgType::ReverseConnect | MsgType::ReverseProof => {
                     tracing::info!("incoming reverse connect request");
                     if let Some(tx) = reverse_connect_tx {
                         if let Err(e) = tx.send(envelope).await {

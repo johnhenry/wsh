@@ -26,6 +26,24 @@ use wsh_core::peer_record::{build_peer_record_transcript, PeerRecord};
 
 const DEFAULT_PTY_REPLAY_LIMIT: usize = 256 * 1024;
 
+/// The host's own identity key (the one it logs in to the relay with): it signs the
+/// `ReverseChallenge` that makes an operator prove who it is (wsh #117).
+#[derive(Clone)]
+pub struct IdentityKey(pub Arc<SigningKey>);
+
+impl std::fmt::Debug for IdentityKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IdentityKey(<redacted>)")
+    }
+}
+
+impl PartialEq for IdentityKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.verifying_key() == other.0.verifying_key()
+    }
+}
+impl Eq for IdentityKey {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReverseHostOptions {
     pub capabilities: Vec<String>,
@@ -35,6 +53,15 @@ pub struct ReverseHostOptions {
     pub supports_replay: bool,
     pub supports_echo: bool,
     pub supports_term_sync: bool,
+    /// Ask every operator that offers it for proof of its identity, and refuse one that cannot
+    /// give it (`--require-operator-proof`). Needs `identity`.
+    pub require_operator_proof: bool,
+    /// Fingerprints (or prefixes of at least 8 hex digits) of the operators this host serves;
+    /// empty = anyone the relay lets through. Checked against the PROVEN key when the operator
+    /// proved one, otherwise against what the relay stamped -- which is the relay's word.
+    pub allowed_operators: Vec<String>,
+    /// This host's identity key. Without it no challenge can be issued.
+    pub identity: Option<IdentityKey>,
 }
 
 impl Default for ReverseHostOptions {
@@ -47,11 +74,23 @@ impl Default for ReverseHostOptions {
             supports_replay: false,
             supports_echo: false,
             supports_term_sync: false,
+            require_operator_proof: false,
+            allowed_operators: Vec::new(),
+            identity: None,
         }
     }
 }
 
 impl ReverseHostOptions {
+    /// May this operator (`fingerprint`, proven or as stamped by the relay) be served?
+    pub fn allows_operator(&self, fingerprint: &str) -> bool {
+        self.allowed_operators.is_empty()
+            || self
+                .allowed_operators
+                .iter()
+                .any(|a| a.len() >= 8 && fingerprint.starts_with(a.as_str()))
+    }
+
     /// Build a self-signed `ReverseRegister` payload (wsh #17: signed peer
     /// records). `signing_key` is the caller's own identity key -- the
     /// server verifies the resulting `record_signature` against the raw
@@ -78,11 +117,17 @@ impl ReverseHostOptions {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        // A host that can issue a challenge says so, so an operator knows it may state
+        // `operator-proof` (a released host cannot decode `ReverseConnect.features`).
+        let mut capabilities = self.capabilities.clone();
+        if self.identity.is_some() {
+            capabilities.push(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE.to_string());
+        }
         let record = PeerRecord {
             username: username.clone(),
             peer_type: self.peer_type.clone(),
             shell_backend: self.shell_backend.clone(),
-            capabilities: self.capabilities.clone(),
+            capabilities: capabilities.clone(),
             supports_attach: self.supports_attach,
             supports_replay: self.supports_replay,
             supports_echo: self.supports_echo,
@@ -94,7 +139,7 @@ impl ReverseHostOptions {
 
         ReverseRegisterPayload {
             username,
-            capabilities: self.capabilities.clone(),
+            capabilities,
             peer_type: self.peer_type.clone(),
             shell_backend: self.shell_backend.clone(),
             supports_attach: self.supports_attach,
@@ -192,7 +237,10 @@ pub async fn run_with_service(
         tokio::select! {
             envelope = reverse_connect_rx.recv(), if !reverse_channel_closed => {
                 match envelope {
-                    Some(envelope) => service.runtime.handle_reverse_connect(envelope).await?,
+                    Some(envelope) => match envelope.payload {
+                        Payload::ReverseProof(proof) => service.runtime.handle_reverse_proof(proof).await?,
+                        _ => service.runtime.handle_reverse_connect(envelope).await?,
+                    },
                     None => reverse_channel_closed = true,
                 }
             }
@@ -201,6 +249,14 @@ pub async fn run_with_service(
                     Some(envelope) => service.runtime.handle_relay_message(envelope).await?,
                     None => relay_channel_closed = true,
                 }
+            }
+            _ = async {
+                match service.runtime.proof_deadline() {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                service.runtime.expire_proof().await?;
             }
             Some(event) = service.event_rx.recv() => {
                 service.runtime.handle_runtime_event(event).await?;
@@ -255,12 +311,23 @@ impl ReverseHostService {
     }
 }
 
+/// How long an operator has to answer a challenge.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct PendingProof {
+    request: ReverseConnectPayload,
+    issued: wsh_core::operator_proof::IssuedChallenge,
+    deadline: tokio::time::Instant,
+}
+
 struct ReverseHostRuntime {
     client: Option<Arc<WshClient>>,
     event_tx: Option<mpsc::UnboundedSender<RuntimeEvent>>,
     options: ReverseHostOptions,
     status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
     active_request: Option<ReverseConnectPayload>,
+    /// A request whose operator has been challenged and has not answered yet (wsh #117).
+    pending_proof: Option<PendingProof>,
     sessions: HashMap<u32, ReverseHostSession>,
     gateway_connections: HashMap<u32, ReverseGatewayConnection>,
     mcp: LocalMcpBridge,
@@ -275,6 +342,7 @@ impl ReverseHostRuntime {
             event_tx: None,
             status_tx: None,
             active_request: None,
+            pending_proof: None,
             sessions: HashMap::new(),
             gateway_connections: HashMap::new(),
             mcp: LocalMcpBridge::default(),
@@ -318,12 +386,26 @@ impl ReverseHostRuntime {
             return Ok(());
         };
 
-        if self.active_request.is_some() || !self.sessions.is_empty() {
-            if self
-                .active_request
-                .as_ref()
-                .is_some_and(|existing| same_reverse_request(existing, &request))
-            {
+        // Does this request offer proof, and will this host ask for it?
+        let proof_offered = request.features.as_ref().is_some_and(|f| {
+            f.iter()
+                .any(|f| f == wsh_core::operator_proof::OPERATOR_PROOF_FEATURE)
+        }) && self
+            .client()?
+            .has_feature(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE)
+            .await
+            && self.options.identity.is_some();
+        let needs_proof = self.options.require_operator_proof || proof_offered;
+
+        let busy = self.active_request.is_some() || !self.sessions.is_empty();
+        let same_operator = self.active_request.as_ref().is_some_and(|existing| {
+            same_reverse_request(existing, &request)
+                && existing.from_fingerprint == request.from_fingerprint
+        });
+        // The same operator coming back reattaches without a new proof only when no proof is in
+        // play; otherwise it proves itself again.
+        if self.pending_proof.is_some() || (busy && !(same_operator && needs_proof)) {
+            if same_operator && !needs_proof && self.pending_proof.is_none() {
                 info!(
                     requester = %request.username,
                     target = %request.target_fingerprint,
@@ -360,6 +442,56 @@ impl ReverseHostRuntime {
             return Ok(());
         }
 
+        // Who is this operator? The relay says (`from_fingerprint`); with proof the operator says
+        // so itself, and the host takes the identity from the proof, not from the relay.
+        let client = self.client()?;
+        let identity = self.options.identity.clone();
+        if self.options.require_operator_proof && !proof_offered {
+            return self.reject(&request, "operator proof required").await;
+        }
+        if let (true, Some(identity)) = (proof_offered, identity) {
+            let (challenge, issued) = wsh_core::operator_proof::create_challenge(
+                &identity.0,
+                &request.from_fingerprint,
+                &request.from_fingerprint,
+            );
+            self.pending_proof = Some(PendingProof {
+                request,
+                issued,
+                deadline: tokio::time::Instant::now() + PROOF_TIMEOUT,
+            });
+            client
+                .send_fire_and_forget(Envelope {
+                    msg_type: MsgType::ReverseChallenge,
+                    payload: Payload::ReverseChallenge(challenge),
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            return Ok(());
+        }
+        let from = request.from_fingerprint.clone();
+        if !self.options.allows_operator(&from) {
+            return self.reject(&request, "operator not allowed").await;
+        }
+        self.accept_request(request).await
+    }
+
+    async fn reject(&mut self, request: &ReverseConnectPayload, reason: &str) -> Result<()> {
+        info!(requester = %request.username, reason, "refusing reverse host connection");
+        self.client()?
+            .send_fire_and_forget(Envelope {
+                msg_type: MsgType::ReverseReject,
+                payload: Payload::ReverseReject(ReverseRejectPayload {
+                    target_fingerprint: request.target_fingerprint.clone(),
+                    username: request.username.clone(),
+                    reason: reason.to_string(),
+                }),
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    async fn accept_request(&mut self, request: ReverseConnectPayload) -> Result<()> {
         info!(
             requester = %request.username,
             target = %request.target_fingerprint,
@@ -382,7 +514,65 @@ impl ReverseHostRuntime {
             })
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
 
+    /// The operator's answer to the challenge this host issued (wsh #117).
+    async fn handle_reverse_proof(&mut self, proof: ReverseProofPayload) -> Result<()> {
+        let Some(pending) = self.pending_proof.as_ref() else {
+            return Ok(());
+        };
+        // A proof for some other challenge is ignored, not a reason to drop the real one.
+        if proof.nonce != pending.issued.nonce {
+            return Ok(());
+        }
+        let pending = self.pending_proof.take().expect("checked above");
+        let request = pending.request;
+        let Some(proven) = wsh_core::operator_proof::verify_proof(&proof, &pending.issued) else {
+            return self
+                .reject(&request, "operator proof does not verify")
+                .await;
+        };
+        // The relay's claim and the operator's own must agree: a relay that rewrote
+        // `from_fingerprint` is caught here.
+        if proven.fingerprint != request.from_fingerprint {
+            warn!(
+                proof = %&proven.fingerprint[..12.min(proven.fingerprint.len())],
+                relay = %&request.from_fingerprint[..12.min(request.from_fingerprint.len())],
+                "operator proof is by another key than the relay asserted"
+            );
+            return self
+                .reject(
+                    &request,
+                    "operator proof does not match the identity the relay asserted",
+                )
+                .await;
+        }
+        if proven.username != request.username {
+            return self
+                .reject(
+                    &request,
+                    "operator proof names another username than the relay asserted",
+                )
+                .await;
+        }
+        if !self.options.allows_operator(&proven.fingerprint) {
+            return self.reject(&request, "operator not allowed").await;
+        }
+        self.accept_request(request).await
+    }
+
+    /// When the pending challenge stops waiting (for the run loop's timer).
+    fn proof_deadline(&self) -> Option<tokio::time::Instant> {
+        self.pending_proof.as_ref().map(|p| p.deadline)
+    }
+
+    async fn expire_proof(&mut self) -> Result<()> {
+        if let Some(p) = self.pending_proof.take() {
+            return self
+                .reject(&p.request, "operator did not answer the challenge")
+                .await;
+        }
         Ok(())
     }
 

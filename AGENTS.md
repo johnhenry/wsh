@@ -63,9 +63,9 @@ before pushing a change that touches `crates/`.
   the other before the fix; `closeReason` and both teardown paths need to
   move together, not be patched independently.
 - **`ServerHello.host_fingerprint` (TOFU host identity, wsh #59) is
-  populated only by `@johnhenry/wsh/server` (0.19+, `hostKey` option), with
+  populated by `@johnhenry/wsh/server` (0.19+, `hostKey` option) and by `wsh-server` (opt-in `[server] host_key`), with
   the key and a replay-proof signature carried in `features` strings
-  (`src/host-key.mjs`).** No Rust `wsh-server` release populates it, so don't
+  (`src/host-key.mjs`).** A `wsh-server` populates it only with `host_key` set, so don't
   write code, docs, or tests that assume every server pins its host identity
   -- see the README's [Security model](README.md#security-model).
 - **Release binary target names are a stable external contract.** The

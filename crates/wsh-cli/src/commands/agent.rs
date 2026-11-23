@@ -164,6 +164,8 @@ pub async fn run(
     let public_key = auth::public_key_bytes(&verifying_key);
     let reconnect_delay = Duration::from_secs(reconnect_delay_secs.max(1));
     let resolved = resolve_target(relay_host, port, transport)?;
+    let mut options = options;
+    crate::commands::common::apply_host_policy(&mut options, &signing_key)?;
     let mut service = reverse_host::ReverseHostService::new(options.clone());
 
     println!(
