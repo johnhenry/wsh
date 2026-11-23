@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.39.0 / Rust `rust-v0.10.0`
 
 ### Rust: the sealed bridge (#145, step 5)
 
