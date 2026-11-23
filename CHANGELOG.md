@@ -63,6 +63,59 @@ stage b's.
   feature, a pinned-key mismatch, `true` refused before any `Auth` is sent); each new rule was broken once and its test seen to fail.
   `test/session-seal.test.mjs` now opts the client out (`sealSession: false`) where it tests the host's refusal of a plain client.
 
+## 0.41.0 / Rust `rust-v0.12.0`
+
+### Shares carry each folder's root path: `ShareOffer.paths`, `fs.root`, `--share-hide-path` (#164) (npm change)
+
+A host that is asked for an absolute path (a Docker bind mount `-v /abs/dir:/in`) can now tell which share it belongs to, instead
+of reading a hash the operator put in the share name. Optional field, no feature string needed, no default changed.
+
+- **Wire** (`spec/wsh-v1.yaml`): `ShareOffer` gains optional `paths: string[]`, parallel to `shares` (each share's root as the
+  operator typed it, made absolute and tidy). Optional on decode in JS and Rust. A client of 0.40.0 / `rust-v0.11.0` sends none; a
+  0.40.0 host ignores the field it does not know.
+- **CLI** (`rust-v` release): `wsh --share` sends the paths; `--share-hide-path` omits them. The path of `--share` is now made
+  tidy (`//`, `.` and a trailing `/` removed) before the directory is opened.
+- **JS host** (npm): `WshShareFs.root` (string or `undefined`). Validated: an array as long as `shares`, each entry an absolute
+  string of at most 4096 bytes without NUL; anything else is `undefined`, never an error. `onShare` keeps its signature.
+- **Advisory.** The host cannot verify the path and the CLI still serves only the directory it opened; stated in the README (Security
+  model) and the types.
+- Tests: `test/shares.test.mjs` (validation table, offer without the field), `test/rust/wsh-cli-share.test.mjs` (the real CLI:
+  `fs.root` equals the shared directory, `--share-hide-path`), `crates/wsh-cli/src/sharefs/tests.rs` (tidy path, offer with and
+  without paths, old-shape decoder).
+
+### Rust CLI: `wsh scp` speaks `FileChunk`, like every host (#140) (Rust CLI and `wsh-client`)
+
+Rust workspace and tests only (no `src/` change, no wire change); lands in the next `rust-v` release. Hosts are unchanged.
+
+- **Fix.** The Rust client's `file_transfer::download` sent a header and read a raw stream (an 8-byte size, then the data), and
+  `upload` wrote a header and the data as session bytes and waited for an acknowledgement that way. No host speaks that: the JS
+  hosts (Node, in-page) and `wsh-server` carry a file as `FileChunk` control messages (offset-addressed, the last `is_final`) and
+  end an upload with `Exit` and `Close`, as the JS client does. So `wsh scp` hung (JS hosts) or failed (`wsh-server`). The client
+  now speaks `FileChunk` both ways: `WshSession::write_file_chunk`, `read_file_chunk` and `wait_closed` are new, `FileChunk` is
+  routed to its session, and the download checks what the host sends (announced size, chunks in order, the last one reaches the
+  size; a refusal is an `Exit` with a non-zero code and no chunk; memory reserved up front is capped at 64 MiB whatever the host
+  claims). The raw-stream header builders are gone. An older `wsh` (`rust-v0.11.0` and before) still cannot `scp` from any host.
+- README: the capability matrix's upload/download row and the in-page host row say so.
+- Tests: `test/rust/wsh-cli-scp.test.mjs` (the real `wsh scp` up and down, 0 B / 17 B / 64 KiB / 300 KiB, a missing file, against a
+  Node host through a pipe relay and against `wsh-server`: all 18 hung or failed before). The JS client's own upload and
+  download against `wsh-server` was already in `test/rust/wsh-rust-server.test.mjs`.
+
+### `onRefused` on the JS hosts; `wsh --version` prints the real version (#163) (npm and Rust CLI)
+
+- **`onRefused({ reason, who, detail })`** (npm, additive, no wire change) on `createMemoryHost`, `createWshServer` and
+  `createReverseHost` (and `cfg.onRefused` of `createConnectionFactory`): called once per connection the host turned away, with a
+  stable code instead of a log line to parse. Codes (`REFUSAL_REASONS`, exported from `@johnhenry/wsh/host`; new ones may be
+  added, none renamed): `not-sealed` (a plain client on `sealSession: 'require'` / `requireOperatorProof`), `unauthorized` (key
+  not allowed, wrong password, operator not accepted), `binding-required`, `bad-signature`, `method-disabled`, `rate-limited`,
+  `bad-request`, `seal-failed`, and for a reverse host `busy`, `proof-required`, `proof-failed`. `who` = `{ username?, fingerprint?,
+  address? }`; `detail` is human text and not stable. A callback that throws is logged and changes nothing. The existing log
+  lines are unchanged. Types in `host.d.ts` (`WshOnRefused`, `WshRefusalReason`). The Rust hosts have no such callback (README matrix).
+- **`wsh --version`** (Rust CLI) printed a fixed `0.1.0` for every release; it now prints the workspace version (`wsh 0.11.0`,
+  also `-V`), the number of the `rust-vX.Y.Z` tag. `wsh-server --version` already did.
+- The bundle grows by about 1 kB gzip in `./host`, `./memory` and `./reverse` (the code table and the callback plumbing);
+  `scripts/bundle-budget.json` updated. `.` (the client) is unchanged.
+- Tests: `test/host-refused.test.mjs`; `test/rust/wsh-version.test.mjs`; a type fixture in `test/types/memory.ts`.
+
 ### Rust: a reverse host no longer loses the last output of a command that exits at once; no process umask swap; two flaky tests fixed (#162)
 
 Rust workspace and tests only (no `src/` change, no wire change); lands in the next `rust-v` release.

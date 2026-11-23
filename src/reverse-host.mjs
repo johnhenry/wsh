@@ -24,6 +24,7 @@ import { SealedBridge } from './bridge-seal.mjs';
 import { resolveBackends } from './host-backends.mjs';
 import { createConnectionFactory, hostFeatures } from './server/connection.mjs';
 import { validateOnShare } from './shares.mjs';
+import { refusalNotifier, validateOnRefused } from './refusal.mjs';
 
 const BACKOFF_START_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
@@ -71,6 +72,9 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {(name: string, fs: object, who: { username: string | null, fingerprint: string | null }) => void | Promise<void>} [options.onShare]
  *   Folders an operator offers (`ShareOffer`, #159), once per share, as an object of async file operations. The Rust CLI
  *   offers shares on a direct or pipe-relayed session (`wsh --share`), not over `wsh reverse-connect` yet.
+ * @param {(refusal: { reason: string, who: { username?: string, fingerprint?: string, address?: string }, detail: string }) => void} [options.onRefused]
+ *   #163: called when this host turns an operator away (`unauthorized` when `accept` says no, `busy`, `proof-required`,
+ *   `proof-failed`, `not-sealed`, `seal-failed`; see `REFUSAL_REASONS`), with what is known of `who` and a human `detail`.
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost(options = {}) {
@@ -85,9 +89,11 @@ export function createReverseHost(options = {}) {
  */
 export function createReverseHostWith({
   url, username, keyPair, accept, reconnect = true, connect = {}, peerType = 'host', reportFeatures = true, maxOperators = 1, e2e = {},
-  requireOperatorProof = false, proofTimeoutMs = 5000, onLog = () => {}, onShare,
+  requireOperatorProof = false, proofTimeoutMs = 5000, onLog = () => {}, onShare, onRefused,
 } = {}, backends) {
   validateOnShare(onShare, 'createReverseHost');
+  validateOnRefused(onRefused, 'createReverseHost');
+  const notifyRefused = refusalNotifier(onRefused, onLog);
   if (typeof requireOperatorProof !== 'boolean') throw new TypeError('createReverseHost: requireOperatorProof must be a boolean');
   if (requireOperatorProof && e2e === false) throw new TypeError('createReverseHost: requireOperatorProof seals the bridge, which needs e2e (do not set e2e: false)');
   if (requireOperatorProof && !reportFeatures) throw new TypeError('createReverseHost: requireOperatorProof needs reportFeatures (the operator learns "e2e-sealed" from ReverseAccept.features)');
@@ -163,8 +169,11 @@ export function createReverseHostWith({
     c.onReverseConnect = async (req) => {
       const from = req.from_fingerprint;
       const answer = (m) => c.sendRelayControl(m).catch(() => {});
-      const refuse = (reason) => answer(reverseReject({ targetFingerprint: myFingerprint, username, reason }));
-      if (typeof from !== 'string' || !from) { await refuse('busy: this host is already serving an operator'); return; }
+      const refuse = (reason, code = 'busy') => {
+        notifyRefused(code, { fingerprint: typeof from === 'string' ? from : undefined, username: req.username }, reason);
+        return answer(reverseReject({ targetFingerprint: myFingerprint, username, reason }));
+      };
+      if (typeof from !== 'string' || !from) { await refuse('busy: this host is already serving an operator', 'bad-request'); return; }
       if (bridges.has(from) || reserved.has(from)) { await refuse('busy: you already have a bridge with this host'); return; }
       if (bridges.size + reserved.size >= operatorLimit()) {
         await refuse(manyOperators() ? `busy: this host is already serving its maximum of ${maxOperators} operators` : 'busy: this host is already serving an operator');
@@ -175,20 +184,21 @@ export function createReverseHostWith({
       try {
         // Who is this operator? The relay says (`from`); with proof the operator says so itself (#117).
         const canProve = c.hasFeature(OPERATOR_PROOF_FEATURE) && Array.isArray(req.features) && req.features.includes(OPERATOR_PROOF_FEATURE);
-        if (requireOperatorProof && !canProve) { await refuse('operator proof required'); return; }
+        if (requireOperatorProof && !canProve) { await refuse('operator proof required', 'proof-required'); return; }
         let proven = null;
         let challenge = null;
         if (canProve) {
           const outcome = await challengeOperator(c, from);
-          if (outcome.error) { await refuse(outcome.error); return; }
+          if (outcome.error) { await refuse(outcome.error, 'proof-failed'); return; }
           ({ proven, challenge } = outcome);
           // The relay's claim and the operator's own must agree: a relay that rewrote from_fingerprint is caught here.
-          if (proven.fingerprint !== from) { onLog(`[reverse] proof is by ${proven.fingerprint.slice(0, 12)}, the relay said ${from.slice(0, 12)}`); await refuse('operator proof does not match the identity the relay asserted'); return; }
-          if (proven.username !== String(req.username ?? '')) { await refuse('operator proof names another username than the relay asserted'); return; }
+          if (proven.fingerprint !== from) { onLog(`[reverse] proof is by ${proven.fingerprint.slice(0, 12)}, the relay said ${from.slice(0, 12)}`); await refuse('operator proof does not match the identity the relay asserted', 'proof-failed'); return; }
+          if (proven.username !== String(req.username ?? '')) { await refuse('operator proof names another username than the relay asserted', 'proof-failed'); return; }
         }
         const who = { fingerprint: from, username: String(req.username ?? ''), proven: !!proven, ...(proven ? { publicKey: proven.publicKey } : {}) };
         try { ok = (await accept?.(who)) === true; } catch (e) { onLog(`[reverse] accept threw: ${e.message}`); }
-        if (!ok || bridges.size >= operatorLimit()) { await refuse('not accepted'); return; }
+        if (!ok) { await refuse('not accepted', 'unauthorized'); return; }
+        if (bridges.size >= operatorLimit()) { await refuse('not accepted'); return; }
         c.trustRelayPeer(from);
         const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge);
         bridges.set(from, bridge);
@@ -253,7 +263,9 @@ export function createReverseHostWith({
       });
       let chain = Promise.resolve();
       let giveUp = null;
-      const fail = (why) => { onLog(`[reverse] sealed bridge with ${from.slice(0, 12)} failed: ${why}`); endBridge(from); };
+      const who = { fingerprint: from, username: operatorName };
+      let unsealedReported = false;
+      const fail = (why) => { onLog(`[reverse] sealed bridge with ${from.slice(0, 12)} failed: ${why}`); notifyRefused('seal-failed', who, why); endBridge(from); };
       if (mustSeal) {
         giveUp = setTimeout(() => { if (!sealed) fail('no key exchange in time'); }, proofTimeoutMs * 2);
         giveUp.unref?.();
@@ -276,7 +288,11 @@ export function createReverseHostWith({
             }).catch((e) => fail(e.message));
             return;
           }
-          if (mustSeal) { onLog(`[reverse] dropped a message that is not sealed (type ${msg.type}) on a bridge that must be`); return; }
+          if (mustSeal) {
+            onLog(`[reverse] dropped a message that is not sealed (type ${msg.type}) on a bridge that must be`);
+            if (!unsealedReported) { unsealedReported = true; notifyRefused('not-sealed', who, `a message that is not sealed (type ${msg.type}) on a bridge that must be`); }
+            return;
+          }
           base.receiveMessage(msg);
         },
         bindStream: (s) => base.bindStream?.(s),

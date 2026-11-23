@@ -243,6 +243,7 @@ mod tests {
             writable: vec![],
             max_inflight,
             max_bytes: 4096,
+            paths: None,
         }
     }
 

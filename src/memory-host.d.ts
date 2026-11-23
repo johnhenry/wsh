@@ -1,6 +1,6 @@
 import type { WshClient, RpcChannel } from './index.js';
 import type { WshSigner } from './index.js';
-import type { WshFileBackend, WshHostKeyOption, WshOnShare } from './host.js';
+import type { WshFileBackend, WshHostKeyOption, WshOnShare, WshOnRefused } from './host.js';
 import type {
   WshServerAuthOptions, WshServerPrincipal, WshServerMcpOptions, WshExecRunner, WshServerOptions, WshServerPtyOptions, WshClientEnv,
   WshAcceptableSocket, WshAcceptOptions, WshGatewayEndpointHandler as WshMemoryEndpointHandler,
@@ -84,6 +84,8 @@ export interface WshMemoryHostOptions {
   onShare?: WshOnShare;
   /** #155: seal the whole session end to end (needs `hostKey`; offered where `dataStreams` is false). `'require'` serves nothing unsealed. */
   sealSession?: false | 'offer' | 'require';
+  /** #163: told once per connection this host turned away (a key it does not allow, a plain client on a host that requires a sealed session, ...), with a stable reason code. */
+  onRefused?: WshOnRefused;
   onLog?: (line: string) => void;
 }
 

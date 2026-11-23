@@ -179,6 +179,7 @@ impl EarlyChannels {
         };
         let size = match &envelope.payload {
             Payload::SessionData(p) => p.data.len(),
+            Payload::FileChunk(p) => p.data.len(),
             Payload::EncryptedFrame(p) => p.ciphertext.len(),
             _ => 0,
         };
@@ -2221,6 +2222,10 @@ impl WshClient {
                             msg_type: MsgType::Close,
                             payload: Payload::Close(ClosePayload { channel_id }),
                         },
+                        ControlAction::FileChunk { channel_id, offset, data, is_final, total_size } => Envelope {
+                            msg_type: MsgType::FileChunk,
+                            payload: Payload::FileChunk(FileChunkPayload { channel_id, offset, data, is_final, total_size }),
+                        },
                     };
 
                     match frame_encode(&envelope) {
@@ -2440,6 +2445,7 @@ impl WshClient {
                 MsgType::Exit
                 | MsgType::Close
                 | MsgType::SessionData
+                | MsgType::FileChunk
                 | MsgType::EncryptedFrame
                 | MsgType::EchoAck
                 | MsgType::EchoState
@@ -2616,6 +2622,7 @@ fn envelope_channel_id(envelope: &Envelope) -> Option<u32> {
         Payload::Exit(payload) => Some(payload.channel_id),
         Payload::Close(payload) => Some(payload.channel_id),
         Payload::SessionData(payload) => Some(payload.channel_id),
+        Payload::FileChunk(payload) => Some(payload.channel_id),
         Payload::EncryptedFrame(payload) => Some(payload.channel_id),
         Payload::EchoAck(payload) => Some(payload.channel_id),
         Payload::EchoState(payload) => Some(payload.channel_id),
@@ -3433,6 +3440,22 @@ mod tests {
                 ControlAction::Close { channel_id } => Envelope {
                     msg_type: MsgType::Close,
                     payload: Payload::Close(ClosePayload { channel_id }),
+                },
+                ControlAction::FileChunk {
+                    channel_id,
+                    offset,
+                    data,
+                    is_final,
+                    total_size,
+                } => Envelope {
+                    msg_type: MsgType::FileChunk,
+                    payload: Payload::FileChunk(wsh_core::messages::FileChunkPayload {
+                        channel_id,
+                        offset,
+                        data,
+                        is_final,
+                        total_size,
+                    }),
                 },
             };
 

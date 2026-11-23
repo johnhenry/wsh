@@ -351,3 +351,65 @@ async function setup2(timeoutMs) {
   const got = async (n = 1) => { for (let i = 0; i < 100 && shares.length < n; i += 1) await sleep(10); return shares; };
   return { keyPair, host, got };
 }
+
+describe('ShareOffer.paths: the root path of each share, advisory (#164)', () => {
+  const offerOf = (extra) => ({ shares: ['a', 'b'], writable: [], maxInflight: 4, maxBytes: 65536, ...extra });
+  const rootsOf = async (offer) => {
+    const t = await setup();
+    const op = await operator(t.host, { keyPair: t.keyPair, offer });
+    const shares = await t.got(offer.shares.length);
+    const roots = shares.map((s) => s.fs.root);
+    await op.client.disconnect(); await t.host.close();
+    return roots;
+  };
+
+  it('the message builder carries `paths` when given and omits the key otherwise (an offer of 0.40.0 has no such key)', () => {
+    assert.deepEqual(shareOffer(offerOf({ paths: ['/x', '/y'] })).paths, ['/x', '/y']);
+    assert.equal('paths' in shareOffer(offerOf()), false);
+  });
+
+  it('fs.root is the path the operator offered, per share, and the share still works', async () => {
+    assert.deepEqual(await rootsOf(offerOf({ paths: ['/home/me/proj', '/srv/out dir/x'] })), ['/home/me/proj', '/srv/out dir/x']);
+  });
+
+  it('an offer without `paths` (a peer of 0.40.0 / rust-v0.11.0) works: fs.root is undefined and the files are served', async () => {
+    const { keyPair, host, got } = await setup();
+    const op = await operator(host, { keyPair, offer: offerOf({ shares: ['proj'] }), answer: (req, { reply }) => reply({ attr: attrOf('file', 5) }) });
+    const [{ fs }] = await got();
+    assert.equal(fs.root, undefined);
+    assert.equal('root' in fs && fs.root !== undefined, false);
+    assert.equal((await fs.stat('/a')).size, 5);
+    await op.client.disconnect(); await host.close();
+  });
+
+  it('anything invalid is ignored (undefined), never an error: wrong type, relative, NUL, too long, wrong length', async () => {
+    const long = `/${'a'.repeat(4096)}`;
+    const cases = [
+      [['rel/path', '/ok'], [undefined, '/ok']],
+      [['/ok', ''], ['/ok', undefined]],
+      [['/a\0b', '/ok'], [undefined, '/ok']],
+      [[long, `/${'a'.repeat(4095)}`], [undefined, `/${'a'.repeat(4095)}`]],
+      [[5, null], [undefined, undefined]],
+      [[['/x'], { a: 1 }], [undefined, undefined]],
+      [['/only-one'], [undefined, undefined]],
+      [['/a', '/b', '/c'], [undefined, undefined]],
+      ['/not-an-array', [undefined, undefined]],
+      [{ 0: '/a', 1: '/b' }, [undefined, undefined]],
+    ];
+    for (const [paths, want] of cases) assert.deepEqual(await rootsOf(offerOf({ paths })), want, JSON.stringify(paths).slice(0, 60));
+  });
+
+  it('the length bound is in bytes, not characters', async () => {
+    const wide = `/${'é'.repeat(2048)}`; // 1 + 4096 bytes
+    assert.deepEqual(await rootsOf(offerOf({ paths: [wide, '/é'] })), [undefined, '/é']);
+  });
+
+  it('fs.root is read-only data: the host cannot change what the share is', async () => {
+    const { keyPair, host, got } = await setup();
+    const op = await operator(host, { keyPair, offer: offerOf({ shares: ['proj'], paths: ['/real'] }) });
+    const [{ fs }] = await got();
+    assert.throws(() => { 'use strict'; fs.root = '/elsewhere'; }, TypeError);
+    assert.equal(fs.root, '/real');
+    await op.client.disconnect(); await host.close();
+  });
+});

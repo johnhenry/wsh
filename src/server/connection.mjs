@@ -35,6 +35,7 @@ import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
 import { acceptableBindings, bindingFeatures } from '../channel-binding.mjs';
 import { SealedBridge } from '../bridge-seal.mjs';
+import { refusalNotifier, validateOnRefused } from '../refusal.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 import { SHARES_FEATURE, createShareSession } from '../shares.mjs';
 
@@ -121,6 +122,8 @@ export function createConnectionFactory(cfg) {
     bindTimeoutMs: cfg.bindTimeoutMs ?? 3000,
     log: cfg.log ?? (() => {}),
   };
+  validateOnRefused(cfg.onRefused, 'createConnectionFactory');
+  const notifyRefused = refusalNotifier(cfg.onRefused, cfg.log);
   let counter = 0;
   // What a client may put in `Open.env` (#126): an allow-list unless the host says otherwise.
   const execEnv = clientEnvFilter(cfg.execOptions?.clientEnv);
@@ -378,8 +381,17 @@ export function createConnectionFactory(cfg) {
       await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: Math.ceil(ttlMs / 1000) }));
     }
 
-    async function refuse(reason) {
+    /** Tell the embedder (`onRefused`, #163) once per connection that this peer was turned away. */
+    let refusalReported = false;
+    function reportRefused(code, detail, extra = {}) {
+      if (refusalReported) return;
+      refusalReported = true;
+      notifyRefused(code, { username: state.username, fingerprint: state.fingerprint, address: remote.address, ...extra }, detail);
+    }
+
+    async function refuse(reason, code = 'bad-request', who) {
       log(`AUTH_FAIL: ${reason}`);
+      reportRefused(code, reason, who);
       await send(authFail({ reason }));
       setTimeout(() => shutdown('auth failed'), 50);
     }
@@ -390,13 +402,13 @@ export function createConnectionFactory(cfg) {
         if (!USERNAME_RE.test(user)) return refuse(`bad username ${JSON.stringify(user)}`);
         const method = m.auth_method || 'pubkey';
         if (method === 'password') {
-          if (!cfg.methods.password) return refuse('password auth is not enabled on this host');
+          if (!cfg.methods.password) return refuse('password auth is not enabled on this host', 'method-disabled', { username: user });
         } else if (method === 'pubkey') {
-          if (!cfg.methods.pubkey) return refuse('pubkey auth is not enabled on this host');
+          if (!cfg.methods.pubkey) return refuse('pubkey auth is not enabled on this host', 'method-disabled', { username: user });
         } else {
-          return refuse(`unsupported auth method ${JSON.stringify(method)}`);
+          return refuse(`unsupported auth method ${JSON.stringify(method)}`, 'bad-request', { username: user });
         }
-        if (cfg.sealSession === 'require' && cfg.hostKey && !dataStreams && method !== 'pubkey') return refuse('this host requires a sealed session, which needs a key login');
+        if (cfg.sealSession === 'require' && cfg.hostKey && !dataStreams && method !== 'pubkey') return refuse('this host requires a sealed session, which needs a key login', 'not-sealed', { username: user });
         state.username = user;
         state.method = method;
         gateway?.setPeerFeatures(m.features);
@@ -442,6 +454,7 @@ export function createConnectionFactory(cfg) {
           fp = await fingerprint(m.public_key);
           key = await importPublicKeyRaw(m.public_key);
         } catch { return refuse('malformed public key'); }
+        const claimed = { fingerprint: fp };
         // Verify the signature first: nothing about who is on the allowlist
         // is revealed to a caller who cannot even prove they hold a key.
         // The signature may be over the empty binding (a client that knows nothing of #119, or a browser that can
@@ -460,16 +473,16 @@ export function createConnectionFactory(cfg) {
           if (required) {
             let unbound = false;
             try { unbound = await verifyChallenge(key, m.signature, state.sessionId, state.nonce, { username: state.username }); } catch { /* not that either */ }
-            if (unbound) return refuse('channel binding required: the signature is not bound to this connection');
+            if (unbound) return refuse('channel binding required: the signature is not bound to this connection', 'binding-required', claimed);
           }
-          return refuse('signature does not verify over the transcript');
+          return refuse('signature does not verify over the transcript', 'bad-signature', claimed);
         }
         state.channelBinding = boundKinds;
         let allowed = false;
         try {
           allowed = await cfg.authorize({ username: state.username, fingerprint: fp, publicKey: m.public_key });
         } catch (e) { log(`authorize threw: ${e.message}`); }
-        if (!allowed) return refuse('key not authorized');
+        if (!allowed) return refuse('key not authorized', 'unauthorized', claimed);
         state.authed = true;
         state.fingerprint = fp;
         state.publicKey = m.public_key;
@@ -490,12 +503,13 @@ export function createConnectionFactory(cfg) {
         if (!sealed.bridge.isFrame(m)) { log(`dropped a plaintext message (type ${m.type}) on a sealed session`); return undefined; }
         try { return await sealed.bridge.open(m); } catch (e) {
           log(`a sealed frame did not open (${e.message}): closing the session`);
+          reportRefused('seal-failed', `a sealed frame did not open: ${e.message}`);
           shutdown('sealed frame did not open');
           return undefined;
         }
       }
       if (m.type === MSG.KEY_EXCHANGE && m.session_id === state.sessionId) {
-        if (!state.publicKey) { log('sealed session refused: no login key to authenticate the initiator with'); shutdown('sealed session needs a key login'); return undefined; }
+        if (!state.publicKey) { log('sealed session refused: no login key to authenticate the initiator with'); reportRefused('seal-failed', 'no login key to authenticate the initiator with'); shutdown('sealed session needs a key login'); return undefined; }
         sealed.responder ??= new E2EResponder({
           signKey: cfg.hostKey, hybrid: true, identity: cfg.hostKey.publicKey,
           initiator: { publicKey: state.publicKey, require: true },
@@ -506,12 +520,13 @@ export function createConnectionFactory(cfg) {
             sealed.bridge = new SealedBridge({ key: result.key, sessionId: state.sessionId, role: 'responder', scope: 'session' });
             log(`session sealed${result.hybrid ? ' (hybrid)' : ''}`);
           }
-        } catch (e) { log(`sealed session refused: ${e.message}`); shutdown('sealed session key exchange failed'); }
+        } catch (e) { log(`sealed session refused: ${e.message}`); reportRefused('seal-failed', `key exchange failed: ${e.message}`); shutdown('sealed session key exchange failed'); }
         return undefined;
       }
       if (m.type === MSG.PING) return m;
       if (sealRequired) {
         log(`refused a plaintext message (type ${m.type}): this host requires a sealed session`);
+        reportRefused('not-sealed', `a plaintext message (type ${m.type}) on a host that requires a sealed session`);
         await deliverRaw(errorMsg({ code: 1, message: 'this host requires a sealed session (e2e-session-required)' }));
         setTimeout(() => shutdown('sealed session required'), 50);
         return undefined;
@@ -521,20 +536,20 @@ export function createConnectionFactory(cfg) {
 
     async function handlePasswordAuth(m) {
       state.awaitingPassword = false; // one guess per connection
-      if (m.method !== 'password' || typeof m.password !== 'string') return refuse('expected a password AUTH');
+      if (m.method !== 'password' || typeof m.password !== 'string') return refuse('expected a password AUTH', 'bad-request');
       const rl = cfg.rateLimit;
       const key = rl.key({ address: remote.address, headers: remote.headers, username: state.username });
       const locked = rl.limiter.lockedFor(key);
       if (locked > 0) {
         // Not even evaluated: a locked-out caller learns nothing and costs nothing.
-        return refuse(`too many failed attempts; try again in ${Math.ceil(locked / 1000)}s`);
+        return refuse(`too many failed attempts; try again in ${Math.ceil(locked / 1000)}s`, 'rate-limited');
       }
       let ok = false;
       try { ok = (await cfg.methods.password(state.username, m.password)) === true; } catch (e) { log(`password check threw: ${e.message}`); }
       if (!ok) {
         rl.limiter.fail(key);
         if (rl.failureDelayMs > 0) await new Promise((r) => setTimeout(r, rl.failureDelayMs));
-        return refuse('authentication failed');
+        return refuse('authentication failed', 'unauthorized');
       }
       rl.limiter.succeed(key);
       state.authed = true;

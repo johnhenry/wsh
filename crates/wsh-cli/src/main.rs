@@ -20,7 +20,7 @@ use tracing::error;
 #[derive(Parser)]
 #[command(
     name = "wsh",
-    version = "0.1.0",
+    version,
     about = "Web Shell client — SSH-like remote access over WebTransport/WebSocket"
 )]
 struct Cli {
@@ -82,6 +82,13 @@ struct Cli {
     /// accepts shares.
     #[arg(long = "share", value_name = "NAME=DIR[:ro|:rw]", action = clap::ArgAction::Append)]
     shares: Vec<String>,
+
+    /// With --share: do not tell the host where each shared directory is on this machine. By
+    /// default the offer carries each directory's absolute path (advisory: the host cannot verify
+    /// it, and nothing outside the directory is reachable either way), so a host can map a path
+    /// it was asked for onto a share. Names, modes and limits are sent regardless.
+    #[arg(long = "share-hide-path")]
+    share_hide_path: bool,
 
     /// Do not run a command or a shell: only forward (with -L / -R) or share (--share). Stops on Ctrl-C.
     #[arg(short = 'N')]
@@ -473,7 +480,7 @@ async fn main() {
             );
             std::process::exit(2);
         }
-        if let Err(e) = commands::share::set(&cli.shares) {
+        if let Err(e) = commands::share::set(&cli.shares, cli.share_hide_path) {
             eprintln!("wsh: {e}");
             std::process::exit(2);
         }

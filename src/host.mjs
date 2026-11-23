@@ -29,3 +29,4 @@ export { bindSocket } from './server/socket.mjs';
 export { resolveBackends, resolveHostKey, normalizeFileBackend } from './host-backends.mjs';
 export { buildAuthorizer, authMethods } from './server/auth.mjs';
 export { ShareError, SHARES_FEATURE } from './shares.mjs';
+export { REFUSAL_REASONS } from './refusal.mjs';

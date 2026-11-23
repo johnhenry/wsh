@@ -10,11 +10,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use wsh_core::error::{WshError, WshResult};
 use wsh_core::messages::{
-    ChannelKind, EchoAckPayload, EchoStatePayload, Envelope, Payload, SessionDataMode,
-    TermDiffPayload, TermSyncPayload,
+    ChannelKind, EchoAckPayload, EchoStatePayload, Envelope, FileChunkPayload, Payload,
+    SessionDataMode, TermDiffPayload, TermSyncPayload,
 };
 use wsh_core::transport::ByteStream;
 
@@ -142,6 +142,25 @@ pub struct WshSession {
     /// The stderr half of a `stdio: "pipes"` exec channel, which the host delivers
     /// on a channel id of its own (`OpenOk.stderr_channel_id`).
     stderr: Option<Arc<WshSession>>,
+    /// `FileChunk` messages of a file channel (the one framing every host and client speaks for
+    /// file transfer, #140), in arrival order. The sender is dropped when the channel closes, so
+    /// a reader drains what arrived and then sees the end.
+    file_chunks: FileChunks,
+}
+
+struct FileChunks {
+    tx: Mutex<Option<mpsc::UnboundedSender<FileChunkPayload>>>,
+    rx: Mutex<mpsc::UnboundedReceiver<FileChunkPayload>>,
+}
+
+impl FileChunks {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            tx: Mutex::new(Some(tx)),
+            rx: Mutex::new(rx),
+        }
+    }
 }
 
 /// Per-session E2E state set by `WshSession::enable_e2e`. Connection-scoped,
@@ -212,6 +231,14 @@ pub enum ControlAction {
     Close {
         channel_id: u32,
     },
+    /// One `FileChunk` of an upload (#140).
+    FileChunk {
+        channel_id: u32,
+        offset: u64,
+        data: Vec<u8>,
+        is_final: bool,
+        total_size: u64,
+    },
 }
 
 /// Seal one stream-mode chunk and write it to the underlying `ByteStream`.
@@ -261,6 +288,7 @@ impl WshSession {
             stream_read_pending: Mutex::new(VecDeque::new()),
             stream_coalescer: Mutex::new(None),
             stderr: None,
+            file_chunks: FileChunks::new(),
         }
     }
 
@@ -287,6 +315,7 @@ impl WshSession {
             stream_read_pending: Mutex::new(VecDeque::new()),
             stream_coalescer: Mutex::new(None),
             stderr: None,
+            file_chunks: FileChunks::new(),
         }
     }
 
@@ -730,6 +759,55 @@ impl WshSession {
         }
     }
 
+    /// Send one `FileChunk` of an upload over this file channel (#140): the data at `offset`,
+    /// `is_final` on the last, `total_size` the size of the whole file. The host confirms
+    /// completion with `Exit` and `Close` (see [`wait_closed`](Self::wait_closed)).
+    pub async fn write_file_chunk(
+        &self,
+        offset: u64,
+        data: &[u8],
+        is_final: bool,
+        total_size: u64,
+    ) -> WshResult<()> {
+        if *self.state.lock().await != SessionState::Open {
+            return Err(WshError::Channel(format!(
+                "channel {} is not open",
+                self.channel_id
+            )));
+        }
+        self.control_tx
+            .send(ControlAction::FileChunk {
+                channel_id: self.channel_id,
+                offset,
+                data: data.to_vec(),
+                is_final,
+                total_size,
+            })
+            .await
+            .map_err(|_| WshError::Channel("control channel closed".into()))
+    }
+
+    /// The next `FileChunk` the host sent on this file channel (a download, #140), or `None`
+    /// once the channel has closed and every chunk that arrived has been read.
+    pub async fn read_file_chunk(&self) -> Option<FileChunkPayload> {
+        self.file_chunks.rx.lock().await.recv().await
+    }
+
+    /// Wait until the host has closed this channel (an upload is confirmed by `Exit` then
+    /// `Close`), at most `timeout`. Returns whether it closed in time.
+    pub async fn wait_closed(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if *self.state.lock().await == SessionState::Closed {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Resize the terminal (for pty sessions).
     pub async fn resize(&self, cols: u16, rows: u16) -> WshResult<()> {
         self.control_tx
@@ -796,12 +874,15 @@ impl WshSession {
             let mut state = self.state.lock().await;
             *state = SessionState::Closed;
         }
+        self.file_chunks.tx.lock().await.take();
 
         Ok(())
     }
 
     /// Mark this session as closed (called externally when an Exit message is received).
     pub(crate) async fn mark_closed(&self) {
+        // A reader of file chunks drains what arrived and then sees the end.
+        self.file_chunks.tx.lock().await.take();
         if let SessionBackend::Virtual(backend) = &self.backend {
             backend.close().await;
         }
@@ -869,6 +950,12 @@ impl WshSession {
                     SessionBackend::Virtual(backend) => backend.push_data(plaintext).await,
                     SessionBackend::Stream(_) => Ok(()),
                 }
+            }
+            Payload::FileChunk(chunk) => {
+                if let Some(tx) = self.file_chunks.tx.lock().await.as_ref() {
+                    let _ = tx.send(chunk.clone());
+                }
+                Ok(())
             }
             Payload::Close(_) => {
                 self.mark_closed().await;

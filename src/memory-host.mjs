@@ -39,6 +39,7 @@ import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
 import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
 import { validateOnShare } from './shares.mjs';
+import { validateOnRefused } from './refusal.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -182,11 +183,16 @@ function createRegistry(sessions, log) {
  *   this is called once per share with an object of async file operations (`stat`, `readdir` with attributes, `readFile`,
  *   `open`, `writeFile`, `mkdir`, `rename`, `unlink`, ... and the `operate` / `readWhole` / `writeWhole` / `writeAt` shape of
  *   an `fs` backend) that the embedder can mount. Listing it makes the host state the `shares` feature. See `shares.mjs`.
+ * @param {(refusal: { reason: string, who: { username?: string, fingerprint?: string, address?: string }, detail: string }) => void} [options.onRefused]
+ *   #163: called once per connection that this host turned away (a key it does not allow, a plain client on a host that
+ *   requires a sealed session, a login that is not bound, ...) with a stable `reason` code (`REFUSAL_REASONS`, exported
+ *   from `@johnhenry/wsh/host`), what is known of `who`, and a human `detail` (not stable). Not for parsing `onLog`.
  * @param {(line: string) => void} [options.onLog]
  */
 export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
-  onShare } = {}) {
+  onShare, onRefused } = {}) {
   validateOnShare(onShare, 'createMemoryHost');
+  validateOnRefused(onRefused, 'createMemoryHost');
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
@@ -218,7 +224,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
 
   const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
-    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare,
+    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));
   ready.catch(() => {});
