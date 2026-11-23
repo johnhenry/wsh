@@ -139,6 +139,75 @@ impl Fx {
 // ── command line ──────────────────────────────────────────────────
 
 #[test]
+fn the_root_path_is_made_tidy_but_stays_what_the_operator_typed() {
+    for (typed, want) in [
+        ("/srv/data", "/srv/data"),
+        ("/srv/data/", "/srv/data"),
+        ("/srv//data/./x/", "/srv/data/x"),
+        ("/./srv", "/srv"),
+        ("/", "/"),
+        ("//", "/"),
+        ("/srv/a/../b", "/srv/a/../b"),
+        ("/srv/my dir", "/srv/my dir"),
+    ] {
+        let s = parse_spec(&format!("a={typed}")).unwrap();
+        assert_eq!(s.path, PathBuf::from(want), "typed {typed:?}");
+        assert_eq!(
+            parse_spec(&format!("a={typed}:rw")).unwrap().path,
+            PathBuf::from(want)
+        );
+    }
+}
+
+#[test]
+fn the_offer_carries_each_root_path_parallel_to_the_names_unless_hidden() {
+    let specs = vec![
+        parse_spec("src=/home/me/proj").unwrap(),
+        parse_spec("out=/srv/out/:rw").unwrap(),
+    ];
+    let o = build_offer(&specs, &Limits::default(), false);
+    assert_eq!(o.shares, ["src", "out"]);
+    assert_eq!(o.writable, ["out"]);
+    assert_eq!(
+        o.paths.as_deref(),
+        Some(&["/home/me/proj".to_string(), "/srv/out".to_string()][..])
+    );
+    let hidden = build_offer(&specs, &Limits::default(), true);
+    assert_eq!(hidden.paths, None);
+    assert_eq!(hidden.shares, o.shares);
+    // On the wire the key is absent when hidden (what 0.40.0 / rust-v0.11.0 sent), present otherwise.
+    let json = serde_json::to_value(&hidden).unwrap();
+    assert!(json.get("paths").is_none(), "{json}");
+    let json = serde_json::to_value(&o).unwrap();
+    assert_eq!(
+        json["paths"],
+        serde_json::json!(["/home/me/proj", "/srv/out"])
+    );
+}
+
+#[test]
+fn an_offer_without_paths_still_decodes_and_an_old_decoder_still_reads_a_new_offer() {
+    use wsh_core::messages::ShareOfferPayload;
+    // What a 0.40.0 / rust-v0.11.0 client sends: no `paths`.
+    let old = serde_json::json!({"shares": ["a"], "writable": [], "max_inflight": 16, "max_bytes": 262144});
+    let decoded: ShareOfferPayload = serde_json::from_value(old).unwrap();
+    assert_eq!(decoded.paths, None);
+    // The old shape of the struct (no `paths`, tolerant of unknown fields the way the JS host is) reads a new offer.
+    #[derive(serde::Deserialize)]
+    struct OldOffer {
+        shares: Vec<String>,
+        max_inflight: u32,
+    }
+    let specs = vec![parse_spec("a=/x").unwrap()];
+    let new = serde_json::to_value(build_offer(&specs, &Limits::default(), false)).unwrap();
+    let seen: OldOffer = serde_json::from_value(new).unwrap();
+    assert_eq!(
+        (seen.shares, seen.max_inflight),
+        (vec!["a".to_string()], 16)
+    );
+}
+
+#[test]
 fn spec_parsing() {
     let s = parse_spec("src=/tmp/x").unwrap();
     assert_eq!((s.name.as_str(), s.writable), ("src", false));

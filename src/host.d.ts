@@ -195,6 +195,14 @@ export interface WshShareFs extends WshFileBackend {
   readonly name: string;
   /** Whether the operator offered writes (`:rw`). A change on a read-only share fails with `EROFS`. */
   readonly writable: boolean;
+  /**
+   * The folder's absolute path on the operator's machine, as the operator typed it (made absolute and tidied), or
+   * `undefined` when the operator's client did not send it (an older client, or `wsh --share-hide-path`) or sent
+   * something invalid (not absolute, a NUL, over 4096 bytes, the wrong count). ADVISORY: the host cannot verify it, so use
+   * it only to recognise a share (a bind-mount source, say), never to decide what is safe. The operator's client still
+   * serves only the folder it opened, whatever this says.
+   */
+  readonly root: string | undefined;
   /** Aborted when the connection to the operator ends; every later call fails with `EIO`. */
   readonly signal: AbortSignal;
   /** Requests, replies, errors, bytes each way and timeouts on this connection so far. */

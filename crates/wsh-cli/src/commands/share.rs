@@ -3,6 +3,7 @@
 //! `wsh_client::share`. Shares exist only because they were named on the command line, and are
 //! offered exactly once, after authentication.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use anyhow::{bail, Result};
@@ -17,10 +18,14 @@ static SHARES: OnceLock<Vec<ShareSpec>> = OnceLock::new();
 #[cfg(not(unix))]
 static SHARES: OnceLock<Vec<()>> = OnceLock::new();
 
+/// `--share-hide-path`: leave each share's root path out of the offer (#164).
+static HIDE_PATH: AtomicBool = AtomicBool::new(false);
+
 /// Parse every `--share` and remember them. Opening the directories happens here too, so a bad
 /// path is an error before the connection (and before anything is asked of the host).
 #[cfg(unix)]
-pub fn set(specs: &[String]) -> Result<()> {
+pub fn set(specs: &[String], hide_path: bool) -> Result<()> {
+    HIDE_PATH.store(hide_path, Ordering::Relaxed);
     let mut parsed: Vec<ShareSpec> = Vec::new();
     for s in specs {
         let spec = sharefs::parse_spec(s).map_err(|e| anyhow::anyhow!(e))?;
@@ -36,7 +41,8 @@ pub fn set(specs: &[String]) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn set(specs: &[String]) -> Result<()> {
+pub fn set(specs: &[String], hide_path: bool) -> Result<()> {
+    HIDE_PATH.store(hide_path, Ordering::Relaxed);
     if specs.is_empty() {
         return Ok(());
     }
@@ -49,7 +55,6 @@ pub fn set(specs: &[String]) -> Result<()> {
 #[cfg(unix)]
 pub async fn start_configured(client: &WshClient) -> Result<()> {
     use std::sync::Arc;
-    use wsh_core::messages::ShareOfferPayload;
 
     let Some(specs) = SHARES.get() else {
         return Ok(());
@@ -60,16 +65,7 @@ pub async fn start_configured(client: &WshClient) -> Result<()> {
     let shares = sharefs::open_all(specs).map_err(|e| anyhow::anyhow!(e))?;
     let lines: Vec<String> = shares.iter().map(sharefs::describe).collect();
     let limits = sharefs::Limits::default();
-    let offer = ShareOfferPayload {
-        shares: specs.iter().map(|s| s.name.clone()).collect(),
-        writable: specs
-            .iter()
-            .filter(|s| s.writable)
-            .map(|s| s.name.clone())
-            .collect(),
-        max_inflight: limits.max_inflight,
-        max_bytes: limits.max_bytes as u32,
-    };
+    let offer = sharefs::build_offer(specs, &limits, HIDE_PATH.load(Ordering::Relaxed));
     let server = Arc::new(ShareServer::new(shares, limits));
     client
         .gateway()

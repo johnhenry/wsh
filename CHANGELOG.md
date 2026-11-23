@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Shares carry each folder's root path: `ShareOffer.paths`, `fs.root`, `--share-hide-path` (#164) (npm change)
+
+A host that is asked for an absolute path (a Docker bind mount `-v /abs/dir:/in`) can now tell which share it belongs to, instead
+of reading a hash the operator put in the share name. Optional field, no feature string needed, no default changed.
+
+- **Wire** (`spec/wsh-v1.yaml`): `ShareOffer` gains optional `paths: string[]`, parallel to `shares` (each share's root as the
+  operator typed it, made absolute and tidy). Optional on decode in JS and Rust. A client of 0.40.0 / `rust-v0.11.0` sends none; a
+  0.40.0 host ignores the field it does not know.
+- **CLI** (`rust-v` release): `wsh --share` sends the paths; `--share-hide-path` omits them. The path of `--share` is now made
+  tidy (`//`, `.` and a trailing `/` removed) before the directory is opened.
+- **JS host** (npm): `WshShareFs.root` (string or `undefined`). Validated: an array as long as `shares`, each entry an absolute
+  string of at most 4096 bytes without NUL; anything else is `undefined`, never an error. `onShare` keeps its signature.
+- **Advisory.** The host cannot verify the path and the CLI still serves only the directory it opened; stated in the README (Security
+  model) and the types.
+- Tests: `test/shares.test.mjs` (validation table, offer without the field), `test/rust/wsh-cli-share.test.mjs` (the real CLI:
+  `fs.root` equals the shared directory, `--share-hide-path`), `crates/wsh-cli/src/sharefs/tests.rs` (tidy path, offer with and
+  without paths, old-shape decoder).
+
 ### Rust CLI: `wsh scp` speaks `FileChunk`, like every host (#140) (Rust CLI and `wsh-client`)
 
 Rust workspace and tests only (no `src/` change, no wire change); lands in the next `rust-v` release. Hosts are unchanged.
