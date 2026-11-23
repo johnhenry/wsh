@@ -18,6 +18,28 @@
   `scripts/bundle-budget.json` updated. `.` (the client) is unchanged.
 - Tests: `test/host-refused.test.mjs`; `test/rust/wsh-version.test.mjs`; a type fixture in `test/types/memory.ts`.
 
+### Rust: a reverse host no longer loses the last output of a command that exits at once; no process umask swap; two flaky tests fixed (#162)
+
+Rust workspace and tests only (no `src/` change, no wire change); lands in the next `rust-v` release.
+
+- **`wsh reverse` host: output lost before the exit (fix).** A host session's output reader and its exit watcher are independent
+  tasks. A child that wrote and exited at once (`sleep 0.05; echo done`), on a loaded machine, could have its exit handled before
+  the reader had taken the output out of the pty: `Exit` and `Close` went out, the session was dropped and the output never
+  arrived (an operator saw an empty result and a clean exit). The host now waits (at most 1 s, since a grandchild can hold the pty
+  open) for the reader to reach EOF and sends what it queued before `Exit`. This was the "sealed-bridge recording hop returns
+  empty output" flake of #162; it is not specific to sealing.
+- **`wsh -L SOCKET`: the process umask is no longer swapped.** `bind_local_unix` changed the umask around the bind, which races
+  any thread creating files (directories came out `0600`). It now binds in a private `0700` staging directory next to the socket,
+  sets `0600` there and hard-links it into place (as the server's gateway does). The resulting socket is `0600` as before; an
+  existing file is still refused and never replaced except a stale socket with `--replace-socket`. The test-only `UMASK_GATE`
+  that worked around the swap is gone.
+- **Test: "closes a connection whose client sends past the credit".** Five fixed 60 KiB writes were not always past the credit: on
+  Linux the kernel buffers of the two unix sockets absorb them, the server hands credit back as the origin "takes" it, and no
+  overrun happens (on macOS the buffers are tiny). The test now keeps sending until the server closes the connection. The server
+  enforcement (`on_data`) was read and is correct.
+- Tests: `test/rust/wsh-sealed-bridge.test.mjs` (60 short-lived commands in a row, fails under load without the fix);
+  `crates/wsh-cli/src/commands/forward.rs` (a thread making directories while another binds sockets).
+
 ## 0.40.0 / Rust `rust-v0.11.0`
 
 ### Operator-side shared folders: `wsh --share`, and `onShare` on the JS host (#159) (npm change)

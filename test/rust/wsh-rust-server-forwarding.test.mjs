@@ -463,8 +463,15 @@ describe('Rust wsh-server: gateway credit, unix sockets and listeners (the Node 
       const { client, inbox } = await setup({ allow: [], unix: { connect: [`${t}/mute.sock`] } });
       await client.sendControl({ type: MSG.OPEN_UNIX, gateway_id: 5, path: `${t}/mute.sock` });
       await until(() => inbox.find((m) => m.type === MSG.GATEWAY_OK && m.gateway_id === 5), 'ok');
-      // 5 x 60 KiB against 256 KiB of credit, to an origin that takes nothing.
-      for (let i = 0; i < 5; i++) await client.sendControl({ type: MSG.GATEWAY_DATA, gateway_id: 5, data: new Uint8Array(60 * 1024) });
+      // Keep sending past the 256 KiB of credit until the server closes the connection. A fixed
+      // amount is not enough: the kernel buffers of the two unix sockets absorb the first few
+      // hundred KiB on Linux, the server hands the credit back as the origin "takes" it, and the
+      // client never overruns. Once the buffers are full the origin takes nothing more, no credit
+      // comes back and the overrun is certain. The cap only bounds a server that never closes.
+      for (let i = 0; i < 4096 && !inbox.some((m) => m.type === MSG.GATEWAY_CLOSE && m.gateway_id === 5); i++) {
+        try { await client.sendControl({ type: MSG.GATEWAY_DATA, gateway_id: 5, data: new Uint8Array(60 * 1024) }); } catch { break; }
+        if (i % 8 === 7) await new Promise((r) => setImmediate(r));
+      }
       const closed = await until(() => inbox.find((m) => m.type === MSG.GATEWAY_CLOSE && m.gateway_id === 5), 'close for the overrun');
       assert.match(closed.reason ?? '', /credit/);
     });
