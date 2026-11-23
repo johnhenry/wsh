@@ -135,6 +135,7 @@
 //      session-id fallback for transcript verification.
 
 import { describe, it, before, after, afterEach, beforeEach } from 'node:test';
+import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, symlinkSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';

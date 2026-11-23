@@ -11,6 +11,7 @@
 // Prerequisite: `cargo build --release -p wsh-cli` (or WSH_BIN).
 
 import { describe, it, before, after } from 'node:test';
+import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import http from 'node:http';
@@ -156,6 +157,14 @@ function daemonEndpoints() {
       duplex.closed.then(() => { over = true; });
       try { while (!over) await w.write(chunk); } catch { /* closed */ }
     },
+    // Raw web streams, no Node http in between (#152): the large-transfer test must exercise the gateway's credit and the
+    // transport, not Node's own http server, whose 'drain' went missing under load on a Duplex.fromWeb socket.
+    bulk: async (duplex) => {
+      const w = duplex.writable.getWriter();
+      const body = bigBody();
+      try { for (let o = 0; o < body.length; o += 65536) await w.write(body.subarray(o, o + 65536)); await w.close(); } catch { /* closed */ }
+    },
+    echo: (duplex) => duplex.readable.pipeTo(duplex.writable).catch(() => {}),
     // Never reads: a client that sends past its credit is the client's problem.
     mute: () => {},
     locked: { open: () => {}, authorize: () => false },
@@ -230,16 +239,19 @@ for (const [label, connectArgs] of [
       const h = makeHome();
       const { endpoints } = daemonEndpoints();
       const { args, target } = await connectArgs(pageHost(h, { endpoints }).serve);
-      const fwd = await wshBackground([...args, '-N', '-L', '0:endpoint=docker', target], { home: h.home });
-      const port = fwd.port();
-      assert.ok(port > 0, fwd.stderr());
-      const down = await httpGet({ host: '127.0.0.1', port, path: '/big' });
-      assert.equal(down.body.length, 20 * MiB);
-      assert.equal(sha(down.body), sha(bigBody()));
+      const fwd = await wshBackground([...args, '-N', '-L', '0:endpoint=bulk', '-L', '0:endpoint=echo', target], { home: h.home });
+      assert.ok(fwd.port(0) > 0 && fwd.port(1) > 0, fwd.stderr());
+      const down = await new Promise((resolve, reject) => {
+        const cs = []; const s = net.connect(fwd.port(0), '127.0.0.1');
+        s.on('data', (c) => cs.push(c)); s.on('end', () => resolve(Buffer.concat(cs))); s.on('error', reject);
+      });
+      assert.equal(down.length, 20 * MiB);
+      assert.equal(sha(down), sha(bigBody()));
       const payload = crypto.randomBytes(12 * MiB);
       const up = await new Promise((resolve, reject) => {
-        const req = http.request({ host: '127.0.0.1', port, path: '/echo', method: 'POST', agent: false }, (res) => { const cs = []; res.on('data', (c) => cs.push(c)); res.on('end', () => resolve(Buffer.concat(cs))); });
-        req.on('error', reject); req.end(payload);
+        const cs = []; let got = 0; const s = net.connect(fwd.port(1), '127.0.0.1');
+        s.on('data', (c) => { cs.push(c); got += c.length; if (got >= payload.length) { s.destroy(); resolve(Buffer.concat(cs)); } });
+        s.on('error', reject); s.write(payload);
       });
       assert.equal(sha(up), sha(payload));
       await fwd.stop();

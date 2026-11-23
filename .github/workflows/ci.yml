@@ -31,6 +31,7 @@ jobs:
     # fast and JS-only contributors never need a browser. The Rust CLI test downloads the latest rust-v* release from this
     # repository and verifies it against the release's SHA256SUMS; GITHUB_TOKEN only lifts the API rate limit.
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -71,6 +72,7 @@ jobs:
     # separate Rust toolchain/build, not npm/Node-shaped, which is all the
     # reusable workflow covers.
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 

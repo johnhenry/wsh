@@ -7,6 +7,7 @@
 // Prerequisites: cargo build --release -p wsh-server -p wsh-cli (or WSH_SERVER_BIN / WSH_BIN).
 
 import { describe, it, before, after } from 'node:test';
+import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';

@@ -9,6 +9,7 @@
 // stripper. Prerequisite: `cargo build --release -p wsh-cli` (or WSH_BIN). Every `wsh` runs with HOME in a scratch dir.
 
 import { describe, it, before, after } from 'node:test';
+import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
