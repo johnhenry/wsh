@@ -510,14 +510,18 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
     }
 
     if errors.len() == 1 {
-        anyhow::bail!("failed to connect to {} ({})", resolved.url, errors[0]);
+        anyhow::bail!(
+            "failed to connect to {} ({})",
+            redact_rendezvous(&resolved.url),
+            redact_rendezvous(&errors[0])
+        );
     }
 
     anyhow::bail!(
         "failed to connect to {}:{} across transports ({})",
         resolved.host,
         resolved.port,
-        errors.join("; ")
+        redact_rendezvous(&errors.join("; "))
     )
 }
 
@@ -905,6 +909,44 @@ mod tests {
         assert_eq!(
             parse_endpoint("./weird:name.txt").unwrap(),
             Endpoint::Local(PathBuf::from("./weird:name.txt"))
+        );
+    }
+}
+
+/// A pipe-relay URL (`wss://relay/r/<id>`) with its rendezvous id shortened: the id is a capability
+/// (whoever holds it can dial the other half while it waits), so it does not belong in an error
+/// line, a log or a ticket (#156).
+pub fn redact_rendezvous(url: &str) -> String {
+    match url.split_once("/r/") {
+        Some((head, tail)) => {
+            let (id, rest) = tail
+                .find(['?', '#', '/'])
+                .map_or((tail, ""), |i| tail.split_at(i));
+            let shown: String = id.chars().take(4).collect();
+            if id.len() > 4 {
+                format!("{head}/r/{shown}...{rest}")
+            } else {
+                url.to_string()
+            }
+        }
+        None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_rendezvous;
+
+    #[test]
+    fn the_rendezvous_id_is_shortened_and_the_rest_kept() {
+        assert_eq!(
+            redact_rendezvous("wss://relay.example/r/AbCdEfGhIjKlMnOpQrStUv?role=host"),
+            "wss://relay.example/r/AbCd...?role=host"
+        );
+        assert_eq!(redact_rendezvous("wss://h:1/"), "wss://h:1/");
+        assert!(
+            !redact_rendezvous("ws://127.0.0.1:9/r/SECRETSECRETSECRETSECRET")
+                .contains("SECRETSECRET")
         );
     }
 }

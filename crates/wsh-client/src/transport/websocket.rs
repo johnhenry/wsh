@@ -59,6 +59,25 @@ use wsh_core::transport::{IdentifiedStream, TransportSession};
 /// connection would allow a MITM to impersonate any server.
 const INSECURE_LOOPBACK_TLS_ENV: &str = "WSH_INSECURE_LOOPBACK_TLS";
 
+/// A pipe-relay URL (`wss://relay/r/<id>`) with its rendezvous id shortened for a log line: the id is a
+/// capability (whoever holds it can dial the other half while it waits), #156. Same rule as the CLI's.
+fn redact_rendezvous(url: &str) -> String {
+    match url.split_once("/r/") {
+        Some((head, tail)) => {
+            let (id, rest) = tail
+                .find(['?', '#', '/'])
+                .map_or((tail, ""), |i| tail.split_at(i));
+            if id.chars().count() > 4 {
+                let shown: String = id.chars().take(4).collect();
+                format!("{head}/r/{shown}...{rest}")
+            } else {
+                url.to_string()
+            }
+        }
+        None => url.to_string(),
+    }
+}
+
 fn insecure_loopback_tls_requested() -> bool {
     matches!(
         std::env::var(INSECURE_LOOPBACK_TLS_ENV).as_deref(),
@@ -170,7 +189,7 @@ impl WebSocketSession {
                 .map_err(|e| WshError::Transport(format!("WebSocket connect error: {e}")))?
         };
 
-        tracing::info!("WebSocket connected to {}", url);
+        tracing::info!("WebSocket connected to {}", redact_rendezvous(url));
 
         let (ws_sink, ws_read) = ws_stream.split();
         let ws_sink = Arc::new(Mutex::new(ws_sink));
@@ -178,6 +197,7 @@ impl WebSocketSession {
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<QMuxEvent>();
+        let event_tx_for_io = event_tx.clone();
 
         let qmux = Arc::new(QMuxConnection::new(
             QMuxConnectionConfig {
@@ -203,6 +223,14 @@ impl WebSocketSession {
                 alive_for_io,
             )
             .await;
+            // The socket is gone (the peer closed it, or it failed): say so to whoever reads the control
+            // stream. The QMux connection (and so the event channel) is held by this session as well, so
+            // without this nothing would ever tell the dispatch loop that the host went away, and a
+            // `wsh -N -L` would wait forever (#156).
+            let _ = event_tx_for_io.send(QMuxEvent::ConnectionClosed {
+                error_code: wsh_core::qmux::ErrorCode::NoError,
+                reason: "websocket closed".to_string(),
+            });
         });
 
         let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(256);

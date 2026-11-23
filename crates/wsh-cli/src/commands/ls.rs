@@ -26,7 +26,7 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
     let target_str = format!("{user}@{host}");
     let resolved = resolve_target(&target_str, port, transport)?;
     let client = connect_client(&resolved, identity).await?;
-    debug!(url = %resolved.url, path = %path, "ls");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), path = %path, "ls");
 
     let result = file_transfer::list(&client, &path).await;
     let _ = client.disconnect().await;

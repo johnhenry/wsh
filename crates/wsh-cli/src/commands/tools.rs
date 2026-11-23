@@ -30,7 +30,7 @@ pub async fn run(
     };
     let target = format!("{user}@{resolved_host}");
     let resolved = resolve_target(&target, port, transport)?;
-    debug!(url = %resolved.url, user = %resolved.user, "transport URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), user = %resolved.user, "transport URL");
     let client = connect_client(&resolved, identity).await?;
     save_last_session(&resolved, port, identity)?;
 

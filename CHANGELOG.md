@@ -19,6 +19,19 @@ Rust workspace and tests only (no `src/` change); negotiated by existing feature
   **A frame that does not open (tampered, replayed, reordered) closes the bridge** (the JS host drops the frame and ignores the rest).
 - Not done here: sealing a direct or pipe-relayed connection and gateway data outside a reverse bridge (#155).
 
+### Rust CLI: `-N -L` exits when the host goes; the rendezvous id is not printed (#156)
+
+Rust workspace, tests and README only (no `src/` change, no wire change).
+
+- **`wsh -N -L ...` exits when the host drops the session** (non-zero, "the connection to the host was lost", local sockets
+  removed). The WebSocket transport never told the dispatch loop that the socket had closed, so the process waited forever.
+- **The rendezvous id of a `--via` URL (a capability) is never printed:** errors, `--verbose` logs and `wsh check` show the relay's
+  host and the id shortened (`wss://relay/r/AbCd...`). `last_session.json` still stores no URL.
+- README: the capability matrix's pipe-relay row and the `--via` paragraph now say what the Rust client does today (host-key proof,
+  channel binding `host`).
+- Tests: `test/rust/wsh-cli-156.test.mjs` (host killed or closed mid-session over a relay and a direct socket; stderr/stdout of
+  five commands over four failure paths, with and without `--verbose`, grepped for the id).
+
 ## 0.38.1
 
 ### JS: `operator-proof` is offered only to a peer that advertises it (npm change)

@@ -37,7 +37,7 @@ pub async fn run(
     let target_str = format!("{user}@{host}");
     let resolved = resolve_target(&target_str, port, transport)?;
     let client = connect_client(&resolved, identity).await?;
-    debug!(url = %resolved.url, "sftp");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), "sftp");
 
     let mut session = Session {
         client: &client,
