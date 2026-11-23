@@ -4,6 +4,7 @@
 //! clients via public key or password, and provides PTY-backed shell sessions.
 
 mod auth;
+mod client_env;
 mod config;
 mod gateway;
 mod handshake;

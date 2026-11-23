@@ -76,6 +76,12 @@ pub struct ServerSection {
     pub session_ttl: u64,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
+    /// Which environment variables a client may set for what it runs
+    /// (`Open.env`): absent = `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`;
+    /// `true` = everything; `false` = nothing; a list = exactly those names
+    /// (a trailing `*` makes a prefix). See [`crate::client_env`].
+    #[serde(default)]
+    pub client_env: Option<crate::client_env::ClientEnvSetting>,
 }
 
 impl Default for ServerSection {
@@ -87,6 +93,7 @@ impl Default for ServerSection {
             max_sessions: default_max_sessions(),
             session_ttl: default_session_ttl(),
             idle_timeout: default_idle_timeout(),
+            client_env: None,
         }
     }
 }
@@ -362,6 +369,8 @@ pub struct ServerConfig {
     pub rpc_fs_max_file_bytes: u64,
     /// CLI tools offered over MCP. See [`McpSection`].
     pub mcp_tools: Vec<McpToolSection>,
+    /// Which `Open.env` variables are applied. See [`crate::client_env`].
+    pub client_env: crate::client_env::ClientEnvPolicy,
 }
 
 impl ServerConfig {
@@ -444,6 +453,12 @@ impl ServerConfig {
                 ))
             })?;
         let password_hashes = parse_password_hashes(&file_config.auth);
+        let client_env =
+            crate::client_env::ClientEnvPolicy::from_setting(file_config.server.client_env.as_ref())
+                .map_err(wsh_core::WshError::Other)?;
+        if client_env == crate::client_env::ClientEnvPolicy::Everything {
+            warn!("[server] client_env = true: a client can set any environment variable (PATH, LD_PRELOAD...) for what it runs");
+        }
         warn_about_gateway(&file_config.gateway, gateway_reverse_bind_addr);
 
         Ok(Self {
@@ -469,6 +484,7 @@ impl ServerConfig {
             rpc_fs_read_only: file_config.rpc.fs_read_only,
             rpc_fs_max_file_bytes: file_config.rpc.fs_max_file_bytes,
             mcp_tools: file_config.mcp.tools,
+            client_env,
         })
     }
 }
@@ -568,6 +584,25 @@ mod tests {
 
     fn load_defaults() -> ServerConfig {
         ServerConfig::load(None, None, None, None, None, None, None, false).unwrap()
+    }
+
+    // ── client_env: allow-list by default (BREAKING, wsh #126 / #145) ──
+
+    #[test]
+    fn client_env_defaults_to_the_allow_list_and_the_changelog_line_restores_the_old_behaviour() {
+        use crate::client_env::ClientEnvPolicy;
+        for cfg in [load_defaults(), load("")] {
+            assert_eq!(cfg.client_env, ClientEnvPolicy::default());
+            let kept = cfg.client_env.filter(Some(
+                &[("PATH".to_string(), "/x".to_string()), ("LC_ALL".to_string(), "C".to_string())].into(),
+            ));
+            assert_eq!(kept.unwrap().keys().collect::<Vec<_>>(), ["LC_ALL"]);
+        }
+        // The exact line the CHANGELOG gives:
+        let cfg = load("[server]\nclient_env = true\n");
+        assert_eq!(cfg.client_env, ClientEnvPolicy::Everything);
+        let kept = cfg.client_env.filter(Some(&[("PATH".to_string(), "/x".to_string())].into()));
+        assert!(kept.unwrap().contains_key("PATH"));
     }
 
     // ── gateway: off, deny, loopback ─────────────────────────────────
