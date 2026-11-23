@@ -29,6 +29,9 @@ import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } f
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
+import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
+import { clientEnvFilter } from './client-env.mjs';
+import { acceptableBindings, bindingFeatures } from '../channel-binding.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -49,7 +52,7 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   // A relay carries a signed KeyExchange untouched, and (when configured) several operators per peer: peers read
   // these from its ServerHello before relying on either, since an older relay would drop the connection on them.
   if (cfg.relay) {
-    features.push(E2E_SIGN_FEATURE);
+    features.push(E2E_SIGN_FEATURE, OPERATOR_PROOF_FEATURE);
     if (cfg.relay.maxOperatorsPerPeer > 1) features.push(MULTI_OPERATOR_FEATURE);
   }
   if (cfg.e2e && !dataStreams) features.push(E2E_FEATURE, ...(cfg.e2e.signKey ? [E2E_SIGN_FEATURE] : []));
@@ -111,6 +114,9 @@ export function createConnectionFactory(cfg) {
     log: cfg.log ?? (() => {}),
   };
   let counter = 0;
+  // What a client may put in `Open.env` (#126): an allow-list unless the host says otherwise.
+  const execEnv = clientEnvFilter(cfg.execOptions?.clientEnv);
+  const ptyEnv = clientEnvFilter(cfg.pty?.clientEnv);
 
   /**
    * Attach one connection. Two shapes:
@@ -121,7 +127,7 @@ export function createConnectionFactory(cfg) {
    *    `dataStreams: false` means there are no client-opened streams to bind, so exec output rides SessionData.
    *    `e2e` overrides `cfg.e2e` for this connection.
    */
-  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride }) {
+  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride, channelBinding = null }) {
     const cid = ++counter;
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
@@ -144,6 +150,8 @@ export function createConnectionFactory(cfg) {
     let chain = Promise.resolve();
     /** This connection as the relay hub sees it (created on first need). */
     let relayHandle = null;
+    /** Ends the connection at `connectionTtlMs` after authentication (#125). */
+    let ttlTimer = null;
 
     // The gateway needs Node sockets, so `gateway.mjs` is not imported here (a browser host must not pull it in):
     // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`.
@@ -198,6 +206,7 @@ export function createConnectionFactory(cfg) {
     function shutdown(why) {
       if (state.closed) return;
       state.closed = true;
+      clearTimeout(ttlTimer);
       // A hosted session survives its connection (it is detached, then expires or is resumed);
       // everything else dies with it.
       for (const ch of [...channels.values()]) (ch.detach ?? ch.kill)?.call(ch);
@@ -317,6 +326,20 @@ export function createConnectionFactory(cfg) {
       channels.get(m.channel_id)?.input?.(plain);
     }
 
+    /**
+     * `AuthOk` (#125). `ttl` is the lifetime this host enforces on the connection, in seconds (0 = unlimited, the
+     * default); `token` is an opaque per-connection value that carries no authority -- the spec requires the field
+     * and released peers parse it, but nothing on this host accepts it back.
+     */
+    async function grantAuth() {
+      const ttlMs = cfg.connectionTtlMs ?? 0;
+      if (ttlMs > 0) {
+        ttlTimer = setTimeout(() => { log('connection ttl reached'); shutdownAfterQueue('connection ttl reached'); }, ttlMs);
+        ttlTimer.unref?.();
+      }
+      await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: Math.ceil(ttlMs / 1000) }));
+    }
+
     async function refuse(reason) {
       log(`AUTH_FAIL: ${reason}`);
       await send(authFail({ reason }));
@@ -347,6 +370,13 @@ export function createConnectionFactory(cfg) {
             features.push(HOST_KEY_PREFIX + toHex(cfg.hostKey.publicKey), HOST_KEY_SIG_PREFIX + toHex(sig));
           }
         }
+        // Channel binding (#119): what this host can tie the client's signature to on this connection.
+        if (method === 'pubkey') {
+          state.bindingHeld = { ...(channelBinding ?? {}) };
+          if (cfg.hostKey) state.bindingHeld.host = [cfg.hostKey.publicKey];
+          const kinds = Object.keys(state.bindingHeld).filter((k) => state.bindingHeld[k]?.length);
+          features.push(...bindingFeatures(kinds, { required: !!cfg.requireChannelBinding }));
+        }
         state.features = features;
         state.hostFingerprint = hostFingerprint ?? null;
         await send(serverHello({ sessionId: state.sessionId, features, hostFingerprint }));
@@ -372,11 +402,27 @@ export function createConnectionFactory(cfg) {
         } catch { return refuse('malformed public key'); }
         // Verify the signature first: nothing about who is on the allowlist
         // is revealed to a caller who cannot even prove they hold a key.
+        // The signature may be over the empty binding (a client that knows nothing of #119, or a browser that can
+        // bind nothing) or over any combination of the kinds this host offered; a host that requires a binding
+        // accepts only the latter.
+        const required = cfg.requireChannelBinding ?? false;
+        const acceptable = await acceptableBindings(state.bindingHeld ?? {}, { required });
         let ok = false;
+        let boundKinds = [];
         try {
-          ok = await verifyChallenge(key, m.signature, state.sessionId, state.nonce, { username: state.username });
+          for (const cand of acceptable) {
+            if (await verifyChallenge(key, m.signature, state.sessionId, state.nonce, { username: state.username, channelBinding: cand.binding })) { ok = true; boundKinds = cand.kinds; break; }
+          }
         } catch { ok = false; }
-        if (!ok) return refuse('signature does not verify over the transcript');
+        if (!ok) {
+          if (required) {
+            let unbound = false;
+            try { unbound = await verifyChallenge(key, m.signature, state.sessionId, state.nonce, { username: state.username }); } catch { /* not that either */ }
+            if (unbound) return refuse('channel binding required: the signature is not bound to this connection');
+          }
+          return refuse('signature does not verify over the transcript');
+        }
+        state.channelBinding = boundKinds;
         let allowed = false;
         try {
           allowed = await cfg.authorize({ username: state.username, fingerprint: fp, publicKey: m.public_key });
@@ -385,7 +431,7 @@ export function createConnectionFactory(cfg) {
         state.authed = true;
         state.fingerprint = fp;
         state.nonce = null;
-        await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: 3600 }));
+        await grantAuth();
         log(`authenticated ${state.username} (${fp.slice(0, 12)}...)`);
       }
     }
@@ -409,13 +455,13 @@ export function createConnectionFactory(cfg) {
       }
       rl.limiter.succeed(key);
       state.authed = true;
-      await send(authOk({ sessionId: state.sessionId, token: randomBytes(16), ttl: 3600 }));
+      await grantAuth();
       log(`authenticated ${state.username} (password)`);
     }
 
     // ── Relay (createWshServer({ relay })) ────────────────────────────
 
-    const RELAY_TYPES = new Set([MSG.REVERSE_REGISTER, MSG.REVERSE_LIST, MSG.REVERSE_CONNECT, MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT, MSG.RELAY_FORWARD]);
+    const RELAY_TYPES = new Set([MSG.REVERSE_REGISTER, MSG.REVERSE_LIST, MSG.REVERSE_CONNECT, MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT, MSG.RELAY_FORWARD, MSG.REVERSE_CHALLENGE, MSG.REVERSE_PROOF]);
 
     function hubHandle() {
       relayHandle ??= {
@@ -459,6 +505,8 @@ export function createConnectionFactory(cfg) {
         case MSG.REVERSE_LIST: await send(await hub.list({ username: state.username, fingerprint: state.fingerprint })); return true;
         case MSG.REVERSE_CONNECT: await hub.connect(h, m); return true;
         case MSG.REVERSE_ACCEPT: case MSG.REVERSE_REJECT: hub.answer(h, m); return true;
+        case MSG.REVERSE_CHALLENGE: hub.challenge(h, m); return true;
+        case MSG.REVERSE_PROOF: hub.proof(h, m); return true;
         default: hub.forward(h, m); return true; // a RelayForward the client wrote itself
       }
     }
@@ -752,7 +800,7 @@ export function createConnectionFactory(cfg) {
 
       const io = {
         user: state.username,
-        env: m.env && typeof m.env === 'object' && cfg.execOptions.clientEnv !== false ? m.env : {},
+        env: execEnv(m.env),
         cols: m.cols || 80,
         rows: m.rows || 24,
         signal: abort.signal,
@@ -855,7 +903,7 @@ export function createConnectionFactory(cfg) {
         const args = m.command ? ['-c', String(m.command)] : [];
         proc = p.spawn(p.shell, args, {
           name: p.term, cols, rows, cwd: p.cwd,
-          env: { ...(p.env ?? globalThis.process?.env), TERM: p.term, ...(m.env && typeof m.env === 'object' ? m.env : {}) },
+          env: { ...(p.env ?? globalThis.process?.env), TERM: p.term, ...ptyEnv(m.env) },
         });
       } catch (e) {
         return send(openFail({ reason: `pty spawn failed: ${e.message}` }));

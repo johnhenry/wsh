@@ -54,6 +54,9 @@ export interface WshServerHostKey {
   openssh: string;
 }
 
+/** The `clientEnv` option of `exec` and `pty`: see {@link WshServerExecOptions.clientEnv}. */
+export type WshClientEnv = boolean | string[] | ((name: string, value: string) => boolean);
+
 /** What a custom `exec` runner receives for one session. */
 export interface WshExecIo {
   user: string;
@@ -85,8 +88,12 @@ export interface WshServerExecOptions {
   shell?: boolean | string;
   /** Kill a session after this long (0 / omitted = never). */
   timeoutMs?: number;
-  /** Apply `env` sent by the client (default `true`). */
-  clientEnv?: boolean;
+  /**
+   * Which `env` variables a client may set. Default: an allow-list (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`).
+   * `true` accepts everything (the behaviour before 0.36), `false` nothing, a list names exact variables or `PREFIX_*`
+   * patterns (replacing the default list), a function decides per variable.
+   */
+  clientEnv?: WshClientEnv;
   /** Replace the child_process runner entirely (e.g. a restricted, no-shell host). */
   run?: WshExecRunner;
 }
@@ -111,6 +118,8 @@ export interface WshServerPtyOptions {
   env?: Record<string, string | undefined>;
   /** `TERM` value (default `xterm-256color`). */
   term?: string;
+  /** Which `env` variables a client may add to the shell's environment; same forms and default as `exec.clientEnv`. */
+  clientEnv?: WshClientEnv;
 }
 
 export interface WshServerFsOptions {
@@ -372,6 +381,14 @@ export interface WshServerOptions {
   rpcMaxInflight?: number;
   /** How long exec output waits for a client that has not yet opened its data stream (default 3000). */
   bindTimeoutMs?: number;
+  /** End every authenticated connection this long after login; advertised as `AuthOk.ttl` (whole seconds, rounded up). 0 / omitted = never. */
+  connectionTtlMs?: number;
+  /**
+   * Accept a key login only when its signature is bound to this connection (#119): `true` needs any binding kind, an array
+   * names kinds that must all be bound (`host` needs `hostKey`; `tls-exporter` needs `wss://` served by this process, not a
+   * TLS-terminating proxy; `cert-hash` needs WebTransport with `selfSigned`). Clients older than 0.36 cannot satisfy it.
+   */
+  requireChannelBinding?: boolean | Array<'cert-hash' | 'host' | 'tls-exporter'>;
   onLog?: (line: string) => void;
 }
 
@@ -474,7 +491,14 @@ export interface WshReverseHostOptions {
   /** This host's identity; its fingerprint is what operators connect to. */
   keyPair: CryptoKeyPair;
   /** Who may be bridged to this host. Default: nobody. */
-  accept?: (operator: { fingerprint: string; username: string }) => boolean | Promise<boolean>;
+  accept?: (operator: {
+    fingerprint: string;
+    username: string;
+    /** True when the operator signed a challenge from THIS host (wsh #117): `fingerprint` and `username` are then the operator's own claim, not the relay's. */
+    proven: boolean;
+    /** The operator's raw Ed25519 key, when `proven`. */
+    publicKey?: Uint8Array;
+  }) => boolean | Promise<boolean>;
   exec?: true | WshServerExecOptions | WshExecRunner;
   pty?: WshServerPtyOptions;
   fs?: WshServerFsOptions;
@@ -501,6 +525,16 @@ export interface WshReverseHostOptions {
    * `hybrid` (default true) offers X25519+ML-KEM-768 when asked and available.
    */
   e2e?: false | { sign?: boolean | 'auto'; hybrid?: boolean };
+  /**
+   * Require the operator to prove its identity to this host (wsh #117) and seal the bridge: an operator that does not
+   * offer proof is refused, `accept` runs only after the proof verifies (with the identity taken from the proof, not
+   * the relay), and this host acts only on messages sealed under a key exchange both sides signed -- a relay cannot
+   * inject an `Open`. Needs `e2e` and `reportFeatures`. Without it the proof is still requested when the relay and the
+   * operator can do it, and reported as `proven`.
+   */
+  requireOperatorProof?: boolean;
+  /** How long an operator has to answer the challenge (default 5000). */
+  proofTimeoutMs?: number;
   onLog?: (line: string) => void;
 }
 

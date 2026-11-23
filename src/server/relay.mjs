@@ -36,6 +36,7 @@ const MAX_REMEMBERED_SEQS = 4096;
 const MAX_CAPABILITIES = 32;
 const MAX_FEATURES = 64;
 const MAX_FEATURE_LENGTH = 128;
+const MAX_OPERATOR_FEATURES = 16;
 const SHORT_PREFIX_MIN = 8;
 
 /** `ReverseReject.reason` for a peer that already has an operator (or a request awaiting its answer). */
@@ -245,12 +246,15 @@ export class RelayHub {
     timer.unref?.();
     this.#pending.set(target.handle, { operator, timer });
     // The relay speaks for the operator's identity; whatever the client wrote in these fields is discarded.
-    target.handle.send({
+    const forwarded = {
       type: MSG.REVERSE_CONNECT,
       target_fingerprint: target.meta.fingerprint,
       username: operator.username,
       from_fingerprint: operator.fingerprint,
-    });
+    };
+    // What the operator says it can do (#117), bounded; it is the operator's own claim and decides nothing here.
+    if (Array.isArray(msg.features) && msg.features.length <= MAX_OPERATOR_FEATURES && msg.features.every((f) => isStr(f, MAX_FEATURE_LENGTH))) forwarded.features = [...msg.features];
+    target.handle.send(forwarded);
     this.log(`relay: ${operator.fingerprint.slice(0, 12)} -> ${target.meta.fingerprint.slice(0, 12)} requested`);
   }
 
@@ -275,6 +279,45 @@ export class RelayHub {
       if (!ops) this.#peerOperators.set(peer, ops = new Map());
       ops.set(p.operator.fingerprint, p.operator);
       this.log(`relay: bridged ${p.operator.fingerprint.slice(0, 12)} <-> ${peer.fingerprint.slice(0, 12)}`);
+    }
+  }
+
+  /**
+   * `ReverseChallenge` from a peer to the operator whose `ReverseConnect` it is answering (#117). Carried, not
+   * interpreted: the relay cannot forge it (the peer signed it) and gains nothing by reading it.
+   */
+  challenge(peer, msg) {
+    const p = this.#pending.get(peer);
+    if (!p || !(msg.public_key instanceof Uint8Array) || !(msg.signature instanceof Uint8Array) || !(msg.nonce instanceof Uint8Array)
+      || !isStr(msg.session_id, 256) || !isStr(msg.operator_fingerprint, 256) || msg.public_key.length > 64 || msg.signature.length > 128 || msg.nonce.length > 64) return;
+    p.operator.send({
+      type: MSG.REVERSE_CHALLENGE,
+      target_fingerprint: peer.fingerprint,
+      public_key: msg.public_key,
+      operator_fingerprint: msg.operator_fingerprint,
+      nonce: msg.nonce,
+      session_id: msg.session_id,
+      signature: msg.signature,
+    });
+  }
+
+  /** `ReverseProof` from an operator to the peer it has a pending `ReverseConnect` with (#117). */
+  proof(operator, msg) {
+    for (const [target, p] of this.#pending) {
+      if (p.operator !== operator) continue;
+      if (!(msg.public_key instanceof Uint8Array) || !(msg.signature instanceof Uint8Array) || !(msg.nonce instanceof Uint8Array)
+        || !isStr(msg.session_id, 256) || !isStr(msg.username, 64) || msg.public_key.length > 64 || msg.signature.length > 128 || msg.nonce.length > 64) return;
+      target.send({
+        type: MSG.REVERSE_PROOF,
+        target_fingerprint: target.fingerprint,
+        public_key: msg.public_key,
+        username: msg.username,
+        nonce: msg.nonce,
+        session_id: msg.session_id,
+        signature: msg.signature,
+        from_fingerprint: operator.fingerprint,
+      });
+      return;
     }
   }
 

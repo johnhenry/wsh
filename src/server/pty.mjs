@@ -21,5 +21,6 @@ export function normalizePty(pty) {
     cwd: pty.cwd,
     env: pty.env,
     term: pty.term ?? 'xterm-256color',
+    clientEnv: pty.clientEnv,
   };
 }

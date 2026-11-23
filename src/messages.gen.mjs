@@ -65,6 +65,8 @@ export const MSG = Object.freeze({
   REVERSE_REJECT:    0x55,
   RELAY_FORWARD:     0x56,
   REVERSE_CLOSE:     0x57,
+  REVERSE_CHALLENGE: 0x58,
+  REVERSE_PROOF:     0x59,
 
   // Session
   SESSION_LIST:      0x5f,
@@ -497,13 +499,10 @@ export function reversePeers({ peers } = {}) {
   };
 }
 
-export function reverseConnect({ targetFingerprint, username, fromFingerprint } = {}) {
-  return {
-    type: MSG.REVERSE_CONNECT,
-    target_fingerprint: targetFingerprint,
-    username,
-    from_fingerprint: fromFingerprint,
-  };
+export function reverseConnect({ targetFingerprint, username, fromFingerprint, features } = {}) {
+  const msg = { type: MSG.REVERSE_CONNECT, target_fingerprint: targetFingerprint, username, from_fingerprint: fromFingerprint };
+  if (features !== undefined) msg.features = features;
+  return msg;
 }
 
 export function reverseAccept({ targetFingerprint, username, capabilities = [], peerType = "host", shellBackend = "pty", supportsAttach = false, supportsReplay = false, supportsEcho = false, supportsTermSync = false, features } = {}) {
@@ -530,6 +529,24 @@ export function relayForward({ fromFingerprint, inner, toFingerprint } = {}) {
 export function reverseClose({ targetFingerprint, reason } = {}) {
   const msg = { type: MSG.REVERSE_CLOSE, target_fingerprint: targetFingerprint };
   if (reason !== undefined) msg.reason = reason;
+  return msg;
+}
+
+export function reverseChallenge({ targetFingerprint, publicKey, operatorFingerprint, nonce, sessionId, signature } = {}) {
+  return {
+    type: MSG.REVERSE_CHALLENGE,
+    target_fingerprint: targetFingerprint,
+    public_key: publicKey,
+    operator_fingerprint: operatorFingerprint,
+    nonce,
+    session_id: sessionId,
+    signature,
+  };
+}
+
+export function reverseProof({ targetFingerprint, publicKey, username, nonce, sessionId, signature, fromFingerprint } = {}) {
+  const msg = { type: MSG.REVERSE_PROOF, target_fingerprint: targetFingerprint, public_key: publicKey, username, nonce, session_id: sessionId, signature };
+  if (fromFingerprint !== undefined) msg.from_fingerprint = fromFingerprint;
   return msg;
 }
 

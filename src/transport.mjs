@@ -136,6 +136,17 @@ export class WshTransport {
     return this.#state;
   }
 
+  /**
+   * TLS keying material for channel binding (#119): `length` bytes exported with `label` (RFC 5705 / 8446 7.5), or
+   * `null` where the platform does not expose it (every browser, and Node's own global `WebSocket`).
+   * @param {string} label
+   * @param {number} length
+   * @returns {Uint8Array | null}
+   */
+  tlsExporter(label, length) { // eslint-disable-line no-unused-vars
+    return null;
+  }
+
   /** @protected Update internal state. */
   _setState(s) {
     this.#state = s;
