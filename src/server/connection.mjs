@@ -29,6 +29,7 @@ import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } f
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
+import { gatewayFeatures } from './gateway-core.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -42,7 +43,7 @@ export const STREAM_ANNOUNCE = 'stream-announce';
 export function hostFeatures(cfg, { dataStreams = true } = {}) {
   const features = dataStreams ? [STREAM_ANNOUNCE] : [];
   if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE);
-  if (cfg.gateway) features.push('gateway');
+  if (cfg.gateway) features.push(...gatewayFeatures(cfg.gateway));
   if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
   // End-to-end encryption (#90) is the virtual-mode EncryptedFrame layer, so it is offered where there are no
   // client-opened streams: over a relay bridge.
@@ -146,9 +147,12 @@ export function createConnectionFactory(cfg) {
     let relayHandle = null;
 
     // The gateway needs Node sockets, so `gateway.mjs` is not imported here (a browser host must not pull it in):
-    // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`.
+    // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`; a
+    // host in a page passes the endpoints-only session of `gateway-core.mjs` (`createMemoryHost({ endpoints })`).
     if (cfg.gateway && typeof cfg.createGatewaySession !== 'function') throw new TypeError('createConnectionFactory: gateway needs createGatewaySession (only @johnhenry/wsh/server provides one)');
-    const gateway = cfg.gateway ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log) : null;
+    const gateway = cfg.gateway
+      ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log, { who: () => ({ username: state.username, fingerprint: state.fingerprint }) })
+      : null;
 
     const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
 
@@ -337,6 +341,7 @@ export function createConnectionFactory(cfg) {
         }
         state.username = user;
         state.method = method;
+        gateway?.setPeerFeatures(m.features);
         const features = hostFeatures(cfg, { dataStreams });
         let hostFingerprint;
         if (cfg.hostKey) {

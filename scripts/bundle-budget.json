@@ -2,32 +2,32 @@
   "note": "Browser bundle budget: `npm run size -- --update` rewrites it. A bundle may exceed its gzip figure by 10% before the test fails.",
   "entries": {
     ".": {
-      "raw": 132920,
-      "gzip": 40239
+      "raw": 142445,
+      "gzip": 42892
     },
     "./memory": {
-      "raw": 154903,
-      "gzip": 48043
+      "raw": 170559,
+      "gzip": 52656
     },
     "./host": {
-      "raw": 82279,
-      "gzip": 26835
+      "raw": 82988,
+      "gzip": 27140
     },
     "./reverse": {
-      "raw": 147831,
-      "gzip": 45821
+      "raw": 158388,
+      "gzip": 48816
     },
     ". (generateKeyPair only)": {
       "raw": 404,
       "gzip": 324
     },
     ". (WshClient only)": {
-      "raw": 104945,
-      "gzip": 31697
+      "raw": 115086,
+      "gzip": 34428
     },
     "./host (createConnectionFactory only)": {
-      "raw": 66918,
-      "gzip": 21861
+      "raw": 67438,
+      "gzip": 22089
     }
   }
 }

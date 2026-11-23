@@ -7,12 +7,13 @@
  * password auth, exec channels, MCP tools, extensions), speaking QMux over a pair of in-memory WebSocket-like
  * sockets -- so what a client does here is what it does against a server. It serves what a browser can: `exec` as a
  * function you provide (there is no shell), `mcp` tools, `extensions`, typed `rpc` channels (handler functions you
- * provide) and `sessions` (detach / attach / resume of exec sessions, output replayed from an in-memory ring buffer).
+ * provide), `sessions` (detach / attach / resume of exec sessions, output replayed from an in-memory ring buffer) and
+ * `endpoints` (named virtual endpoints, the in-memory stand-in for unix sockets, with flow control).
  * Backends are injected, shaped like the Node host's: `pty` (`{ spawn }`, node-pty shaped), `fs` (an object of file
  * operations, not a root path), `hostKey` (a `CryptoKeyPair`, which may be non-extractable, or a signer
  * `{ publicKey, sign }`).
- * Not available: `gateway`, `relay`, WebTransport, `exec: true` and `fs: { root }` (they need Node), the `wsh-host` /
- * `wsh-fs` rpc built-ins (use `@johnhenry/wsh/server`).
+ * Not available: the TCP, DNS, UDP and unix-socket parts of `gateway` (named `endpoints` are), `relay`, WebTransport,
+ * `exec: true` and `fs: { root }` (they need Node), the `wsh-host` / `wsh-fs` rpc built-ins (use `@johnhenry/wsh/server`).
  *
  * To serve a socket someone else upgraded (a WebSocket the page opened to a relay, a byte pipe) use `host.accept(socket)`;
  * a peer that cannot open QMux data streams (the released Rust client over WebSocket) needs `dataStreams: false`.
@@ -33,6 +34,7 @@ import { createConnectionFactory } from './server/connection.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
 import { resolveBackends, resolveHostKey } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
+import { normalizeEndpointGateway, createEndpointGatewaySession } from './server/gateway-core.mjs';
 import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
 
@@ -155,10 +157,16 @@ function createRegistry(sessions, log) {
  *   `createWshServer`, with the same defaults (300000 ms detached, 16 detached sessions, 1 MiB of replayable output
  *   per session). Off unless given: sessions then die with their connection. There is no `sessionSecret`: session
  *   tokens are random per session.
+ * @param {Record<string, ((duplex: object, who: { username: string | null, fingerprint: string | null }) => void | Promise<void>) | { open: Function, authorize?: (who: object) => boolean | Promise<boolean> }>} [options.endpoints]
+ *   Named virtual endpoints (a host with no file system exposes these instead of unix sockets): a client reaches one with
+ *   `client.openEndpoint(name)`. `duplex` is `{ readable, writable, close(), destroy(), closed, who }` (web streams with
+ *   backpressure) and `who` is the authenticated `{ username, fingerprint }`, so the handler can authorise per call:
+ *   throw synchronously to refuse, or give `{ open, authorize(who) }`. Only the names listed here exist (an allow-list by
+ *   construction); nothing else of the gateway (TCP, DNS, unix sockets) is on in memory.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, dataStreams = true, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
   if (exec === true) throw new TypeError('createMemoryHost: exec must be a function (run(command, io)); there is no shell to run `true` with');
   if (exec !== undefined && typeof exec !== 'function' && typeof exec?.run !== 'function') {
     throw new TypeError('createMemoryHost: exec must be a function or { run }');
@@ -176,10 +184,14 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
     failureDelayMs: rl.failureDelayMs ?? 250,
   };
   const methods = authMethods(auth);
+  // Named virtual endpoints: a gateway with no TCP, DNS or unix sockets that answers only `OpenEndpoint`, built from
+  // the browser-safe core (`server/gateway-core.mjs`), so a page can have it.
+  const gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints });
 
   const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, log: onLog,
-    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: null, sessions: registry, relay: null,
+    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost,
+    gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));
   ready.catch(() => {});
 

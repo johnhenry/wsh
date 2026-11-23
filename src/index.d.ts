@@ -2073,6 +2073,31 @@ export interface WshFileOperationResult {
  * Supports forward connections (client opens sessions on a remote server) and
  * reverse mode (client registers as a peer for incoming connections).
  */
+/** Options for `openUnix` / `openEndpoint` / `openTcp`. */
+export interface WshGatewayOpenOptions { signal?: AbortSignal; timeoutMs?: number }
+
+/** One gateway connection as web streams with backpressure (credit-based flow control when both ends offer `gateway-credit`). */
+export interface WshGatewayDuplex {
+  /** What the peer sends. Read it to keep credit flowing: a reader that stops reading stops the peer. */
+  readable: ReadableStream<Uint8Array>;
+  /** What you send. Each write waits for credit; closing it half-closes (the peer finishes and closes its side). */
+  writable: WritableStream<Uint8Array>;
+  /** Half-close: nothing more will be written. */
+  close(reason?: string): void;
+  /** Tear the connection down now. */
+  destroy(reason?: string): void;
+  /** Settles once the connection is over. */
+  closed: Promise<string | undefined>;
+}
+
+/** A GatewayFail / ListenFail as an Error: `code` 4 = refused by the host's policy, 7 = too many connections, 1 = refused by the target. */
+export class GatewayError extends Error { code: number }
+
+/** The feature a client lists in `Hello.features` and a host in `ServerHello.features` to meter gateway data with `GatewayCredit`. */
+export const GATEWAY_CREDIT_FEATURE: 'gateway-credit';
+/** Credit, in bytes, each direction of a gateway connection starts with. */
+export const GATEWAY_CREDIT_WINDOW: 262144;
+
 export class WshClient {
   /** Current client state. */
   readonly state: 'disconnected' | 'connecting' | 'connected' | 'authenticated' | 'closed';
@@ -2160,6 +2185,25 @@ export class WshClient {
    * Open a new PTY or exec session on the remote server.
    */
   openSession(opts?: WshOpenSessionOptions): Promise<WshSession>;
+
+  // ── Gateway: unix sockets, named endpoints, TCP egress (#120, #123) ──
+
+  /** Connect to a unix-domain socket on the HOST (needs the host feature `gateway-unix`; refused unless its policy lists the path). */
+  openUnix(path: string, opts?: WshGatewayOpenOptions): Promise<WshGatewayDuplex>;
+  /** Open the host's named virtual endpoint (needs the host feature `gateway-endpoints`). */
+  openEndpoint(name: string, opts?: WshGatewayOpenOptions): Promise<WshGatewayDuplex>;
+  /** Connect to host:port FROM THE HOST (needs the host feature `gateway`; refused unless its `gateway.allow` lists it). */
+  openTcp(host: string, port: number, opts?: WshGatewayOpenOptions): Promise<WshGatewayDuplex>;
+  /** A UDP flow to host:port FROM THE HOST over the reliable control stream: each chunk is one datagram (at most 65507 bytes); the host drops what the receiver cannot keep up with. */
+  openUdp(host: string, port: number, opts?: WshGatewayOpenOptions): Promise<WshGatewayDuplex>;
+  /** Ask the host to listen on a unix-domain socket and hand each connection to `onConnection` (OpenSSH `-R`). */
+  listenUnix(path: string, opts: { replace?: boolean; timeoutMs?: number; onConnection: (duplex: WshGatewayDuplex, info: { peer: string }) => void }): Promise<{ path: string; close(): Promise<void> }>;
+  /**
+   * Node only: forward between a local endpoint and a remote one (`ssh -L` / `-R` with unix sockets and TCP ports mixed).
+   * Each of `local` and `remote` is a socket path (starts with `/`, `./` or `@`) or `host:port`. With `reverse: true` the
+   * HOST listens on `remote` (a unix path) and connections are made to `local` from here.
+   */
+  forwardUnix(opts: { local: string; remote: string; reverse?: boolean; replace?: boolean; onError?: (err: Error) => void }): Promise<{ local: string; remote: string; address?: { address: string; family: string; port: number } | string | null; close(): Promise<void> }>;
 
   /**
    * Open a typed (object-mode) RPC channel (wsh #85): JSON-RPC 2.0 over a CBOR sequence on one stream. Sugar over

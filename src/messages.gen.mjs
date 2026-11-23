@@ -73,6 +73,9 @@ export const MSG = Object.freeze({
   DETACH_FAIL:       0x62,
 
   // Gateway
+  OPEN_UNIX:         0x63,
+  OPEN_ENDPOINT:     0x64,
+  LISTEN_UNIX:       0x65,
   OPEN_TCP:          0x70,
   OPEN_UDP:          0x71,
   RESOLVE_DNS:       0x72,
@@ -88,6 +91,7 @@ export const MSG = Object.freeze({
   LISTEN_FAIL:       0x7c,
   LISTEN_CLOSE:      0x7d,
   GATEWAY_DATA:      0x7e,
+  GATEWAY_CREDIT:    0x7f,
 
   // Guest
   GUEST_INVITE:      0x80,
@@ -561,6 +565,28 @@ export function detachFail({ reason } = {}) {
   };
 }
 
+export function openUnix({ gatewayId, path } = {}) {
+  return {
+    type: MSG.OPEN_UNIX,
+    gateway_id: gatewayId,
+    path,
+  };
+}
+
+export function openEndpoint({ gatewayId, name } = {}) {
+  return {
+    type: MSG.OPEN_ENDPOINT,
+    gateway_id: gatewayId,
+    name,
+  };
+}
+
+export function listenUnix({ listenerId, path, replace } = {}) {
+  const msg = { type: MSG.LISTEN_UNIX, listener_id: listenerId, path };
+  if (replace !== undefined) msg.replace = replace;
+  return msg;
+}
+
 export function openTcp({ gatewayId, host, port } = {}) {
   return {
     type: MSG.OPEN_TCP,
@@ -674,6 +700,14 @@ export function gatewayData({ gatewayId, data } = {}) {
     type: MSG.GATEWAY_DATA,
     gateway_id: gatewayId,
     data,
+  };
+}
+
+export function gatewayCredit({ gatewayId, bytes } = {}) {
+  return {
+    type: MSG.GATEWAY_CREDIT,
+    gateway_id: gatewayId,
+    bytes,
   };
 }
 
@@ -948,6 +982,7 @@ export const RELAY_FORWARDABLE = new Set([
   MSG.SIGNAL,
   MSG.SESSION_DATA,
   MSG.GATEWAY_DATA,
+  MSG.GATEWAY_CREDIT,
   MSG.GATEWAY_OK,
   MSG.GATEWAY_FAIL,
   MSG.GATEWAY_CLOSE,
