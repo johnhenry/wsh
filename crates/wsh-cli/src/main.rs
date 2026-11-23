@@ -131,7 +131,11 @@ struct Cli {
     )]
     no_operator_proof: bool,
 
-    /// `wsh reverse-connect`: seal the bridge. A key exchange both sides sign comes first and
+    /// Seal the session end to end (#155): after login a key exchange both sides sign (the host's
+    /// proven key and yours) comes first, and everything after -- gateway and endpoint data
+    /// included -- crosses the wire encrypted, so a pipe relay that only copies bytes cannot read or
+    /// alter it. Fails, sending nothing, against a host that does not offer it (no downgrade); a
+    /// host that serves nothing unsealed is sealed to automatically. On `wsh reverse-connect`: seal the bridge. A key exchange both sides sign comes first and
     /// everything after crosses the relay encrypted, so the relay cannot read it, replay it or speak
     /// for you. Needs a peer that proves its key and states `e2e-sealed` (a `wsh reverse` /
     /// `wsh agent run` with an identity, or a JS reverse host); nothing is sent otherwise. Needed
@@ -395,7 +399,8 @@ async fn main() {
         } else {
             commands::common::OperatorProofMode::Auto
         },
-        sealed: cli.sealed,
+        sealed: cli.sealed && matches!(cli.command, Some(Command::ReverseConnect { .. })),
+        sealed_session: cli.sealed && !matches!(cli.command, Some(Command::ReverseConnect { .. })),
     });
 
     if let Some(via) = cli.via.clone() {

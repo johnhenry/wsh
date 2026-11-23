@@ -86,7 +86,10 @@ pub async fn run_relay(
             checks.push(CheckItem {
                 name: "relay-connect",
                 status: CheckStatus::Ok,
-                detail: format!("connected to {}", resolved.url),
+                detail: format!(
+                    "connected to {}",
+                    crate::commands::common::redact_rendezvous(&resolved.url)
+                ),
             });
 
             let peers = fetch_peers(&client)

@@ -351,8 +351,10 @@ pub struct IdentityPolicy {
     pub allow_operators: Vec<String>,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
     pub operator_proof: OperatorProofMode,
-    /// Reverse operator: seal the bridge (`--sealed`).
+    /// Reverse operator: seal the bridge (`--sealed` on `wsh reverse-connect`).
     pub sealed: bool,
+    /// Every other command that dials one host: seal the whole session or fail (`--sealed`, #155).
+    pub sealed_session: bool,
 }
 
 /// Whether `wsh reverse-connect` offers to prove its identity to the peer.
@@ -478,6 +480,11 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
         username: resolved.user.clone(),
         key_name: Some(identity.to_string()),
         known_host: resolved.known_host.clone(),
+        seal_session: if identity_policy().sealed_session {
+            wsh_client::SessionSeal::Required
+        } else {
+            wsh_client::SessionSeal::Auto
+        },
         ..Default::default()
     };
 
@@ -502,6 +509,9 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
         {
             Ok(client) => {
                 // `-L` / `-R`: the forwards live as long as this connection does.
+                if client.session_sealed() {
+                    eprintln!("wsh: session sealed end to end (a relay in the middle carries ciphertext only)");
+                }
                 crate::commands::forward::start_configured(&client).await?;
                 // `--share`: offer the folders for the life of this connection.
                 crate::commands::share::start_configured(&client).await?;
@@ -512,14 +522,18 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
     }
 
     if errors.len() == 1 {
-        anyhow::bail!("failed to connect to {} ({})", resolved.url, errors[0]);
+        anyhow::bail!(
+            "failed to connect to {} ({})",
+            redact_rendezvous(&resolved.url),
+            redact_rendezvous(&errors[0])
+        );
     }
 
     anyhow::bail!(
         "failed to connect to {}:{} across transports ({})",
         resolved.host,
         resolved.port,
-        errors.join("; ")
+        redact_rendezvous(&errors.join("; "))
     )
 }
 
@@ -907,6 +921,44 @@ mod tests {
         assert_eq!(
             parse_endpoint("./weird:name.txt").unwrap(),
             Endpoint::Local(PathBuf::from("./weird:name.txt"))
+        );
+    }
+}
+
+/// A pipe-relay URL (`wss://relay/r/<id>`) with its rendezvous id shortened: the id is a capability
+/// (whoever holds it can dial the other half while it waits), so it does not belong in an error
+/// line, a log or a ticket (#156).
+pub fn redact_rendezvous(url: &str) -> String {
+    match url.split_once("/r/") {
+        Some((head, tail)) => {
+            let (id, rest) = tail
+                .find(['?', '#', '/'])
+                .map_or((tail, ""), |i| tail.split_at(i));
+            let shown: String = id.chars().take(4).collect();
+            if id.len() > 4 {
+                format!("{head}/r/{shown}...{rest}")
+            } else {
+                url.to_string()
+            }
+        }
+        None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_rendezvous;
+
+    #[test]
+    fn the_rendezvous_id_is_shortened_and_the_rest_kept() {
+        assert_eq!(
+            redact_rendezvous("wss://relay.example/r/AbCdEfGhIjKlMnOpQrStUv?role=host"),
+            "wss://relay.example/r/AbCd...?role=host"
+        );
+        assert_eq!(redact_rendezvous("wss://h:1/"), "wss://h:1/");
+        assert!(
+            !redact_rendezvous("ws://127.0.0.1:9/r/SECRETSECRETSECRETSECRET")
+                .contains("SECRETSECRET")
         );
     }
 }

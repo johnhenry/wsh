@@ -87,6 +87,9 @@ function tlsChannelBinding(socket) {
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {number} [options.connectionTtlMs=0] - End every authenticated connection this long after login (0 = never).
  *   Advertised as `AuthOk.ttl` in whole seconds, rounded up; the client reads it as `client.authTtl`.
+ * @param {false | 'offer' | 'require'} [options.sealSession=false] - #155: seal a session end to end when the client asks (`e2e-session`); see
+ *   `createMemoryHost`. Offered on connections accepted with `dataStreams: false` (a socket handed to `server.accept`); a
+ *   byte-stream connection with QMux data streams is not sealed.
  * @param {boolean | string[]} [options.requireChannelBinding=false] - Accept a key login only when its signature is bound to
  *   this connection (#119): `true` needs any binding kind, an array names kinds that must all be bound (`host` needs
  *   `hostKey`; `tls-exporter` needs `wss://` served by this process, not a TLS-terminating proxy; `cert-hash` needs
@@ -98,10 +101,12 @@ function tlsChannelBinding(socket) {
  * @returns {{ listen(): Promise<{address: string, port: number}>, accept(socket: object, options?: object): Promise<{ close(): void }>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, onLog = () => {},
+  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
   onShare,
 } = {}) {
   validateOnShare(onShare, 'createWshServer');
+  if (sealSession !== false && sealSession !== 'offer' && sealSession !== 'require') throw new TypeError("createWshServer: sealSession must be false, 'offer' or 'require'");
+  if (sealSession && !hostKey) throw new TypeError('createWshServer: sealSession needs a hostKey (the host signs its half of the key exchange with it)');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createWshServer: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
   }
@@ -151,7 +156,7 @@ export function createWshServer({
       if (relay) hub = new RelayHub({ ...relay, log: onLog });
       if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createWshServer: extensions must be an object of handlers');
       return createConnectionFactory({
-        authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, log: onLog,
+        authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, createGatewaySession, sessions: registry, relay: hub,
         onShare,
       });

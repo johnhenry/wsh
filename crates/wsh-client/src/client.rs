@@ -55,6 +55,8 @@ pub struct ConnectConfig {
     /// The SHA-256 of the WebTransport certificate this connection is pinned to, when it is
     /// pinned to exactly one: the `cert-hash` binding kind.
     pub cert_hash: Option<[u8; 32]>,
+    /// Seal the whole session end to end (wsh #155): see [`SessionSeal`].
+    pub seal_session: SessionSeal,
     /// Ping interval in seconds (0 = disabled).
     pub ping_interval_secs: u64,
     /// Connection timeout in seconds.
@@ -70,6 +72,7 @@ impl Default for ConnectConfig {
             verify_host: true,
             known_host: None,
             require_host_key: false,
+            seal_session: SessionSeal::Auto,
             first_use: FirstUse::Refuse,
             known_hosts_path: None,
             require_channel_binding: false,
@@ -208,6 +211,18 @@ fn take_matching_waiter(waiters: &mut Vec<Waiter>, envelope: &Envelope) -> Optio
     Some(waiters.remove(idx))
 }
 
+/// Whether to seal a direct or pipe-relayed session end to end (wsh #155).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionSeal {
+    /// Seal when the host says it serves nothing else (`e2e-session-required`); otherwise as before.
+    #[default]
+    Auto,
+    /// Seal, or fail: a host that does not offer it is refused (no silent downgrade).
+    Required,
+    /// Never (a host that requires it will then serve nothing).
+    Off,
+}
+
 /// Options of [`WshClient::reverse_connect_with`].
 #[derive(Default, Clone, Copy)]
 pub struct ReverseConnectOptions<'a> {
@@ -281,6 +296,8 @@ pub struct WshClient {
     gateway: Arc<GatewayHub>,
     /// Seals what crosses a sealed bridge (wsh #117, #145); off until a bridge is set up.
     seal: Arc<SealGate>,
+    /// The key this connection logged in with (kept to sign the sealed-session key exchange).
+    login_key: Option<ed25519_dalek::SigningKey>,
 }
 
 /// Opens connections through the host and listens on it; cheap to clone, usable from any task.
@@ -469,6 +486,7 @@ impl WshClient {
             accepted_relay_peers: accepted_relay_peers.clone(),
             gateway: gateway.clone(),
             seal: seal.clone(),
+            login_key: None,
             early: early.clone(),
             host_key: None,
             host_key_newly_pinned: false,
@@ -518,6 +536,22 @@ impl WshClient {
             })
         };
         client.dispatch_handle = Some(dispatch_handle);
+
+        // A sealed session (#155): after login, before anything else is sent.
+        let host_requires = client
+            .server_features
+            .lock()
+            .await
+            .iter()
+            .any(|f| f == crate::seal_gate::SESSION_SEAL_REQUIRED_FEATURE);
+        if config.seal_session == SessionSeal::Required
+            || (config.seal_session == SessionSeal::Auto && host_requires)
+        {
+            if let Err(e) = client.seal_session(true, timeout).await {
+                let _ = client.disconnect().await;
+                return Err(e);
+            }
+        }
 
         // Spawn keepalive if configured
         if config.ping_interval_secs > 0 {
@@ -842,6 +876,81 @@ impl WshClient {
             peer_proven: verified,
             sealed: true,
         })
+    }
+
+    /// Seal this whole connection end to end (wsh #155): a `KeyExchange` for the connection's
+    /// session id, signed by this login key and by the host's PROVEN key, then every message but
+    /// the keepalive -- gateway and endpoint data included -- travels as an `EncryptedFrame` on
+    /// channel 0, so a relay that only copies bytes (a pipe relay) can neither read nor alter it,
+    /// and a frame that does not open closes the connection. Needs a host that lists
+    /// `e2e-session`, a host key it proved, and a key login; fails with a sentence, having sent
+    /// nothing, otherwise.
+    pub async fn seal_session(&self, hybrid: bool, timeout: Duration) -> WshResult<()> {
+        let fail = |why: &str| {
+            Err(WshError::AuthFailed(format!(
+                "sealed session: {why} -- nothing was sent"
+            )))
+        };
+        if !self
+            .has_feature(crate::seal_gate::SESSION_SEAL_FEATURE)
+            .await
+        {
+            return fail(&format!(
+                "the host does not offer \"{}\" (it must have a host key and serve a connection without client-opened data streams)",
+                crate::seal_gate::SESSION_SEAL_FEATURE
+            ));
+        }
+        let Some(host_key) = self.host_key.as_ref() else {
+            return fail("the host proved no host key to authenticate the exchange against");
+        };
+        let Some(login_key) = self.login_key.as_ref() else {
+            return fail(
+                "a sealed session needs a key login (a password login has nothing to sign with)",
+            );
+        };
+        let Some(session_id) = self.session_id.clone() else {
+            return fail("no session id");
+        };
+        self.seal.begin_session(session_id.clone());
+        self.seal.set_close_on_failure(true);
+        let algorithm = if hybrid {
+            ALGORITHM_HYBRID
+        } else {
+            crate::e2e::ALGORITHM_X25519
+        };
+        let exchanged = self
+            .initiate_e2e_with(
+                &session_id,
+                algorithm,
+                timeout,
+                E2eOptions {
+                    verify_peer: Some(host_key.public_key),
+                    sign_as: Some(login_key),
+                    responder_identity: Some(host_key.public_key),
+                },
+            )
+            .await;
+        match exchanged {
+            Ok(x) => {
+                self.seal
+                    .install(crate::bridge_seal::SealedBridge::with_scope(
+                        x.shared_secret,
+                        session_id,
+                        crate::e2e_frame::RoleTag::Initiator,
+                        crate::bridge_seal::Scope::Session,
+                    ));
+                Ok(())
+            }
+            Err(e) => {
+                self.seal.end();
+                Err(e)
+            }
+        }
+    }
+
+    /// Is this session sealed end to end (see [`seal_session`](Self::seal_session))?
+    pub fn session_sealed(&self) -> bool {
+        self.seal.is_sealed() && self.seal.scope() == Some(crate::bridge_seal::Scope::Session)
     }
 
     /// A bridge for `session_id` is being set up on this connection (the peer side of a sealed
@@ -1699,6 +1808,7 @@ impl WshClient {
 
                 let keystore = crate::keystore::KeyStore::default_location()?;
                 let (signing_key, verifying_key) = keystore.load(key_name)?;
+                self.login_key = Some(signing_key.clone());
 
                 // Channel binding (wsh #119): bind every kind the host offers that this client can
                 // supply -- the host key it just saw prove possession, a pinned certificate hash.
@@ -2137,6 +2247,29 @@ impl WshClient {
                             match decode_envelope(&data) {
                                 Ok(envelope) => {
                                     tracing::trace!(msg_type = ?envelope.msg_type, "control message");
+                                    // A sealed session (#155): everything from the host but the keepalive is a frame.
+                                    let envelope = if seal.scope() == Some(crate::bridge_seal::Scope::Session) {
+                                        let gated = seal.incoming_direct(envelope);
+                                        for reply in gated.replies {
+                                            if let Ok(frame) = frame_encode(&reply) {
+                                                let _ = outgoing_tx.send(frame).await;
+                                            }
+                                        }
+                                        match gated.deliver {
+                                            Some(opened) => opened,
+                                            None => {
+                                                if seal.has_failed() && seal.closes_on_failure() {
+                                                    tracing::error!("the sealed session failed: closing the connection");
+                                                    let mut c = connected.lock().await;
+                                                    *c = false;
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        envelope
+                                    };
                                     // A plain message a relay may forward is not heard on a bridge that is sealed.
                                     if seal.drop_unwrapped(&envelope) {
                                         tracing::warn!(msg_type = ?envelope.msg_type, "dropping an unwrapped plaintext message on a sealed bridge");
@@ -3039,6 +3172,7 @@ mod tests {
 
         let client = WshClient {
             seal: Default::default(),
+            login_key: None,
             transport: Arc::new(Mutex::new(crate::transport::AnyTransport::Test(
                 crate::transport::TestTransport,
             ))),
@@ -3143,6 +3277,7 @@ mod tests {
 
         let client = WshClient {
             seal: Default::default(),
+            login_key: None,
             transport: Arc::new(Mutex::new(crate::transport::AnyTransport::Test(
                 crate::transport::TestTransport,
             ))),

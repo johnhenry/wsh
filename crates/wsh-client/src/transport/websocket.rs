@@ -178,6 +178,7 @@ impl WebSocketSession {
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<QMuxEvent>();
+        let event_tx_for_io = event_tx.clone();
 
         let qmux = Arc::new(QMuxConnection::new(
             QMuxConnectionConfig {
@@ -203,6 +204,14 @@ impl WebSocketSession {
                 alive_for_io,
             )
             .await;
+            // The socket is gone (the peer closed it, or it failed): say so to whoever reads the control
+            // stream. The QMux connection (and so the event channel) is held by this session as well, so
+            // without this nothing would ever tell the dispatch loop that the host went away, and a
+            // `wsh -N -L` would wait forever (#156).
+            let _ = event_tx_for_io.send(QMuxEvent::ConnectionClosed {
+                error_code: wsh_core::qmux::ErrorCode::NoError,
+                reason: "websocket closed".to_string(),
+            });
         });
 
         let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(256);

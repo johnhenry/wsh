@@ -17,9 +17,14 @@ use tokio::sync::Notify;
 use wsh_core::codec::{decode_envelope, frame_encode};
 use wsh_core::messages::{is_relay_forwardable, Envelope, MsgType, Payload};
 
-use crate::bridge_seal::SealedBridge;
+use crate::bridge_seal::{Scope, SealedBridge};
 use crate::e2e::E2eResponder;
 use crate::e2e_frame::RoleTag;
+
+/// Host feature (wsh #155): this host seals the whole session when asked.
+pub const SESSION_SEAL_FEATURE: &str = "e2e-session";
+/// Host feature: this host serves nothing on a session that is not sealed.
+pub const SESSION_SEAL_REQUIRED_FEATURE: &str = "e2e-session-required";
 
 enum Mode {
     Off,
@@ -29,6 +34,7 @@ enum Mode {
     Pending {
         session_id: String,
         must: bool,
+        scope: Scope,
         responder: Option<Box<E2eResponder>>,
     },
     Sealed(SealedBridge),
@@ -91,8 +97,67 @@ impl SealGate {
         *self.mode.lock().expect("seal gate") = Mode::Pending {
             session_id,
             must,
+            scope: Scope::Bridge,
             responder: None,
         };
+    }
+
+    /// A whole direct (or pipe-relayed) connection is being sealed (wsh #155): `session_id` is the
+    /// connection's. Nothing but its key exchange and the keepalive crosses until
+    /// [`install`](Self::install).
+    pub fn begin_session(&self, session_id: String) {
+        *self.mode.lock().expect("seal gate") = Mode::Pending {
+            session_id,
+            must: true,
+            scope: Scope::Session,
+            responder: None,
+        };
+    }
+
+    /// The scope of the bridge being set up or sealed, if any.
+    pub fn scope(&self) -> Option<Scope> {
+        match &*self.mode.lock().expect("seal gate") {
+            Mode::Pending { scope, .. } => Some(*scope),
+            Mode::Sealed(b) => Some(b.scope()),
+            _ => None,
+        }
+    }
+
+    /// A message that arrived from the host itself (no `RelayForward`) on a SEALED SESSION:
+    /// what to do with it. The keepalive stays plain; everything else must be a frame.
+    pub fn incoming_direct(&self, msg: Envelope) -> Gated {
+        let mut mode = self.mode.lock().expect("seal gate");
+        let plain_ok = matches!(msg.msg_type, MsgType::Ping | MsgType::Pong);
+        match &mut *mode {
+            Mode::Off => Gated::deliver(msg),
+            Mode::Failed => Gated::default(),
+            Mode::Pending { session_id, .. } => {
+                if plain_ok || is_setup(&msg, session_id) {
+                    Gated::deliver(msg)
+                } else {
+                    tracing::warn!(msg_type = ?msg.msg_type, "dropping a plaintext message before the session is sealed");
+                    Gated::default()
+                }
+            }
+            Mode::Sealed(bridge) => {
+                if plain_ok {
+                    return Gated::deliver(msg);
+                }
+                if !bridge.is_frame(&msg) {
+                    tracing::warn!(msg_type = ?msg.msg_type, "dropping a plaintext message on a sealed session");
+                    return Gated::default();
+                }
+                match bridge.open(&msg) {
+                    Ok(opened) => Gated::deliver(opened),
+                    Err(e) => {
+                        tracing::warn!("a sealed frame did not open ({e}): the session is closed");
+                        *mode = Mode::Failed;
+                        self.failed.notify_one();
+                        Gated::default()
+                    }
+                }
+            }
+        }
     }
 
     /// The peer side: a bridge for `session_id` is set up by answering the operator's signed
@@ -101,6 +166,7 @@ impl SealGate {
         *self.mode.lock().expect("seal gate") = Mode::Pending {
             session_id,
             must,
+            scope: Scope::Bridge,
             responder: Some(Box::new(responder)),
         };
     }
@@ -159,7 +225,17 @@ impl SealGate {
             tracing::warn!("sealed bridge: dropping an undecodable outgoing frame");
             return None;
         };
-        if !is_relay_forwardable(msg.msg_type) || is_relay_level(msg.msg_type) {
+        let session_scope = match &*mode {
+            Mode::Pending { scope, .. } => *scope == Scope::Session,
+            Mode::Sealed(b) => b.scope() == Scope::Session,
+            _ => false,
+        };
+        if session_scope {
+            // The whole session: everything but the keepalive (and the key exchange itself).
+            if matches!(msg.msg_type, MsgType::Ping | MsgType::Pong) {
+                return Some(frame);
+            }
+        } else if !is_relay_forwardable(msg.msg_type) || is_relay_level(msg.msg_type) {
             return Some(frame);
         }
         match &mut *mode {
@@ -204,6 +280,7 @@ impl SealGate {
                 session_id,
                 must,
                 responder,
+                ..
             } => {
                 if is_setup(&inner, session_id) {
                     let Some(responder) = responder else {
@@ -279,8 +356,9 @@ impl SealGate {
         let mode = self.mode.lock().expect("seal gate");
         let guarded = match &*mode {
             Mode::Off => false,
-            Mode::Pending { must, .. } => *must,
-            Mode::Sealed(_) | Mode::Failed => true,
+            Mode::Pending { must, scope, .. } => *must && *scope == Scope::Bridge,
+            Mode::Sealed(b) => b.scope() == Scope::Bridge,
+            Mode::Failed => true,
         };
         guarded
             && is_relay_forwardable(msg.msg_type)

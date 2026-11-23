@@ -21,6 +21,7 @@ export const BRIDGE_CHANNEL_ID = 0;
 
 export class SealedBridge {
   #key;
+  #scope;
   #sessionId;
   #sendTag;
   #recvTag;
@@ -30,9 +31,13 @@ export class SealedBridge {
   #inChain = Promise.resolve();
 
   /**
-   * @param {{ key: CryptoKey, sessionId: string, role: 'initiator' | 'responder' }} p - `initiator` is the operator
+   * @param {{ key: CryptoKey, sessionId: string, role: 'initiator' | 'responder', scope?: 'bridge' | 'session' }} p -
+   *   `initiator` is the operator. `scope: 'session'` (#155) seals a whole direct or pipe-relayed connection, so any
+   *   message may be inside a frame; the default, a bridge, accepts only what a relay may forward.
    */
-  constructor({ key, sessionId, role }) {
+  constructor({ key, sessionId, role, scope = 'bridge' }) {
+    if (scope !== 'bridge' && scope !== 'session') throw new TypeError("SealedBridge: scope must be 'bridge' or 'session'");
+    this.#scope = scope;
     if (role !== 'initiator' && role !== 'responder') throw new TypeError("SealedBridge: role must be 'initiator' or 'responder'");
     this.#key = key;
     this.#sessionId = sessionId;
@@ -68,7 +73,7 @@ export class SealedBridge {
       const plain = await openFrame(this.#key, this.#sessionId, this.#recvCounter, { nonce: frame.nonce, ciphertext: frame.ciphertext, expectedRoleTag: this.#recvTag });
       this.#recvCounter += 1;
       const inner = cborDecode(plain);
-      if (!inner || typeof inner.type !== 'number' || inner.type === MSG.RELAY_FORWARD || !isRelayForwardable(inner.type)) throw new Error('sealed message of a type that may not cross a bridge');
+      if (!inner || typeof inner.type !== 'number' || inner.type === MSG.RELAY_FORWARD || (this.#scope === 'bridge' && !isRelayForwardable(inner.type))) throw new Error('sealed message of a type that may not cross a bridge');
       return inner;
     });
     this.#inChain = run.catch(() => {});

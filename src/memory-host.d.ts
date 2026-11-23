@@ -82,6 +82,8 @@ export interface WshMemoryHostOptions {
    * never hears a share offer. See `WshShareFs`.
    */
   onShare?: WshOnShare;
+  /** #155: seal the whole session end to end (needs `hostKey`; offered where `dataStreams` is false). `'require'` serves nothing unsealed. */
+  sealSession?: false | 'offer' | 'require';
   onLog?: (line: string) => void;
 }
 
