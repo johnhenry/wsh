@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### `onRefused` on the JS hosts; `wsh --version` prints the real version (#163) (npm and Rust CLI)
+
+- **`onRefused({ reason, who, detail })`** (npm, additive, no wire change) on `createMemoryHost`, `createWshServer` and
+  `createReverseHost` (and `cfg.onRefused` of `createConnectionFactory`): called once per connection the host turned away, with a
+  stable code instead of a log line to parse. Codes (`REFUSAL_REASONS`, exported from `@johnhenry/wsh/host`; new ones may be
+  added, none renamed): `not-sealed` (a plain client on `sealSession: 'require'` / `requireOperatorProof`), `unauthorized` (key
+  not allowed, wrong password, operator not accepted), `binding-required`, `bad-signature`, `method-disabled`, `rate-limited`,
+  `bad-request`, `seal-failed`, and for a reverse host `busy`, `proof-required`, `proof-failed`. `who` = `{ username?, fingerprint?,
+  address? }`; `detail` is human text and not stable. A callback that throws is logged and changes nothing. The existing log
+  lines are unchanged. Types in `host.d.ts` (`WshOnRefused`, `WshRefusalReason`). The Rust hosts have no such callback (README matrix).
+- **`wsh --version`** (Rust CLI) printed a fixed `0.1.0` for every release; it now prints the workspace version (`wsh 0.11.0`,
+  also `-V`), the number of the `rust-vX.Y.Z` tag. `wsh-server --version` already did.
+- The bundle grows by about 1 kB gzip in `./host`, `./memory` and `./reverse` (the code table and the callback plumbing);
+  `scripts/bundle-budget.json` updated. `.` (the client) is unchanged.
+- Tests: `test/host-refused.test.mjs`; `test/rust/wsh-version.test.mjs`; a type fixture in `test/types/memory.ts`.
+
 ## 0.40.0 / Rust `rust-v0.11.0`
 
 ### Operator-side shared folders: `wsh --share`, and `onShare` on the JS host (#159) (npm change)

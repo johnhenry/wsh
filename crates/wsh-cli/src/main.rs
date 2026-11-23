@@ -20,7 +20,7 @@ use tracing::error;
 #[derive(Parser)]
 #[command(
     name = "wsh",
-    version = "0.1.0",
+    version,
     about = "Web Shell client — SSH-like remote access over WebTransport/WebSocket"
 )]
 struct Cli {

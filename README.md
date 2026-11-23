@@ -861,6 +861,20 @@ readable by the relay; the signed key exchange is not secret), the sizes and tim
 QMux data streams (not offered there), and a denial of service (a relay can always drop or cut). The JS client has no sealed
 session yet, so against a JS client use a host that only `'offer'`s.
 
+#### Knowing who a host turned away: `onRefused` (#163)
+
+`createMemoryHost`, `createWshServer` and `createReverseHost` take `onRefused({ reason, who, detail })`, called once per
+connection the host turned away, so an embedder can tell the user why a terminal was refused without parsing `onLog`. `reason`
+is a stable code, the list is exported as `REFUSAL_REASONS` from `@johnhenry/wsh/host`: `not-sealed` (a plain client on a
+host that requires a sealed session, or a password login there), `unauthorized` (a key the host does not allow, a wrong
+password, or an operator a reverse host's `accept` turned down), `binding-required`, `bad-signature`, `method-disabled`,
+`rate-limited`, `bad-request`, `seal-failed` (a sealed session's key exchange failed or a frame did not open), and for a reverse
+host `busy`, `proof-required`, `proof-failed`. `who` holds what is known: `username`, `fingerprint` (a key login), `address` (when
+the transport gives one); a refusal before the login names no one. `detail` is human text and not stable. New codes may be added;
+none is renamed. It reports only what this host decided: it does not say what a relay in the middle dropped, a client
+that never reached the host, or a frame the host silently ignored on an already-sealed session (a plain message after sealing
+is dropped, as before, without a report).
+
 #### A pipe relay (`@johnhenry/wsh/pipe-relay`, #118)
 
 When you do not want the relay to be a party at all, use a pipe: the host dials the relay, the operator dials the
@@ -1635,6 +1649,7 @@ than left to be found.
 | Pipe relay (#118) | `@johnhenry/wsh/pipe-relay` | operator side only (#145): `wsh --via wss://relay/r/<id> user@host command...` (also `connect`, `scp`, `ls`, `sftp`, `copy-id`), or the URL as the target. The host side of a pipe is not implemented in Rust. As on a direct connection the Rust client verifies the host-key proof (`host-key` / `host-key-sig` over its own nonce) before sending a credential, pins only a proven key, and binds the login to it (channel binding `host`; `test/rust/wsh-cli-identity.test.mjs`); the pipe-relayed session itself is not sealed (see Security model). `wsh -N -L` exits non-zero when the host drops the session (#156), and the error lines show the relay and a shortened id, never the whole rendezvous id | **Deliberately a relay without wsh parsing** -- nothing to unify on the wire. `--via` keeps `user@host` as the identity: its key is recorded in `known_hosts` under `host:port` (what a direct connection uses), never under the relay's address; a URL target is recorded under the URL's own authority, i.e. the relay's. The URL is not saved to `last_session.json` (the id is a capability) |
 | Operator-side shared folders (`--share`, #159) | host side: `onShare(name, fs, who)` on `createMemoryHost` / `createWshServer` / `createReverseHost` (the host *uses* the operator's directories; `fs` is an object of async file operations, also shaped like an `fs` backend). The JS client does not offer shares | CLI side: `wsh --share NAME=/abs/dir[:ro\|:rw]` offers them (`wsh_client::share`, `wsh-cli`'s `sharefs`: descriptor-relative, never follows a link, see [Sharing a directory](#sharing-a-directory-with-the-host-wsh---share-159)); unix only. **A Rust host that uses shares: not built** (`wsh-server` does not state `shares`) | **Wire-unified, negotiated**: the host states the feature `shares`; the client sends one `ShareOffer` after login (opcodes `0xa8` `ShareOffer`, `0xa9` `ShareRequest`, host to client, `0xaa` `ShareReply`). No change notification, no sharing over `reverse-connect` |
 | Sealed session: any authenticated connection incl. gateway/endpoint data (#155) | host `sealSession: 'offer' \| 'require'` (stage b); the JS client does not seal yet | `wsh --sealed ...` (or automatic against `e2e-session-required`) seals a direct or pipe-relayed session; `wsh-server` does not offer it yet | **Wire-unified, negotiated** (`e2e-session`, `e2e-session-required`, `KeyExchange` for the connection's session id, `EncryptedFrame` channel 0) |
+| Refusal event with stable reason codes (`onRefused`, #163) | `onRefused({ reason, who, detail })` on `createMemoryHost` / `createWshServer` / `createReverseHost`; `REFUSAL_REASONS` from `@johnhenry/wsh/host` | none: `wsh-server` and `wsh reverse` log a refusal, they have no callback (an embedding process has none) | **JS-only** -- a host-side callback of the embedding API, no wire change |
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |
@@ -1692,6 +1707,10 @@ wsh-cli-<target>.tar.gz      # binary: wsh
 plus one `SHA256SUMS` file covering every archive in the release. These
 names are a stable contract other repos (clawser) pin and download by --
 do not change them without coordinating downstream.
+
+`wsh --version` and `wsh-server --version` print the workspace version the binary was built from (`wsh 0.11.0`), which is the
+number in the `rust-vX.Y.Z` tag. Binaries of `rust-v0.9.0` to `rust-v0.10.0` printed a fixed `0.1.0`, so against one of those the
+version cannot be read from the binary (look for a flag in `wsh --help` instead).
 
 ## Security model
 
