@@ -167,7 +167,7 @@ for (const relayKind of ['js', 'rust']) {
         const blob = wire(world.hop);
         for (const secret of ['SECRET-ZEBRA', 'ECHOED-BACK-QUOKKA']) assert.ok(!blob.includes(secret), `${secret} crossed the relay in the clear`);
         const forwardedTypes = world.hop.seen.filter((x) => x.msg.type === MSG.RELAY_FORWARD).map((x) => innerType(x.msg));
-        assert.ok(forwardedTypes.length > 2);
+        assert.ok(forwardedTypes.includes(MSG.KEY_EXCHANGE) && forwardedTypes.includes(MSG.ENCRYPTED_FRAME), `forwarded: ${forwardedTypes}`);
         assert.ok(forwardedTypes.every((t) => t === MSG.KEY_EXCHANGE || t === MSG.ENCRYPTED_FRAME), `plaintext types: ${forwardedTypes}`);
       }
     });
