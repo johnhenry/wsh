@@ -480,6 +480,11 @@ export interface WshServerOptions {
    * TLS-terminating proxy; `cert-hash` needs WebTransport with `selfSigned`). Clients older than 0.36 cannot satisfy it.
    */
   requireChannelBinding?: boolean | Array<'cert-hash' | 'host' | 'tls-exporter'>;
+  /**
+   * Folders the operator's `wsh --share NAME=/abs/dir[:ro|:rw]` offers (#159): called once per share with an object of
+   * async file operations to mount. Listing it makes the host state the `shares` feature.
+   */
+  onShare?: import('../host.js').WshOnShare;
   onLog?: (line: string) => void;
 }
 
@@ -628,6 +633,8 @@ export interface WshReverseHostOptions {
   requireOperatorProof?: boolean;
   /** How long an operator has to answer the challenge (default 5000). */
   proofTimeoutMs?: number;
+  /** Folders an operator offers over a bridge (#159), once per share, as an object of async file operations. */
+  onShare?: import('../host.js').WshOnShare;
   onLog?: (line: string) => void;
 }
 

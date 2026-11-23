@@ -2315,6 +2315,189 @@ messages:
           default: "{}"
           description: "Frontend-specific options (font, theme, keybindings)"
 
+  # ── Operator-side shared folders (#159) ──────────────────────────────
+  # A host with no disk of its own (a browser tab) sometimes needs files that
+  # live on the OPERATOR's machine (`docker run -v $PWD:/app` reached through
+  # `wsh -L sock:endpoint=docker`). The operator's client OFFERS named
+  # directories (`wsh --share NAME=/abs/dir[:ro|:rw]`); the host asks for file
+  # operations on them, one bounded request at a time, and the client answers.
+  #
+  # Negotiation: a host that can use shares lists the feature "shares" in
+  # ServerHello.features. A client that has shares to offer and sees the
+  # feature sends ONE ShareOffer after authentication. A host that does not
+  # list the feature never receives a ShareOffer; a client without shares
+  # never sends one, so a released peer is unaffected either way.
+  #
+  # Direction: unlike every other request in wsh, these are HOST-initiated: the
+  # host sends ShareRequest, the client answers each with exactly one
+  # ShareReply carrying the same request_id. The client is the file server and
+  # treats every request as untrusted input (it serves only what its operator
+  # named on the command line; nothing a host sends can add or widen a share).
+  #
+  # Paths: relative to the share root, "/"-separated; a leading "/" means the
+  # root; empty and "." components are ignored; ".." is refused (EINVAL); at
+  # most 4096 bytes and 128 components, each at most 255 bytes. A symlink is
+  # never followed: every operation sees a symlink as a symlink (type
+  # "symlink"), and a symlink in the middle of a path is ELOOP. Sockets,
+  # devices and FIFOs do not exist for the host (ENOENT, and they are left out
+  # of listings).
+  #
+  # Attr (a map): {type: "file" | "directory" | "symlink", size, mode
+  # (permission bits, 0o777 at most), mtime_ms, atime_ms, ctime_ms, nlink, ino}.
+  # Errors: ShareReply.ok=false with `errno` one of ENOENT, EEXIST, ENOTDIR,
+  # EISDIR, ENOTEMPTY, EACCES, EPERM, EROFS, EINVAL, EBADF, ELOOP,
+  # ENAMETOOLONG, ENOSPC, EMFILE, EBUSY, EAGAIN, EXDEV, EFBIG, ENOTSUP, ESTALE,
+  # EIO, and a short `message` for a person (never a path outside the share).
+  #
+  # Flow control: ShareOffer.max_inflight is the number of requests the host
+  # may have unanswered at once (more get EAGAIN); ShareOffer.max_bytes is the
+  # most data one request may carry or ask for (a bigger `length` is clamped, a
+  # bigger `data` is EINVAL). A ShareReply is at most max_bytes of
+  # data plus a bounded listing. This is the same bounded-window idea as
+  # GatewayCredit, expressed in requests because each reply is the answer to
+  # one of them. Everything rides the connection's normal framing, so a sealed
+  # session (EncryptedFrame) protects it with no extra crypto.
+  shares:
+    ShareOffer:
+      code: 0xa8
+      description: >
+        Sent once by the client after authentication to a host that listed
+        "shares", naming the directories it serves. `writable` lists the names
+        among `shares` that accept writes (everything else is read-only).
+        The host may use any subset; it never learns more than the names.
+      fields:
+        shares:
+          type: "string[]"
+          required: true
+          description: 'Share names ([A-Za-z0-9][A-Za-z0-9._-]{0,63}); at most 16'
+        writable:
+          type: "string[]"
+          default: "[]"
+        max_inflight:
+          type: u32
+          required: true
+          description: "Requests the host may have unanswered at once"
+        max_bytes:
+          type: u32
+          required: true
+          description: "Largest data payload of one request or reply"
+
+    ShareRequest:
+      code: 0xa9
+      description: >
+        Sent by the HOST to ask the client for one file operation on a share.
+        `op` selects the operation; the fields it uses:
+        stat, lstat (path) -> attr;
+        readdir (path, cursor?, length? = most entries) -> entries (each an
+        Attr plus `name`, sorted by name) and `cursor` when more remain: one
+        round trip lists a directory WITH attributes;
+        readlink (path) -> target;
+        open (path, flags, length?) -> handle, attr, and, when the file is
+        no bigger than `length` (clamped to max_bytes) and opened for
+        reading ONLY, its whole content in `data` with eof=true and NO
+        handle (there is nothing left to read or close: a small file costs
+        one round trip); flags are any of
+        "read" "write" "create" "excl" "trunc" (a write is at an explicit
+        offset: there is no append mode); "create", "write" and "trunc"
+        need a writable share; `mode` applies to a created file;
+        create (path, mode?) -> handle, attr: a NEW file (EEXIST if the name
+        is taken, even by a symlink), opened for writing; use open with
+        "create" to open-or-create;
+        read (handle, offset, length) -> data, eof;
+        write (handle, offset, data) -> written;
+        close (handle);
+        mkdir (path, mode?) -> attr; unlink (path); rmdir (path);
+        rename (path, to);
+        setattr (path, or handle, and attr with any of mode, atime_ms,
+        mtime_ms, size) -> attr: a new size is a truncate.
+        A host should close what it opens; the client bounds the open handles
+        (EMFILE) and drops them all when the connection ends.
+      fields:
+        request_id:
+          type: u32
+          required: true
+        share:
+          type: string
+          required: true
+        op:
+          type: string
+          required: true
+        path:
+          type: string
+          required: false
+        to:
+          type: string
+          required: false
+        handle:
+          type: u32
+          required: false
+        offset:
+          type: u64
+          required: false
+        length:
+          type: u32
+          required: false
+        mode:
+          type: u32
+          required: false
+        flags:
+          type: "string[]"
+          default: "[]"
+        cursor:
+          type: string
+          required: false
+        attr:
+          type: json
+          default: "{}"
+          description: "setattr: the changes ({mode, atime_ms, mtime_ms, size})"
+        data:
+          type: bytes
+          required: false
+
+    ShareReply:
+      code: 0xaa
+      description: >
+        The client's answer to one ShareRequest. ok=false carries `errno` (and
+        a `message`); ok=true carries what the operation returns (see
+        ShareRequest). Only the fields an operation returns are present.
+      fields:
+        request_id:
+          type: u32
+          required: true
+        ok:
+          type: bool
+          required: true
+        errno:
+          type: string
+          required: false
+        message:
+          type: string
+          required: false
+        attr:
+          type: json
+          default: "{}"
+        entries:
+          type: json
+          default: "[]"
+        cursor:
+          type: string
+          required: false
+        handle:
+          type: u32
+          required: false
+        data:
+          type: bytes
+          required: false
+        eof:
+          type: bool
+          required: false
+        written:
+          type: u32
+          required: false
+        target:
+          type: string
+          required: false
+
 nested_types:
   FileEntry:
     # wsh #59: the shape of a directory entry, formalized from the JS SDK's

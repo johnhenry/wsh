@@ -38,6 +38,7 @@ import { normalizeEndpointGateway, createEndpointGatewaySession } from './server
 import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
 import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
+import { validateOnShare } from './shares.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;
@@ -176,9 +177,16 @@ function createRegistry(sessions, log) {
  * @param {boolean | string[]} [options.requireChannelBinding=false] - Accept a key login only when its signature is bound
  *   to this host's key (#119). A memory host can bind only `host` (it has no TLS of its own), so this needs `hostKey`;
  *   `true` or `['host']`.
+ * @param {(name: string, fs: object, who: { username: string | null, fingerprint: string | null }) => void | Promise<void>} [options.onShare]
+ *   Folders of the OPERATOR's machine (#159): the operator's `wsh --share NAME=/abs/dir[:ro|:rw]` offers them after login and
+ *   this is called once per share with an object of async file operations (`stat`, `readdir` with attributes, `readFile`,
+ *   `open`, `writeFile`, `mkdir`, `rename`, `unlink`, ... and the `operate` / `readWhole` / `writeWhole` / `writeAt` shape of
+ *   an `fs` backend) that the embedder can mount. Listing it makes the host state the `shares` feature. See `shares.mjs`.
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {} } = {}) {
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
+  onShare } = {}) {
+  validateOnShare(onShare, 'createMemoryHost');
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
@@ -210,7 +218,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
 
   const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
-    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost,
+    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));
   ready.catch(() => {});

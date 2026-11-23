@@ -513,6 +513,8 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
                     eprintln!("wsh: session sealed end to end (a relay in the middle carries ciphertext only)");
                 }
                 crate::commands::forward::start_configured(&client).await?;
+                // `--share`: offer the folders for the life of this connection.
+                crate::commands::share::start_configured(&client).await?;
                 return Ok(client);
             }
             Err(err) => errors.push(format!("{label}: {err}")),

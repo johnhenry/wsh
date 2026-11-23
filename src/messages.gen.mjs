@@ -157,6 +157,11 @@ export const MSG = Object.freeze({
   // Keys
   AUTHORIZED_KEY_ADD: 0x9f,
   AUTHORIZED_KEY_RESULT: 0xa0,
+
+  // Shares
+  SHARE_OFFER:       0xa8,
+  SHARE_REQUEST:     0xa9,
+  SHARE_REPLY:       0xaa,
 });
 
 // Reverse lookup: number → name
@@ -983,6 +988,42 @@ export function authorizedKeyAdd({ publicKey, comment } = {}) {
 export function authorizedKeyResult({ success, added = false, errorMessage } = {}) {
   const msg = { type: MSG.AUTHORIZED_KEY_RESULT, success, added };
   if (errorMessage !== undefined) msg.error_message = errorMessage;
+  return msg;
+}
+
+export function shareOffer({ shares, writable = [], maxInflight, maxBytes } = {}) {
+  return {
+    type: MSG.SHARE_OFFER,
+    shares,
+    writable,
+    max_inflight: maxInflight,
+    max_bytes: maxBytes,
+  };
+}
+
+export function shareRequest({ requestId, share, op, path, to, handle, offset, length, mode, flags = [], cursor, attr = {}, data } = {}) {
+  const msg = { type: MSG.SHARE_REQUEST, request_id: requestId, share, op, flags, attr };
+  if (path !== undefined) msg.path = path;
+  if (to !== undefined) msg.to = to;
+  if (handle !== undefined) msg.handle = handle;
+  if (offset !== undefined) msg.offset = offset;
+  if (length !== undefined) msg.length = length;
+  if (mode !== undefined) msg.mode = mode;
+  if (cursor !== undefined) msg.cursor = cursor;
+  if (data !== undefined) msg.data = data;
+  return msg;
+}
+
+export function shareReply({ requestId, ok, errno, message, attr = {}, entries = [], cursor, handle, data, eof, written, target } = {}) {
+  const msg = { type: MSG.SHARE_REPLY, request_id: requestId, ok, attr, entries };
+  if (errno !== undefined) msg.errno = errno;
+  if (message !== undefined) msg.message = message;
+  if (cursor !== undefined) msg.cursor = cursor;
+  if (handle !== undefined) msg.handle = handle;
+  if (data !== undefined) msg.data = data;
+  if (eof !== undefined) msg.eof = eof;
+  if (written !== undefined) msg.written = written;
+  if (target !== undefined) msg.target = target;
   return msg;
 }
 

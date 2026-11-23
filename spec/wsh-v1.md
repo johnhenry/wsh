@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 105
+- **Total message types**: 108
 
 ## Enums
 
@@ -177,6 +177,9 @@ Type: `string`
 | `0x9e` | TerminalConfig | terminal |
 | `0x9f` | AuthorizedKeyAdd | keys |
 | `0xa0` | AuthorizedKeyResult | keys |
+| `0xa8` | ShareOffer | shares |
+| `0xa9` | ShareRequest | shares |
+| `0xaa` | ShareReply | shares |
 
 ## Message Details
 
@@ -1412,6 +1415,62 @@ Category: **keys**
 | `success` | `bool` | yes | — |
 | `added` | `bool` | no | `false` |
 | `error_message` | `string` | no | — |
+
+### ShareOffer (`0xa8`)
+
+Category: **shares**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `shares` | `string[]` | yes | — |
+| `writable` | `string[]` | no | `[]` |
+| `max_inflight` | `u32` | yes | — |
+| `max_bytes` | `u32` | yes | — |
+
+### ShareRequest (`0xa9`)
+
+Category: **shares**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `request_id` | `u32` | yes | — |
+| `share` | `string` | yes | — |
+| `op` | `string` | yes | — |
+| `path` | `string` | no | — |
+| `to` | `string` | no | — |
+| `handle` | `u32` | no | — |
+| `offset` | `u64` | no | — |
+| `length` | `u32` | no | — |
+| `mode` | `u32` | no | — |
+| `flags` | `string[]` | no | `[]` |
+| `cursor` | `string` | no | — |
+| `attr` | `json` | no | `{}` |
+| `data` | `bytes` | no | — |
+
+### ShareReply (`0xaa`)
+
+Category: **shares**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `request_id` | `u32` | yes | — |
+| `ok` | `bool` | yes | — |
+| `errno` | `string` | no | — |
+| `message` | `string` | no | — |
+| `attr` | `json` | no | `{}` |
+| `entries` | `json` | no | `[]` |
+| `cursor` | `string` | no | — |
+| `handle` | `u32` | no | — |
+| `data` | `bytes` | no | — |
+| `eof` | `bool` | no | — |
+| `written` | `u32` | no | — |
+| `target` | `string` | no | — |
 
 ## Nested Types
 

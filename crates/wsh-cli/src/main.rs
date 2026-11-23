@@ -8,6 +8,8 @@ mod commands;
 mod config;
 #[allow(dead_code)]
 mod known_hosts;
+#[cfg(unix)]
+mod sharefs;
 #[allow(dead_code)]
 mod terminal;
 
@@ -73,7 +75,15 @@ struct Cli {
     #[arg(short = 'R', value_name = "SPEC", action = clap::ArgAction::Append)]
     remote_forwards: Vec<String>,
 
-    /// Do not run a command or a shell: only forward (with -L / -R). Stops on Ctrl-C.
+    /// Offer a directory of THIS machine to the host for the session, as `NAME=/abs/dir[:ro|:rw]`
+    /// (read-only unless `:rw`). Repeatable. The host can then list, read (and with `:rw` change)
+    /// files under that directory, and nothing else: nothing outside it, no symlink followed
+    /// out of it, no special files. For a host with no disk of its own (a page); it must say it
+    /// accepts shares.
+    #[arg(long = "share", value_name = "NAME=DIR[:ro|:rw]", action = clap::ArgAction::Append)]
+    shares: Vec<String>,
+
+    /// Do not run a command or a shell: only forward (with -L / -R) or share (--share). Stops on Ctrl-C.
     #[arg(short = 'N')]
     no_command: bool,
 
@@ -439,8 +449,8 @@ async fn main() {
                 std::process::exit(2);
             }
         };
-        if cli.no_command && config.is_empty() {
-            eprintln!("wsh: -N has nothing to do without -L or -R");
+        if cli.no_command && config.is_empty() && cli.shares.is_empty() {
+            eprintln!("wsh: -N has nothing to do without -L, -R or --share");
             std::process::exit(2);
         }
         if cli.no_command && (!matches!(&cli.command, None) || cli.args.len() != 1) {
@@ -448,6 +458,25 @@ async fn main() {
             std::process::exit(2);
         }
         commands::forward::set(config);
+    }
+
+    // Shared folders (--share): like forwarding, they ride the one connection that
+    // `wsh [user@]host [command...]` and `wsh connect` open, which are also exactly the commands
+    // `--via` accepts that keep a connection open. The two lists are kept in step on purpose: a
+    // `--via` pipe relay carries a share like any other session traffic (it sits inside whatever
+    // sealing the session has), so `--share` needs no `--via` case of its own, and a command that
+    // is not on this list never offers a share.
+    if !cli.shares.is_empty() {
+        if !matches!(&cli.command, None | Some(Command::Connect { .. })) {
+            eprintln!(
+                "wsh: --share applies to `wsh [user@]host [command...]` and `wsh connect` only"
+            );
+            std::process::exit(2);
+        }
+        if let Err(e) = commands::share::set(&cli.shares) {
+            eprintln!("wsh: {e}");
+            std::process::exit(2);
+        }
     }
 
     let result = match cli.command {

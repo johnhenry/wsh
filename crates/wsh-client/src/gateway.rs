@@ -596,6 +596,9 @@ pub(crate) struct GatewayHub {
     next_id: AtomicU32,
     budget: AtomicUsize,
     state: Mutex<HubState>,
+    /// Folders this client offers to the host (#159): the hub already holds the connection's
+    /// outgoing sender and is told when the connection ends, which is all shares need.
+    pub(crate) shares: crate::share::ShareHub,
 }
 
 impl Default for GatewayHub {
@@ -608,11 +611,12 @@ impl Default for GatewayHub {
 impl GatewayHub {
     pub(crate) fn new(out: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
-            out,
             credit: AtomicBool::new(false),
             next_id: AtomicU32::new(1),
             budget: AtomicUsize::new(0),
             state: Mutex::new(HubState::default()),
+            shares: crate::share::ShareHub::new(out.clone()),
+            out,
         }
     }
 
@@ -915,12 +919,14 @@ impl GatewayHub {
                     None => false,
                 }
             }
+            Payload::ShareRequest(_) => self.shares.on_message(envelope),
             _ => false,
         }
     }
 
     /// The connection to the host is gone: end everything.
     pub(crate) fn close_all(&self) {
+        self.shares.shutdown();
         let (conns, pending): (Vec<_>, Vec<_>) = {
             let mut state = self.state.lock().expect("hub");
             state.listeners.clear();

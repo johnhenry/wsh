@@ -1,6 +1,6 @@
 import type { WshClient, RpcChannel } from './index.js';
 import type { WshSigner } from './index.js';
-import type { WshFileBackend, WshHostKeyOption } from './host.js';
+import type { WshFileBackend, WshHostKeyOption, WshOnShare } from './host.js';
 import type {
   WshServerAuthOptions, WshServerPrincipal, WshServerMcpOptions, WshExecRunner, WshServerOptions, WshServerPtyOptions, WshClientEnv,
   WshAcceptableSocket, WshAcceptOptions, WshGatewayEndpointHandler as WshMemoryEndpointHandler,
@@ -75,6 +75,13 @@ export interface WshMemoryHostOptions {
    * Needs `hostKey`; a client older than 0.36 cannot satisfy it.
    */
   requireChannelBinding?: boolean | Array<'host'>;
+  /**
+   * Folders of the OPERATOR's machine (#159): `wsh --share NAME=/abs/dir[:ro|:rw]` offers them after login, and this is
+   * called once per share with an object of async file operations the page can mount (a host with no disk of its own
+   * can then serve `docker run -v $PWD:/app`). Listing it makes the host state the `shares` feature; a host without it
+   * never hears a share offer. See `WshShareFs`.
+   */
+  onShare?: WshOnShare;
   /** #155: seal the whole session end to end (needs `hostKey`; offered where `dataStreams` is false). `'require'` serves nothing unsealed. */
   sealSession?: false | 'offer' | 'require';
   onLog?: (line: string) => void;
