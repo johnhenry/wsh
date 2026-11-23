@@ -591,8 +591,39 @@ export interface WshServer {
 
 export function createWshServer(options?: WshServerOptions): WshServer;
 
-/** Parse `authorized_keys`-style text into raw 32-byte Ed25519 keys (malformed lines skipped). */
+/**
+ * Parse `authorized_keys`-style text into the raw 32-byte Ed25519 keys of the lines that carry NO options (malformed lines
+ * skipped). A line with options is not returned, because its restrictions would be lost: use `auth.authorizedKeys` (which
+ * enforces them) or `parseAuthorizedKeyEntries`.
+ */
 export function parseAuthorizedKeys(text: string): Uint8Array[];
+
+/** What an `authorized_keys` line's options allow (wsh #122; the same on the Rust `wsh-server`). */
+export interface KeyPermissions {
+  /** A pty shell. */
+  pty: boolean;
+  /** `exec` channels. */
+  exec: boolean;
+  /** MCP discovery and calls. */
+  mcp: boolean;
+  /** File channels, `FileOp` and `wsh-fs`. */
+  fileTransfer: boolean;
+  /** Relay registration, listing and connecting. */
+  relay: boolean;
+  /** `command="..."`: the only command the key may run (replaces what the client asks for). */
+  forcedCommand: string | null;
+  /** `max-sessions=N`: most live pty/exec sessions the key may hold at once. */
+  maxSessions: number | null;
+}
+
+/**
+ * Parse `authorized_keys`-style text, options included. `refused` lists the lines whose options this host does not
+ * understand (`code`: `unknown-option`, `bad-syntax`, `bad-value`, `duplicate-option`); those keys are not let in.
+ */
+export function parseAuthorizedKeyEntries(text: string): {
+  entries: Array<{ key: Uint8Array; options: string | null; permissions: KeyPermissions; line: number }>;
+  refused: Array<{ line: number; code: string; reason: string; key: Uint8Array }>;
+};
 
 /** ServerHello feature: the host discovers client-opened exec data streams itself (no primer byte). */
 export const STREAM_ANNOUNCE: 'stream-announce';
