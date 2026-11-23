@@ -73,7 +73,12 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))
-    .with_context(|| format!("failed to connect to {}", resolved.url))?;
+    .with_context(|| {
+        format!(
+            "failed to connect to {}",
+            crate::commands::common::redact_rendezvous(&resolved.url)
+        )
+    })?;
 
     let comment = format!("{}@{}", resolved.user, resolved.host);
     let result = client

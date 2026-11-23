@@ -140,6 +140,12 @@ function createRegistry(sessions, log) {
  * @param {{ operate: Function, readWhole: Function, writeWhole: Function, writeAt: Function, openRange?: Function, maxFileBytes?: number }} [options.fs]
  *   File operations, as `createFileAccess` in `@johnhenry/wsh/server` returns them (see `normalizeFileBackend` in
  *   `host-backends.mjs`). Not a root path: confining paths is the backend's job.
+ * @param {false | 'offer' | 'require'} [options.sealSession=false] - #155: seal the whole session end to end (needs `hostKey` and
+ *   `dataStreams: false`, which is how a page host is served). A client that asks (a signed `KeyExchange` for the connection's
+ *   session id, features `e2e-session`) gets every message after login -- gateway and endpoint data included -- as an
+ *   authenticated encrypted frame, so a relay that only copies bytes (a pipe relay) can neither read nor alter it; a frame that
+ *   does not open closes the session. `'offer'` serves a client that does not ask in the clear; `'require'` (advertised as
+ *   `e2e-session-required`) serves nobody who has not sealed, and no password login. The keepalive stays plain.
  * @param {true | CryptoKeyPair | { publicKey: Uint8Array | CryptoKey, sign: Function }} [options.hostKey]
  *   This host's own identity, so clients can pin it (TOFU): a `CryptoKeyPair` (non-extractable is fine), a signer
  *   `{ publicKey, sign(data) }`, or `true` for a fresh non-extractable key.
@@ -172,13 +178,15 @@ function createRegistry(sessions, log) {
  *   `true` or `['host']`.
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, onLog = () => {} } = {}) {
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {} } = {}) {
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
   }
   if (Array.isArray(requireChannelBinding) && requireChannelBinding.some((k) => k !== 'host')) throw new TypeError('createMemoryHost: requireChannelBinding can name only "host" (a memory host has no TLS connection or certificate to bind)');
   if (requireChannelBinding && !hostKey) throw new TypeError('createMemoryHost: requireChannelBinding needs a hostKey (the only thing a memory host can bind a login to)');
+  if (sealSession !== false && sealSession !== 'offer' && sealSession !== 'require') throw new TypeError("createMemoryHost: sealSession must be false, 'offer' or 'require'");
+  if (sealSession && !hostKey) throw new TypeError('createMemoryHost: sealSession needs a hostKey (the host signs its half of the key exchange with it)');
   if (exec === true) throw new TypeError('createMemoryHost: exec must be a function (run(command, io)); there is no shell to run `true` with');
   if (exec !== undefined && typeof exec !== 'function' && typeof exec?.run !== 'function') {
     throw new TypeError('createMemoryHost: exec must be a function or { run }');
@@ -201,7 +209,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   const gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints });
 
   const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
-    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, log: onLog,
+    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
     methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));

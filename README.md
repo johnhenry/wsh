@@ -843,6 +843,22 @@ sides; a host that does not require proof is exactly as exposed as before), the 
 messages and seals nothing itself), and a compromised *operator* key (it proves the key, not the
 person). A relay can still refuse service by dropping the challenge.
 
+#### A sealed session (#155, host: JS; client: the Rust CLI so far)
+
+`createMemoryHost({ hostKey, dataStreams: false, sealSession: 'offer' | 'require' })` (and `createWshServer`, for a connection
+accepted with `dataStreams: false`) seals the WHOLE session end to end. After login the client sends a `KeyExchange` whose
+`session_id` is the connection's, signed with its login key and answered by the host with a signature of its host key (the
+transcripts of the sealed bridge, bound to both identities and both ephemeral keys; hybrid X25519+ML-KEM-768). From then on every
+message but the keepalive -- control messages, `GatewayData` for TCP / unix sockets / named endpoints, `GatewayCredit` -- is an
+authenticated encrypted frame (`EncryptedFrame`, channel 0), so flow-control credit works as before. A plain message is not heard
+once the session is sealed, and a frame that does not open (flipped bit, replay, reorder) closes it. Features: `e2e-session`
+(offered), `e2e-session-required` (the host serves nothing on a session that is not sealed, and no password login). The Rust CLI
+seals with `--sealed` (or on its own when the host says `e2e-session-required`) and refuses a host that does not offer it: no silent
+downgrade. What it does NOT cover: the handshake before login (the user name, the login public key and the host key proof are
+readable by the relay; the signed key exchange is not secret), the sizes and timing of traffic, a host whose connection has client-opened
+QMux data streams (not offered there), and a denial of service (a relay can always drop or cut). The JS client has no sealed
+session yet, so against a JS client use a host that only `'offer'`s.
+
 #### A pipe relay (`@johnhenry/wsh/pipe-relay`, #118)
 
 When you do not want the relay to be a party at all, use a pipe: the host dials the relay, the operator dials the
@@ -872,7 +888,10 @@ for nothing, and the rendezvous id is the only thing standing between the host's
 an impostor that reaches the id first is still a stranger to the operator, who must pin the host key
 (`expectHostKey`) to notice; and the host still authenticates every operator. A pipe relay terminates the TLS of each leg, so what it copies -- the wsh
 handshake and the session traffic -- is readable by it unless the two ends seal it themselves
-(per-session `initiateE2E`); it cannot forge the operator's signature or the host's. It can drop, delay or
+(per-session `initiateE2E`, or the **sealed session** below); it cannot forge the operator's signature or the host's.
+**Until you seal the session, treat a pipe relay as trusted for secrecy AND integrity**: it can read every control message and
+all gateway and endpoint data (`GatewayData`: TCP, unix sockets, named endpoints) and alter forwarded bytes after the handshake
+(#155). Pin the host key, require channel binding, use `wss://` to a relay you trust, or seal the session. It can drop, delay or
 cut a connection, and it sees who dials which id and how much they send.
 
 *CLI side (#145).* `wsh --via wss://relay/r/<id> user@host [command...]` dials the operator side
@@ -1546,6 +1565,7 @@ than left to be found.
 | Gateway destination policy by resolved address | `@johnhenry/wsh/server` `gateway`: resolved address checked, `allowPrivate` | fixed in the Rust release after `rust-v0.6.0`: a loopback/private/link-local/ULA/CGNAT/unspecified/multicast address is refused after resolution unless a rule names it, and the server connects to the address it checked | **Same rule on both sides** (a Rust server released before that still has the name-only check) |
 | Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | **Operator proof: yes.** The Rust relay lists `operator-proof` and carries `ReverseChallenge`/`ReverseProof`/`ReverseConnect.features`; `wsh reverse-connect` answers a challenge (`--operator-proof` / `--no-operator-proof`; by default only for a peer that registered the `operator-proof` capability, because a released Rust host cannot decode the field); `wsh reverse` / `wsh agent run` challenge, verify BEFORE accepting, and take `--require-operator-proof` and `--allow-operator`. **Sealed bridge and both signed `KeyExchange` halves: yes** (`wsh reverse-connect --sealed`; a host with an identity states `e2e` / `e2e-sign` / `e2e-sealed` in its `ReverseAccept` once it has proven the operator). The exchange is byte-identical to JS (transcripts compared against vectors printed by the JS code), hybrid X25519+ML-KEM-768 negotiated exactly as JS does, X25519 when the peer lists no ML-KEM key. A host started with `--require-operator-proof` REQUIRES the sealed bridge (the JS rule): until the key exists it hears and sends nothing but the key exchange, and drops a bridge that has not sealed in 10 s; an operator that does not seal gets no answer to its plain messages. Every message that would cross the relay travels as an `EncryptedFrame` on channel 0; a plain message (wrapped or not) is dropped; **a frame that does not open (tampered, replayed, reordered) closes the bridge** (stricter than the JS host, which drops the frame and ignores the rest). Not covered: a direct or pipe-relayed connection, and `GatewayData` outside a reverse bridge (#155) | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); both implementations seal a reverse bridge |
 | Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | Kind `host`: the client binds to the proven host key (`--require-channel-binding`, and it honours `channel-binding-required`), and `wsh-server` offers it and can require it (`[server] require_channel_binding`, needs `host_key`). `cert-hash` and `tls-exporter`: not in Rust (the Rust WebTransport client has no certificate-hash pinning; `ConnectConfig.cert_hash` binds it if a caller supplies one) | **Wire-unified, negotiated** (`channel-binding:<kind>` features); verified against the spec's test vectors |
+| Sealed session: any authenticated connection incl. gateway/endpoint data (#155) | host `sealSession: 'offer' \| 'require'` (stage b); the JS client does not seal yet | `wsh --sealed ...` (or automatic against `e2e-session-required`) seals a direct or pipe-relayed session; `wsh-server` does not offer it yet | **Wire-unified, negotiated** (`e2e-session`, `e2e-session-required`, `KeyExchange` for the connection's session id, `EncryptedFrame` channel 0) |
 | Pipe relay (#118) | `@johnhenry/wsh/pipe-relay` | operator side only (#145): `wsh --via wss://relay/r/<id> user@host command...` (also `connect`, `scp`, `ls`, `sftp`, `copy-id`), or the URL as the target. The host side of a pipe is not implemented in Rust, and the Rust client does not yet verify the host-key proof or bind the login to the host (see Security model) | **Deliberately a relay without wsh parsing** -- nothing to unify on the wire. `--via` keeps `user@host` as the identity: its key is recorded in `known_hosts` under `host:port` (what a direct connection uses), never under the relay's address; a URL target is recorded under the URL's own authority, i.e. the relay's. The URL is not saved to `last_session.json` (the id is a capability) |
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
