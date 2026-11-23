@@ -6,6 +6,7 @@ pub mod common;
 pub mod connect;
 pub mod copy_id;
 pub mod exec;
+pub mod forward;
 pub mod fs_display;
 pub mod interactive;
 pub mod keygen;

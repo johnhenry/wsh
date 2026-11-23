@@ -5,6 +5,7 @@
 
 pub mod codec;
 pub mod error;
+pub mod gateway_credit;
 pub mod identity;
 pub mod keys;
 pub mod messages;

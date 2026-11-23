@@ -54,6 +54,37 @@ unchanged. **The Rust `wsh-server` changes one default (`client_env`) and one va
   cover the allow-list, the config line above, signal names and `--via` parsing. `test/rust/wsh-cli.test.mjs` trusts the
   generated certificate through `SSL_CERT_FILE` instead of `WSH_INSECURE_LOOPBACK_TLS`.
 
+### Rust: forwarding (#145)
+
+Rust workspace only (`wsh`, `wsh-server`, `wsh-client`, `wsh-core`); no message or field was added to the wire. **Read the
+two behaviour changes marked below.**
+
+- **`GatewayCredit` / `gateway-credit` in `wsh-server` and `wsh-client`.** 256 KiB initial credit per direction, returned as
+  data is consumed; a peer that exceeds its credit is closed. The server advertises it with the gateway, the client lists it
+  in `Hello.features`; both needed. Without it the server closes a connection holding more than `[gateway]
+  max_buffered_bytes` (default 4 MiB) of unconsumed client data, or a client holding more than `max_client_buffered_bytes`
+  (32 MiB): the Node host's numbers. `OpenUdp` flows are metered too.
+- **New: `OpenUnix` / `ListenUnix` in `wsh-server`, off by default**, with the Node host's policy: `[gateway] unix_connect`,
+  `unix_listen` (exact path, `/dir/` prefix, `@abstract` on Linux), `unix_replace_stale`, `unix_max_listeners`. Paths are
+  checked after `realpath` of the parent, the target must be a socket, no symlink escape, created sockets are `0600` and
+  unlinked on close, a stale socket is replaced only if asked AND allowed, a bad pattern stops start-up. `gateway-unix` is
+  advertised only when a socket is listed.
+- **Behaviour change: gateway tables are per client connection.** `gateway_id`/`listener_id` used to be one table for the
+  whole server (a client could address, and close, another client's connection). `GatewayClose` is now a half-close, as on
+  the Node host (the origin gets 1 s to finish), where it used to tear the connection down at once. Opens no longer block
+  the session loop. Over the connection limit the answer is code 7 (was 4); the new `[gateway]` keys are above.
+- **Behaviour change: reverse listeners and inbound connections are bounded** (16 unanswered per client, 30 s to answer).
+- **New in `wsh-client`:** `open_tcp`, `open_unix`, `open_endpoint`, `listen_unix`, `listen_tcp`, `WshClient::gateway()`,
+  `GatewayStream` (`read`, `write_all`, `shutdown`, `pump`), `GatewayListener`. `Hello.features` now lists `gateway-credit`.
+- **New: `wsh -L`, `-R`, `-N`, `--replace-socket`**, with TCP, unix and named-endpoint (`endpoint=NAME`) ends; see the README.
+  Works with `--via`. Local sockets `0600`, removed on exit, an existing file refused unless `--replace-socket`.
+- **Tests:** Rust unit tests (session, policy, client hub, spec parsing); `test/rust/wsh-rust-server-forwarding.test.mjs`
+  (the JS client against the real `wsh-server`: the Node host's unix and credit cases, flat memory with a stalled client);
+  `test/rust/wsh-cli-forward.test.mjs` (the built `wsh` against a Node host and an in-page `createMemoryHost({ endpoints })`
+  host, through `createPipeRelay` with `--via` and over a plain byte pipe, and against `wsh-server`: fake HTTP daemon, 20 MiB
+  both ways, stalled reader, refusals). Browser suite: an in-page host's endpoint reached by the freshly built `wsh -L`
+  (`WSH_CLI_BIN`); the 50 ms pause for #135 is removed.
+
 ## 0.38.0
 
 ### npm package: TCP reverse tunnels and UDP over WebTransport datagrams (#98, #124)

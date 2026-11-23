@@ -104,6 +104,7 @@ pub async fn run(
     // Exit here rather than return: the stdin reader is blocked in a read nothing can
     // cancel, and returning would wait for it.
     std::io::stdout().flush().ok();
+    crate::commands::forward::cleanup();
     std::process::exit(code);
 }
 
@@ -203,6 +204,7 @@ fn forward_signals(session: Arc<WshSession>) {
                 if seen > 1 {
                     eprintln!("\nwsh: {name} again: disconnecting");
                     let _ = session.close().await;
+                    crate::commands::forward::cleanup();
                     std::process::exit(128 + number);
                 }
                 if let Err(e) = session.signal(name).await {

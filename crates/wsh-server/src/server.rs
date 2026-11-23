@@ -4,10 +4,8 @@
 //! and MCP bridge. Coordinates the lifecycle of all incoming connections.
 
 use crate::config::ServerConfig;
-use crate::gateway::forwarder::GatewayForwarder;
-use crate::gateway::listener::ReverseListenerManager;
 use crate::gateway::policy::{GatewayPolicy, GatewayPolicyEnforcer};
-use crate::gateway::GatewayEvent;
+use crate::gateway::GatewaySession;
 use crate::handshake;
 use crate::mcp::{McpBridge, McpProxy};
 use crate::relay::{wisp, PeerMetadata, PeerRegistry, RelayBroker, WispGuestSession, WispRegistry};
@@ -48,6 +46,9 @@ struct ConnectionContext {
     /// In-flight `McpCall`s, by call_id, so `McpCancel` can stop them. Dropping the
     /// context (connection closed) aborts whatever is still running.
     mcp_calls: crate::mcp::McpCalls,
+    /// This connection's gateway: its connections, listeners and credit. Dropping the context
+    /// closes them all.
+    gateway: GatewaySession,
 }
 
 /// A share link entry for session sharing.
@@ -166,10 +167,8 @@ pub struct WshServer {
     mcp_proxy: Arc<RwLock<McpProxy>>,
     /// Directory for session recordings.
     recording_dir: Option<PathBuf>,
-    /// Gateway forwarder (TCP/UDP/DNS).
-    gateway_forwarder: Arc<GatewayForwarder>,
-    /// Reverse listener manager.
-    reverse_listener: Arc<ReverseListenerManager>,
+    /// Gateway policy; each connection builds its own [`GatewaySession`] on it.
+    gateway_policy: Arc<GatewayPolicyEnforcer>,
     /// Whether gateway is enabled.
     gateway_enabled: bool,
     /// Per-connection outbound senders, keyed by connection_id.
@@ -312,10 +311,12 @@ impl WshServer {
             max_connections: config.gateway_max_connections,
             enable_reverse_tunnels: config.gateway_enable_reverse_tunnels,
             reverse_bind_addr: config.gateway_reverse_bind_addr,
+            unix: config.gateway_unix.clone(),
+            max_buffered_bytes: config.gateway_max_buffered_bytes,
+            max_client_buffered_bytes: config.gateway_max_client_buffered_bytes,
         };
         let policy_enforcer = Arc::new(GatewayPolicyEnforcer::new(gateway_policy));
-        let gateway_forwarder = Arc::new(GatewayForwarder::new(policy_enforcer.clone()));
-        let reverse_listener = Arc::new(ReverseListenerManager::new(policy_enforcer));
+        let gateway_policy = policy_enforcer;
         let gateway_enabled = config.gateway_enabled;
 
         // Typed rpc channels (#86). `wsh-fs` needs an explicit root: file access is opt-in.
@@ -357,8 +358,7 @@ impl WshServer {
             mcp_bridge,
             mcp_proxy,
             recording_dir,
-            gateway_forwarder,
-            reverse_listener,
+            gateway_policy,
             gateway_enabled,
             peer_senders: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(tokio::sync::Mutex::new(
@@ -791,9 +791,15 @@ impl WshServer {
                     fingerprint: result.fingerprint.clone(),
                     session_id: result.session_id.clone(),
                     token: result.token.clone(),
-                    peer_tx,
+                    peer_tx: peer_tx.clone(),
                     conn_id: Some(conn_id),
                     mcp_calls: Default::default(),
+                    gateway: GatewaySession::new(
+                        self.gateway_policy.clone(),
+                        peer_tx.clone(),
+                        self.gateway_enabled,
+                        &hello.features,
+                    ),
                 };
 
                 // Session message loop
@@ -1455,13 +1461,11 @@ impl WshServer {
         // Typed rpc channels of this connection (#86); features are filled in at Hello.
         let mut rpc_sessions = RpcSessions::new(self.rpc.clone(), Vec::new());
 
-        // Created eagerly (mirroring `inbound_tx`/`data_tx` below) so it can
+        // Created eagerly so it can
         // be a plain, unconditional `select!` arm: nothing holds a clone of
         // `peer_tx` until auth succeeds and it's registered in
         // `peer_senders`, so this simply never fires before then.
         let (peer_tx, mut peer_rx) = mpsc::channel::<Envelope>(64);
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
-        let (data_tx, mut data_rx) = mpsc::channel::<GatewayEvent>(256);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let loop_result: WshResult<()> = 'session: loop {
@@ -1481,38 +1485,6 @@ impl WshServer {
                         }
                     }
                     break 'session Ok(());
-                }
-
-                Some(event) = inbound_rx.recv() => {
-                    let msg = build_inbound_open(&event);
-                    match frame_encode(&msg) {
-                        Ok(frame) => {
-                            if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
-                                break 'session Err(e.into());
-                            }
-                        }
-                        Err(e) => break 'session Err(e),
-                    }
-                }
-
-                Some(event) = data_rx.recv() => {
-                    let msg = match &event {
-                        GatewayEvent::Data { gateway_id, data } => {
-                            build_gateway_data(*gateway_id, data.clone())
-                        }
-                        GatewayEvent::Closed { gateway_id } => {
-                            self.gateway_forwarder.close(*gateway_id).await;
-                            build_gateway_close_msg(*gateway_id)
-                        }
-                    };
-                    match frame_encode(&msg) {
-                        Ok(frame) => {
-                            if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
-                                break 'session Err(e.into());
-                            }
-                        }
-                        Err(e) => break 'session Err(e),
-                    }
                 }
 
                 // Peer push messages (e.g. forwarded ReverseConnect)
@@ -1801,6 +1773,12 @@ impl WshServer {
                                                     peer_tx: peer_tx.clone(),
                                                     conn_id: Some(conn_id),
                                                     mcp_calls: Default::default(),
+                                                    gateway: GatewaySession::new(
+                                                        self.gateway_policy.clone(),
+                                                        peer_tx.clone(),
+                                                        self.gateway_enabled,
+                                                        &hello.features,
+                                                    ),
                                                 });
                                                 rpc_sessions.set_user(&result.username);
                                                 state = ConnState::Authenticated;
@@ -1818,7 +1796,7 @@ impl WshServer {
                                     ConnState::Authenticated => {
                                         let ctx_ref = ctx.as_mut().expect("ctx set once Authenticated");
                                         match self
-                                            .dispatch_message(envelope, ctx_ref, inbound_tx.clone(), data_tx.clone())
+                                            .dispatch_message(envelope, ctx_ref)
                                             .await
                                         {
                                             Ok(Some(response)) => {
@@ -2069,8 +2047,6 @@ impl WshServer {
         ctx: &mut ConnectionContext,
         mut peer_rx: mpsc::Receiver<Envelope>,
     ) -> WshResult<()> {
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
-        let (data_tx, mut data_rx) = mpsc::channel::<GatewayEvent>(256);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
@@ -2090,30 +2066,6 @@ impl WshServer {
                     break;
                 }
 
-                Some(event) = inbound_rx.recv() => {
-                    let msg = build_inbound_open(&event);
-                    let frame = frame_encode(&msg)?;
-                    send.write_all(&frame)
-                        .await
-                        .map_err(|e| WshError::Transport(format!("WebTransport write: {e}")))?;
-                }
-
-                Some(event) = data_rx.recv() => {
-                    let msg = match &event {
-                        GatewayEvent::Data { gateway_id, data } => {
-                            build_gateway_data(*gateway_id, data.clone())
-                        }
-                        GatewayEvent::Closed { gateway_id } => {
-                            self.gateway_forwarder.close(*gateway_id).await;
-                            build_gateway_close_msg(*gateway_id)
-                        }
-                    };
-                    let frame = frame_encode(&msg)?;
-                    send.write_all(&frame)
-                        .await
-                        .map_err(|e| WshError::Transport(format!("WebTransport write: {e}")))?;
-                }
-
                 // Peer push messages (e.g. forwarded ReverseConnect)
                 Some(envelope) = peer_rx.recv() => {
                     let frame = frame_encode(&envelope)?;
@@ -2126,7 +2078,7 @@ impl WshServer {
                     match frame_result {
                         Ok(data) => {
                             let envelope = decode_envelope(&data)?;
-                            if let Some(response) = self.dispatch_message(envelope, ctx, inbound_tx.clone(), data_tx.clone()).await? {
+                            if let Some(response) = self.dispatch_message(envelope, ctx).await? {
                                 let frame = frame_encode(&response)?;
                                 send.write_all(&frame)
                                     .await
@@ -2225,6 +2177,12 @@ impl WshServer {
         ];
         if self.gateway_enabled {
             features.push("gateway".to_string());
+            // GatewayCredit flow control: used only when the client lists it too.
+            features.push(crate::gateway::session::GATEWAY_CREDIT_FEATURE.to_string());
+            // OpenUnix / ListenUnix, only when the operator listed sockets.
+            if self.gateway_policy.unix().is_enabled() {
+                features.push(crate::gateway::session::GATEWAY_UNIX_FEATURE.to_string());
+            }
         }
         if self.config.enable_relay {
             features.push("reverse".to_string());
@@ -2294,8 +2252,6 @@ impl WshServer {
         &self,
         envelope: Envelope,
         ctx: &mut ConnectionContext,
-        inbound_tx: mpsc::Sender<crate::gateway::listener::InboundEvent>,
-        data_tx: mpsc::Sender<GatewayEvent>,
     ) -> WshResult<Option<Envelope>> {
         if let Some(conn_id) = ctx.conn_id {
             if matches!(
@@ -3373,109 +3329,11 @@ impl WshServer {
             (MsgType::McpCancel, Payload::McpCancel(p)) => Ok(ctx.mcp_calls.cancel(&p.call_id)),
 
             // ── Gateway messages ────────────────────────────────────
-            (MsgType::OpenTcp, Payload::OpenTcp(p)) => {
-                if !self.gateway_enabled {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::GatewayFail,
-                        payload: Payload::GatewayFail(GatewayFailPayload {
-                            gateway_id: p.gateway_id,
-                            code: 5,
-                            message: "gateway disabled".to_string(),
-                        }),
-                    }));
-                }
-                let resp = self
-                    .gateway_forwarder
-                    .handle_open_tcp(p.gateway_id, &p.host, p.port, data_tx)
-                    .await;
-                Ok(Some(resp))
-            }
-            (MsgType::OpenUdp, Payload::OpenUdp(p)) => {
-                if !self.gateway_enabled {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::GatewayFail,
-                        payload: Payload::GatewayFail(GatewayFailPayload {
-                            gateway_id: p.gateway_id,
-                            code: 5,
-                            message: "gateway disabled".to_string(),
-                        }),
-                    }));
-                }
-                let resp = self
-                    .gateway_forwarder
-                    .handle_open_udp(p.gateway_id, &p.host, p.port, data_tx)
-                    .await;
-                Ok(Some(resp))
-            }
-            (MsgType::ResolveDns, Payload::ResolveDns(p)) => {
-                if !self.gateway_enabled {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::GatewayFail,
-                        payload: Payload::GatewayFail(GatewayFailPayload {
-                            gateway_id: p.gateway_id,
-                            code: 5,
-                            message: "gateway disabled".to_string(),
-                        }),
-                    }));
-                }
-                let resp = self
-                    .gateway_forwarder
-                    .handle_resolve_dns(p.gateway_id, &p.name, &p.record_type)
-                    .await;
-                Ok(Some(resp))
-            }
-            (MsgType::GatewayData, Payload::GatewayData(p)) => {
-                self.gateway_forwarder
-                    .handle_gateway_data(p.gateway_id, p.data.clone())
-                    .await;
-                Ok(None)
-            }
-            (MsgType::GatewayClose, Payload::GatewayClose(p)) => {
-                self.gateway_forwarder.close(p.gateway_id).await;
-                Ok(None)
-            }
-            (MsgType::ListenRequest, Payload::ListenRequest(p)) => {
-                if !self.gateway_enabled {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::ListenFail,
-                        payload: Payload::ListenFail(ListenFailPayload {
-                            listener_id: p.listener_id,
-                            reason: "gateway disabled".to_string(),
-                        }),
-                    }));
-                }
-                let resp = self
-                    .reverse_listener
-                    .handle_listen_request(p.listener_id, p.port, &p.bind_addr, inbound_tx)
-                    .await;
-                Ok(Some(resp))
-            }
-            (MsgType::ListenClose, Payload::ListenClose(p)) => {
-                let resp = self.reverse_listener.close_listener(p.listener_id).await;
-                Ok(resp)
-            }
-            (MsgType::InboundAccept, Payload::InboundAccept(p)) => {
-                if let Some(gateway_id) = p.gateway_id {
-                    self.reverse_listener
-                        .handle_inbound_accept(
-                            p.channel_id,
-                            gateway_id,
-                            data_tx,
-                            &self.gateway_forwarder,
-                        )
-                        .await;
-                } else {
-                    debug!(
-                        channel_id = p.channel_id,
-                        "InboundAccept without gateway_id, ignoring"
-                    );
-                }
-                Ok(None)
-            }
-            (MsgType::InboundReject, Payload::InboundReject(p)) => {
-                self.reverse_listener
-                    .handle_inbound_reject(p.channel_id)
-                    .await;
+            // One session per connection (see `gateway::session`): the work runs in its own tasks
+            // and the answers go out through the connection's outbound queue, so nothing here
+            // waits on a connect.
+            (msg_type, _) if GatewaySession::serves(*msg_type) => {
+                ctx.gateway.handle(envelope.clone());
                 Ok(None)
             }
 
@@ -4701,42 +4559,6 @@ impl WshServer {
     }
 }
 
-/// Build a [`MsgType::GatewayData`] envelope to forward TCP data to the client.
-fn build_gateway_data(gateway_id: u32, data: Vec<u8>) -> Envelope {
-    Envelope {
-        msg_type: MsgType::GatewayData,
-        payload: Payload::GatewayData(GatewayDataPayload { gateway_id, data }),
-    }
-}
-
-/// Build a [`MsgType::GatewayClose`] envelope to notify the client of connection close.
-fn build_gateway_close_msg(gateway_id: u32) -> Envelope {
-    Envelope {
-        msg_type: MsgType::GatewayClose,
-        payload: Payload::GatewayClose(GatewayClosePayload {
-            gateway_id,
-            reason: None,
-        }),
-    }
-}
-
-/// Build an [`MsgType::InboundOpen`] envelope from a reverse tunnel
-/// [`InboundEvent`](crate::gateway::listener::InboundEvent).
-///
-/// Sent to the client to notify it that a new inbound TCP connection was
-/// accepted on one of its reverse tunnel listeners.
-fn build_inbound_open(event: &crate::gateway::listener::InboundEvent) -> Envelope {
-    Envelope {
-        msg_type: MsgType::InboundOpen,
-        payload: Payload::InboundOpen(InboundOpenPayload {
-            listener_id: event.listener_id,
-            channel_id: event.channel_id,
-            peer_addr: event.peer_addr.clone(),
-            peer_port: event.peer_port,
-        }),
-    }
-}
-
 /// Read a length-prefixed frame from a WebTransport recv stream.
 async fn read_webtransport_frame(recv: &mut wtransport::RecvStream) -> WshResult<Vec<u8>> {
     let mut len_buf = [0u8; 4];
@@ -4890,6 +4712,10 @@ mod wisp_reverse_connect_e2e_tests {
             gateway_max_connections: 10,
             gateway_enable_reverse_tunnels: false,
             gateway_reverse_bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            gateway_unix: Default::default(),
+            gateway_max_buffered_bytes: crate::gateway::policy::DEFAULT_MAX_BUFFERED_BYTES,
+            gateway_max_client_buffered_bytes:
+                crate::gateway::policy::DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
             password_hashes: std::collections::HashMap::new(),
             rpc_enabled: true,
             rpc_max_message_bytes: crate::rpc::RPC_DEFAULT_MAX_MESSAGE,

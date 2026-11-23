@@ -46,9 +46,22 @@ pub struct GatewayPolicy {
     /// Where reverse listeners bind. The client's `bind_addr` is not honoured; it
     /// cannot widen this.
     pub reverse_bind_addr: IpAddr,
+    /// Unix-domain sockets a client may reach or create (off unless listed).
+    pub unix: super::unix_policy::UnixPolicy,
+    /// Bytes received from a client for one connection and not yet taken by its origin
+    /// before the connection is closed.
+    pub max_buffered_bytes: usize,
+    /// The same, summed over one client's connections.
+    pub max_client_buffered_bytes: usize,
 }
 
-/// Default policy: no destinations, 100 max connections, no reverse tunnels, loopback bind.
+/// Default for [`GatewayPolicy::max_buffered_bytes`] (the same as the Node host).
+pub const DEFAULT_MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
+/// Default for [`GatewayPolicy::max_client_buffered_bytes`] (the same as the Node host).
+pub const DEFAULT_MAX_CLIENT_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Default policy: no destinations, 100 max connections, no reverse tunnels, loopback bind,
+/// no unix sockets.
 impl Default for GatewayPolicy {
     fn default() -> Self {
         Self {
@@ -56,6 +69,12 @@ impl Default for GatewayPolicy {
             max_connections: 100,
             enable_reverse_tunnels: false,
             reverse_bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            unix: super::unix_policy::UnixPolicy {
+                max_listeners: super::unix_policy::DEFAULT_MAX_UNIX_LISTENERS,
+                ..Default::default()
+            },
+            max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
+            max_client_buffered_bytes: DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
         }
     }
 }
@@ -275,6 +294,12 @@ impl GatewayPolicyEnforcer {
     /// caller must connect to one of *those* addresses, not resolve the name again.
     pub fn check_connect(&self, host: &str, port: u16) -> Result<(), String> {
         self.check_limit()?;
+        self.check_destination(host, port)
+    }
+
+    /// [`check_connect`](Self::check_connect) without the connection limit, for a caller that
+    /// has already counted its connection with [`try_acquire`](Self::try_acquire).
+    pub fn check_destination(&self, host: &str, port: u16) -> Result<(), String> {
         if self.rules_for_name(host, Some(port)).is_empty() {
             return Err(format!("destination not allowed: {host}:{port}"));
         }
@@ -354,6 +379,36 @@ impl GatewayPolicyEnforcer {
         self.check_limit()
     }
 
+    /// The unix-socket policy.
+    pub fn unix(&self) -> &super::unix_policy::UnixPolicy {
+        &self.policy.unix
+    }
+
+    /// Per-connection and per-client byte caps on data received from a client.
+    pub fn buffer_limits(&self) -> (usize, usize) {
+        (
+            self.policy.max_buffered_bytes,
+            self.policy.max_client_buffered_bytes,
+        )
+    }
+
+    /// Count a connection if the limit allows it: the check and the count are one step, so
+    /// concurrent opens cannot both slip under it.
+    pub fn try_acquire(&self) -> Result<ConnectionGuard, String> {
+        let before = self.active_connections.fetch_add(1, Ordering::AcqRel);
+        let guard = ConnectionGuard {
+            counter: self.active_connections.clone(),
+        };
+        if before >= self.policy.max_connections {
+            // `guard` drops here and takes the count back.
+            return Err(format!(
+                "connection limit reached ({}/{})",
+                before, self.policy.max_connections
+            ));
+        }
+        Ok(guard)
+    }
+
     /// Increment active connection count. Returns an owned guard that
     /// decrements on drop. The guard is `Send` so it can be moved into
     /// spawned tasks — the connection stays counted until the task ends.
@@ -399,6 +454,7 @@ mod tests {
             max_connections: 100,
             enable_reverse_tunnels: true,
             reverse_bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..GatewayPolicy::default()
         })
     }
 
