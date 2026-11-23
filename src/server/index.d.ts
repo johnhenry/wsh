@@ -107,6 +107,59 @@ export interface WshPtyProcess {
   kill(signal?: string): void;
 }
 
+/** Who is calling a named endpoint: the authenticated identity of the connection. */
+export interface WshGatewayWho { username: string | null; fingerprint: string | null }
+
+/** What a named endpoint handler (or a client's `openEndpoint`) gets: web streams with backpressure. */
+export interface WshGatewayEndpointDuplex {
+  readable: ReadableStream<Uint8Array>;
+  writable: WritableStream<Uint8Array>;
+  who: WshGatewayWho;
+  /** Half-close: nothing more will be sent. */
+  close(reason?: string): void;
+  /** Tear the connection down now. */
+  destroy(reason?: string): void;
+  /** Settles when the connection is over (either side, or the client disconnected). */
+  closed: Promise<string | undefined>;
+}
+
+export type WshGatewayEndpointHandler = (duplex: WshGatewayEndpointDuplex, who: WshGatewayWho) => void | Promise<void>;
+
+export interface WshServerGatewayOptions {
+  /** Destinations a client may reach: `"*"`, `"host"` (any port), `"host:port"`. Default deny. An IP-literal entry permits exactly that address even if private. */
+  allow: string[];
+  /** CIDR blocks or addresses the host may dial although they are not globally routable (`"10.0.0.0/8"`, `"127.0.0.1"`, `"fd00::/8"`). Default none. */
+  allowPrivate?: string[];
+  /** Concurrent gateway connections per client (default 32). */
+  maxConnections?: number;
+  connectTimeoutMs?: number;
+  /** A UDP flow with no datagram in either direction for this long is closed (default 60000). */
+  udpIdleMs?: number;
+  /** Bytes received from a client for one connection and not yet taken by its origin before it is closed (default 4 MiB; at least 262144). */
+  maxBufferedBytes?: number;
+  /** The same, summed over one client's connections (default 32 MiB). */
+  maxClientBufferedBytes?: number;
+  socks?: string | { host: string; port: number };
+  /**
+   * Unix-domain sockets a client may reach (`OpenUnix`, feature `gateway-unix`) or ask the host to create
+   * (`ListenUnix`). Off unless given; each entry is an absolute path (exact), a directory prefix with a trailing `/`,
+   * or `@name` / `@prefix/` for the Linux abstract namespace. Checked after `realpath` of the parent directory; the
+   * file must be a socket, not a symlink. Sockets the host creates are mode 0600 and removed on close.
+   */
+  unix?: {
+    connect?: string[];
+    listen?: string[];
+    /** Let a client replace an existing STALE socket file when it asks to (OpenSSH `StreamLocalBindUnlink`). Default false. */
+    replaceStale?: boolean;
+    /** Unix listeners per client (default 4). */
+    maxListeners?: number;
+  };
+  /** Named virtual endpoints (`OpenEndpoint`, feature `gateway-endpoints`): only these names exist. */
+  endpoints?: Record<string, WshGatewayEndpointHandler | { open: WshGatewayEndpointHandler; authorize?: (who: WshGatewayWho) => boolean | Promise<boolean> }>;
+  /** `false`: no TCP or DNS at all (an endpoints-only gateway). Default true. */
+  tcp?: boolean;
+}
+
 export interface WshServerPtyOptions {
   /** `node-pty`'s `spawn(file, args, options)`, or anything shaped like it. */
   spawn(file: string, args: string[], options: {
@@ -352,9 +405,14 @@ export interface WshServerOptions {
    * Answer the gateway opcodes (OpenTcp, ResolveDns, GatewayData, GatewayClose) so a client can open TCP connections and
    * resolve names from this host. Default deny: a destination must match `allow` (`"*"`, `"host"` any port, `"host:port"`).
    * `socks` dials through a SOCKS5 proxy (e.g. Tor at `127.0.0.1:9050`) with the name left unresolved; `ResolveDns` is then
-   * refused. UDP and reverse tunnels are answered with a failure. Off by default.
+   * refused. UDP and TCP reverse tunnels are answered with a failure. Off by default.
+   *
+   * The ADDRESS a name resolves to is checked too: the host resolves once, refuses every address
+   * that is not globally routable (loopback, private, link-local, CGNAT, ULA, multicast, reserved, and IPv4 wrapped as
+   * mapped / NAT64 / 6to4 IPv6) unless `allowPrivate` or an IP-literal `allow` entry says so, and connects to that
+   * address. `ResolveDns` answers are filtered the same way. Gateway data is flow controlled (`gateway-credit`).
    */
-  gateway?: { allow: string[]; maxConnections?: number; connectTimeoutMs?: number; socks?: string | { host: string; port: number } };
+  gateway?: WshServerGatewayOptions;
   /**
    * Handlers for application-defined control messages: one whose `type` is a string (protocol messages are numeric, so
    * there is no collision) from an authenticated connection is handed to `extensions[type]`. A throw is logged.

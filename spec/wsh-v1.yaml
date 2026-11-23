@@ -1395,6 +1395,98 @@ messages:
           type: bytes
           required: true
 
+    GatewayCredit:
+      code: 0x7f
+      description: >
+        Per-connection flow control for GatewayData (feature
+        "gateway-credit"). Sent by the RECEIVER of a gateway connection's
+        data to tell the sender it may send `bytes` more payload bytes of
+        GatewayData on gateway_id. Each direction of each connection has its
+        own credit, which starts at 262144 bytes when the connection is
+        established (the host's GatewayOk, or the client's InboundAccept) and
+        is topped up by GatewayCredit as the receiver consumes data (the Node
+        host: when the origin socket has taken it; a client: when the
+        application has read it). A sender never has more than the credit
+        it holds in flight; a receiver closes a connection whose peer
+        overruns the credit it granted. Both peers use it only when the
+        client listed "gateway-credit" in Hello.features AND the host listed
+        it in ServerHello.features; otherwise neither sends it and GatewayData
+        is unmetered as before (the host then bounds its buffering with
+        byte caps instead and closes a connection that exceeds them).
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        bytes:
+          type: u32
+          required: true
+
+    OpenUnix:
+      code: 0x63
+      description: >
+        Sent by the client to ask the host to connect to a unix-domain
+        socket at `path` on the HOST's file system (OpenSSH streamlocal,
+        `-L ...:/remote.sock`). Only to a host that listed "gateway-unix" in
+        ServerHello.features. Answered by GatewayOk or GatewayFail; the data
+        then flows as GatewayData / GatewayCredit / GatewayClose on
+        gateway_id exactly as for OpenTcp. `path` is absolute; a leading "@"
+        names a Linux abstract-namespace socket. The host refuses (code
+        4=POLICY_DENIED) any path its policy does not list.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        path:
+          type: string
+          required: true
+
+    OpenEndpoint:
+      code: 0x64
+      description: >
+        Sent by the client to open the host's NAMED VIRTUAL ENDPOINT `name`:
+        an in-process handler the host's embedder registered (a host with no
+        file system, such as a browser tab, offers these instead of unix
+        sockets). Only to a host that listed "gateway-endpoints" in
+        ServerHello.features. Answered by GatewayOk or GatewayFail (4 for a
+        name that is not registered); the data then flows as for OpenUnix.
+        It is a separate message rather than a reserved OpenUnix path so
+        that a name can never be confused with a file-system path (or an
+        abstract-namespace name) and so a host's file-system policy is not
+        consulted for it.
+      fields:
+        gateway_id:
+          type: u32
+          required: true
+        name:
+          type: string
+          required: true
+
+    ListenUnix:
+      code: 0x65
+      description: >
+        Sent by the client to ask the host to LISTEN on a unix-domain socket
+        at `path` on the host's file system and hand each connection to the
+        client (OpenSSH `-R /remote.sock:...`). Only to a host that listed
+        "gateway-unix". Answered by ListenOk (actual_port is 0) or ListenFail.
+        Each accepted connection is announced with InboundOpen
+        (peer_addr "" and peer_port 0) and, once the client answers
+        InboundAccept{gateway_id}, flows as GatewayData / GatewayCredit /
+        GatewayClose on that gateway_id. ListenClose stops it. The host
+        creates the socket with mode 0600 and removes it when the listener
+        closes or the connection ends. An existing socket file at `path` is
+        replaced only when `replace` is true AND the host's policy allows
+        replacing AND nothing is accepting connections on it.
+      fields:
+        listener_id:
+          type: u32
+          required: true
+        path:
+          type: string
+          required: true
+        replace:
+          type: bool
+          required: false
+
   # ── Guest sessions ──────────────────────────────────────────────────
   # Ephemeral guest sessions allow session owners to create short-lived
   # share links.  A guest invite produces a single-use token that a
@@ -2380,4 +2472,4 @@ relay:
   # exchange, so it protects against a relay that only observes, not one that
   # substitutes keys; peers who need that must authenticate the derived key
   # themselves (see the README's Security model).
-  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, McpCancel, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff, KeyExchange, EncryptedFrame]
+  forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayCredit, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, McpCancel, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff, KeyExchange, EncryptedFrame]

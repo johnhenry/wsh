@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 101
+- **Total message types**: 105
 
 ## Enums
 
@@ -125,6 +125,9 @@ Type: `string`
 | `0x60` | Detach | session |
 | `0x61` | DetachOk | session |
 | `0x62` | DetachFail | session |
+| `0x63` | OpenUnix | gateway |
+| `0x64` | OpenEndpoint | gateway |
+| `0x65` | ListenUnix | gateway |
 | `0x70` | OpenTcp | gateway |
 | `0x71` | OpenUdp | gateway |
 | `0x72` | ResolveDns | gateway |
@@ -140,6 +143,7 @@ Type: `string`
 | `0x7c` | ListenFail | gateway |
 | `0x7d` | ListenClose | gateway |
 | `0x7e` | GatewayData | gateway |
+| `0x7f` | GatewayCredit | gateway |
 | `0x80` | GuestInvite | guest |
 | `0x81` | GuestJoin | guest |
 | `0x82` | GuestRevoke | guest |
@@ -788,6 +792,40 @@ Category: **session**
 |-------|------|----------|---------|
 | `reason` | `string` | yes | — |
 
+### OpenUnix (`0x63`)
+
+Category: **gateway**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `gateway_id` | `u32` | yes | — |
+| `path` | `string` | yes | — |
+
+### OpenEndpoint (`0x64`)
+
+Category: **gateway**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `gateway_id` | `u32` | yes | — |
+| `name` | `string` | yes | — |
+
+### ListenUnix (`0x65`)
+
+Category: **gateway**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `listener_id` | `u32` | yes | — |
+| `path` | `string` | yes | — |
+| `replace` | `bool` | no | — |
+
 ### OpenTcp (`0x70`)
 
 Category: **gateway**
@@ -959,6 +997,17 @@ Category: **gateway**
 |-------|------|----------|---------|
 | `gateway_id` | `u32` | yes | — |
 | `data` | `bytes` | yes | — |
+
+### GatewayCredit (`0x7f`)
+
+Category: **gateway**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `gateway_id` | `u32` | yes | — |
+| `bytes` | `u32` | yes | — |
 
 ### GuestInvite (`0x80`)
 
