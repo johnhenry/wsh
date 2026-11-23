@@ -28,12 +28,20 @@
     "./reverse": {
       "types": "./src/reverse-host.d.ts",
       "import": "./src/reverse-host.mjs"
+    },
+    "./mcp-stdio": {
+      "types": "./src/mcp-stdio.d.ts",
+      "import": "./src/mcp-stdio.mjs"
     }
+  },
+  "bin": {
+    "wsh-mcp": "./bin/wsh-mcp.mjs"
   },
   "sideEffects": false,
   "types": "./src/index.d.ts",
   "files": [
     "src",
+    "bin",
     "LICENSE",
     "README.md"
   ],

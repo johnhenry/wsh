@@ -1202,6 +1202,40 @@ const server = createWshServer({
 - Without `mcp`, `McpDiscover` answers an empty list and `McpCall` an
   `{ success: false, error: 'mcp is not enabled on this server' }` result.
 
+### `wsh-mcp`: a stdio bridge for MCP clients (#127)
+
+An MCP client (Claude Desktop, Cursor, an SDK `StdioClientTransport`, ...) launches a command and speaks MCP over its stdio. The package
+ships one, `wsh-mcp`, that connects to a wsh host, opens its `mcp` [rpc channel](#rpc-channels-object-mode) and passes the messages
+both ways, verbatim (ids, notifications, progress, cancellation). The host serves it with
+`createWshServer({ rpc: { mcp: mcpServerAdapter(server) } })` or, in a page, `createMemoryHost({ rpc: { mcp } })` (reach a memory host
+through whatever carries its WebSocket or a [pipe relay](#a-pipe-relay-johnhenrywshpipe-relay-118)); give each channel its own server with a factory
+(`mcpServerAdapter(() => makeServer())`) so a reconnect is served.
+
+```
+npx -p @johnhenry/wsh wsh-mcp [options] [user@]<url>        # or install the package and run `wsh-mcp`
+
+  -l, --user NAME          login name (default: the user@ in the URL, $WSH_USER, $USER, the OS user)
+  -i, --identity FILE      Ed25519 private key (default ~/.wsh/keys/default.pem, what `wsh keygen` writes; a PKCS#8 PEM works too)
+      --channel NAME       the rpc channel to open (default mcp)
+      --host-key KEY       pin the host (hex fingerprint or ssh-ed25519 line); unpinned, it warns on stderr
+      --no-reconnect, --reconnect-attempts N, --timeout MS
+```
+
+An MCP client configuration:
+
+```json
+{ "mcpServers": { "remote": { "command": "wsh-mcp", "args": ["--identity", "/home/me/.wsh/keys/default.pem", "--host-key", "<fingerprint>", "wss://host.example:4422"] } } }
+```
+
+stdout carries MCP messages only (one JSON-RPC message per line); every diagnostic goes to stderr. Exit status: `0` the client closed
+its side, `1` the host was lost for good, `2` it could not start -- no connection, a refused login or host key, or **a host that offers
+no such channel** (the error lists the channels it does offer and how to serve one). After a dropped connection it reconnects (5
+attempts from 500 ms, doubling), re-sends the client's `initialize` to the new channel without telling the client, answers a request
+that was in flight with a JSON-RPC error (`-32603`, the client may retry) and delivers what the client sent meanwhile (at most 200
+messages). `--target` is not offered: rpc channels are not per target on any host (#121). The same bridge is a function,
+`runMcpStdioBridge()` from `@johnhenry/wsh/mcp-stdio`. **Rust: not built** -- the `wsh` CLI has no `wsh mcp`, because `wsh-client` has no
+rpc channel yet; `wsh-mcp` needs Node.
+
 ### Host key (fingerprint / TOFU)
 
 Give the server an identity and the stock client can pin it:
@@ -1819,6 +1853,7 @@ than left to be found.
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed); the client sends `host-key-nonce`, verifies `host-key`/`host-key-sig`, pins only a proven key, and a first use needs `--accept-new-host-key` or a yes at a terminal (`--require-host-key` refuses a host with no proof); `wsh-server` has an opt-in host key (`[server] host_key`) | **Unified** (wsh #59, #145): both pin a PROVEN `ServerHello.host_fingerprint`. A Rust server with no `host_key` configured (the default, so released clients keep working) proves nothing |
 | Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | Rust `wsh-server` (`rust-v0.4.0`+): `wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set; no client yet in `wsh-client` | **No wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere; the Rust server serves it on WebSocket/QMux only |
+| MCP over stdio for MCP clients that launch a command (#127) | `wsh-mcp` (the package's `bin`) and `runMcpStdioBridge()` from `@johnhenry/wsh/mcp-stdio`: opens the host's `mcp` rpc channel, reconnects, a clear error when the host offers none | **not built**: no `wsh mcp`, because `wsh-client` has no rpc channel; the Rust `wsh-server` also serves no `mcp` rpc channel (it answers `McpDiscover`/`McpCall`, which `WshMcpBridge` uses) | **JS-only for now** -- no wire change (the channel is #85's) |
 | Exec stdin + EOF, separate stderr | `exec({ stdin })`, `session.closeStdin()`, `session.onStderr` | `SessionOpts { stdio: Some("pipes") }`, `WshSession::read_stderr()` / `close_stdin()`; `wsh host command` uses them whenever its stdin is a pipe or a file and the host offers `exec-pipes` | **Wire-unified, negotiated** (#105): `Open.stdio = "pipes"` + `OpenOk.stderr_channel_id` + zero-length `SessionData` as EOF, offered by the `exec-pipes` `ServerHello` feature. `@johnhenry/wsh/server` needs none of it (stream-mode EOF); the Rust `wsh-server` (`rust-v0.5.0`+) runs such an exec on pipes, everything else on the PTY. Against a host without `exec-pipes` the CLI still forwards stdin, but cannot tell the command it ended |
 | Signals and resize for a one-off command | `session.signal()`, `session.resize()` | `wsh host command` forwards SIGINT/SIGTERM/SIGHUP (the same signal twice disconnects); `wsh --tty host command` also forwards terminal resizes | **Wire-unified** (`Signal`, `Resize`). The Rust `wsh-server` delivers `Signal` (#145) to a pty session's foreground process group (what ^C reaches) and to an exec-on-pipes command's own process group, for `HUP INT QUIT TERM KILL USR1 USR2 WINCH CONT STOP TSTP ALRM` (with or without `SIG`); another name is ignored, and only the control attachment of the connection that owns the channel can send one. Not delivered on Windows |
 | Dial target | a URL | `wsh [user@]host` (dials `https://` then `wss://` on `--port`), or a full URL: `wsh wss://host:8443/rendezvous/ab12 command`, `ws://127.0.0.1:PORT/` | **CLI-only convenience**: a URL is dialled exactly as given (no transport fallback; `--port` and `--transport` do not apply). Plain `ws://` is accepted only to a loopback host |
@@ -2008,6 +2043,13 @@ out explicitly below rather than left to be discovered.
   dropped and counted (`server.gatewayStats()`).
 
 **What is still yours:**
+
+- **`wsh-mcp` runs as a client with your key (#127).** It reads a private key file you point it at (no passphrase support: protect the
+  file, `0600`), logs in as you and hands the MCP client everything the host's `mcp` channel serves; whatever the MCP client (or the
+  model behind it) asks of those tools is done as you. It does not pin the host unless you pass `--host-key` (it warns once on stderr),
+  so a first connection to an unpinned host trusts whoever answers. After a reconnect it re-sends the client's `initialize` to a new
+  server-side session: server state from the old session (subscriptions, per-session data) is not carried over. It does not filter
+  or inspect MCP messages; a tool's own authorization is the host's (`mcp.authorize`).
 
 - **What a reverse listener exposes.** Whoever can reach the bound port can talk to whatever the client behind it serves,
   as the client, with no authentication of their own: wsh authenticates the operator that asks for the listener, not the
