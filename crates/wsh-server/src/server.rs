@@ -8,11 +8,17 @@ use crate::gateway::policy::{GatewayPolicy, GatewayPolicyEnforcer};
 use crate::gateway::GatewaySession;
 use crate::handshake;
 use crate::mcp::{McpBridge, McpProxy};
-use crate::relay::{wisp, PeerMetadata, PeerRegistry, RelayBroker, WispGuestSession, WispRegistry};
+use crate::relay::bridges::Route;
+use crate::relay::{
+    wisp, Bridges, PeerMetadata, PeerRegistry, RelayBroker, WispGuestSession, WispRegistry,
+};
 use crate::rpc::session::{open_fail as rpc_open_fail, peek_rpc_open, RpcSessions};
 use crate::rpc::RpcSettings;
 use crate::session::{AttachError, Attachment, SessionManager};
 use crate::transport::{websocket, webtransport};
+/// The most a peer may wrap in one `RelayForward` it writes itself (the JS relay's bound).
+const MAX_RELAY_FORWARD_BYTES: usize = 8 * 1024 * 1024;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -221,15 +227,10 @@ pub struct WshServer {
     /// Channel-to-session mapping: channel_id → session_id.
     /// Used by Close/Resize to operate on the correct session.
     channel_sessions: Arc<RwLock<HashMap<u32, String>>>,
-    /// Relay pairs: maps conn_id → partner conn_id for bidirectional relay.
-    /// When a ReverseConnect bridge is established between a CLI client and a
-    /// browser peer, both directions are stored here so that forwardable
-    /// messages from one side are relayed to the other.
-    relay_pairs: Arc<RwLock<HashMap<u64, u64>>>,
-    /// Pending reverse-connect handshakes: conn_id → partner conn_id.
-    /// These entries exist after `ReverseConnect` is forwarded and before the
-    /// target peer answers with `ReverseAccept` or `ReverseReject`.
-    pending_relay_pairs: Arc<RwLock<HashMap<u64, u64>>>,
+    /// Relay bridges (wsh #93): which operator connections are bridged to which peer, and the
+    /// `ReverseConnect` handshakes that await their peer's answer. Forwardable messages from
+    /// either side are relayed to the other (a peer serving several operators addresses them).
+    bridges: Arc<RwLock<Bridges>>,
     /// Atomic counter for generating unique connection IDs.
     /// Starts at 1; 0 is reserved as sentinel for unwrap_or(0).
     next_conn_id: Arc<AtomicU64>,
@@ -272,6 +273,7 @@ impl WshServer {
     pub fn new(config: ServerConfig) -> WshResult<Self> {
         // Generate server secret
         let secret = wsh_core::generate_secret();
+        let relay_max_operators_per_peer = config.relay_max_operators_per_peer;
 
         // Load authorized keys
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -420,8 +422,7 @@ impl WshServer {
             share_entries: Arc::new(RwLock::new(HashMap::new())),
             conn_session_map: Arc::new(RwLock::new(HashMap::new())),
             channel_sessions: Arc::new(RwLock::new(HashMap::new())),
-            relay_pairs: Arc::new(RwLock::new(HashMap::new())),
-            pending_relay_pairs: Arc::new(RwLock::new(HashMap::new())),
+            bridges: Arc::new(RwLock::new(Bridges::new(relay_max_operators_per_peer))),
             next_conn_id: Arc::new(AtomicU64::new(1)),
             next_channel_id: Arc::new(AtomicU32::new(1)),
             file_uploads: Arc::new(RwLock::new(HashMap::new())),
@@ -474,8 +475,7 @@ impl WshServer {
         let gc_terminal_configs = server.terminal_configs.clone();
         let gc_echo_trackers = server.echo_trackers.clone();
         let gc_channel_sessions = server.channel_sessions.clone();
-        let gc_relay_pairs = server.relay_pairs.clone();
-        let gc_pending_relay_pairs = server.pending_relay_pairs.clone();
+        let gc_bridges = server.bridges.clone();
         let idle_warning_grace: u64 = 300; // Warn 5 minutes before idle timeout
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -585,17 +585,15 @@ impl WshServer {
                         .retain(|cid, _| senders.contains_key(cid));
                 }
 
-                // GC relay_pairs entries for connections no longer in peer_senders
+                // GC relay bridges of connections no longer in peer_senders
                 {
                     let senders = gc_peer_senders.read().await;
-                    gc_relay_pairs
-                        .write()
-                        .await
-                        .retain(|cid, _| senders.contains_key(cid));
-                    gc_pending_relay_pairs
-                        .write()
-                        .await
-                        .retain(|cid, _| senders.contains_key(cid));
+                    let mut bridges = gc_bridges.write().await;
+                    for cid in bridges.connections() {
+                        if !senders.contains_key(&cid) {
+                            bridges.depart(cid);
+                        }
+                    }
                 }
 
                 // GC channel-keyed maps (terminal_configs, echo_trackers)
@@ -2323,17 +2321,21 @@ impl WshServer {
         }
     }
 
+    /// A connection ended (or its partner is gone): forget its bridges. A peer that serves several
+    /// operators (wsh #93) is told with `ReverseClose` which one left; any other peer is left
+    /// connected, as it always was.
     async fn clear_relay_links(&self, conn_id: u64) {
-        {
-            let mut pending = self.pending_relay_pairs.write().await;
-            if let Some(partner) = pending.remove(&conn_id) {
-                pending.remove(&partner);
+        let departed = self.bridges.write().await.depart(conn_id);
+        if let Some((peer, operator_fingerprint)) = departed.reverse_close {
+            if let Some(tx) = self.peer_senders.read().await.get(&peer) {
+                let _ = tx.try_send(Envelope {
+                    msg_type: MsgType::ReverseClose,
+                    payload: Payload::ReverseClose(ReverseClosePayload {
+                        target_fingerprint: operator_fingerprint,
+                        reason: Some("operator left".to_string()),
+                    }),
+                });
             }
-        }
-
-        let mut pairs = self.relay_pairs.write().await;
-        if let Some(partner) = pairs.remove(&conn_id) {
-            pairs.remove(&partner);
         }
     }
 
@@ -2372,6 +2374,16 @@ impl WshServer {
             features.push("reverse".to_string());
             // ReverseChallenge / ReverseProof and ReverseConnect.features are carried (wsh #117).
             features.push(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE.to_string());
+            // The relay carries `KeyExchange.signature` (the regenerated payload has the field), so a
+            // peer may sign its half of an end-to-end exchange; the JS reverse host signs only after
+            // reading this (wsh #93). A relay built before the field drops a connection that sends it.
+            features.push(wsh_core::e2e_exchange::E2E_SIGN_FEATURE.to_string());
+            // `RelayForward.to_fingerprint` and `ReverseClose`: a peer that states the same feature
+            // in its ReverseAccept may be bridged to several operators (wsh #93). Only when the
+            // operator configured more than one, so a default relay advertises nothing new.
+            if self.config.relay_max_operators_per_peer > 1 {
+                features.push(wsh_core::RELAY_MULTI_OPERATOR_FEATURE.to_string());
+            }
         }
         if self.recording_dir.is_some() {
             features.push("recording".to_string());
@@ -2431,11 +2443,17 @@ impl WshServer {
         }
     }
 
-    /// `ReverseConnect.features` as the relay copies it: at most 8 entries of at most 64 bytes each;
-    /// anything else is dropped (the peer then sees an operator that claims nothing).
-    fn bounded_features(features: Option<&[String]>) -> Option<Vec<String>> {
+    /// A `features` list as the relay reads or copies it: at most `max_entries` entries of at most
+    /// `max_len` bytes each; anything else is dropped (the reader then sees a peer that claims
+    /// nothing). `ReverseConnect.features` is bounded at 8 x 64, `ReverseAccept.features` at 64 x 128.
+    fn bounded_features(
+        features: Option<&[String]>,
+        max_entries: usize,
+        max_len: usize,
+    ) -> Option<Vec<String>> {
         let f = features?;
-        (f.len() <= 8 && f.iter().all(|s| !s.is_empty() && s.len() <= 64)).then(|| f.to_vec())
+        (f.len() <= max_entries && f.iter().all(|s| !s.is_empty() && s.len() <= max_len))
+            .then(|| f.to_vec())
     }
 
     /// Check whether a message type should be forwarded through a relay bridge
@@ -2451,19 +2469,31 @@ impl WshServer {
                 envelope.msg_type,
                 MsgType::ReverseAccept | MsgType::ReverseReject
             ) {
-                let partner_id = {
-                    let pending = self.pending_relay_pairs.read().await;
-                    pending.get(&conn_id).copied()
-                };
+                // Only the peer a request was forwarded to can answer it.
+                let partner_id = self.bridges.read().await.pending_operator(conn_id);
 
                 if let Some(partner_id) = partner_id {
                     let msg_type = envelope.msg_type;
+                    // A peer that serves several operators says so in the features of its accept
+                    // (bounded: anything else is not read).
+                    let multi = match &envelope.payload {
+                        Payload::ReverseAccept(a) => {
+                            Self::bounded_features(a.features.as_deref(), 64, 128).is_some_and(
+                                |f| {
+                                    f.iter()
+                                        .any(|f| f == wsh_core::RELAY_MULTI_OPERATOR_FEATURE)
+                                },
+                            )
+                        }
+                        _ => false,
+                    };
                     let senders = self.peer_senders.read().await;
                     if let Some(sender) = senders.get(&partner_id) {
                         let _ = sender.try_send(envelope);
                     } else {
                         drop(senders);
-                        self.clear_relay_links(conn_id).await;
+                        // The requester is gone: its pending request and anything of it go.
+                        self.clear_relay_links(partner_id).await;
                         warn!(
                             conn_id,
                             partner_id,
@@ -2473,19 +2503,13 @@ impl WshServer {
                     }
                     drop(senders);
 
-                    {
-                        let mut pending = self.pending_relay_pairs.write().await;
-                        pending.remove(&conn_id);
-                        pending.remove(&partner_id);
-                    }
-
-                    if matches!(msg_type, MsgType::ReverseAccept) {
-                        let mut pairs = self.relay_pairs.write().await;
-                        pairs.insert(conn_id, partner_id);
-                        pairs.insert(partner_id, conn_id);
+                    let accepted = matches!(msg_type, MsgType::ReverseAccept);
+                    self.bridges.write().await.answer(conn_id, accepted, multi);
+                    if accepted {
                         info!(
                             requester = partner_id,
                             target = conn_id,
+                            multi_operator = multi,
                             "relay bridge established after reverse accept"
                         );
                     }
@@ -2501,42 +2525,86 @@ impl WshServer {
         // them locally. This creates a transparent bidirectional bridge between
         // CLI client and browser peer.
         if let Some(conn_id) = ctx.conn_id {
-            if is_relay_forwardable(envelope.msg_type) {
-                let relay_pairs = self.relay_pairs.read().await;
-                if let Some(&partner_id) = relay_pairs.get(&conn_id) {
-                    drop(relay_pairs);
-                    let senders = self.peer_senders.read().await;
-                    if let Some(sender) = senders.get(&partner_id) {
-                        // Wrap in RelayForward so the receiving peer can verify
-                        // who actually sent this rather than trusting the relay
-                        // blindly. from_fingerprint is the server's own record
-                        // of this connection's authenticated identity, never a
-                        // client-supplied value.
-                        match wsh_core::cbor_encode(&envelope) {
-                            Ok(inner) => {
-                                let wrapped = Envelope {
-                                    msg_type: MsgType::RelayForward,
-                                    payload: Payload::RelayForward(RelayForwardPayload {
-                                        from_fingerprint: ctx.fingerprint.clone(),
-                                        inner,
-                                        to_fingerprint: None,
-                                    }),
-                                };
-                                let _ = sender.try_send(wrapped);
-                            }
-                            Err(err) => {
-                                warn!(conn_id, %err, "failed to encode relay-forwarded envelope");
-                            }
-                        }
-                        return Ok(None); // forwarded, don't process locally
+            let forwardable = is_relay_forwardable(envelope.msg_type);
+            // A peer that serves several operators writes its own `RelayForward` to address one
+            // (`to_fingerprint`); the relay checks the inner, then re-wraps it with the sender's
+            // authenticated key, so the field is never delivered (wsh #93).
+            let own_forward = matches!(envelope.msg_type, MsgType::RelayForward);
+            if forwardable || own_forward {
+                let to = match &envelope.payload {
+                    Payload::RelayForward(p) => p.to_fingerprint.as_deref(),
+                    _ => None,
+                };
+                let route = self.bridges.read().await.recipient(conn_id, to);
+                match route {
+                    Route::NoBridge => {}
+                    Route::Drop(why) => {
+                        warn!(conn_id, "relay: dropped {why}");
+                        return Ok(None);
                     }
-                    // Partner sender gone — clean up stale relay pair
-                    drop(senders);
-                    self.clear_relay_links(conn_id).await;
-                    warn!(
-                        conn_id,
-                        partner_id, "relay partner sender gone, cleaning up bridge"
-                    );
+                    Route::To(partner_id) => {
+                        // What is delivered: this message wrapped (a plain forwardable one) or the
+                        // inner of the forward the connection wrote, once it has been checked.
+                        let inner = match &envelope.payload {
+                            Payload::RelayForward(p) => {
+                                if p.inner.len() > MAX_RELAY_FORWARD_BYTES {
+                                    warn!(conn_id, "relay: dropped an oversized RelayForward");
+                                    return Ok(None);
+                                }
+                                match wsh_core::decode_envelope(&p.inner) {
+                                    Ok(decoded) if is_relay_forwardable(decoded.msg_type) => {
+                                        Ok(p.inner.clone())
+                                    }
+                                    Ok(decoded) => {
+                                        warn!(
+                                            conn_id,
+                                            msg_type = ?decoded.msg_type,
+                                            "relay: dropped a RelayForward wrapping a non-forwardable type"
+                                        );
+                                        return Ok(None);
+                                    }
+                                    Err(err) => {
+                                        warn!(conn_id, %err, "relay: dropped a RelayForward with an undecodable inner");
+                                        return Ok(None);
+                                    }
+                                }
+                            }
+                            _ => wsh_core::cbor_encode(&envelope),
+                        };
+                        let senders = self.peer_senders.read().await;
+                        if let Some(sender) = senders.get(&partner_id) {
+                            // Wrap in RelayForward so the receiving peer can verify
+                            // who actually sent this rather than trusting the relay
+                            // blindly. from_fingerprint is the server's own record
+                            // of this connection's authenticated identity, never a
+                            // client-supplied value.
+                            match inner {
+                                Ok(inner) => {
+                                    let wrapped = Envelope {
+                                        msg_type: MsgType::RelayForward,
+                                        payload: Payload::RelayForward(RelayForwardPayload {
+                                            from_fingerprint: ctx.fingerprint.clone(),
+                                            inner,
+                                            to_fingerprint: None,
+                                        }),
+                                    };
+                                    let _ = sender.try_send(wrapped);
+                                }
+                                Err(err) => {
+                                    warn!(conn_id, %err, "failed to encode relay-forwarded envelope");
+                                }
+                            }
+                            return Ok(None); // forwarded, don't process locally
+                        }
+                        // Partner sender gone — clean up its stale links (and tell a multi-operator
+                        // peer when it was an operator)
+                        drop(senders);
+                        self.clear_relay_links(partner_id).await;
+                        warn!(
+                            conn_id,
+                            partner_id, "relay partner sender gone, cleaning up bridge"
+                        );
+                    }
                 }
             }
         }
@@ -2682,7 +2750,8 @@ impl WshServer {
                         && p.session_id.len() <= 256
                         && p.operator_fingerprint.len() <= 256
                     {
-                        let partner = self.pending_relay_pairs.read().await.get(&conn_id).copied();
+                        // only the peer a request is waiting on challenges its operator
+                        let partner = self.bridges.read().await.pending_operator(conn_id);
                         if let Some(partner) = partner {
                             let fwd = Envelope {
                                 msg_type: MsgType::ReverseChallenge,
@@ -2708,7 +2777,8 @@ impl WshServer {
                         && p.session_id.len() <= 256
                         && p.username.len() <= 64
                     {
-                        let partner = self.pending_relay_pairs.read().await.get(&conn_id).copied();
+                        // only the operator whose request is pending proves itself, to that peer
+                        let partner = self.bridges.read().await.pending_peer(conn_id);
                         if let Some(partner) = partner {
                             let fwd = Envelope {
                                 msg_type: MsgType::ReverseProof,
@@ -2738,6 +2808,26 @@ impl WshServer {
                         // Forward the ReverseConnect to the target peer's transport
                         let senders = self.peer_senders.read().await;
                         if let Some(target_tx) = senders.get(&target_conn_id) {
+                            // One request per operator and per peer at a time, and one operator per
+                            // peer unless the relay and the peer allow several (wsh #93). The
+                            // answer is a ReverseReject, as the JS relay's.
+                            if let Some(requester) = ctx.conn_id {
+                                if let Err(reason) = self.bridges.write().await.begin_connect(
+                                    requester,
+                                    &ctx.fingerprint,
+                                    target_conn_id,
+                                    std::time::Instant::now(),
+                                ) {
+                                    return Ok(Some(Envelope {
+                                        msg_type: MsgType::ReverseReject,
+                                        payload: Payload::ReverseReject(ReverseRejectPayload {
+                                            target_fingerprint: p.target_fingerprint.clone(),
+                                            username: p.username.clone(),
+                                            reason,
+                                        }),
+                                    }));
+                                }
+                            }
                             let fwd = Envelope {
                                 msg_type: MsgType::ReverseConnect,
                                 payload: Payload::ReverseConnect(ReverseConnectPayload {
@@ -2748,11 +2838,15 @@ impl WshServer {
                                     from_fingerprint: ctx.fingerprint.clone(),
                                     // What the OPERATOR says it can do (#117), bounded; the
                                     // relay decides nothing by it and drops a claim it cannot bound.
-                                    features: Self::bounded_features(p.features.as_deref()),
+                                    features: Self::bounded_features(p.features.as_deref(), 8, 64),
                                 }),
                             };
                             if target_tx.try_send(fwd).is_err() {
                                 warn!(target = %&p.target_fingerprint, "failed to forward ReverseConnect");
+                                self.bridges
+                                    .write()
+                                    .await
+                                    .answer(target_conn_id, false, false);
                                 return Ok(Some(Envelope {
                                     msg_type: MsgType::Error,
                                     payload: Payload::Error(ErrorPayload {
@@ -2764,9 +2858,6 @@ impl WshServer {
                             drop(senders);
 
                             if let Some(requester_conn_id) = ctx.conn_id {
-                                let mut pending = self.pending_relay_pairs.write().await;
-                                pending.insert(requester_conn_id, target_conn_id);
-                                pending.insert(target_conn_id, requester_conn_id);
                                 info!(
                                     requester = requester_conn_id,
                                     target = target_conn_id,
@@ -4989,6 +5080,7 @@ mod wisp_reverse_connect_e2e_tests {
             session_ttl: 3600,
             idle_timeout: 3600,
             enable_relay: true,
+            relay_max_operators_per_peer: 1,
             allow_pubkey: true,
             allow_password: false,
             gateway_enabled: false,

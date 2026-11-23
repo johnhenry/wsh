@@ -713,10 +713,20 @@ const s = await client.openSession({ type: 'exec', command: 'echo hello' });
   `ReverseConnect` at a time (a concurrent one is told `busy: ... retry in a
   moment`), since a `ReverseAccept` does not name its operator; and at the cap
   the reason is `busy: this peer already has its maximum of n operators`
-  (`busyPeerFull(n)`). The **Rust relay is still one operator per peer**: it
-  never sends `ReverseClose` and rejects the second operator; the new spec
-  fields are regenerated into the Rust types and ignored there. Tracked for the
-  Rust relay in #93.
+  (`busyPeerFull(n)`). The **Rust relay and the Rust peer do this too** (#93): `wsh-server --enable-relay`
+  with `[relay] max_operators_per_peer = n` in its config (default `1`, 1 to 64; above 1 it advertises
+  `relay-multi-operator`), and `wsh --max-operators n reverse ...` / `wsh --max-operators n agent run ...` on the
+  peer (default `1`; the peer states the feature only to a relay that advertises it, and serves one operator at a
+  time on any other). The Rust relay rejects a busy peer's next operator with a `ReverseReject` carrying the same
+  `busy:` reasons. Differences from the JS relay, kept so nothing existing changes: when an operator leaves a peer
+  that serves one, the Rust relay leaves the peer connected (it may take the operator back), where the JS relay
+  closes it; and a peer that goes away leaves its operators connected. A Rust peer serving several operators keeps
+  each operator's sessions, processes and files apart (when one leaves, only its work is killed), takes each
+  operator's `--allow-operator` decision and operator proof on its own, and **does not seal bridges** (a
+  connection holds one seal): `--max-operators` above 1 is refused together with `--require-operator-proof`, and
+  an operator that insists on `--sealed` is refused by such a peer. The Rust relay also carries
+  `KeyExchange.signature` and advertises `e2e-sign`, so a JS reverse host signs its half of an end-to-end
+  exchange through it.
 - **On the peer**, the bridged operator is served by the same connection code as
   a direct client, over an in-memory message pipe instead of a socket. Nothing a
   client opens can cross the relay but control messages, so exec sessions are
@@ -1338,7 +1348,7 @@ closes the channel when received.
 | Protocol | Methods |
 |---|---|
 | `wsh-host` | `host.info` -> `{ version, protocol, features (this connection's ServerHello), hostFingerprint, user, rpc }`; `host.ping` -> `{ time }` |
-| `wsh-fs` | `stat`, `list`, `mkdir`, `remove`, `rename { path, newPath }`, `write { path, data, offset? }`, `upload { path, data, offset? }` (offset omitted/0 creates or truncates, later offsets continue in place: chunk big files), `read { path, offset?, length? }` and `download { path }` (the bytes arrive as `$/progress` chunks of at most 64 KiB; the result is `{ size, offset, length, eof }`). Same confinement as `fs`: no traversal or symlink escapes, `readOnly`, `maxFileBytes`; policy refusals are `-32003`. |
+| `wsh-fs` | `stat`, `list` (entries sorted by name in UTF-16 code-unit order on every platform and on both hosts: upper case before lower case, whatever the filesystem's case rules), `mkdir`, `remove`, `rename { path, newPath }`, `write { path, data, offset? }`, `upload { path, data, offset? }` (offset omitted/0 creates or truncates, later offsets continue in place: chunk big files), `read { path, offset?, length? }` and `download { path }` (the bytes arrive as `$/progress` chunks of at most 64 KiB; the result is `{ size, offset, length, eof }`). Same confinement as `fs`: no traversal or symlink escapes, `readOnly`, `maxFileBytes`; policy refusals are `-32003`. |
 | `mcp` | The MCP JSON-RPC surface verbatim; see below |
 
 When a host advertises `rpc-protocol:wsh-fs`, `fileStat` / `fileList` / `fileRead` /
@@ -1719,7 +1729,7 @@ than left to be found.
 | Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. `wsh scp` works against such a host with the Rust client of the next `rust-v` release (it speaks `FileChunk`, #140); a released `rust-v0.11.0` or older `wsh scp` hangs against it (`wsh ls` and exec work) |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
-| Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side; several operators per peer and the signed `KeyExchange` are JS-relay only for now |
+| Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side. **Several operators per peer (#93): both relays** (`maxOperatorsPerPeer`; `[relay] max_operators_per_peer`, default 1) **and both peers** (`createReverseHost({ maxOperators })`; `wsh --max-operators n reverse` / `agent run`, default 1), negotiated by `relay-multi-operator`; a Rust peer serving several operators does not seal bridges (see the reverse-mode notes), and the Rust relay leaves a peer connected when its operator leaves. The signed `KeyExchange` (`e2e-sign`) is carried by the Rust relay too |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
 | Unix-domain socket forwarding, both directions; named endpoints (#120) | `client.openUnix()`, `listenUnix()`, `forwardUnix()` (Node: `-L`/`-R` shapes with unix and TCP ends mixed), `openEndpoint()`; host: `gateway: { unix, endpoints }`, `createMemoryHost({ endpoints })` | `wsh-server` serves `OpenUnix`/`ListenUnix` (`[gateway] unix_connect`, `unix_listen`, `unix_replace_stale`, `unix_max_listeners`; same policy as the Node host); `wsh-client` has `open_tcp`/`open_unix`/`open_endpoint`/`listen_unix`/`listen_tcp`; CLI `wsh -L` / `-R` / `-N` with TCP, unix and `endpoint=NAME` ends, also through `--via` | **Wire-unified, both directions** (#145). A Rust host does not offer named endpoints (an in-page host does); the CLI reaches them. See [Forwarding with `wsh -L`](#forwarding-with-wsh--l---r---n) |
 | Gateway flow control (#123) | credit per connection (`GatewayCredit`, feature `gateway-credit`); host caps for peers without it | `wsh-server` and `wsh-client`: 256 KiB per direction when both list `gateway-credit`; without it, per-connection and per-client byte caps (`max_buffered_bytes` 4 MiB, `max_client_buffered_bytes` 32 MiB) close the connection that exceeds them | **Wire-unified, negotiated**; an older peer on either side keeps working under the caps. `OpenUdp` flows are metered too (a datagram without credit is dropped) |
@@ -1848,6 +1858,14 @@ out explicitly below rather than left to be discovered.
   isolation a target gives is your backends'. `requireTarget` does not cover the gateway, MCP or `Attach`; without it a request with no
   target runs on the host's own backends, which any authenticated key can use, so a deployment that confines a key to one target must set
   `requireTarget` (or leave the host with no backends of its own). The Rust `wsh-server` has no targets and refuses any request that names one.
+- **Several operators per peer share one peer, and the relay decides who is who (#93).** Off unless both the relay
+  (`maxOperatorsPerPeer`, `[relay] max_operators_per_peer`) and the peer (`maxOperators`, `--max-operators`) are
+  set above 1. The relay stamps each message with its own record of the sender's authenticated key and removes
+  `to_fingerprint`; it checks the inner of a forward a peer wrote (size, decodes, a forwardable type) and drops what it
+  cannot address. It does NOT protect operators from each other beyond that: they run as the same OS user as the
+  peer, so a command one operator starts can read or kill another's files and processes. A Rust peer serving several
+  operators cannot seal bridges (one seal per connection), so its bridges are as private as the relay is honest;
+  use one operator per peer where that matters (`--require-operator-proof` needs it and is refused otherwise).
 
 - **The Node gateway checks where a connection goes, not only what it was called.** `gateway.allow` matches the name a
   client sent, and then the address it resolves to must be globally routable (or permitted by `allowPrivate` or an

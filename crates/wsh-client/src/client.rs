@@ -995,6 +995,14 @@ impl WshClient {
         self.seal.end();
     }
 
+    /// For a peer that serves several operators (wsh #93): deliver each relayed message on the
+    /// relay-message channel still wrapped in the `RelayForward` the relay sent, so that its
+    /// `from_fingerprint` says which operator wrote it. Off by default: the channel then carries
+    /// the bare messages, as it always did.
+    pub fn tag_relay_origin(&self, on: bool) {
+        self.seal.set_tag_relay_origin(on);
+    }
+
     /// Is the bridge on this connection sealed?
     pub fn bridge_sealed(&self) -> bool {
         self.seal.is_sealed()
@@ -2415,6 +2423,27 @@ impl WshClient {
                             let Some(inner) = gated.deliver else {
                                 return;
                             };
+                            // A peer that serves several operators (wsh #93) must know which one
+                            // sent this: it gets the forward as the relay stamped it, and unwraps it
+                            // itself.
+                            if seal.tags_relay_origin() {
+                                if let Some(tx) = relay_message_tx {
+                                    if let Ok(bytes) = wsh_core::cbor_encode(&inner) {
+                                        let tagged = Envelope {
+                                            msg_type: MsgType::RelayForward,
+                                            payload: Payload::RelayForward(RelayForwardPayload {
+                                                from_fingerprint: p.from_fingerprint.clone(),
+                                                inner: bytes,
+                                                to_fingerprint: None,
+                                            }),
+                                        };
+                                        if let Err(err) = tx.send(tagged).await {
+                                            tracing::debug!("relay message channel closed: {err}");
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
                             Self::handle_incoming(
                                 inner,
                                 response_tx,
@@ -2578,7 +2607,8 @@ impl WshClient {
 
                 // Incoming reverse connection request (unsolicited from relay), and the
                 // operator's proof that follows a challenge this peer issued (#117).
-                MsgType::ReverseConnect | MsgType::ReverseProof => {
+                // `ReverseClose` (wsh #93) names an operator that left a peer which serves several.
+                MsgType::ReverseConnect | MsgType::ReverseProof | MsgType::ReverseClose => {
                     tracing::info!("incoming reverse connect request");
                     if let Some(tx) = reverse_connect_tx {
                         if let Err(e) = tx.send(envelope).await {

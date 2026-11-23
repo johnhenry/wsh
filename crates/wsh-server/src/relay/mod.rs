@@ -1,5 +1,6 @@
 //! Reverse connection relay: registry and broker.
 
+pub mod bridges;
 pub mod broker;
 pub mod registry;
 
@@ -15,6 +16,7 @@ pub mod wisp;
 #[cfg(test)]
 pub mod wisp_bridge_poc;
 
+pub use bridges::Bridges;
 pub use broker::RelayBroker;
 pub use registry::{PeerEntry, PeerMetadata, PeerRegistry};
 pub use wisp::{WispGuestSession, WispRegistry};

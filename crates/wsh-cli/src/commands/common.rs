@@ -361,6 +361,8 @@ pub struct IdentityPolicy {
     pub require_operator_proof: bool,
     /// Reverse host: the operators it serves (fingerprints or prefixes of at least 8 digits).
     pub allow_operators: Vec<String>,
+    /// Reverse host: how many operators it serves at once (0 = unset = 1).
+    pub max_operators: usize,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
     pub operator_proof: OperatorProofMode,
     /// Reverse operator: seal the bridge (`--sealed` on `wsh reverse-connect`).
@@ -400,6 +402,13 @@ pub fn apply_host_policy(
 ) -> Result<()> {
     let p = identity_policy();
     options.require_operator_proof = p.require_operator_proof;
+    options.max_operators = p.max_operators.max(1);
+    if options.max_operators > 1 && p.require_operator_proof {
+        anyhow::bail!(
+            "--max-operators above 1 cannot be combined with --require-operator-proof: that rule needs \
+             a sealed bridge, and a connection holds one seal, so a host cannot seal each of several operators"
+        );
+    }
     for a in &p.allow_operators {
         if a.len() < 8 || !a.bytes().all(|b| b.is_ascii_hexdigit()) {
             anyhow::bail!("--allow-operator takes at least 8 hex digits of an operator fingerprint, got `{a}`");
