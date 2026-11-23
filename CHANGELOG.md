@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.38.0
+
+- **Security fix and behaviour change: the Node gateway checks the resolved address.** The `gateway` option of
+  `createWshServer` matched `allow` against the NAME a client sent and dialled that name; it now checks the address the
+  name resolves to as well. The host resolves the name once, drops every address that
+  is not globally routable, and connects to the address it checked (never the name again). "Not globally routable" covers
+  IPv4 loopback, private, link-local, CGNAT, documentation, benchmarking, multicast and reserved ranges, IPv6 loopback,
+  unspecified, ULA, link-local, site-local, multicast, documentation and deprecated ranges, and IPv4 wrapped in IPv6
+  (IPv4-mapped, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`). `ResolveDns` answers are filtered with the same rule, so the host
+  does not hand out internal addresses and a later `OpenTcp` to one is refused. `GatewayOk.resolved_addr` now carries the
+  address that was connected to.
+  - **Breaking for existing deployments:** a gateway that reached loopback or private space (`allow: ['*']` to a local
+    service, `allow: ['broker.lan:1883']` for a LAN broker, `localhost`) is now refused with `POLICY_DENIED` until you say
+    so explicitly: `gateway.allowPrivate: ['10.0.0.0/8', '127.0.0.1', ...]` (CIDR blocks or addresses), or an `allow`
+    entry that is itself an IP literal (`"192.168.1.5:1883"`, which permits exactly that address). Public destinations are
+    unaffected. Through `socks` the name still goes to the proxy unresolved (nothing to check); IP literals are checked.
+  - The Rust `wsh-server` gateway has the same gap (`check_connect` matches the name, `connect` resolves it again) and is
+    NOT fixed by this change.
+  - **Tests:** `test/gateway-address-guard.test.mjs` (the guard over IPv4, IPv6, mapped, NAT64, 6to4, malformed input),
+    `test/gateway-address-policy.test.mjs` (an allowed name resolving to loopback/private/link-local/mapped/NAT64 refused
+    after exactly one lookup; connect uses the checked address; literals and the odd numeric spellings; `allowPrivate`
+    and literal rules; ResolveDns filtering; SOCKS literals).
 ## 0.36.0
 
 - **A host that lives in a page, with the public API only (#131: #114, #115, #132, #133, #116, #128, #130).** An embedder
