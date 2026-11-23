@@ -158,7 +158,7 @@ for (const relayKind of ['js', 'rust']) {
       const res = await op.reverseConnect(host.fp, 8000, { sealed: true });
       assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
       assert.ok(res.features.includes('e2e-sealed'));
-      const s = await op.openSession({ type: 'exec', command: `echo SECRET-ZEBRA > ${dir}/legit; echo ECHOED-BACK-QUOKKA` });
+      const s = await op.openSession({ type: 'exec', command: `echo SECRET-ZEBRA > ${dir}/legit; sleep 0.4; echo ECHOED-BACK-QUOKKA` });
       const out = await collectExec(s);
       assert.match(out, /ECHOED-BACK-QUOKKA/);
       await until(() => existsSync(path.join(dir, 'legit')), 'the command to run');
