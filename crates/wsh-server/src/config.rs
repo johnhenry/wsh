@@ -94,6 +94,23 @@ pub struct ServerSection {
     /// refused -- turn this on only when every client is new enough.
     #[serde(default)]
     pub require_channel_binding: bool,
+    /// Seal a WebSocket session end to end (wsh #155): `off` (default: nothing changes for any
+    /// client), `offer` (a client that asks -- `wsh --sealed`, `connect({ sealSession: true })` --
+    /// gets a sealed session, any other is served as before) or `require` (nothing is served on a
+    /// session that is not sealed: no password login, no WebTransport, no relay tunnels). Needs
+    /// `host_key`. Typed rpc channels are not offered while this is on (their streams are not frames).
+    #[serde(default)]
+    pub seal_session: SealSession,
+}
+
+/// `[server] seal_session`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SealSession {
+    #[default]
+    Off,
+    Offer,
+    Require,
 }
 
 impl Default for ServerSection {
@@ -108,6 +125,7 @@ impl Default for ServerSection {
             client_env: None,
             host_key: None,
             require_channel_binding: false,
+            seal_session: SealSession::Off,
         }
     }
 }
@@ -456,6 +474,8 @@ pub struct ServerConfig {
     pub host_key_path: Option<PathBuf>,
     /// See [`ServerSection::require_channel_binding`].
     pub require_channel_binding: bool,
+    /// See [`ServerSection::seal_session`].
+    pub seal_session: SealSession,
 }
 
 impl ServerConfig {
@@ -576,6 +596,16 @@ impl ServerConfig {
                     .into(),
             ));
         }
+        if file_config.server.seal_session != SealSession::Off
+            && file_config.server.host_key.is_none()
+        {
+            return Err(wsh_core::WshError::Other(
+                "config: [server] seal_session = \"offer\" or \"require\" needs [server] host_key: the \
+                 server signs its half of the key exchange with its own key, and a client has nothing \
+                 to authenticate the exchange against without it"
+                    .into(),
+            ));
+        }
 
         Ok(Self {
             port,
@@ -606,6 +636,7 @@ impl ServerConfig {
             client_env,
             host_key_path: file_config.server.host_key.as_deref().map(expand_tilde_str),
             require_channel_binding: file_config.server.require_channel_binding,
+            seal_session: file_config.server.seal_session,
         })
     }
 }
@@ -812,6 +843,53 @@ reverse_bind_addr = "0.0.0.0"
         let result = ServerConfig::load(Some(&path), None, None, None, None, None, None, false);
         std::fs::remove_dir_all(&dir).ok();
         assert!(result.is_err());
+    }
+
+    // ── sealed sessions (#155): off by default, `offer` / `require` need the host key ──
+
+    fn load_err(toml_text: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "wsh-config-seal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml_text).unwrap();
+        let result = ServerConfig::load(Some(&path), None, None, None, None, None, None, false);
+        std::fs::remove_dir_all(&dir).ok();
+        result.err().expect("config is refused").to_string()
+    }
+
+    #[test]
+    fn seal_session_is_off_by_default_so_no_released_client_is_affected() {
+        assert_eq!(load_defaults().seal_session, SealSession::Off);
+        assert_eq!(load("").seal_session, SealSession::Off);
+        assert_eq!(
+            load("[server]\nseal_session = \"off\"\n").seal_session,
+            SealSession::Off
+        );
+    }
+
+    #[test]
+    fn seal_session_offer_and_require_load_with_a_host_key() {
+        let offer = load("[server]\nhost_key = \"/tmp/k\"\nseal_session = \"offer\"\n");
+        assert_eq!(offer.seal_session, SealSession::Offer);
+        let require = load("[server]\nhost_key = \"/tmp/k\"\nseal_session = \"require\"\n");
+        assert_eq!(require.seal_session, SealSession::Require);
+    }
+
+    #[test]
+    fn seal_session_needs_a_host_key_and_a_known_value() {
+        for mode in ["offer", "require"] {
+            let e = load_err(&format!("[server]\nseal_session = \"{mode}\"\n"));
+            assert!(e.contains("seal_session") && e.contains("host_key"), "{e}");
+        }
+        let e = load_err("[server]\nhost_key = \"/tmp/k\"\nseal_session = \"yes\"\n");
+        assert!(e.contains("seal_session") || e.contains("yes"), "{e}");
     }
 
     // ── passwords: off, salted, no legacy ────────────────────────────

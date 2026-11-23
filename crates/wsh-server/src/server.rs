@@ -3,7 +3,7 @@
 //! Owns the server secret (for token signing), session manager, relay subsystem,
 //! and MCP bridge. Coordinates the lifecycle of all incoming connections.
 
-use crate::config::ServerConfig;
+use crate::config::{SealSession, ServerConfig};
 use crate::gateway::policy::{GatewayPolicy, GatewayPolicyEnforcer};
 use crate::gateway::GatewaySession;
 use crate::handshake;
@@ -21,6 +21,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
+use wsh_client::e2e::{E2eResponder, InitiatorAuth};
+use wsh_client::seal_gate::{SealGate, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE};
 use wsh_core::keys::{load_authorized_keys, AuthorizedKey};
 use wsh_core::messages::*;
 use wsh_core::qmux::ErrorCode;
@@ -28,6 +30,23 @@ use wsh_core::qmux_connection::{QMuxConnection, QMuxConnectionConfig, QMuxEvent}
 use wsh_core::{
     decode_envelope, fingerprint, frame_encode, verify_token, FrameDecoder, WshError, WshResult,
 };
+
+/// Write one encoded message to a WebSocket connection's control stream, through the sealed-session
+/// gate (wsh #155): on a sealed session it leaves as an `EncryptedFrame` (the keepalive stays plain),
+/// and nothing leaves a session whose key exchange failed. Every write to the control stream of an
+/// authenticated connection goes through here, in the order the session loop makes them (the frame
+/// counter is strict).
+async fn write_control(
+    qmux: &QMuxConnection,
+    seal: &SealGate,
+    stream_id: u64,
+    frame: Vec<u8>,
+) -> WshResult<()> {
+    match seal.outgoing(frame) {
+        Some(out) => qmux.write_stream(stream_id, &out).await.map_err(Into::into),
+        None => Ok(()),
+    }
+}
 
 /// Per-connection context threaded through the session loop.
 struct ConnectionContext {
@@ -278,6 +297,11 @@ impl WshServer {
             }
             None => None,
         };
+        if config.seal_session != SealSession::Off && identity.is_none() {
+            return Err(WshError::Other(
+                "seal_session needs a host key: the server signs its half of the key exchange with it".into(),
+            ));
+        }
 
         // Session manager
         let sessions = Arc::new(SessionManager::new(
@@ -334,7 +358,13 @@ impl WshServer {
         let gateway_enabled = config.gateway_enabled;
 
         // Typed rpc channels (#86). `wsh-fs` needs an explicit root: file access is opt-in.
-        let rpc = if config.rpc_enabled {
+        // A sealed session (#155) carries everything as frames on the control stream; a typed rpc channel rides client-opened
+        // data streams, whose bytes are not frames, so rpc is not offered while sealing is (as the JS host does not offer
+        // `e2e-session` where there are client-opened streams).
+        if config.rpc_enabled && config.seal_session != SealSession::Off {
+            warn!("[server] seal_session is on: typed rpc channels (wsh-fs, ...) are not offered, their data streams cannot be sealed");
+        }
+        let rpc = if config.rpc_enabled && config.seal_session == SealSession::Off {
             if config.rpc_max_message_bytes < crate::rpc::RPC_MIN_MAX_MESSAGE {
                 return Err(WshError::Other(format!(
                     "rpc max_message_bytes must be at least {}",
@@ -653,6 +683,16 @@ impl WshServer {
     ) -> WshResult<()> {
         let remote = conn.remote_addr;
         info!(remote = %remote, "handling WebTransport connection");
+
+        // `seal_session = "require"` serves nothing that is not sealed, and the sealed session is a WebSocket one (its
+        // frames ride the control stream; a WebTransport session has per-session QUIC data streams whose bytes are not
+        // frames). Refused, not served in the clear.
+        if self.config.seal_session == SealSession::Require {
+            warn!(remote = %remote, "refused a WebTransport connection: [server] seal_session = \"require\" (connect over WebSocket and seal the session)");
+            conn.connection
+                .close(wtransport::VarInt::from_u32(1), b"sealed session required");
+            return Ok(());
+        }
 
         // Accept the first bidirectional stream as the control channel.
         let (mut send, mut recv) = conn
@@ -1480,6 +1520,10 @@ impl WshServer {
         }
         let mut state = ConnState::AwaitingHello;
         let mut ctx: Option<ConnectionContext> = None;
+        // The sealed session (#155): off until a key login with `seal_session` on; then every message but the keepalive
+        // leaves as an `EncryptedFrame` and arrives as one, and a frame that does not open ends the connection.
+        let seal = SealGate::default();
+        let must_seal = self.config.seal_session == SealSession::Require;
         // Typed rpc channels of this connection (#86); features are filled in at Hello.
         let mut rpc_sessions = RpcSessions::new(self.rpc.clone(), Vec::new());
 
@@ -1503,7 +1547,7 @@ impl WshServer {
                             }),
                         };
                         if let Ok(frame) = frame_encode(&shutdown_msg) {
-                            let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
+                            let _ = write_control(&qmux, &seal, CONTROL_STREAM_ID, frame).await;
                         }
                     }
                     break 'session Ok(());
@@ -1520,7 +1564,7 @@ impl WshServer {
                             // output larger than the window, e.g. a command that
                             // echoes a big stdin, deadlocks both ends. Inbound
                             // control messages queue in `event_rx` meanwhile.
-                            let write = qmux.write_stream(CONTROL_STREAM_ID, &frame);
+                            let write = write_control(&qmux, &seal, CONTROL_STREAM_ID, frame);
                             tokio::pin!(write);
                             loop {
                                 tokio::select! {
@@ -1613,10 +1657,61 @@ impl WshServer {
                             }
 
                             for raw in control_decoder.feed_raw(&data) {
+                                // The sealed-session gate (#155): once the session is sealed, or must be, what
+                                // arrives is the keepalive, the key exchange for this connection or a frame of the
+                                // session; a plain message is not heard (a relay in the middle can write any), and a
+                                // frame that does not open ends the connection. `sealed_in` is the message to handle.
+                                let mut sealed_in: Option<Envelope> = None;
+                                // (A plain `Open { kind: "rpc" }` is not a typed message: on a server that only offers sealing it
+                                // is answered below as it always was, so a client that never seals sees no difference.)
+                                let plain_rpc = !must_seal && !seal.is_sealed() && peek_rpc_open(&raw).is_some();
+                                if seal.is_active() && !plain_rpc {
+                                    let envelope = match decode_envelope(&raw) {
+                                        Ok(e) => e,
+                                        Err(e) => break 'session Err(e),
+                                    };
+                                    // `require`: before the key exists nothing is served. Say so, once, and close.
+                                    let setup = matches!(&envelope.payload, Payload::KeyExchange(k)
+                                        if Some(&k.session_id) == ctx.as_ref().map(|c| &c.session_id));
+                                    let keepalive = matches!(envelope.msg_type, MsgType::Ping | MsgType::Pong);
+                                    if must_seal && !seal.is_sealed() && !setup && !keepalive {
+                                        warn!(msg_type = ?envelope.msg_type, "refused a plaintext message: this server requires a sealed session");
+                                        let refusal = Envelope {
+                                            msg_type: MsgType::Error,
+                                            payload: Payload::Error(ErrorPayload {
+                                                code: 1,
+                                                message: "this server requires a sealed session (e2e-session-required)".into(),
+                                            }),
+                                        };
+                                        if let Ok(frame) = frame_encode(&refusal) {
+                                            let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
+                                        }
+                                        break 'session Err(WshError::AuthFailed("a sealed session is required".into()));
+                                    }
+                                    let gated = seal.incoming_direct(envelope);
+                                    if seal.has_failed() {
+                                        break 'session Err(WshError::AuthFailed(
+                                            "sealed session: a frame did not open (or the key exchange was refused); closing".into(),
+                                        ));
+                                    }
+                                    for reply in &gated.replies {
+                                        let frame = match frame_encode(reply) {
+                                            Ok(f) => f,
+                                            Err(e) => break 'session Err(e),
+                                        };
+                                        if let Err(e) = write_control(&qmux, &seal, CONTROL_STREAM_ID, frame).await {
+                                            break 'session Err(e);
+                                        }
+                                    }
+                                    match gated.deliver {
+                                        Some(e) => sealed_in = Some(e),
+                                        None => continue,
+                                    }
+                                }
                                 // `Open { kind: "rpc" }` is not in the generated `ChannelKind`
                                 // enum (a free string on the wire), so it is recognised before
                                 // the typed decoder would reject it.
-                                if matches!(state, ConnState::Authenticated) {
+                                if sealed_in.is_none() && matches!(state, ConnState::Authenticated) {
                                     if let Some(protocol) = peek_rpc_open(&raw) {
                                         let ctx_ref = ctx.as_ref().expect("ctx set once Authenticated");
                                         let reply = self.open_rpc(ctx_ref, &protocol, &mut rpc_sessions);
@@ -1624,15 +1719,18 @@ impl WshServer {
                                             Ok(f) => f,
                                             Err(e) => break 'session Err(e),
                                         };
-                                        if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
-                                            break 'session Err(e.into());
+                                        if let Err(e) = write_control(&qmux, &seal, CONTROL_STREAM_ID, frame).await {
+                                            break 'session Err(e);
                                         }
                                         continue;
                                     }
                                 }
-                                let envelope = match decode_envelope(&raw) {
-                                    Ok(e) => e,
-                                    Err(e) => break 'session Err(e),
+                                let envelope = match sealed_in {
+                                    Some(e) => e,
+                                    None => match decode_envelope(&raw) {
+                                        Ok(e) => e,
+                                        Err(e) => break 'session Err(e),
+                                    },
                                 };
                                 // A `Close` for an rpc channel is not a session `Close`.
                                 if matches!(state, ConnState::Authenticated) {
@@ -1657,7 +1755,15 @@ impl WshServer {
                                             .iter()
                                             .map(|k| k.fingerprint.clone())
                                             .collect();
-                                        let features = self.build_feature_list(true);
+                                        let mut features = self.build_feature_list(true);
+                                        // A sealed session (#155) is offered on a WebSocket connection (its control stream
+                                        // carries the frames); `build_feature_list(false)` (WebTransport) never lists it.
+                                        if self.config.seal_session != SealSession::Off && self.identity.is_some() {
+                                            features.push(SESSION_SEAL_FEATURE.to_string());
+                                            if must_seal {
+                                                features.push(SESSION_SEAL_REQUIRED_FEATURE.to_string());
+                                            }
+                                        }
                                         rpc_sessions = RpcSessions::new(self.rpc.clone(), features.clone());
                                         let hello_result = match handshake::handle_hello(
                                             &hello,
@@ -1713,6 +1819,17 @@ impl WshServer {
                                                 }
                                                 break 'session Err(WshError::AuthFailed("rate limited".into()));
                                             }
+                                        }
+
+                                        // `require`: a password login has no key to authenticate the key exchange with.
+                                        if must_seal && auth.method != AuthMethod::Pubkey {
+                                            let fail = handshake::build_auth_fail(
+                                                "this server requires a sealed session, which needs a key login",
+                                            );
+                                            if let Ok(fail_frame) = frame_encode(&fail) {
+                                                let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                            }
+                                            break 'session Err(WshError::AuthFailed("sealed session needs a key login".into()));
                                         }
 
                                         // Pre-check password auth against config hashes
@@ -1806,6 +1923,34 @@ impl WshServer {
                                                     ),
                                                 });
                                                 rpc_sessions.set_user(&result.username);
+                                                // A sealed session (#155): from here the key exchange for this connection's
+                                                // session id is answered by the gate, which holds the host key and the login
+                                                // key this connection just proved (the initiator signs its half with it).
+                                                // `offer` serves a client that never asks plainly; `require` hears nothing else.
+                                                if self.config.seal_session != SealSession::Off && auth.method == AuthMethod::Pubkey {
+                                                    let login_key: Option<[u8; 32]> = auth
+                                                        .public_key
+                                                        .as_deref()
+                                                        .and_then(|k| k.try_into().ok())
+                                                        .filter(|k: &[u8; 32]| fingerprint(k) == result.fingerprint);
+                                                    match (self.identity.as_deref(), login_key) {
+                                                        (Some(identity), Some(login_key)) => {
+                                                            seal.begin_session_responder(
+                                                                result.session_id.clone(),
+                                                                must_seal,
+                                                                E2eResponder::new(
+                                                                    Some(identity.signing_key().clone()),
+                                                                    true,
+                                                                    Some(identity.public_key()),
+                                                                    Some(InitiatorAuth { public_key: login_key, require: true }),
+                                                                ),
+                                                            );
+                                                        }
+                                                        _ => break 'session Err(WshError::AuthFailed(
+                                                            "sealed session: no login key to authenticate the key exchange with".into(),
+                                                        )),
+                                                    }
+                                                }
                                                 state = ConnState::Authenticated;
                                             }
                                             Err(e) => {
@@ -1829,8 +1974,8 @@ impl WshServer {
                                                     Ok(f) => f,
                                                     Err(e) => break 'session Err(e),
                                                 };
-                                                if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &frame).await {
-                                                    break 'session Err(e.into());
+                                                if let Err(e) = write_control(&qmux, &seal, CONTROL_STREAM_ID, frame).await {
+                                                    break 'session Err(e);
                                                 }
                                             }
                                             Ok(None) => {}
@@ -1951,6 +2096,14 @@ impl WshServer {
             fingerprint,
         } = conn;
 
+        // A WISP tunnel is a byte pipe that no wsh session of this server rides, and it cannot be sealed: with
+        // `seal_session = "require"` the server serves nothing in the clear, so it is refused.
+        if self.config.seal_session == SealSession::Require {
+            warn!(remote = %remote_addr, "refused a WISP guest tunnel: [server] seal_session = \"require\"");
+            let _ = ws_stream.close(None).await;
+            return;
+        }
+
         info!(remote = %remote_addr, %fingerprint, "WISP guest tunnel connected");
 
         let (to_guest_tx, mut to_guest_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -2012,6 +2165,12 @@ impl WshServer {
             fingerprint,
             local_port,
         } = conn;
+
+        if self.config.seal_session == SealSession::Require {
+            warn!(remote = %remote_addr, "refused a WISP reverse-connect: [server] seal_session = \"require\"");
+            let _ = ws_stream.close(None).await;
+            return;
+        }
 
         let Some(session) = self.wisp_registry.get(&fingerprint).await else {
             warn!(remote = %remote_addr, %fingerprint, "WISP reverse-connect: no guest tunnel registered for fingerprint");
@@ -4822,6 +4981,7 @@ mod wisp_reverse_connect_e2e_tests {
             client_env: crate::client_env::ClientEnvPolicy::default(),
             host_key_path: None,
             require_channel_binding: false,
+            seal_session: crate::config::SealSession::Off,
         }
     }
 
