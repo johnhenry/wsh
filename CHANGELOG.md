@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.38.0
+## Unreleased
 
 - **Security fix and behaviour change: the Node gateway checks the resolved address.** The `gateway` option of
   `createWshServer` matched `allow` against the NAME a client sent and dialled that name; it now checks the address the
