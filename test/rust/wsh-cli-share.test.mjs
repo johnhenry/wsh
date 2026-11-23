@@ -471,3 +471,39 @@ describe('wsh --share: a host that stops reading does not make the CLI grow', ()
     void flood;
   });
 });
+
+describe('wsh --share inside a sealed session (#155): share data rides the sealing, with no crypto of its own', () => {
+  it('a host that requires sealing is served shares over `--sealed`, and a relay that copies bytes sees neither names nor content', async () => {
+    const dir = tmpDir();
+    const secret = `the-content-${crypto.randomBytes(8).toString('hex')}`;
+    tree(dir, { 'needle-file-name.txt': secret });
+    const h = makeHome();
+    const shares = collector();
+    const host = createMemoryHost({ auth: { authorizedKeys: h.pub }, exec: async () => 0, hostKey: true, dataStreams: false, sealSession: 'require', onShare: shares.onShare });
+    closers.push(() => host.close());
+    const seen = [];
+    const relay = createPipeRelay({ rendezvousTimeoutMs: 15_000 });
+    const { port } = await relay.listen();
+    closers.push(() => relay.close());
+    // A byte-copying hop in front of the relay would be the recording relay of wsh-session-seal.test.mjs; here the page side
+    // records what the real relay forwards by wrapping the host's socket.
+    const id = newRendezvousId();
+    const ws = new WsClient(pipeUrl(`ws://127.0.0.1:${port}`, id, 'host'));
+    ws.on('error', () => {});
+    closers.push(async () => ws.terminate());
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    ws.on("message", (d) => seen.push(Buffer.from(d))); // what the CLI sent (the file content travels this way)
+    const realSend = ws.send.bind(ws);
+    ws.send = (data, ...rest) => { seen.push(Buffer.from(data)); return realSend(data, ...rest); };
+    await host.accept(ws);
+    const cli = await wshShare(['--via', pipeUrl(`ws://127.0.0.1:${port}`, id), '--sealed', '--share', `proj=${dir}`, '-N', 'alice@tab.example'], { home: h.home });
+    const fs = await shares.share('proj');
+    assert.equal(dec(await fs.readFile('needle-file-name.txt')), secret);
+    assert.deepEqual((await fs.readdir('/')).map((e) => e.name), ['needle-file-name.txt']);
+    const wire = Buffer.concat(seen);
+    assert.ok(wire.length > 0);
+    assert.equal(wire.includes(Buffer.from(secret)), false, 'the file content is not on the wire in the clear');
+    assert.equal(wire.includes(Buffer.from('needle-file-name')), false, 'neither is a file name');
+    await cli.stop();
+  });
+});
