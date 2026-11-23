@@ -13,6 +13,10 @@
       "types": "./src/server/index.d.ts",
       "import": "./src/server/index.mjs"
     },
+    "./pipe-relay": {
+      "types": "./src/pipe-relay.d.ts",
+      "import": "./src/pipe-relay.mjs"
+    },
     "./memory": {
       "types": "./src/memory-host.d.ts",
       "import": "./src/memory-host.mjs"
