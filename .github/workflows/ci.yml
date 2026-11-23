@@ -23,6 +23,39 @@ jobs:
         npm test
         npm run typecheck
         npm run examples
+        npm run size
+
+  browser:
+    # A real Chromium (Playwright) against this package: a browser client -> Node host, a host living in the page driven
+    # by the JS client and by the released Rust CLI, WshKeyStore across a reload (#116). Its own job so `npm test` stays
+    # fast and JS-only contributors never need a browser. The Rust CLI test downloads the latest rust-v* release from this
+    # repository and verifies it against the release's SHA256SUMS; GITHUB_TOKEN only lifts the API rate limit.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: npm install
+        run: npm install --no-save --include=optional
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: npm run test:browser
+        run: npm run test:browser
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Upload Playwright traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: test-results/
+          if-no-files-found: ignore
 
   rust:
     # Kept as its own job, not folded into the reusable ci.yml call: it's a
