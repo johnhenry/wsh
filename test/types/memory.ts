@@ -30,3 +30,12 @@ async function gatewayTypes(c: WshClient): Promise<void> {
   await Promise.all([l.close(), f.close()]);
 }
 void gatewayTypes;
+
+/** #163: `onRefused` gets a stable reason code; `REFUSAL_REASONS` lists them. */
+import { REFUSAL_REASONS, type WshRefusalReason } from '@johnhenry/wsh/host';
+const refusals: WshRefusalReason[] = [];
+const withRefusals: WshMemoryHost = createMemoryHost({
+  auth: { authorizedKeys: 'ssh-ed25519 AAAA' },
+  onRefused: ({ reason, who, detail }) => { refusals.push(reason); void [who.username, who.fingerprint, who.address, detail]; },
+});
+void [REFUSAL_REASONS, withRefusals];

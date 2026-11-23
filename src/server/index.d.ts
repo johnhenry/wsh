@@ -485,6 +485,8 @@ export interface WshServerOptions {
    * async file operations to mount. Listing it makes the host state the `shares` feature.
    */
   onShare?: import('../host.js').WshOnShare;
+  /** #163: told once per connection this host turned away (an operator, on a reverse host), with a stable reason code (`REFUSAL_REASONS`, from `@johnhenry/wsh/host`). */
+  onRefused?: import('../host.js').WshOnRefused;
   onLog?: (line: string) => void;
 }
 
@@ -635,6 +637,8 @@ export interface WshReverseHostOptions {
   proofTimeoutMs?: number;
   /** Folders an operator offers over a bridge (#159), once per share, as an object of async file operations. */
   onShare?: import('../host.js').WshOnShare;
+  /** #163: told once per connection this host turned away (an operator, on a reverse host), with a stable reason code (`REFUSAL_REASONS`, from `@johnhenry/wsh/host`). */
+  onRefused?: import('../host.js').WshOnRefused;
   onLog?: (line: string) => void;
 }
 
