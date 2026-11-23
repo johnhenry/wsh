@@ -854,7 +854,9 @@ authenticated encrypted frame (`EncryptedFrame`, channel 0), so flow-control cre
 once the session is sealed, and a frame that does not open (flipped bit, replay, reorder) closes it. Features: `e2e-session`
 (offered), `e2e-session-required` (the host serves nothing on a session that is not sealed, and no password login). The Rust CLI
 seals with `--sealed` (or on its own when the host says `e2e-session-required`) and refuses a host that does not offer it: no silent
-downgrade. What it does NOT cover: the handshake before login (the user name, the login public key and the host key proof are
+downgrade. Only `--sealed` is a guarantee: sealing "on its own" rests on a `ServerHello` feature that a relay can strip before
+login, so a client that must never talk in the clear passes `--sealed` (against a host that requires sealing, a stripped client is
+refused, but what it sent before the refusal -- its commands, if any -- was already readable). What it does NOT cover: the handshake before login (the user name, the login public key and the host key proof are
 readable by the relay; the signed key exchange is not secret), the sizes and timing of traffic, a host whose connection has client-opened
 QMux data streams (not offered there), and a denial of service (a relay can always drop or cut). The JS client has no sealed
 session yet, so against a JS client use a host that only `'offer'`s.

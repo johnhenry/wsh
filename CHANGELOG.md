@@ -31,6 +31,7 @@ Rust workspace and tests only (no `src/` change); negotiated by existing feature
   `SealedBridge` takes `scope: 'session'`; `E2EResponder`'s `signKey` may be a signer (`{ sign }`).
 - **Rust CLI:** `--sealed` seals the session (any command that dials one host), automatic against `e2e-session-required`; against a host that
   does not offer it the CLI fails with a sentence and sends nothing (no silent downgrade). `WshClient::seal_session`, `ConnectConfig.seal_session`.
+- **Bundle size** (gzip, `npm run size`): `./host` +0.9 kB, `./memory` +0.7 kB, `./reverse` +0.5 kB, `.` unchanged; `scripts/bundle-budget.json` left as is (within its 10% margin). Browser acceptance: `test/browser/rust-cli-sealed.spec.mjs` (the built `wsh --sealed -N -L` against an in-page host that requires sealing, through a recording pipe).
 - **Not done:** the JS client and the Rust server (#155 stage c); a sealed session is not offered with client-opened QMux data streams.
 - **#156:** `wsh -N -L ...` now exits (non-zero, "the connection to the host was lost", sockets removed) when the host drops the connection
   (the WebSocket transport never told the dispatch loop the socket had closed); a pipe relay's rendezvous id is shortened in error lines.

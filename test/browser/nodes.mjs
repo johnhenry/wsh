@@ -31,9 +31,10 @@ export async function startPipe() {
   const waitingHosts = [];
   const waitingOperators = [];
   const traffic = { toHost: 0, toOperator: 0 };
+  const recorded = []; // every byte the relay copied, both ways (what a recording relay would keep)
   const join = (host, operator) => {
-    host.on('message', (d, isBinary) => { traffic.toOperator += d.length; if (operator.readyState === 1) operator.send(d, { binary: isBinary }); });
-    operator.on('message', (d, isBinary) => { traffic.toHost += d.length; if (host.readyState === 1) host.send(d, { binary: isBinary }); });
+    host.on('message', (d, isBinary) => { traffic.toOperator += d.length; recorded.push(Buffer.from(d)); if (operator.readyState === 1) operator.send(d, { binary: isBinary }); });
+    operator.on('message', (d, isBinary) => { traffic.toHost += d.length; recorded.push(Buffer.from(d)); if (host.readyState === 1) host.send(d, { binary: isBinary }); });
     host.on('close', () => operator.close());
     operator.on('close', () => host.close());
   };
@@ -45,6 +46,8 @@ export async function startPipe() {
     operatorUrl: `ws://127.0.0.1:${operatorSide.address().port}`,
     operatorTlsPort: tls.address().port,
     traffic,
+    /** Everything the relay copied so far, as one buffer. */
+    recording: () => Buffer.concat(recorded),
     async close() {
       for (const w of [hostSide, operatorSide, operatorTls]) { for (const c of w.clients) c.terminate(); w.close(); }
       tls.closeAllConnections?.();
