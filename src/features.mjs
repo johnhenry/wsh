@@ -26,3 +26,11 @@ export const MCP_CANCEL_FEATURE = 'mcp-cancel';
  */
 export const STREAM_ANNOUNCE_FEATURE = 'stream-announce';
 export const EXEC_PIPES_FEATURE = 'exec-pipes';
+
+/**
+ * Host feature (#155): this host seals the whole session end to end when asked (a signed `KeyExchange` for the
+ * connection's session id, then every message but the keepalive as an `EncryptedFrame` on channel 0).
+ */
+export const SESSION_SEAL_FEATURE = 'e2e-session';
+/** Host feature (#155): this host serves nothing on a session that is not sealed. */
+export const SESSION_SEAL_REQUIRED_FEATURE = 'e2e-session-required';

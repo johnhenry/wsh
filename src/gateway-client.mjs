@@ -91,8 +91,10 @@ export class GatewayConnections {
       onRemoteClose: datagram ? () => channel.destroy() : undefined,
       onData,
       sendData: (data) => this.#send(gatewayDataMsg({ gatewayId: id, data })),
-      sendCredit: (n) => this.#send(gatewayCreditMsg({ gatewayId: id, bytes: n })),
-      sendClose: (reason) => this.#send(gatewayCloseMsg({ gatewayId: id, reason })),
+      sendCredit: (n) => Promise.resolve(this.#send(gatewayCreditMsg({ gatewayId: id, bytes: n }))).catch(() => {}),
+      // Best effort and not awaited by the channel: on a sealed session (#155) the send finishes after the frame is
+      // sealed, so a connection that closed meanwhile must not surface as an unhandled rejection.
+      sendClose: (reason) => Promise.resolve(this.#send(gatewayCloseMsg({ gatewayId: id, reason }))).catch(() => {}),
       onClose: () => { this.#channels.delete(id); this.#udp.delete(id); },
     });
     this.#channels.set(id, channel);

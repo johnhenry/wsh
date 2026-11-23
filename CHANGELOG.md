@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### JS client: seal a whole session end to end, `connect(url, { sealSession })` (#155 stage c, part 1; npm change)
+
+Stage a (#157) sealed the Rust bridge and stage b (#158) gave the JS host `sealSession: 'offer' | 'require'` and the Rust CLI the
+initiator side. The JS client could not take part: against a host that requires sealing it was refused, and it could not seal a
+pipe-relayed session at all. It can now. No wire change: the messages and feature strings (`e2e-session`, `e2e-session-required`) are
+stage b's.
+
+- **`sealSession: false | 'auto' | true`** on `client.connect()` (and so `WshClient.exec()`, `connectWithTransport()`). After login, before the keepalive starts
+  and before anything is handed back, the client sends the signed hybrid `KeyExchange` for the connection's session id (login key signs
+  its half, the host's PROVEN key signs the other: `initiateE2E` with `verifyPeer` / `signAs` / `responderIdentity`), then every
+  message but ping/pong leaves as an `EncryptedFrame` on channel 0, in order. Nothing but the key exchange is sent before the key exists.
+- **Receive side:** a message from the host that is not a frame of the session is dropped (only the keepalive is heard plain; before the
+  key exists, only the key exchange). A frame that does not open (flipped bit, replay, reorder, forged) is fatal: `onError`, then the
+  transport closes and `onClose` fires. A plain message injected by the relay does not close the session, it is not heard.
+- **Default `'auto'` (a behaviour change, not a break):** seals only against a host that says `e2e-session-required`. A client that
+  never heard of the option keeps talking plainly to a host that merely offers sealing, and a host that requires it, which used to
+  refuse the JS client, now serves it sealed. `false` restores the old behaviour exactly (a requiring host then serves it nothing).
+  `true` seals or fails BEFORE a credential is sent: a host that does not offer `e2e-session`, one that proved no host key, or a password
+  login is refused with a sentence. Only `true` is a guarantee (`'auto'` rests on a ServerHello feature a relay can strip).
+- `client.sessionSealed`; `openStream()` is refused and datagrams are neither sent nor heard on a sealed session (their bytes are not
+  frames); `index.d.ts` and `test/types/identity.ts` carry the option.
+- Fix on the way: a gateway channel's best-effort `GatewayClose` / `GatewayCredit` are now caught, since on a sealed session the send
+  finishes after sealing and could surface as an unhandled rejection when the connection closed meanwhile.
+- README: the sealed-session section, the capability matrix and the Security model say what this covers and what it does not (the
+  exchange authenticates the key the host proved, not whose it is: pin it; the handshake before login stays readable; a relay can still
+  drop or cut). The bundle grows about 0.7 kB gzip in `.`, `./memory`, `./reverse` (budget updated by hand from the measured delta).
+- Not done (PR 2 of this stage): the Rust `wsh-server` does not offer `e2e-session` yet, so a JS client's `true` against it is refused.
+- Tests: `test/session-seal-client.test.mjs` (a recording relay finds no plaintext marker and no endpoint name; a tampering relay in each
+  direction, a replaying relay, injection of plain messages both ways, a relay answering the exchange with a bad signature, a stripped
+  feature, a pinned-key mismatch, `true` refused before any `Auth` is sent); each new rule was broken once and its test seen to fail.
+  `test/session-seal.test.mjs` now opts the client out (`sealSession: false`) where it tests the host's refusal of a plain client.
+
 ## 0.41.0 / Rust `rust-v0.12.0`
 
 ### Shares carry each folder's root path: `ShareOffer.paths`, `fs.root`, `--share-hide-path` (#164) (npm change)
