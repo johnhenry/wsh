@@ -32,6 +32,7 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
             cols: Some(cols),
             rows: Some(rows),
             env: None,
+            target: crate::commands::common::target(),
             ..Default::default()
         })
         .await

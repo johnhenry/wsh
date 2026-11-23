@@ -2978,6 +2978,16 @@ impl WshServer {
 
             // ── Channel management ──────────────────────────────────
             (MsgType::Open, Payload::Open(p)) => {
+                // wsh #121: this server has no execution targets (it never advertises `targets`),
+                // so a channel that names one is refused rather than run on the server itself.
+                if p.target.is_some() {
+                    return Ok(Some(Envelope {
+                        msg_type: MsgType::OpenFail,
+                        payload: Payload::OpenFail(OpenFailPayload {
+                            reason: "this host has no targets".into(),
+                        }),
+                    }));
+                }
                 let cols = p.cols.unwrap_or(80);
                 let rows = p.rows.unwrap_or(24);
                 // Look up key options for permission enforcement
@@ -4506,6 +4516,15 @@ impl WshServer {
                 Ok(None)
             }
 
+            // ── Execution targets (wsh #121): this server has none ─────
+            (MsgType::ListTargets, Payload::ListTargets(_)) => Ok(Some(Envelope {
+                msg_type: MsgType::Error,
+                payload: Payload::Error(ErrorPayload {
+                    code: 3,
+                    message: "this host has no targets".into(),
+                }),
+            })),
+
             // ── Structured file channel ────────────────────────────
             (MsgType::FileOp, Payload::FileOp(p)) => {
                 debug!(channel_id = p.channel_id, op = %p.op, path = %p.path, "file op");
@@ -4530,7 +4549,18 @@ impl WshServer {
                     key_options,
                 );
 
-                let result_payload = if !permissions
+                let result_payload = if p.target.is_some() {
+                    // wsh #121: this server has no execution targets (it never advertises
+                    // `targets`). A request that names one is refused, never answered from the
+                    // server's own files.
+                    FileResultPayload {
+                        channel_id: p.channel_id,
+                        success: false,
+                        metadata: serde_json::Value::Object(Default::default()),
+                        entries: vec![],
+                        error_message: Some("this host has no targets".to_string()),
+                    }
+                } else if !permissions
                     .has_scope(&crate::auth::permissions::SessionScope::FileTransfer)
                 {
                     // Named refusal identifying the missing "fs" capability

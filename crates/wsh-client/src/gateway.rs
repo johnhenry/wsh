@@ -1001,6 +1001,7 @@ pub(crate) fn open_endpoint_msg(id: u32, name: &str) -> Envelope {
         payload: Payload::OpenEndpoint(OpenEndpointPayload {
             gateway_id: id,
             name: name.to_string(),
+            target: None,
         }),
     }
 }

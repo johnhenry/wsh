@@ -145,11 +145,16 @@ export class GatewayConnections {
     return this.#open((id) => openUnixMsg({ gatewayId: id, path }), opts);
   }
 
-  /** Open a named virtual endpoint of the host. */
+  /** Open a named virtual endpoint of the host (`opts.target`, #121: of one of its execution targets; needs `targets`). */
   async openEndpoint(name, opts) {
     this.#need('gateway-endpoints', 'named endpoints');
     if (typeof name !== 'string' || !name) throw new TypeError('openEndpoint: name must be a non-empty string');
-    return this.#open((id) => openEndpointMsg({ gatewayId: id, name }), opts);
+    const target = opts?.target;
+    if (target !== undefined) {
+      if (typeof target !== 'string' || !target) throw new TypeError('openEndpoint: target must be a non-empty string');
+      this.#need('targets', 'execution targets');
+    }
+    return this.#open((id) => openEndpointMsg({ gatewayId: id, name, target }), opts);
   }
 
   /** Connect to host:port FROM THE HOST (the gateway's TCP egress, subject to the host's allow list). */

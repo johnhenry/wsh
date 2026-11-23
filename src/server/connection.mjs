@@ -19,12 +19,14 @@ import {
   MSG, serverHello, challenge, authOk, authFail, openOk, openFail, sessionData,
   exit as exitMsg, close as closeMsg, encryptedFrame as encryptedFrameMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
   presence as presenceMsg, error as errorMsg, sessionList, detachOk, detachFail, reversePeers, reverseReject,
+  targetList as targetListMsg,
 } from '../messages.gen.mjs';
 import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES, MAX_ATTACHMENTS } from './constants.mjs';
-import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE } from '../features.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE, TARGETS_FEATURE } from '../features.mjs';
+import { TARGET_NAME_RE } from '../host-backends.mjs';
 import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
@@ -53,6 +55,12 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE);
   if (cfg.gateway) features.push(...gatewayFeatures(cfg.gateway));
   if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
+  // Execution targets (#121): `Open`, `FileOp` and `OpenEndpoint` take `target`, and `ListTargets` is answered. A target with files is
+  // reached over FileOp, so the file features are stated for it too (the host's own may have none).
+  if (cfg.targets) {
+    features.push(TARGETS_FEATURE);
+    if (!cfg.files && [...cfg.targets.values()].some((t) => t.files)) features.push('file-transfer', 'file-write', 'file-rename');
+  }
   if (cfg.onShare) features.push(SHARES_FEATURE); // #159: this host can use folders the operator's client offers
   // End-to-end encryption (#90) is the virtual-mode EncryptedFrame layer, so it is offered where there are no
   // client-opened streams: over a relay bridge.
@@ -128,6 +136,17 @@ export function createConnectionFactory(cfg) {
   // What a client may put in `Open.env` (#126): an allow-list unless the host says otherwise.
   const execEnv = clientEnvFilter(cfg.execOptions?.clientEnv);
   const ptyEnv = clientEnvFilter(cfg.pty?.clientEnv);
+  // Execution targets (#121): each has its own backends (and its own `clientEnv` rules). A request that names no target uses
+  // the host's own, unless `requireTarget` says nothing may run on the host itself.
+  /** @type {Map<string, object> | null} */
+  const targetTable = cfg.targets && cfg.targets.size
+    ? new Map([...cfg.targets].map(([name, spec]) => [name, { ...spec, execEnv: clientEnvFilter(spec.execOptions?.clientEnv), ptyEnv: clientEnvFilter(spec.pty?.clientEnv) }]))
+    : null;
+  const requireTarget = !!targetTable && !!cfg.requireTarget;
+  const ownBackends = { execRunner: cfg.execRunner, execOptions: cfg.execOptions, execEnv, pty: cfg.pty, ptyEnv, files: cfg.files, ownHost: true };
+  /** One answer for a target that does not exist and for one the caller may not use: the reply does not say which targets exist. */
+  const NO_SUCH_TARGET = 'no such target';
+  const targetCapabilities = (spec) => [...(spec.execRunner ? ['exec'] : []), ...(spec.pty ? ['pty'] : []), ...(spec.files ? ['file'] : []), ...(spec.endpoints ? ['endpoint'] : [])];
 
   /**
    * Attach one connection. Two shapes:
@@ -176,7 +195,13 @@ export function createConnectionFactory(cfg) {
     // host in a page passes the endpoints-only session of `gateway-core.mjs` (`createMemoryHost({ endpoints })`).
     if (cfg.gateway && typeof cfg.createGatewaySession !== 'function') throw new TypeError('createConnectionFactory: gateway needs createGatewaySession (only @johnhenry/wsh/server provides one)');
     const gateway = cfg.gateway
-      ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log, { who: () => ({ username: state.username, fingerprint: state.fingerprint }), datagrams })
+      ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log, {
+        who: () => ({ username: state.username, fingerprint: state.fingerprint }),
+        datagrams,
+        // #121: a named target's own endpoints, once `authorize` has let the caller onto it
+        target: async (name) => { const r = await resolveTarget(name, 'endpoint'); return r.refuse ? { refuse: r.refuse } : { endpoints: r.b.endpoints ?? null }; },
+        requireTarget: () => requireTarget,
+      })
       : null;
 
     // Operator-side shared folders (#159): created with the connection, used only after the client's ShareOffer.
@@ -322,6 +347,7 @@ export function createConnectionFactory(cfg) {
         case MSG.RESUME: return handleAttach(m, true);
         case MSG.DETACH: return handleDetach(m);
         case MSG.SESSION_LIST_REQUEST: return handleSessionList();
+        case MSG.LIST_TARGETS: return handleListTargets();
         case MSG.MCP_DISCOVER: return handleMcpDiscover();
         // Not awaited: the handler chain is serial, and a slow tool must not hold up
         // the next call (or a Close) behind it.
@@ -669,13 +695,55 @@ export function createConnectionFactory(cfg) {
 
     // ── Open ──────────────────────────────────────────────────────────
 
-    function handleOpen(m) {
+    /**
+     * The backends a request is served by (#121): the host's own when it names no target (and `requireTarget` is off), else the
+     * target's, once the host knows the name and its `authorize(who, { target, kind })` lets this caller on. `{ refuse }`
+     * otherwise, never a fallback to the host's own: a request for somewhere else is not run here.
+     * @returns {Promise<{ b: object } | { refuse: string }>}
+     */
+    async function resolveTarget(target, kind) {
+      if (target === undefined || target === null) return requireTarget ? { refuse: 'a target is required' } : { b: ownBackends };
+      if (!targetTable) return { refuse: 'this host has no targets' };
+      const spec = typeof target === 'string' && TARGET_NAME_RE.test(target) ? targetTable.get(target) : undefined;
+      if (!spec) return { refuse: NO_SUCH_TARGET };
+      if (spec.authorize) {
+        let allowed = false;
+        try { allowed = (await spec.authorize({ username: state.username, fingerprint: state.fingerprint }, { target, kind })) === true; } catch (e) { log(`target ${target} authorize threw: ${e.message}`); }
+        if (!allowed) {
+          log(`target ${target} refused for ${state.username ?? '?'} (${kind})`);
+          return { refuse: NO_SUCH_TARGET };
+        }
+      }
+      return { b: spec };
+    }
+
+    /** `ListTargets`: the targets this caller may use, as the host shows them. */
+    async function handleListTargets() {
+      if (!targetTable) return send(errorMsg({ code: 3, message: 'this host has no targets' }));
+      const out = [];
+      for (const [name, spec] of targetTable) {
+        const r = await resolveTarget(name, 'list');
+        if (r.refuse) continue;
+        out.push({ name, ...(spec.description !== undefined ? { description: spec.description } : {}), capabilities: targetCapabilities(spec) });
+      }
+      return send(targetListMsg({ targets: out }));
+    }
+
+    async function handleOpen(m) {
       if (channels.size >= MAX_CHANNELS) return send(openFail({ reason: 'too many open channels' }));
+      const target = m.target ?? undefined;
       switch (m.kind) {
-        case 'exec': return openExec(m);
-        case 'pty': return openPty(m);
-        case 'file': return openFile(m);
-        case 'rpc': return openRpc(m);
+        case 'exec': case 'pty': case 'file': {
+          const r = await resolveTarget(target, m.kind);
+          if (r.refuse) return send(openFail({ reason: r.refuse }));
+          if (m.kind === 'exec') return openExec(m, r.b, target);
+          return m.kind === 'pty' ? openPty(m, r.b, target) : openFile(m, r.b);
+        }
+        case 'rpc':
+          // rpc channels (`wsh-fs`, `wsh-host`, `mcp`) are the host's own, not per target.
+          if (target !== undefined) return send(openFail({ reason: 'rpc channels do not take a target' }));
+          if (requireTarget) return send(openFail({ reason: 'a target is required' }));
+          return openRpc(m);
         default: return send(openFail({ reason: `kind "${m.kind}" is not supported by this server` }));
       }
     }
@@ -798,8 +866,8 @@ export function createConnectionFactory(cfg) {
       return send(sessionList({ sessions }));
     }
 
-    async function openExec(m) {
-      if (!cfg.execRunner) return send(openFail({ reason: 'exec is not enabled on this server' }));
+    async function openExec(m, b, target) {
+      if (!b.execRunner) return send(openFail({ reason: `exec is not enabled ${b.ownHost ? 'on this server' : 'for this target'}` }));
       const command = String(m.command ?? '').trim();
       if (!command) return send(openFail({ reason: 'command is required for kind "exec"' }));
 
@@ -847,7 +915,7 @@ export function createConnectionFactory(cfg) {
       else ch.input = (d) => { for (const cb of inputCbs) cb(d); };
 
       let timer = null;
-      if (cfg.execOptions.timeoutMs > 0) timer = setTimeout(() => abort.abort(), cfg.execOptions.timeoutMs);
+      if (b.execOptions.timeoutMs > 0) timer = setTimeout(() => abort.abort(), b.execOptions.timeoutMs);
 
       // Output to the opening connection's data stream (held until the client has opened it).
       const toStream = (bytes) => {
@@ -898,7 +966,9 @@ export function createConnectionFactory(cfg) {
 
       const io = {
         user: state.username,
-        env: execEnv(m.env),
+        // Which execution target this command runs on (#121); undefined on the host's own.
+        target,
+        env: b.execEnv(m.env),
         cols: m.cols || 80,
         rows: m.rows || 24,
         signal: abort.signal,
@@ -925,7 +995,7 @@ export function createConnectionFactory(cfg) {
 
       async function runExec() {
         let code;
-        try { code = await cfg.execRunner(command, io); } catch (e) {
+        try { code = await b.execRunner(command, io); } catch (e) {
           await io.write(`wsh: ${e.message}\n`);
           code = 1;
         }
@@ -990,18 +1060,20 @@ export function createConnectionFactory(cfg) {
       log(`rpc channel ${channelId}: ${protocol}`);
     }
 
-    async function openPty(m) {
-      if (!cfg.pty) return send(openFail({ reason: 'pty is not enabled on this server' }));
+    async function openPty(m, b, target) {
+      if (!b.pty) return send(openFail({ reason: `pty is not enabled ${b.ownHost ? 'on this server' : 'for this target'}` }));
       const channelId = ++state.nextChannel;
       const cols = m.cols || 80;
       const rows = m.rows || 24;
-      const p = cfg.pty;
+      const p = b.pty;
       let proc;
       try {
         const args = m.command ? ['-c', String(m.command)] : [];
         proc = p.spawn(p.shell, args, {
           name: p.term, cols, rows, cwd: p.cwd,
-          env: { ...(p.env ?? globalThis.process?.env), TERM: p.term, ...ptyEnv(m.env) },
+          env: { ...(p.env ?? globalThis.process?.env), TERM: p.term, ...b.ptyEnv(m.env) },
+          // Which execution target this shell is for (#121); absent on the host's own.
+          ...(target !== undefined ? { target } : {}),
         });
       } catch (e) {
         return send(openFail({ reason: `pty spawn failed: ${e.message}` }));
@@ -1045,8 +1117,9 @@ export function createConnectionFactory(cfg) {
       log(`pty channel ${channelId} opened (${cols}x${rows})`);
     }
 
-    async function openFile(m) {
-      if (!cfg.files) return send(openFail({ reason: 'file access is not enabled on this server' }));
+    async function openFile(m, b) {
+      const files = b.files;
+      if (!files) return send(openFail({ reason: `file access is not enabled ${b.ownHost ? 'on this server' : 'for this target'}` }));
       const spec = String(m.command ?? '');
       const mm = spec.match(/^(upload|download):(.*)$/s);
       if (!mm) return send(openFail({ reason: 'file channel expects upload:<path> or download:<path>' }));
@@ -1055,7 +1128,7 @@ export function createConnectionFactory(cfg) {
 
       if (direction === 'download') {
         let data;
-        try { data = await cfg.files.readWhole(filePath); } catch (e) { return send(openFail({ reason: e.message })); }
+        try { data = await files.readWhole(filePath); } catch (e) { return send(openFail({ reason: e.message })); }
         let cancelled = false;
         channels.set(channelId, { kill: () => { if (channels.delete(channelId)) { cancelled = true; log(`download ${filePath}: closed before completion`); } } });
         await send(openOk({ channelId, dataMode: 'virtual', capabilities: [] }));
@@ -1081,13 +1154,13 @@ export function createConnectionFactory(cfg) {
       ch.chunk = async (c) => {
         if (ch.failed) return;
         const total = Number(c.total_size ?? 0);
-        if (total > cfg.files.maxFileBytes) { ch.failed = true; return done(1, `refused: ${total} B exceeds ${cfg.files.maxFileBytes} B`); }
+        if (total > files.maxFileBytes) { ch.failed = true; return done(1, `refused: ${total} B exceeds ${files.maxFileBytes} B`); }
         ch.buf ??= new Uint8Array(total);
         const data = c.data instanceof Uint8Array ? c.data : new Uint8Array(0);
         if (c.offset + data.byteLength > ch.buf.byteLength) { ch.failed = true; return done(1, 'chunk past total_size'); }
         ch.buf.set(data, c.offset);
         if (c.is_final) {
-          try { await cfg.files.writeWhole(filePath, ch.buf); } catch (e) { ch.failed = true; return done(1, e.message); }
+          try { await files.writeWhole(filePath, ch.buf); } catch (e) { ch.failed = true; return done(1, e.message); }
           return done(0, `stored ${ch.buf.byteLength} B`);
         }
       };
@@ -1096,10 +1169,14 @@ export function createConnectionFactory(cfg) {
 
     async function handleFileOp(m) {
       const channelId = m.channel_id;
-      if (!cfg.files) return send(fileResult({ channelId, success: false, errorMessage: 'file access is not enabled on this server' }));
-      if (m.op === 'write' || m.op === 'rename') return startPayloadOp(m);
+      const target = m.target ?? undefined;
+      const r0 = await resolveTarget(target, 'file');
+      if (r0.refuse) return send(fileResult({ channelId, success: false, errorMessage: r0.refuse }));
+      const files = r0.b.files;
+      if (!files) return send(fileResult({ channelId, success: false, errorMessage: `file access is not enabled ${r0.b.ownHost ? 'on this server' : 'for this target'}` }));
+      if (m.op === 'write' || m.op === 'rename') return startPayloadOp(m, files);
       try {
-        const r = await cfg.files.operate(m.op, m.path, { offset: m.offset, length: m.length });
+        const r = await files.operate(m.op, m.path, { offset: m.offset, length: m.length });
         return send(fileResult({ channelId, success: true, metadata: r.metadata ?? {}, entries: r.entries ?? [] }));
       } catch (e) {
         const message = e.wsh ? e.message : (e.code === 'ENOENT' ? 'no such file or directory' : `${m.op} failed`);
@@ -1111,17 +1188,17 @@ export function createConnectionFactory(cfg) {
     // write / rename = FileOp then FileChunk frame(s) on the same channel id
     // (rename's payload is the UTF-8 destination path); one FileResult once
     // the last chunk lands (see WshClient.fileOperation).
-    async function startPayloadOp(m) {
+    async function startPayloadOp(m, files) {
       const channelId = m.channel_id;
       const failWrite = (errorMessage) => send(fileResult({ channelId, success: false, errorMessage }));
       const rename = m.op === 'rename';
       const length = Number(m.length);
       if (!Number.isSafeInteger(length) || length < 0) return failWrite(`${m.op} needs a length`);
-      const limit = rename ? MAX_RENAME_PATH_BYTES : cfg.files.maxFileBytes;
+      const limit = rename ? MAX_RENAME_PATH_BYTES : files.maxFileBytes;
       if (length > limit) return failWrite(`${m.op} payload of ${length} bytes exceeds the ${limit} byte limit`);
       if (channels.has(channelId) || fileWrites.has(channelId)) return failWrite('channel id already in use');
       if (fileWrites.size >= MAX_PENDING_WRITES) return failWrite('too many writes in flight');
-      const w = { rename, path: m.path, offset: m.offset, length, buf: new Uint8Array(length), next: 0, timer: null };
+      const w = { rename, files, path: m.path, offset: m.offset, length, buf: new Uint8Array(length), next: 0, timer: null };
       const arm = () => {
         clearTimeout(w.timer);
         w.timer = setTimeout(() => {
@@ -1153,8 +1230,8 @@ export function createConnectionFactory(cfg) {
       if (w.next !== w.length) return send(fileResult({ channelId, success: false, errorMessage: 'payload ended short of the declared length' }));
       try {
         const r = w.rename
-          ? await cfg.files.operate('rename', w.path, { newPath: new TextDecoder('utf-8', { fatal: true }).decode(w.buf) })
-          : await cfg.files.operate('write', w.path, { offset: w.offset, data: w.buf });
+          ? await w.files.operate('rename', w.path, { newPath: new TextDecoder('utf-8', { fatal: true }).decode(w.buf) })
+          : await w.files.operate('write', w.path, { offset: w.offset, data: w.buf });
         return send(fileResult({ channelId, success: true, metadata: r.metadata ?? {} }));
       } catch (e) {
         const message = e.wsh ? e.message : (e.code === 'ENOENT' ? 'no such file or directory' : `${w.rename ? 'rename' : 'write'} failed`);

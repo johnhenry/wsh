@@ -68,6 +68,7 @@ pub async fn run(
             rows,
             env: None,
             stdio: use_pipes.then(|| "pipes".to_string()),
+            target: crate::commands::common::target(),
         })
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))

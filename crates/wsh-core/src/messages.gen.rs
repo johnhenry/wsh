@@ -140,6 +140,9 @@ pub enum MsgType {
     ShareOffer = 0xa8,
     ShareRequest = 0xa9,
     ShareReply = 0xaa,
+
+    ListTargets = 0xab,
+    TargetList = 0xac,
 }
 
 impl From<MsgType> for u8 {
@@ -260,6 +263,8 @@ impl TryFrom<u8> for MsgType {
             0xa8 => Ok(Self::ShareOffer),
             0xa9 => Ok(Self::ShareRequest),
             0xaa => Ok(Self::ShareReply),
+            0xab => Ok(Self::ListTargets),
+            0xac => Ok(Self::TargetList),
             _ => Err(format!("unknown message type: 0x{v:02x}")),
         }
     }
@@ -444,6 +449,8 @@ pub enum Payload {
     ShareOffer(ShareOfferPayload),
     ShareRequest(ShareRequestPayload),
     ShareReply(ShareReplyPayload),
+    ListTargets(ListTargetsPayload),
+    TargetList(TargetListPayload),
     Empty(EmptyPayload),
 }
 
@@ -561,6 +568,8 @@ impl Payload {
             MsgType::ShareOffer => Ok(Self::ShareOffer(ciborium::from_reader(cursor)?)),
             MsgType::ShareRequest => Ok(Self::ShareRequest(ciborium::from_reader(cursor)?)),
             MsgType::ShareReply => Ok(Self::ShareReply(ciborium::from_reader(cursor)?)),
+            MsgType::ListTargets => Ok(Self::ListTargets(ciborium::from_reader(cursor)?)),
+            MsgType::TargetList => Ok(Self::TargetList(ciborium::from_reader(cursor)?)),
         }
     }
 }
@@ -655,6 +664,8 @@ pub struct OpenPayload {
     pub env: Option<std::collections::HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1072,6 +1083,8 @@ pub struct OpenUnixPayload {
 pub struct OpenEndpointPayload {
     pub gateway_id: u32,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1465,6 +1478,8 @@ pub struct FileOpPayload {
     pub offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1615,6 +1630,26 @@ pub struct ShareReplyPayload {
 
 fn default_share_reply_entries() -> serde_json::Value {
     Default::default()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListTargetsPayload {
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetListPayload {
+    pub targets: Vec<TargetInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

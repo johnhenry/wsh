@@ -62,7 +62,7 @@ export function gatewayFeatures(cfg) {
   if (cfg.tcp || cfg.reverse) f.push('gateway');
   f.push(GATEWAY_CREDIT_FEATURE);
   if (cfg.unix) f.push('gateway-unix');
-  if (cfg.endpoints) f.push('gateway-endpoints');
+  if (cfg.endpoints || cfg.targetEndpoints) f.push('gateway-endpoints');
   return f;
 }
 
@@ -104,7 +104,17 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
     const id = m.gateway_id;
     if (!Number.isInteger(id) || typeof m.name !== 'string') return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'malformed OpenEndpoint');
     if (idInUse(id)) return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'gateway_id already in use');
-    const ep = cfg.endpoints && ENDPOINT_NAME_RE.test(m.name) ? cfg.endpoints.get(m.name) : undefined;
+    // Execution targets (#121): a named target has its own endpoints, and the host decides (`ctx.target`) whether the caller
+    // may use it; the answer for a target that does not exist and one that is refused is the same. Without a target, the host's own.
+    let endpoints = cfg.endpoints;
+    if (m.target !== undefined && m.target !== null) {
+      const t = ctx.target ? await ctx.target(m.target) : { refuse: 'this host has no targets' };
+      if (t.refuse) return fail(id, GATEWAY_FAIL.POLICY_DENIED, t.refuse);
+      endpoints = t.endpoints;
+    } else if (ctx.requireTarget?.()) {
+      return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'a target is required');
+    }
+    const ep = endpoints && ENDPOINT_NAME_RE.test(m.name) ? endpoints.get(m.name) : undefined;
     if (!ep) return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'no such endpoint');
     if (active() >= cfg.maxConnections) return fail(id, GATEWAY_FAIL.QUEUE_FULL, 'too many gateway connections');
     const who = ctx.who?.() ?? { username: null, fingerprint: null };
@@ -119,6 +129,8 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
     const { readable, writable } = channel.streams();
     const duplex = {
       readable, writable, who,
+      /** The execution target this endpoint belongs to (#121); undefined for the host's own. */
+      target: m.target ?? undefined,
       /** Half-close: nothing more will be sent. */
       close: (reason) => channel.end(reason),
       /** Tear the connection down now. */

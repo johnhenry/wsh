@@ -249,6 +249,8 @@ export const MCP_CANCEL_FEATURE: 'mcp-cancel';
 export const STREAM_ANNOUNCE_FEATURE: 'stream-announce';
 /** ServerHello feature: the host runs `exec` on plain pipes (stderr apart, stdin EOF) when asked with `stdio: 'pipes'`. */
 export const EXEC_PIPES_FEATURE: 'exec-pipes';
+/** ServerHello feature (#121): the host has execution targets; `Open`, `FileOp` and `OpenEndpoint` take `target`. */
+export const TARGETS_FEATURE: 'targets';
 
 // ── Typed (object-mode) RPC channels -- wsh #85 ────────────────────────
 
@@ -444,6 +446,9 @@ export function open(opts?: {
   cols?: number;
   rows?: number;
   env?: Record<string, string>;
+  stdio?: string;
+  /** #121: the host's execution target (only to a host that advertises `targets`). */
+  target?: string;
 }): WshMessage;
 
 export function openOk(opts?: {
@@ -761,6 +766,12 @@ export function restartPty(opts?: {
 
 export function sessionListRequest(): WshMessage;
 
+export function listTargets(): WshMessage;
+
+export function targetList(opts?: {
+  targets?: WshTargetInfo[];
+}): WshMessage;
+
 export function sessionList(opts?: {
   sessions?: unknown[];
 }): WshMessage;
@@ -941,6 +952,8 @@ export function fileOp(opts?: {
   path?: string;
   offset?: number;
   length?: number;
+  /** #121: the host's execution target (only to a host that advertises `targets`). */
+  target?: string;
 }): WshMessage;
 
 export function fileResult(opts?: {
@@ -1899,6 +1912,11 @@ export interface WshOpenSessionOptions {
    * advertises `exec-pipes`. `'pty'` or omitted: the host's native mode.
    */
   stdio?: 'pty' | 'pipes';
+  /**
+   * #121: which of the host's execution targets this channel runs on (see {@link WshClient.listTargets}). Throws before sending
+   * anything unless the host advertises `targets`. Omitted: the host's own default, as before.
+   */
+  target?: string;
 }
 
 /**
@@ -1988,6 +2006,8 @@ export interface WshExecOptions extends WshHostKeyOptions {
    * `'pipes'` throws if the host lacks `exec-pipes`; `'pty'` never asks for pipes.
    */
   stdio?: 'pty' | 'pipes';
+  /** See {@link WshOpenSessionOptions.target}. */
+  target?: string;
 }
 
 /** Result from WshClient.exec(). */
@@ -2130,7 +2150,22 @@ export interface WshFileOperationResult {
  * reverse mode (client registers as a peer for incoming connections).
  */
 /** Options for `openUnix` / `openEndpoint` / `openTcp`. */
-export interface WshGatewayOpenOptions { signal?: AbortSignal; timeoutMs?: number }
+export interface WshGatewayOpenOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /** `openEndpoint` only (#121): the host's execution target whose endpoint this is. Needs the `targets` feature. */
+  target?: string;
+}
+
+/** One execution target a host shows this key (`ListTargets` / `TargetList`, #121). */
+export interface WshTargetInfo {
+  /** What to pass as `target`. */
+  name: string;
+  /** A human line about the target; not for parsing. */
+  description?: string;
+  /** What the caller can do there: any of `exec`, `pty`, `file`, `endpoint` (a hint; the host decides on each request). */
+  capabilities: string[];
+}
 
 /** One gateway connection as web streams with backpressure (credit-based flow control when both ends offer `gateway-credit`). */
 export interface WshGatewayDuplex {
@@ -2416,6 +2451,18 @@ export class WshClient {
    * List peers registered on the relay server.
    */
   listPeers(timeout?: number): Promise<WshPeerInfo[]>;
+
+  /**
+   * The execution targets this connection may use (#121): what the host decides to show THIS key. Pass a `name` as `target` to
+   * `openSession`, `exec`, `fileOperation` or `openEndpoint`. Throws if the host does not advertise `targets`.
+   */
+  listTargets(timeout?: number): Promise<WshTargetInfo[]>;
+
+  /**
+   * One structured file operation (`FileOp`), the raw wire-shaped result. `opts.target` (#121) names the execution target whose
+   * files these are (needs `targets`; such a request is never sent over the `wsh-fs` rpc, which is not per target).
+   */
+  fileOperation(op: string, path: string, opts?: { offset?: number; length?: number; data?: Uint8Array | string; newPath?: string; target?: string }, timeout?: number): Promise<WshFileOperationResult>;
 
   /**
    * Initiate a reverse connection to a registered peer.

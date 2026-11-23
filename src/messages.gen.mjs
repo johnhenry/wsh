@@ -162,6 +162,10 @@ export const MSG = Object.freeze({
   SHARE_OFFER:       0xa8,
   SHARE_REQUEST:     0xa9,
   SHARE_REPLY:       0xaa,
+
+  // Targets
+  LIST_TARGETS:      0xab,
+  TARGET_LIST:       0xac,
 });
 
 // Reverse lookup: number → name
@@ -252,13 +256,14 @@ export function authFail({ reason } = {}) {
   };
 }
 
-export function open({ kind, command, cols, rows, env, stdio } = {}) {
+export function open({ kind, command, cols, rows, env, stdio, target } = {}) {
   const msg = { type: MSG.OPEN, kind };
   if (command !== undefined) msg.command = command;
   if (cols !== undefined) msg.cols = cols;
   if (rows !== undefined) msg.rows = rows;
   if (env !== undefined) msg.env = env;
   if (stdio !== undefined) msg.stdio = stdio;
+  if (target !== undefined) msg.target = target;
   return msg;
 }
 
@@ -595,12 +600,10 @@ export function openUnix({ gatewayId, path } = {}) {
   };
 }
 
-export function openEndpoint({ gatewayId, name } = {}) {
-  return {
-    type: MSG.OPEN_ENDPOINT,
-    gateway_id: gatewayId,
-    name,
-  };
+export function openEndpoint({ gatewayId, name, target } = {}) {
+  const msg = { type: MSG.OPEN_ENDPOINT, gateway_id: gatewayId, name };
+  if (target !== undefined) msg.target = target;
+  return msg;
 }
 
 export function listenUnix({ listenerId, path, replace } = {}) {
@@ -921,10 +924,11 @@ export function sessionRevoke({ sessionId, principal, reason } = {}) {
   return msg;
 }
 
-export function fileOp({ channelId, op, path, offset, length } = {}) {
+export function fileOp({ channelId, op, path, offset, length, target } = {}) {
   const msg = { type: MSG.FILE_OP, channel_id: channelId, op, path };
   if (offset !== undefined) msg.offset = offset;
   if (length !== undefined) msg.length = length;
+  if (target !== undefined) msg.target = target;
   return msg;
 }
 
@@ -1021,6 +1025,17 @@ export function shareReply({ requestId, ok, errno, message, attr = {}, entries =
   if (written !== undefined) msg.written = written;
   if (target !== undefined) msg.target = target;
   return msg;
+}
+
+export function listTargets() {
+  return { type: MSG.LIST_TARGETS };
+}
+
+export function targetList({ targets } = {}) {
+  return {
+    type: MSG.TARGET_LIST,
+    targets,
+  };
 }
 
 // ── Relay forwarding ─────────────────────────────────────────────────

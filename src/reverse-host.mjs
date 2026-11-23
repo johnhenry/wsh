@@ -97,6 +97,7 @@ export function createReverseHostWith({
   if (typeof requireOperatorProof !== 'boolean') throw new TypeError('createReverseHost: requireOperatorProof must be a boolean');
   if (requireOperatorProof && e2e === false) throw new TypeError('createReverseHost: requireOperatorProof seals the bridge, which needs e2e (do not set e2e: false)');
   if (requireOperatorProof && !reportFeatures) throw new TypeError('createReverseHost: requireOperatorProof needs reportFeatures (the operator learns "e2e-sealed" from ReverseAccept.features)');
+  if (backends.targets) throw new TypeError('createReverseHost: targets are not supported by a reverse host (a bridged operator reaches the one machine behind it); use createWshServer or createMemoryHost');
   if (!url) throw new TypeError('createReverseHost: url is required');
   if (!username) throw new TypeError('createReverseHost: username is required');
   if (!keyPair) throw new TypeError('createReverseHost: keyPair is required (the relay keys peers by fingerprint)');

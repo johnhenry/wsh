@@ -524,6 +524,7 @@ function rustInnerType(yamlType) {
   if (yamlType === 'PeerInfo[]') return 'Vec<PeerInfo>';
   if (yamlType === 'McpToolSpec[]') return 'Vec<McpToolSpec>';
   if (yamlType === 'FileEntry[]') return 'Vec<FileEntry>';
+  if (yamlType === 'TargetInfo[]') return 'Vec<TargetInfo>';
   if (yamlType === 'map<string,string>') return 'std::collections::HashMap<String, String>';
   return yamlType; // nested type reference
 }

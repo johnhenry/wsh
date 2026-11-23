@@ -18,4 +18,5 @@ pub mod scp;
 pub mod sessions;
 pub mod sftp;
 pub mod share;
+pub mod targets;
 pub mod tools;

@@ -66,7 +66,7 @@ Or via CDN:
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
 - **Session recording** -- own JSON schema (asciicast-v2-shaped, not a playable asciicast file -- see note below) recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
-- **108 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
+- **110 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
 
 > **Session recording is asciicast-v2-shaped, but not an asciicast file.**
 > The JS `SessionRecorder.toJSON()` export borrows asciicast v2's vocabulary --
@@ -1223,6 +1223,47 @@ The host advertises `file-write` / `file-rename` in `ServerHello`; the client
 throws instead of sending to a host without them (the Rust `wsh-server`
 refuses these ops).
 
+### Execution targets (#121)
+
+A host that fronts several places to run things (containers, VMs, workers, sandboxes) names them, instead of overloading `username` or
+prefixing the command. Off unless you give `targets` (to `createWshServer`, `createMemoryHost`, or `createConnectionFactory` through
+`resolveBackends`); then the host advertises `targets` in `ServerHello.features`.
+
+```js
+createWshServer({
+  auth: { authorizedKeys },
+  targets: {
+    web: { description: 'the web container', exec: true },
+    db:  { description: 'the database VM', exec: (command, io) => runInVm(io.target, command, io), fs: dbFiles,
+           authorize: (who, { target, kind }) => who.fingerprint === DBA_KEY }, // kind: exec | pty | file | endpoint | list
+  },
+  // requireTarget: true,  // an Open, FileOp or OpenEndpoint that names no target is refused: nothing runs on the host itself
+});
+const targets = await client.listTargets();   // [{ name, description?, capabilities }] -- only what THIS key may use
+await client.openSession({ type: 'exec', command: 'psql -c ...', target: 'db' });   // also exec(url, cmd, { target })
+await client.fileOperation('list', '/var/lib', { target: 'db' });                    // FileOp.target
+await client.openEndpoint('metrics', { target: 'web' });                             // OpenEndpoint.target
+```
+
+Each target has its own `exec`, `pty`, `fs` and `endpoints` (the same forms as the host's own, `exec: true` and `fs: { root }` included on
+Node); the host's own are used only by a request that names no target. A target without a backend for the request refuses it (`exec is
+not enabled for this target`): a request is never run somewhere else. `io.target` (exec), `{ target }` in the pty `spawn` options, in every
+file backend call and on an endpoint's `duplex.target` tell a shared function which target it serves. `authorize(who, { target, kind })` is
+asked for every request that names the target and for `listTargets()`; only `true` lets the caller on, and a refused target and one that
+does not exist get the same answer (`no such target`), so the reply does not say which targets exist. A target without `authorize` is open
+to every key the host authenticated, as the host's own `exec` is. A `target` the client sends to a host that does not advertise `targets` is
+not sent (the client throws); a raw one is refused (`this host has no targets`). `createReverseHost` takes no `targets`.
+
+What it does **not** do: `requireTarget` covers `Open` (exec, pty, file, rpc), `FileOp` and `OpenEndpoint`, not the gateway (`OpenTcp`,
+`OpenUnix`, `ListenRequest`, ...), MCP, the `rpc` channels (`wsh-fs`, ... are the host's own and are refused when a target is named), or
+`Attach` to a session that already exists (it was opened on its target, and its owner may attach as before). A target is an authorization
+boundary only as far as your `authorize` and your backends make it one: the library routes and refuses, it does not isolate anything.
+
+The Rust CLI names one with `wsh --target NAME [user@]host [command...]` (or `wsh --target NAME connect [user@]host`) and lists them with
+`wsh targets [user@]host [--json]`; `--target` is refused (exit 2) by file transfer, forwarding, `--share`, `-N` and every other subcommand,
+and sent only to a host that advertises `targets`. The Rust `wsh-server` has no targets (it states no feature and refuses any request that
+names one).
+
 ### Compatibility: announce vs. primer
 
 An exec session's output flows on a second, client-opened stream, and a QMux
@@ -1498,7 +1539,7 @@ so options the platform gains later need no change here.
 
 | Export | Description |
 |--------|-------------|
-| `MSG` | 108 message type constants (hex opcodes) |
+| `MSG` | 110 message type constants (hex opcodes) |
 | `CHANNEL_KIND` | Channel types: `pty`, `exec`, `meta`, `file`, `tcp`, `udp`, `job` |
 | `AUTH_METHOD` | Auth methods: `pubkey`, `password` |
 | `cborEncode` / `cborDecode` | CBOR codec (maps, arrays, strings, ints, bytes, bools, null, floats) |
@@ -1546,6 +1587,9 @@ SIGINT, SIGTERM and SIGHUP sent to `wsh` are forwarded to the command, and the s
 disconnects. `wsh connect` ends when the remote session does. Diagnostics go to stderr (`-v` for more),
 never into the command's stdout. TLS uses the platform trust store, and `SSL_CERT_FILE` points it at another certificate (how a self-signed host is trusted); a plain
 `ws://` URL is accepted only for a loopback host.
+
+`wsh --target NAME [user@]host [command...]` runs on one of the host's execution targets and `wsh targets [user@]host` lists the ones this key may
+use (see [Execution targets](#execution-targets-121)); it is sent only to a host that advertises `targets`.
 
 ### Forwarding with `wsh -L` / `-R` / `-N`
 
@@ -1685,6 +1729,7 @@ than left to be found.
 | Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | **Operator proof: yes.** The Rust relay lists `operator-proof` and carries `ReverseChallenge`/`ReverseProof`/`ReverseConnect.features`; `wsh reverse-connect` answers a challenge (`--operator-proof` / `--no-operator-proof`; by default only for a peer that registered the `operator-proof` capability, because a released Rust host cannot decode the field); `wsh reverse` / `wsh agent run` challenge, verify BEFORE accepting, and take `--require-operator-proof` and `--allow-operator`. **Sealed bridge and both signed `KeyExchange` halves: yes** (`wsh reverse-connect --sealed`; a host with an identity states `e2e` / `e2e-sign` / `e2e-sealed` in its `ReverseAccept` once it has proven the operator). The exchange is byte-identical to JS (transcripts compared against vectors printed by the JS code), hybrid X25519+ML-KEM-768 negotiated exactly as JS does, X25519 when the peer lists no ML-KEM key. A host started with `--require-operator-proof` REQUIRES the sealed bridge (the JS rule): until the key exists it hears and sends nothing but the key exchange, and drops a bridge that has not sealed in 10 s; an operator that does not seal gets no answer to its plain messages. Every message that would cross the relay travels as an `EncryptedFrame` on channel 0; a plain message (wrapped or not) is dropped; **a frame that does not open (tampered, replayed, reordered) closes the bridge** (stricter than the JS host, which drops the frame and ignores the rest). Not covered: a direct or pipe-relayed connection, and `GatewayData` outside a reverse bridge (#155) | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); both implementations seal a reverse bridge |
 | Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | Kind `host`: the client binds to the proven host key (`--require-channel-binding`, and it honours `channel-binding-required`), and `wsh-server` offers it and can require it (`[server] require_channel_binding`, needs `host_key`). `cert-hash` and `tls-exporter`: not in Rust (the Rust WebTransport client has no certificate-hash pinning; `ConnectConfig.cert_hash` binds it if a caller supplies one) | **Wire-unified, negotiated** (`channel-binding:<kind>` features); verified against the spec's test vectors |
 | Pipe relay (#118) | `@johnhenry/wsh/pipe-relay` | operator side only (#145): `wsh --via wss://relay/r/<id> user@host command...` (also `connect`, `scp`, `ls`, `sftp`, `copy-id`), or the URL as the target. The host side of a pipe is not implemented in Rust. As on a direct connection the Rust client verifies the host-key proof (`host-key` / `host-key-sig` over its own nonce) before sending a credential, pins only a proven key, and binds the login to it (channel binding `host`; `test/rust/wsh-cli-identity.test.mjs`); the pipe-relayed session itself is not sealed (see Security model). `wsh -N -L` exits non-zero when the host drops the session (#156), and the error lines show the relay and a shortened id, never the whole rendezvous id | **Deliberately a relay without wsh parsing** -- nothing to unify on the wire. `--via` keeps `user@host` as the identity: its key is recorded in `known_hosts` under `host:port` (what a direct connection uses), never under the relay's address; a URL target is recorded under the URL's own authority, i.e. the relay's. The URL is not saved to `last_session.json` (the id is a capability) |
+| Execution targets (#121): `Open.target`, `FileOp.target`, `OpenEndpoint.target`, `ListTargets` / `TargetList` | host: `targets` on `createWshServer` / `createMemoryHost` (own backends and `authorize(who, { target, kind })` per target, `requireTarget`); client: `openSession({ target })`, `exec(.., { target })`, `fileOperation(.., { target })`, `openEndpoint(.., { target })`, `listTargets()` | CLI: `wsh --target NAME [user@]host [command...]` and `wsh connect` (exec and shells only; every other subcommand, `-L`/`-R`/`-N` and `--share` refuse `--target`), `wsh targets [user@]host [--json]`; the client's `open_session(SessionOpts { target })` and `list_targets()` (file and endpoint calls send no target). **A Rust host with targets: not built**: `wsh-server` states no `targets`, refuses a request that names one and answers `ListTargets` with an error | **Wire-unified, negotiated** (`targets` feature; every new field optional, never sent to a host that did not advertise it) |
 | Operator-side shared folders (`--share`, #159) | host side: `onShare(name, fs, who)` on `createMemoryHost` / `createWshServer` / `createReverseHost` (the host *uses* the operator's directories; `fs` is an object of async file operations, also shaped like an `fs` backend; `fs.root` is the operator's advisory, unverified path for the share, #164). The JS client does not offer shares | CLI side: `wsh --share NAME=/abs/dir[:ro\|:rw]` offers them, with each directory's path unless `--share-hide-path` (`wsh_client::share`, `wsh-cli`'s `sharefs`: descriptor-relative, never follows a link, see [Sharing a directory](#sharing-a-directory-with-the-host-wsh---share-159)); unix only. **A Rust host that uses shares: not built** (`wsh-server` does not state `shares`) | **Wire-unified, negotiated**: the host states the feature `shares`; the client sends one `ShareOffer` after login (opcodes `0xa8` `ShareOffer`, `0xa9` `ShareRequest`, host to client, `0xaa` `ShareReply`). No change notification, no sharing over `reverse-connect` |
 | Sealed session: any authenticated connection incl. gateway/endpoint data (#155) | host `sealSession: 'offer' \| 'require'` (stage b); client `connect(url, { sealSession: false \| 'auto' \| true })` (stage c) | `wsh --sealed ...` (or automatic against `e2e-session-required`) seals a direct or pipe-relayed session; `wsh-server` offers or requires it on WebSocket (`[server] seal_session = "off" \| "offer" \| "require"`, needs `host_key`; `require` refuses WebTransport, WISP tunnels and password logins; no typed rpc channels while it is on) | **Wire-unified, negotiated** (`e2e-session`, `e2e-session-required`, `KeyExchange` for the connection's session id, `EncryptedFrame` channel 0) |
 | Refusal event with stable reason codes (`onRefused`, #163) | `onRefused({ reason, who, detail })` on `createMemoryHost` / `createWshServer` / `createReverseHost`; `REFUSAL_REASONS` from `@johnhenry/wsh/host` | none: `wsh-server` and `wsh reverse` log a refusal, they have no callback (an embedding process has none) | **JS-only** -- a host-side callback of the embedding API, no wire change |
@@ -1796,6 +1841,13 @@ out explicitly below rather than left to be discovered.
   domain separate from the auth challenge. `listPeers()` verifies every
   entry client-side and reports a `verified` boolean, independent of
   trusting the relay.
+
+- **Execution targets: a name the client sends and the host decides on (#121).** Off unless `targets` is given. The host runs
+  `authorize(who, { target, kind })` for every request that names a target (and `listTargets()`), and a refused target looks like an
+  unknown one. It does NOT isolate targets from each other: a key allowed on two can use both, the library only routes and refuses, so the
+  isolation a target gives is your backends'. `requireTarget` does not cover the gateway, MCP or `Attach`; without it a request with no
+  target runs on the host's own backends, which any authenticated key can use, so a deployment that confines a key to one target must set
+  `requireTarget` (or leave the host with no backends of its own). The Rust `wsh-server` has no targets and refuses any request that names one.
 
 - **The Node gateway checks where a connection goes, not only what it was called.** `gateway.allow` matches the name a
   client sent, and then the address it resolves to must be globally routable (or permitted by `allowPrivate` or an

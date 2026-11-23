@@ -172,6 +172,10 @@ function createRegistry(sessions, log) {
  *   backpressure) and `who` is the authenticated `{ username, fingerprint }`, so the handler can authorise per call:
  *   throw synchronously to refuse, or give `{ open, authorize(who) }`. Only the names listed here exist (an allow-list by
  *   construction); nothing else of the gateway (TCP, DNS, unix sockets) is on in memory.
+ * @param {Record<string, { description?: string, authorize?: Function, exec?: Function | { run: Function }, pty?: object, fs?: object, endpoints?: object }>} [options.targets]
+ *   Execution targets (#121), as for `createWshServer`: each with its own `exec`, `pty`, `fs` and `endpoints` (the injected
+ *   forms only: there is no shell or directory here) and an `authorize(who, { target, kind })`. Off unless given.
+ * @param {boolean} [options.requireTarget=false] - With `targets`: a request that names no target is refused. As for `createWshServer`.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {number} [options.connectionTtlMs=0] - End each authenticated connection this long after login; advertised as
  *   `AuthOk.ttl` in whole seconds (#125). 0 = never.
@@ -190,7 +194,7 @@ function createRegistry(sessions, log) {
  * @param {(line: string) => void} [options.onLog]
  */
 export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
-  onShare, onRefused } = {}) {
+  onShare, onRefused, targets, requireTarget } = {}) {
   validateOnShare(onShare, 'createMemoryHost');
   validateOnRefused(onRefused, 'createMemoryHost');
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
@@ -209,7 +213,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   if (typeof dataStreams !== 'boolean') throw new TypeError('createMemoryHost: dataStreams must be true or false');
   const rpcHost = rpc === undefined || rpc === null ? null : createRpcTable(rpc, rpcMaxMessageBytes, rpcMaxInflight);
   const registry = sessions === undefined || sessions === null || sessions === false ? null : createRegistry(sessions, onLog);
-  const { execRunner, execOptions, pty: ptyBackend, files, mcp: mcpHost } = resolveBackends({ exec, pty, fs, mcp });
+  const { execRunner, execOptions, pty: ptyBackend, files, mcp: mcpHost, targets: targetTable, requireTarget: mustHaveTarget } = resolveBackends({ exec, pty, fs, mcp, targets, requireTarget });
   const hostKeyReady = hostKey === undefined || hostKey === null || hostKey === false ? Promise.resolve(null) : resolveHostKey(hostKey, 'createMemoryHost: hostKey');
   const rl = auth?.rateLimit ?? {};
   const rateLimit = {
@@ -220,11 +224,14 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   const methods = authMethods(auth);
   // Named virtual endpoints: a gateway with no TCP, DNS or unix sockets that answers only `OpenEndpoint`, built from
   // the browser-safe core (`server/gateway-core.mjs`), so a page can have it.
-  const gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints });
+  let gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints });
+  // A target's own endpoints (#121) need the endpoints-only gateway too, even when the host has none of its own.
+  if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({})), targetEndpoints: true };
 
   const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
     methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused,
+    targets: targetTable, requireTarget: mustHaveTarget,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));
   ready.catch(() => {});

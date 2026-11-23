@@ -35,6 +35,7 @@ export {
   nodeAnnounce, nodeRedirect,
   sessionGrant, sessionRevoke,
   fileOp, fileResult, fileChunk,
+  listTargets, targetList,
   authorizedKeyAdd, authorizedKeyResult,
   policyEval, policyResult, policyUpdate,
   terminalConfig,
@@ -75,7 +76,7 @@ export {
 // Session + Client
 export { WshSession } from './session.mjs';
 export { WshVirtualSessionBackend, normalizeSessionData } from './virtual-session.mjs';
-export { WshClient, MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE } from './client.mjs';
+export { WshClient, MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE } from './client.mjs';
 // Gateway forwarding (unix sockets, named endpoints, flow control) -- wsh #120, #123
 export { GatewayError } from './gateway-client.mjs';
 export { GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW } from './gateway-channel.mjs';
