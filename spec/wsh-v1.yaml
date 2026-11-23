@@ -140,6 +140,47 @@ messages:
       description: >
         Client authentication response.  Contains the method and
         either a signature+public_key (pubkey) or password (password).
+
+        The pubkey signature is over the transcript
+          SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce || channel_binding)
+        (lp = 4-byte big-endian length prefix). channel_binding (wsh #119)
+        is empty unless both ends agree to bind it, which makes the
+        signature specific to the connection it was made over, so an
+        intermediary that relays a genuine challenge to the host cannot use
+        the signature it gets back. It is
+          SHA-256("wsh-channel-binding-v1\0" || lp(kind) || lp(value) ...)
+        over the kinds present, in this order, with these values:
+          cert-hash     the 32-byte SHA-256 of the WebTransport certificate
+                        pinned through serverCertificateHashes (a client
+                        with exactly one pinned hash; a host serving a
+                        self-signed certificate)
+          host          the raw 32-byte Ed25519 host key that proved
+                        possession in ServerHello (host-key features), so a
+                        relay presenting its own host key binds to ITS key
+          tls-exporter  32 bytes of TLS keying material, label
+                        "EXPORTER-wsh-channel-binding", empty context
+                        (RFC 5705 / RFC 8446 7.5), where both ends can
+                        compute it (Node over wss:// served by the process
+                        itself; never a browser, never behind a
+                        TLS-terminating proxy)
+        Negotiation is by feature string only: a host lists
+        "channel-binding:<kind>" in ServerHello.features for each kind it
+        can bind and "channel-binding-required" when it will accept no
+        login without one; a client binds every kind the host offers and it
+        can supply and signs that; the host accepts the signature over any
+        non-empty combination of the kinds it offered (the empty binding
+        only when it does not require one, and it requires the kinds it
+        names). With no kind the binding is the empty byte string, exactly
+        the transcript released peers sign, so they keep working. A client
+        that must not authenticate unbound refuses when it ends up with no
+        kind -- which also defeats an intermediary stripping the offer.
+
+        Test vectors (channel_binding = SHA-256 of the layout above, kinds
+        filled with one repeated byte, 32 bytes each):
+          host = 0x22*32
+            266d39f1ffe60713ab836382fa8373407c8facaa88a3ddaf80c1cd5433e80dcc
+          cert-hash = 0x11*32, host = 0x22*32, tls-exporter = 0x33*32
+            dc2256bcbd4bff249870321a14390d305147a1e4e6dc701c0a3fc3dfff750da7
       fields:
         method:
           type: AuthMethod
@@ -158,7 +199,10 @@ messages:
       code: 0x06
       description: >
         Sent by the server on successful authentication.  Contains
-        the session_id, a signed session token, and the token TTL.
+        the session_id, an opaque connection token, and the connection
+        lifetime.  Neither field is a credential: token and ttl are kept
+        on the wire only because released peers require them (they are
+        not optional in 0.35 / rust-v0.6.0 clients).
       fields:
         session_id:
           type: string
@@ -166,9 +210,26 @@ messages:
         token:
           type: bytes
           required: true
+          description: >
+            An opaque per-connection value. It carries no authority: no
+            message accepts it back (Resume and Attach use the per-session
+            token from OpenOk, never this one), a host MUST NOT treat it as
+            a credential, and a client MUST NOT present it as one. Before
+            wsh 0.36 this text called it "a signed session token"; the
+            Rust host still sends an HMAC there, which nothing verifies.
         ttl:
           type: u64
           required: true
+          description: >
+            Seconds this host will keep the connection before it ends it;
+            0 means no limit is promised. A host that sends a non-zero ttl
+            MUST end the connection when it elapses (the client reconnects
+            and authenticates again); the JS host does so when started
+            with connectionTtlMs, and sends 0 otherwise. Before wsh 0.36 the
+            JS host sent a fixed 3600 it never enforced, and the Rust
+            host sends its session_ttl setting (default 86400) likewise
+            unenforced -- a client must not rely on a non-zero ttl from a
+            host that does not advertise otherwise.
 
     AuthFail:
       code: 0x07
@@ -854,6 +915,17 @@ messages:
         from_fingerprint:
           type: string
           required: true
+        features:
+          type: "string[]"
+          required: false
+          description: >
+            What the OPERATOR can do, stated by the operator and bounded and
+            copied by the relay: "operator-proof" says it answers a
+            ReverseChallenge with a ReverseProof (see ReverseChallenge). An
+            operator states it only when the relay's ServerHello lists
+            "operator-proof" -- a relay that predates the field (a Rust relay,
+            which rejects unknown fields) would drop the connection on it.
+            Absent: the peer must not send a ReverseChallenge.
 
     ReverseAccept:
       code: 0x54
@@ -942,6 +1014,95 @@ messages:
           type: string
           required: true
         reason:
+          type: string
+          required: false
+
+    ReverseChallenge:
+      code: 0x58
+      description: >
+        Peer -> operator, between a ReverseConnect and the peer's
+        ReverseAccept/Reject (wsh #117): the peer asks the operator to prove
+        its identity to the PEER, instead of the peer taking the identity
+        the relay stamped on ReverseConnect.from_fingerprint on trust. Sent
+        only to an operator that stated "operator-proof" in
+        ReverseConnect.features, over a relay that lists "operator-proof"
+        in its ServerHello; the relay carries it to the operator with
+        target_fingerprint set to the answering peer, and does nothing else
+        with it. The peer SIGNS the challenge so the operator knows whom it
+        is about to prove itself to and that the peer saw the operator's own
+        fingerprint (a relay that rewrote from_fingerprint shows up here).
+
+        signature (by the peer's Ed25519 identity key, public_key) covers
+          "wsh-reverse-challenge-v1\0" || lp(public_key) || lp(operator_fingerprint)
+          || lp(nonce) || lp(session_id)
+        where lp() is a 4-byte big-endian length prefix, operator_fingerprint
+        is the from_fingerprint the peer received, nonce is 32 random bytes
+        chosen by the peer for this request alone, and session_id is a fresh
+        random string the peer chose for the bridge (it is also the
+        session_id of a sealed bridge's KeyExchange). The operator verifies
+        the signature, that the fingerprint of public_key is the peer it
+        asked for, and that operator_fingerprint is its own; a peer accepts
+        each nonce once, within seconds.
+      fields:
+        target_fingerprint:
+          type: string
+          required: true
+        public_key:
+          type: bytes
+          required: true
+        operator_fingerprint:
+          type: string
+          required: true
+        nonce:
+          type: bytes
+          required: true
+        session_id:
+          type: string
+          required: true
+        signature:
+          type: bytes
+          required: true
+
+    ReverseProof:
+      code: 0x59
+      description: >
+        Operator -> peer, answering a ReverseChallenge (wsh #117). The
+        operator signs, with its Ed25519 identity key (public_key) that is
+        also its login key at the relay,
+          "wsh-operator-proof-v1\0" || lp(peer_public_key) || lp(public_key)
+          || lp(username) || lp(nonce) || lp(session_id)
+        so the signature names the peer it is for (peer_public_key is the
+        raw key from the verified ReverseChallenge), the operator's own key,
+        the username it claims, and the peer's nonce and session id: it
+        cannot be replayed to another peer, at another time, or for another
+        bridge. The peer verifies it BEFORE its accept callback runs, takes
+        the operator's identity from public_key (not from the relay's
+        from_fingerprint) and refuses if the two differ. The relay stamps
+        from_fingerprint on what it delivers; it is advisory here. A peer
+        that requires operator proof refuses an operator that does not send
+        one, and from then on acts only on traffic sealed under a key
+        exchange both sides signed (see KeyExchange.signature), because a
+        relay can stamp any from_fingerprint on a plain message.
+      fields:
+        target_fingerprint:
+          type: string
+          required: true
+        public_key:
+          type: bytes
+          required: true
+        username:
+          type: string
+          required: true
+        nonce:
+          type: bytes
+          required: true
+        session_id:
+          type: string
+          required: true
+        signature:
+          type: bytes
+          required: true
+        from_fingerprint:
           type: string
           required: false
 
@@ -1569,6 +1730,34 @@ messages:
             the exchange. Peers older than this field ignore it (JS) or may
             reject a KeyExchange carrying it (an older Rust build), so a host
             signs by default and offers e2e.sign: false for such a relay.
+
+            The INITIATOR may sign its round-1 message too (wsh #117), so
+            that both halves are authenticated. Its signature is over the
+            label "wsh-e2e-keyexchange-init-v1\0" (a different label, so it
+            can never be taken for a responder signature), the session_id,
+            the algorithm, its own ephemeral X25519 key and the responder's
+            raw identity key, each length-prefixed -- the responder's
+            reply, signed as above, then covers both ephemeral keys. The
+            responder verifies it against the operator key it already
+            proved in a ReverseProof (a host that states "e2e-sealed" in
+            ReverseAccept.features does), and a host that requires operator
+            proof refuses an unsigned or badly signed initiator half. An
+            initiator signs only after the host stated "e2e-sealed": an
+            older host would ignore the signature and a Rust one may reject
+            it.
+
+            "e2e-sealed" also means the bridge itself can be sealed: a
+            KeyExchange whose session_id is the ReverseChallenge.session_id
+            of the bridge, sent right after ReverseAccept, establishes a key
+            for the whole bridge. From then on every message that would
+            cross it (the relay forwardable list, KeyExchange aside) travels
+            as an EncryptedFrame with channel_id 0 and that session_id,
+            sealed with the same AES-256-GCM framing as session data
+            (counters, role tags, session_id as AAD), the CBOR of the
+            message as plaintext. A peer or operator that sealed the bridge
+            drops every plaintext message it receives over it. Nothing that
+            names a command, a path or a session is sent before the key
+            exists.
 
     EncryptedFrame:
       code: 0x8f

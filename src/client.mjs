@@ -8,14 +8,15 @@
  * reverse mode (client registers as a peer for incoming connections).
  */
 
-import { WebTransportTransport } from './transport.mjs';
+import { WebTransportTransport, normalizeWebTransportOptions } from './transport.mjs';
+import { clientChannelBinding, offeredKinds, TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH } from './channel-binding.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
 import {
   MSG, AUTH_METHOD,
   hello, auth as authMsg, open as openMsg, close as closeMsg,
   attach as attachMsg, resume as resumeMsg, ping as pingMsg, pong as pongMsg,
   reverseRegister as reverseRegisterMsg, reverseList as reverseListMsg,
-  reverseConnect as reverseConnectMsg, relayForward as relayForwardMsg,
+  reverseConnect as reverseConnectMsg, relayForward as relayForwardMsg, reverseProof as reverseProofMsg,
   mcpDiscover as mcpDiscoverMsg, mcpCall as mcpCallMsg, mcpCancel as mcpCancelMsg,
   suspendSession as suspendSessionMsg, restartPty as restartPtyMsg,
   metricsRequest as metricsRequestMsg,
@@ -39,7 +40,9 @@ import {
 } from './messages.mjs';
 import { resolveSigner, signChallengeWith, signPeerRecordWith, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
 import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
-import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature } from './e2e-exchange.mjs';
+import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature, initiatorTranscript } from './e2e-exchange.mjs';
+import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, verifyReverseChallenge, createOperatorProof } from './operator-proof.mjs';
+import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
 import { cborDecode, cborEncode } from './cbor.mjs';
 import {
@@ -224,6 +227,20 @@ async function pumpStdin(session, stdin) {
   await session.closeStdin();
 }
 
+/**
+ * The single certificate hash a WebTransport connection was pinned to (`serverCertificateHashes`), or null: with
+ * several the browser does not say which one the server presented, so none is bound.
+ * @returns {Uint8Array | null}
+ */
+function webTransportCertHash(webTransport) {
+  try {
+    const list = normalizeWebTransportOptions(webTransport)?.serverCertificateHashes;
+    if (list?.length !== 1 || list[0].algorithm !== 'sha-256') return null;
+    const v = list[0].value;
+    return v instanceof Uint8Array ? v : new Uint8Array(v);
+  } catch { return null; }
+}
+
 export class WshClient {
 
   /** @type {'disconnected'|'connecting'|'connected'|'authenticated'|'closed'} */
@@ -245,11 +262,39 @@ export class WshClient {
    */
   #authToken = null;
 
+  /**
+   * `AuthOk.ttl`: how many seconds the host says it will keep this connection (it ends it then), `0` = no limit
+   * promised (#125).
+   */
+  #authTtl = 0;
+
   /** @type {import('./transport.mjs').WshTransport|null} Active transport. */
   #transport = null;
 
   /** @type {{fingerprint: string, publicKey: Uint8Array, openssh: string, status: string}|null} */
   #hostKey = null;
+
+  /** This login's signer, kept so `reverseConnect()` can prove the operator's identity to a peer (#117). */
+  #signer = null;
+
+  /** The username of the last login: what a ReverseProof claims. */
+  #loginUsername = '';
+
+  /** The peer that proved itself to this operator on its last reverseConnect, if any. */
+  #peerProof = null;
+
+  /**
+   * Set while a sealed reverse bridge is being set up or is up (#117): `{ sessionId, bridge }`, `bridge` null until
+   * the key exists. Everything a relay forwards to this operator is then dropped unless it is the key exchange (while
+   * pending) or a frame of the bridge (after).
+   */
+  #sealState = null;
+
+  /** The binding kinds the last login's signature covered (#119); empty when it was unbound. */
+  #channelBindingKinds = [];
+
+  /** The one certificate hash this connection was pinned to over WebTransport, if any (a `cert-hash` binding). */
+  #certHash = null;
 
   /**
    * Called with the host's verified key before any credential is sent.
@@ -373,6 +418,13 @@ export class WshClient {
   onReverseConnect = null;
 
   /**
+   * Called when an operator's `ReverseProof` arrives, answering the `ReverseChallenge` this peer sent (reverse
+   * mode only, wsh #117). `createReverseHost` uses it; a hand-written handler pairs it with `operator-proof.mjs`.
+   * @type {function(object): void|null}
+   */
+  onReverseProof = null;
+
+  /**
    * Called when a clipboard sync message arrives (OSC 52).
    * The default handler writes to navigator.clipboard automatically.
    * @type {function(object): void|null}
@@ -449,6 +501,15 @@ export class WshClient {
    */
   get authToken() {
     return this.#authToken;
+  }
+
+  /**
+   * Seconds the host said it will keep this connection (`AuthOk.ttl`), `0` when it promised no limit. A host that
+   * sets one ends the connection then (`createWshServer({ connectionTtlMs })`); reconnect to continue. Hosts older
+   * than 0.36 sent a fixed 3600 that nothing enforced.
+   */
+  get authTtl() {
+    return this.#authTtl;
   }
 
   /** Read-only view of active sessions. */
@@ -543,9 +604,13 @@ export class WshClient {
    * @param {string} [opts.hostLabel] - Key under which `knownHosts` records
    *   this host (default: the URL's `host:port`).
    * @param {Function} [opts.onHostKey] - Per-connect `onHostKey`.
+   * @param {boolean | string[]} [opts.requireChannelBinding] - Refuse to authenticate unless the signature can be bound
+   *   to this connection (#119): `true` needs at least one binding kind (`host`, `cert-hash`, `tls-exporter`) that
+   *   both the host offers and this client can supply; an array names kinds that must all be bound. Not for
+   *   password auth (nothing is signed). Stops an intermediary from relaying a genuine challenge to the host.
    * @returns {Promise<string>} The server-assigned session ID
    */
-  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, ...hostKeyOpts } = {}) {
+  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, requireChannelBinding = false, ...hostKeyOpts } = {}) {
     if (this.#state !== STATE_DISCONNECTED && this.#state !== STATE_CLOSED) {
       throw new Error(`Client already ${this.#state}`);
     }
@@ -553,16 +618,24 @@ export class WshClient {
       throw new Error('username is required');
     }
     const cred = await resolveSigner({ keyPair, signer });
+    this.#signer = cred;
+    this.#loginUsername = username;
     if (!cred && !password) {
       throw new Error('Either keyPair, signer or password is required for authentication');
     }
+    if (requireChannelBinding && !cred) throw new Error('requireChannelBinding needs a key: a password login signs nothing to bind');
 
     this.#state = STATE_CONNECTING;
+    this.#channelBindingKinds = [];
+    this.#certHash = null;
+    this.#sealState = null;
+    this.#peerProof = null;
     this.#sessions.clear();
     this.#channelCounter = 0;
     this.#waiters.clear();
     this.#sessionId = null;
     this.#authToken = null;
+    this.#authTtl = 0;
     this.#hostKey = null;
 
     try {
@@ -613,6 +686,7 @@ export class WshClient {
             // Server accepted without challenge (e.g. trusted key).
             this.#sessionId = challengeMsg.session_id || tempSessionId;
             this.#authToken = challengeMsg.token || null;
+            this.#authTtl = Number(challengeMsg.ttl) || 0;
             this.#state = STATE_AUTHENTICATED;
             this.#startPing();
             return this.#sessionId;
@@ -625,7 +699,7 @@ export class WshClient {
             cred,
             challengeMsg.session_id,
             challengeMsg.nonce,
-            { username }
+            { username, channelBinding: await this.#bindingFor(this.#serverFeatures, requireChannelBinding) }
           );
 
           await transport.sendControl(
@@ -663,7 +737,7 @@ export class WshClient {
           cred,
           firstResponse.session_id,
           firstResponse.nonce,
-          { username }
+          { username, channelBinding: await this.#bindingFor([], requireChannelBinding) }
         );
 
         await transport.sendControl(
@@ -688,6 +762,7 @@ export class WshClient {
 
       this.#sessionId = authResult.session_id || tempSessionId;
       this.#authToken = authResult.token || null;
+      this.#authTtl = Number(authResult.ttl) || 0;
       this.#state = STATE_AUTHENTICATED;
       this.#startPing();
 
@@ -1204,6 +1279,8 @@ export class WshClient {
 
     // Export public key for peer identification.
     const cred = await resolveSigner({ keyPair, signer });
+    this.#signer = cred;
+    this.#loginUsername = username;
     let publicKey = null;
     if (cred) publicKey = cred.publicKeyRaw;
 
@@ -1298,23 +1375,95 @@ export class WshClient {
    * @param {number} [timeout=10000]
    * @returns {Promise<object>}
    */
-  async reverseConnect(targetFingerprint, timeout = DEFAULT_OPEN_TIMEOUT) {
+  async reverseConnect(targetFingerprint, timeout = DEFAULT_OPEN_TIMEOUT, { proof = 'auto', requirePeerProof = false, sealed = false } = {}) {
     this.#assertAuthenticated('reverseConnect');
 
-    await this.#transport.sendControl(
+    // Proving this operator's identity to the PEER (wsh #117) needs a relay that carries the challenge and a key to sign with.
+    const relayCarriesProof = this.#serverFeatures.includes(OPERATOR_PROOF_FEATURE);
+    const sealOpts = sealed === true ? {} : (sealed || null);
+    if ((sealOpts || requirePeerProof || proof === true) && !relayCarriesProof) {
+      throw new Error(`reverseConnect: this relay does not carry operator proof (no "${OPERATOR_PROOF_FEATURE}" in its features), so ${sealOpts ? 'a sealed bridge' : 'proof'} is not available -- nothing was sent`);
+    }
+    if ((sealOpts || requirePeerProof || proof === true) && !this.#signer) throw new Error('reverseConnect: proof needs a key login (a password login has nothing to sign with)');
+    const offerProof = proof !== false && relayCarriesProof && !!this.#signer;
+
+    // A sealed bridge sends nothing that names a command, a path or a session before the key exists: from here on a
+    // message the relay may forward is refused locally until the bridge key is in place.
+    const transport = this.#transport;
+    const plainSend = transport.sendControl.bind(transport);
+    let bridge = null;
+    let sealing = null; // { sessionId }
+    if (sealOpts) {
+      this.#sealState = { sessionId: null, bridge: null };
+      transport.sendControl = async (msg) => {
+        if (!isRelayForwardable(msg.type)) return plainSend(msg);
+        if (bridge) return plainSend(await bridge.seal(msg));
+        if (msg.type === MSG.KEY_EXCHANGE && sealing && msg.session_id === sealing.sessionId) return plainSend(msg);
+        throw new Error('sealed bridge: nothing is sent over it before the key exists');
+      };
+    }
+    const undoSealGate = () => { if (!bridge) { transport.sendControl = plainSend; this.#sealState = null; } };
+
+    let response = null;
+    let challenge = null;
+    try {
+      const ownFingerprint = this.#signer ? await computeFingerprint(this.#signer.publicKeyRaw) : null;
+      // Register before sending: the answer can follow the request closely.
+      const first = this.#waitForMessage(
+        [MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT, MSG.REVERSE_CHALLENGE],
+        timeout,
+        'Timed out waiting for reverse-connect response'
+      );
+      first.catch(() => {});
+      const connectMsg = reverseConnectMsg({ targetFingerprint, username: '', fromFingerprint: '' });
+      if (offerProof) connectMsg.features = [OPERATOR_PROOF_FEATURE]; // only a relay that lists it may be sent the field
       // fromFingerprint is ignored by the server -- it overwrites it with
       // this connection's own authenticated fingerprint before forwarding.
-      reverseConnectMsg({ targetFingerprint, username: '', fromFingerprint: '' })
-    );
+      await plainSend(connectMsg);
 
-    const response = await this.#waitForMessage(
-      [MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT],
-      timeout,
-      'Timed out waiting for reverse-connect response'
-    );
+      response = await first;
+      challenge = null;
+      if (response.type === MSG.REVERSE_CHALLENGE) {
+        // The peer asks who is at this end. Verify it is the peer we asked for and that it saw OUR fingerprint
+        // (a relay that rewrote from_fingerprint shows here), then answer; the answer names the peer, its nonce
+        // and the bridge's session, so it is good for nothing else.
+        const answer = this.#waitForMessage([MSG.REVERSE_ACCEPT, MSG.REVERSE_REJECT], timeout, 'Timed out waiting for reverse-connect response');
+        answer.catch(() => {});
+        try {
+          challenge = await verifyReverseChallenge(response, { target: targetFingerprint, ownFingerprint });
+          await plainSend(reverseProofMsg({ targetFingerprint: challenge.peerFingerprint, ...await createOperatorProof(this.#signer, challenge, this.#loginUsername) }));
+        } catch (e) { answer.catch(() => {}); throw e; }
+        response = await answer;
+      }
+
+      if (response.type === MSG.REVERSE_ACCEPT) {
+        if (requirePeerProof && !challenge) throw new Error('reverseConnect: the peer did not prove its identity (requirePeerProof) -- nothing was sent over the bridge');
+        if (challenge && response.target_fingerprint !== challenge.peerFingerprint) throw new Error('reverseConnect: the relay named a different peer than the one that signed the challenge');
+        if (sealOpts) {
+          if (!challenge) throw new Error('reverseConnect: a sealed bridge needs the peer to answer with a challenge (does it require operator proof support?)');
+          if (!(response.features ?? []).includes(E2E_SEALED_FEATURE)) throw new Error(`reverseConnect: the peer does not state "${E2E_SEALED_FEATURE}", so a sealed bridge is not available -- nothing was sent`);
+        }
+        this.trustRelayPeer(challenge?.peerFingerprint ?? response.target_fingerprint);
+        if (sealOpts) {
+          sealing = { sessionId: challenge.sessionId };
+          this.#sealState = { sessionId: challenge.sessionId, bridge: null };
+          const algorithm = sealOpts.hybrid === false ? 'X25519' : 'X25519+ML-KEM-768';
+          const { sharedSecret } = await this.initiateE2E(challenge.sessionId, algorithm, timeout, {
+            verifyPeer: challenge.peerPublicKey, signAs: this.#signer, responderIdentity: challenge.peerPublicKey,
+          });
+          bridge = new SealedBridge({ key: sharedSecret, sessionId: challenge.sessionId, role: 'initiator' });
+          this.#sealState = { sessionId: challenge.sessionId, bridge };
+        }
+        this.#peerProof = challenge ? { peerFingerprint: challenge.peerFingerprint, sealed: !!sealOpts } : null;
+      } else {
+        undoSealGate();
+      }
+    } catch (e) {
+      undoSealGate();
+      throw e;
+    }
 
     if (response.type === MSG.REVERSE_ACCEPT) {
-      this.trustRelayPeer(response.target_fingerprint);
       // The relay's SERVER_HELLO describes the relay, not the host behind the
       // bridge: when that host says what it supports, feature gates
       // (file-write, file-rename, mcp-call-id) follow it instead.
@@ -1956,9 +2105,11 @@ export class WshClient {
    * @param {number} [timeout=10000]
    * @param {object} [opts]
    * @param {Uint8Array | CryptoKey} [opts.verifyPeer] - the peer's Ed25519 public key (raw 32 bytes or imported)
+   * @param {{ sign: (data: Uint8Array) => Promise<Uint8Array> }} [opts.signAs] - sign this (initiator) half with the operator's key (`resolveSigner` shape); send only to a peer that stated `e2e-sealed`
+   * @param {Uint8Array} [opts.responderIdentity] - the responder's raw identity key, bound into the initiator signature (default: `verifyPeer` when raw)
    * @returns {Promise<{sharedSecret: CryptoKey, peerPublicKey: Uint8Array, hybrid: boolean, peerAuthenticated: boolean}>}
    */
-  async initiateE2E(sessionId, algorithm = 'X25519', timeout = DEFAULT_OPEN_TIMEOUT, { verifyPeer } = {}) {
+  async initiateE2E(sessionId, algorithm = 'X25519', timeout = DEFAULT_OPEN_TIMEOUT, { verifyPeer, signAs, responderIdentity } = {}) {
     this.#assertAuthenticated('initiateE2E');
     const wantHybrid = algorithm === 'X25519+ML-KEM-768';
 
@@ -1998,8 +2149,17 @@ export class WshClient {
     );
     const localKem = wantHybrid ? await generateMlKemKeyPair() : null;
 
+    // The initiator signs its half too (wsh #117) when it has a signer and knows whom it is talking to: the host
+    // verifies it against the operator key it proved, so neither ephemeral key can be swapped by the relay.
+    let initiatorSignature;
+    if (signAs) {
+      const responder = responderIdentity ?? (verifyPeer instanceof Uint8Array ? verifyPeer : null);
+      if (!responder) throw new TypeError('initiateE2E: signAs needs responderIdentity (or a raw verifyPeer key)');
+      initiatorSignature = await signAs.sign(initiatorTranscript({ sessionId, algorithm, initiatorKey: localPub, responderIdentity: responder }));
+    }
+
     await this.#transport.sendControl(
-      keyExchangeMsg({ algorithm, publicKey: localPub, sessionId, kemPublicKey: localKem?.publicKey })
+      keyExchangeMsg({ algorithm, publicKey: localPub, sessionId, kemPublicKey: localKem?.publicKey, signature: initiatorSignature })
     );
 
     const peerMsg = await peerMsgPromise;
@@ -2348,6 +2508,7 @@ export class WshClient {
       const transport = this.#createTransport(attempt.kind);
       try {
         await transport.connect(attempt.url, attempt.kind === 'wt' ? webTransport : undefined);
+        this.#certHash = attempt.kind === 'wt' ? webTransportCertHash(webTransport) : null;
         this.#attachTransportHandlers(transport);
         return transport;
       } catch (err) {
@@ -2453,6 +2614,41 @@ export class WshClient {
     return this.#performAuth({ ...opts, url });
   }
 
+  // ── Internal: channel binding (#119) ────────────────────────────────
+
+  /**
+   * The channel binding for the login signature: every kind the host offers (`channel-binding:<kind>` in its
+   * ServerHello) that this connection can supply. Throws when `required` and the result is not enough.
+   * @param {string[]} serverFeatures - `[]` when the host sent no ServerHello
+   * @param {boolean | string[]} required
+   * @returns {Promise<Uint8Array>}
+   */
+  async #bindingFor(serverFeatures, required) {
+    const exporter = this.#transport?.tlsExporter?.(TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH) ?? null;
+    const { binding, kinds } = await clientChannelBinding(serverFeatures, {
+      host: this.#hostKey?.publicKey ?? null,
+      'cert-hash': this.#certHash,
+      'tls-exporter': exporter,
+    });
+    if (required) {
+      const needed = Array.isArray(required) ? required : [];
+      const missing = needed.filter((k) => !kinds.includes(k));
+      if (kinds.length === 0 || missing.length) {
+        const offered = offeredKinds(serverFeatures);
+        throw new Error(
+          `channel binding required but not available (host offers: ${offered.join(', ') || 'none'}; bound: ${kinds.join(', ') || 'none'}${missing.length ? `; missing: ${missing.join(', ')}` : ''}) -- nothing was signed`,
+        );
+      }
+    }
+    this.#channelBindingKinds = kinds;
+    return binding;
+  }
+
+  /** The binding kinds the login signature covered (`'host'`, `'cert-hash'`, `'tls-exporter'`); empty when unbound. */
+  get channelBinding() {
+    return [...this.#channelBindingKinds];
+  }
+
   // ── Internal: host key (TOFU / pinning) ─────────────────────────────
 
   /**
@@ -2556,12 +2752,16 @@ export class WshClient {
    * @returns {Promise<string>} Session ID
    * @private
    */
-  async #performAuth({ username, keyPair, signer, password, timeout = DEFAULT_AUTH_TIMEOUT, url, ...hostKeyOpts } = {}) {
+  async #performAuth({ username, keyPair, signer, password, timeout = DEFAULT_AUTH_TIMEOUT, url, requireChannelBinding = false, ...hostKeyOpts } = {}) {
     if (!username) throw new Error('username is required');
     const cred = await resolveSigner({ keyPair, signer });
+    this.#signer = cred;
+    this.#loginUsername = username;
     if (!cred && !password) throw new Error('Either keyPair, signer or password is required');
 
     this.#hostKey = null;
+    this.#channelBindingKinds = [];
+    this.#certHash = null;
     try {
       const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
@@ -2596,13 +2796,15 @@ export class WshClient {
           if (challengeMsg.type === MSG.AUTH_OK) {
             this.#sessionId = challengeMsg.session_id || tempSessionId;
             this.#authToken = challengeMsg.token || null;
+            this.#authTtl = Number(challengeMsg.ttl) || 0;
             this.#state = STATE_AUTHENTICATED;
             this.#startPing();
             return this.#sessionId;
           }
 
           const { signature, publicKeyRaw } = await signChallengeWith(
-            cred, challengeMsg.session_id, challengeMsg.nonce, { username }
+            cred, challengeMsg.session_id, challengeMsg.nonce,
+            { username, channelBinding: await this.#bindingFor(this.#serverFeatures, requireChannelBinding) }
           );
 
           await this.#transport.sendControl(authMsg({
@@ -2623,7 +2825,8 @@ export class WshClient {
         // absent.
         tempSessionId = firstResponse.session_id;
         const { signature, publicKeyRaw } = await signChallengeWith(
-          cred, firstResponse.session_id, firstResponse.nonce, { username }
+          cred, firstResponse.session_id, firstResponse.nonce,
+          { username, channelBinding: await this.#bindingFor([], requireChannelBinding) }
         );
 
         await this.#transport.sendControl(authMsg({
@@ -2643,6 +2846,7 @@ export class WshClient {
 
       this.#sessionId = authResult.session_id || tempSessionId;
       this.#authToken = authResult.token || null;
+      this.#authTtl = Number(authResult.ttl) || 0;
       this.#state = STATE_AUTHENTICATED;
       this.#startPing();
 
@@ -2688,6 +2892,22 @@ export class WshClient {
       if (!isRelayForwardable(inner.type)) {
         console.warn('[wsh:client] dropping RelayForward wrapping a non-forwardable type:', inner.type);
         return;
+      }
+      // A sealed bridge (#117): from_fingerprint is whatever the relay stamped, so plain traffic proves nothing --
+      // only the key exchange that sets the bridge up (while it is pending) and frames of the bridge are heard.
+      const sealState = this.#sealState;
+      if (sealState) {
+        if (sealState.bridge?.isFrame(inner)) {
+          sealState.bridge.open(inner)
+            .then((opened) => this.#handleControl(opened, msg.from_fingerprint))
+            .catch((err) => console.warn('[wsh:client] dropping a sealed frame:', err.message));
+          return;
+        }
+        const setup = !sealState.bridge && inner.type === MSG.KEY_EXCHANGE && inner.session_id === sealState.sessionId;
+        if (!setup) {
+          console.warn('[wsh:client] dropping a plaintext message on a sealed bridge');
+          return;
+        }
       }
       this.#handleControl(inner, msg.from_fingerprint);
       return;
@@ -2898,6 +3118,14 @@ export class WshClient {
           this.onReverseClose?.(msg);
         } catch (err) {
           console.error('[wsh:client] onReverseClose handler error:', err);
+        }
+        break;
+
+      case MSG.REVERSE_PROOF:
+        try {
+          this.onReverseProof?.(msg);
+        } catch (err) {
+          console.error('[wsh:client] onReverseProof handler error:', err);
         }
         break;
 

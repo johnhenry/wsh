@@ -324,6 +324,22 @@ export class WebSocketTransport extends WshTransport {
     this._emitClose();
   }
 
+  /**
+   * The TLS exporter, when the WebSocket implementation exposes its TLS socket (the `ws` package does, as
+   * `_socket`, over `wss://`); `null` for a browser, Node's global `WebSocket`, or a plain `ws://`. See `WshTransport`.
+   * @param {string} label
+   * @param {number} length
+   * @returns {Uint8Array | null}
+   */
+  tlsExporter(label, length) {
+    try {
+      const sock = this.#ws?._socket;
+      if (!sock || typeof sock.exportKeyingMaterial !== 'function' || sock.encrypted !== true) return null;
+      const out = sock.exportKeyingMaterial(length, label);
+      return out && out.length === length ? new Uint8Array(out.buffer, out.byteOffset, out.byteLength).slice() : null;
+    } catch { return null; }
+  }
+
   // ── Outbound helper ──────────────────────────────────────────────
 
   /**

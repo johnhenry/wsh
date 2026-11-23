@@ -89,6 +89,34 @@ export function keyExchangeTranscript({ sessionId, algorithm, initiatorKey, resp
   return out;
 }
 
+const INIT_LABEL = new TextEncoder().encode('wsh-e2e-keyexchange-init-v1\0');
+
+/**
+ * The bytes an INITIATOR signs in its round-1 `KeyExchange` (wsh #117), so that both halves are authenticated: the
+ * label (different from the responder's, so neither signature can pass for the other), the session id, the algorithm,
+ * its own ephemeral key and the identity key of the responder it means to reach. The responder's signed reply then
+ * covers both ephemeral keys.
+ * @param {{ sessionId: string, algorithm: string, initiatorKey: Uint8Array, responderIdentity: Uint8Array }} t
+ */
+export function initiatorTranscript({ sessionId, algorithm, initiatorKey, responderIdentity }) {
+  const parts = [INIT_LABEL, lp(enc.encode(sessionId)), lp(enc.encode(algorithm)), lp(initiatorKey), lp(responderIdentity)];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+/** Verify an initiator's `KeyExchange.signature` against its identity key. */
+export async function verifyInitiatorSignature(initiatorIdentity, signature, transcript) {
+  if (!(signature instanceof Uint8Array) || signature.length !== 64) return false;
+  try {
+    const key = initiatorIdentity instanceof Uint8Array ? await importPublicKeyRaw(initiatorIdentity) : initiatorIdentity;
+    return await verifyBytes(key, signature, initiatorTranscript(transcript));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Verify a responder's `KeyExchange.signature`.
  * @param {Uint8Array | CryptoKey} peerIdentity - the host's raw 32-byte Ed25519 public key (or an imported one)
@@ -125,11 +153,20 @@ export class E2EResponder {
    * @param {object} [opts]
    * @param {CryptoKey | null} [opts.signKey] - long-term Ed25519 private key; given, the reply is signed
    * @param {boolean} [opts.hybrid=true] - offer X25519+ML-KEM-768 when the initiator asks for it
+   * @param {Uint8Array | null} [opts.identity] - this responder's raw 32-byte identity key (what an initiator signs as `responderIdentity`)
+   * @param {{ publicKey: Uint8Array, require?: boolean } | null} [opts.initiator] - the operator's identity key, already
+   *   proven (a `ReverseProof`): a round-1 `signature` is verified against it and a bad one refuses the exchange;
+   *   with `require`, a missing one does too (#117)
    */
-  constructor({ signKey = null, hybrid = true } = {}) {
+  constructor({ signKey = null, hybrid = true, identity = null, initiator = null } = {}) {
     this.#sign = signKey;
     this.#hybrid = hybrid;
+    this.#identity = identity;
+    this.#initiator = initiator;
   }
+
+  #identity;
+  #initiator;
 
   get signs() { return !!this.#sign; }
 
@@ -165,6 +202,19 @@ export class E2EResponder {
     const peerKem = msg.kem_public_key;
     const wantHybrid = algorithm === E2E_ALGORITHM_HYBRID && this.#hybrid
       && peerKem instanceof Uint8Array && peerKem.length === MLKEM768_PUBLIC_KEY_LENGTH;
+
+    // The initiator's half (wsh #117): signed by the operator key this connection already proved.
+    let initiatorAuthenticated = false;
+    if (this.#initiator) {
+      if (msg.signature !== undefined) {
+        initiatorAuthenticated = !!this.#identity && await verifyInitiatorSignature(this.#initiator.publicKey, msg.signature, {
+          sessionId, algorithm, initiatorKey: peerPub, responderIdentity: this.#identity,
+        });
+        if (!initiatorAuthenticated) throw Object.assign(new Error('KeyExchange initiator signature does not verify'), { code: 'E2E_INITIATOR_UNAUTHENTICATED' });
+      } else if (this.#initiator.require) {
+        throw Object.assign(new Error('KeyExchange without the initiator signature this host requires'), { code: 'E2E_INITIATOR_UNAUTHENTICATED' });
+      }
+    }
 
     // A fresh exchange for this session replaces an unfinished one.
     this.#drop(sessionId);

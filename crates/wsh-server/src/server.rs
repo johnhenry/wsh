@@ -2535,6 +2535,7 @@ impl WshServer {
                                     target_fingerprint: p.target_fingerprint.clone(),
                                     username: p.username.clone(),
                                     from_fingerprint: ctx.fingerprint.clone(),
+                                    features: None,
                                 }),
                             };
                             if target_tx.try_send(fwd).is_err() {

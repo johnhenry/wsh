@@ -64,7 +64,7 @@ describe('createWshServer', () => {
 
   describe('exec', () => {
     let ctx;
-    before(async () => { ctx = await start({ auth: { authorizedKeys }, exec: true }); });
+    before(async () => { ctx = await start({ auth: { authorizedKeys }, exec: { clientEnv: true } }); }); // clientEnv: true for the 'N' variable below
     after(() => ctx.server.close());
 
     it('the consumer scenario: static exec of `echo hello` with no primer', async () => {

@@ -80,6 +80,16 @@ export { WshClient, MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEA
 // End-to-end key exchange (responder side, feature names, signed transcript) -- wsh #90
 export { E2E_FEATURE, E2E_SIGN_FEATURE, keyExchangeTranscript, verifyKeyExchangeSignature } from './e2e-exchange.mjs';
 
+// The operator proves its identity to the peer; sealed bridges -- wsh #117
+export {
+  OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyReverseChallenge, createOperatorProof, verifyOperatorProof,
+  challengeTranscript, proofTranscript,
+} from './operator-proof.mjs';
+export { SealedBridge, BRIDGE_CHANNEL_ID } from './bridge-seal.mjs';
+
+// Channel binding for the login signature -- wsh #119
+export { computeChannelBinding, CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
+
 // Key storage
 export { WshKeyStore } from './keystore.mjs';
 

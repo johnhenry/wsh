@@ -2049,16 +2049,19 @@ mod tests {
             target_fingerprint: "fp".into(),
             username: "alice".into(),
             from_fingerprint: "operator".into(),
+            features: None,
         };
         let right = ReverseConnectPayload {
             target_fingerprint: "fp".into(),
             username: "alice".into(),
             from_fingerprint: "operator".into(),
+            features: None,
         };
         let wrong_user = ReverseConnectPayload {
             target_fingerprint: "fp".into(),
             username: "bob".into(),
             from_fingerprint: "operator".into(),
+            features: None,
         };
 
         assert!(same_reverse_request(&left, &right));

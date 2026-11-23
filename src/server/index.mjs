@@ -18,10 +18,20 @@ import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
 import { normalizeGateway } from './gateway.mjs';
 import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
 import { bindSocket } from './socket.mjs';
+import { TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH, CHANNEL_BINDING_KINDS } from '../channel-binding.mjs';
 
 export { parseAuthorizedKeys, STREAM_ANNOUNCE, mcpServerAdapter };
 export { createReverseHost } from './reverse-host.mjs';
 export { generateSelfSignedCertificate } from './self-signed.mjs';
+
+/** The TLS exporter of a `wss://` connection as a channel binding (#119); null on a plain socket or a TLS-terminating proxy hop. */
+function tlsChannelBinding(socket) {
+  try {
+    if (!socket || socket.encrypted !== true || typeof socket.exportKeyingMaterial !== 'function') return null;
+    const out = socket.exportKeyingMaterial(TLS_EXPORTER_LENGTH, TLS_EXPORTER_LABEL);
+    return out?.length === TLS_EXPORTER_LENGTH ? { 'tls-exporter': [new Uint8Array(out.buffer, out.byteOffset, out.byteLength).slice()] } : null;
+  } catch { return null; }
+}
 
 /**
  * @param {object} [options]
@@ -74,12 +84,22 @@ export { generateSelfSignedCertificate } from './self-signed.mjs';
  *   names from this host. Default deny: a destination must match `allow` (`"*"`, `"host"`, `"host:port"`). `socks` dials
  *   through a SOCKS5 proxy (Tor) with the name unresolved. UDP and reverse tunnels are refused. Off unless given. See `gateway.mjs`.
  * @param {number} [options.bindTimeoutMs=3000]
+ * @param {number} [options.connectionTtlMs=0] - End every authenticated connection this long after login (0 = never).
+ *   Advertised as `AuthOk.ttl` in whole seconds, rounded up; the client reads it as `client.authTtl`.
+ * @param {boolean | string[]} [options.requireChannelBinding=false] - Accept a key login only when its signature is bound to
+ *   this connection (#119): `true` needs any binding kind, an array names kinds that must all be bound (`host` needs
+ *   `hostKey`; `tls-exporter` needs `wss://` served by this process, not a TLS-terminating proxy; `cert-hash` needs
+ *   WebTransport with `selfSigned`). Clients older than 0.36 cannot satisfy it. Off by default.
  * @param {(line: string) => void} [options.onLog]
  * @returns {{ listen(): Promise<{address: string, port: number}>, accept(socket: object, options?: object): Promise<{ close(): void }>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, onLog = () => {},
+  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, onLog = () => {},
 } = {}) {
+  if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
+    throw new TypeError(`createWshServer: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
+  }
+  if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createWshServer: connectionTtlMs must be a non-negative number of milliseconds (0 = no limit)');
   let wss = null;
   let httpsServer = null;
   let bound = null;
@@ -125,7 +145,7 @@ export function createWshServer({
       if (relay) hub = new RelayHub({ ...relay, log: onLog });
       if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createWshServer: extensions must be an object of handlers');
       return createConnectionFactory({
-        authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, log: onLog,
+        authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, sessions: registry, relay: hub,
       });
     })();
@@ -156,6 +176,7 @@ export function createWshServer({
           send: (b) => { if (ws.readyState === 1) ws.send(b); },
           remote: { address: req?.socket?.remoteAddress, headers: req?.headers ?? {} },
           closeTransport: () => ws.close(1000),
+          channelBinding: tlsChannelBinding(req?.socket),
         });
         ws.on('message', (d) => {
           const buf = Array.isArray(d) ? Buffer.concat(d) : Buffer.isBuffer(d) ? d : Buffer.from(d);

@@ -121,6 +121,8 @@ export async function startWebTransport({ options, host, attach, log }) {
       sendMessage: (msg) => (controlWriter ? controlWriter.write(frameEncode(msg)) : undefined),
       remote: { address: session.peerAddress, headers: session.header ?? {} },
       closeTransport: () => { try { session.close(); } catch { /* already closed */ } },
+      // A client that pinned this self-signed certificate can bind its login signature to it (#119).
+      channelBinding: current?.hash ? { 'cert-hash': [current.hash] } : null,
     });
 
     const incoming = session.incomingBidirectionalStreams.getReader();

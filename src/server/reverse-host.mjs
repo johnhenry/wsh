@@ -16,9 +16,11 @@
 
 import { WshClient } from '../client.mjs';
 import { exportPublicKeyRaw, fingerprint } from '../auth.mjs';
-import { reverseAccept, reverseReject } from '../messages.gen.mjs';
+import { MSG, reverseAccept, reverseReject, reverseChallenge } from '../messages.gen.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
-import { E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
+import { E2E_SIGN_FEATURE, E2EResponder } from '../e2e-exchange.mjs';
+import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyOperatorProof } from '../operator-proof.mjs';
+import { SealedBridge } from '../bridge-seal.mjs';
 import { buildBackends } from './backends.mjs';
 import { createConnectionFactory, hostFeatures } from './connection.mjs';
 
@@ -55,11 +57,25 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {boolean} [options.reportFeatures=true] - State this host's features in `ReverseAccept.features`, so the operator's
  *   feature gates follow this host rather than the relay. Turn off only for a relay (a Rust `wsh-server` older than the field)
  *   that rejects a `ReverseAccept` carrying it.
+ * @param {boolean} [options.requireOperatorProof=false] - wsh #117. Do not take the operator's identity from the relay.
+ *   When the relay carries `operator-proof` (its ServerHello says so) and the operator can answer, this host sends it a
+ *   signed challenge and verifies the operator's signature over this host's fingerprint, a nonce it chose and the
+ *   bridge's session BEFORE `accept` runs; `accept` then receives `{ fingerprint, username, proven: true, publicKey }`
+ *   taken from the proof, not from the relay (a relay that rewrote `from_fingerprint` is refused). This option makes
+ *   that mandatory: an operator that does not prove itself is refused, and the bridge is SEALED -- this host acts only on
+ *   messages the operator sealed under a key exchange both sides signed, because a relay can stamp any identity on a
+ *   plain message (it could inject an `Open`). Needs `e2e` (on by default) and `reportFeatures`. Without this option the
+ *   proof is requested when it can be and reported as `proven`, and the bridge is sealed only if the operator asks.
+ * @param {number} [options.proofTimeoutMs=5000] - How long an operator has to answer the challenge.
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost({
-  url, username, keyPair, accept, exec, pty, fs, mcp, reconnect = true, connect = {}, peerType = 'host', reportFeatures = true, maxOperators = 1, e2e = {}, onLog = () => {},
+  url, username, keyPair, accept, exec, pty, fs, mcp, reconnect = true, connect = {}, peerType = 'host', reportFeatures = true, maxOperators = 1, e2e = {},
+  requireOperatorProof = false, proofTimeoutMs = 5000, onLog = () => {},
 } = {}) {
+  if (typeof requireOperatorProof !== 'boolean') throw new TypeError('createReverseHost: requireOperatorProof must be a boolean');
+  if (requireOperatorProof && e2e === false) throw new TypeError('createReverseHost: requireOperatorProof seals the bridge, which needs e2e (do not set e2e: false)');
+  if (requireOperatorProof && !reportFeatures) throw new TypeError('createReverseHost: requireOperatorProof needs reportFeatures (the operator learns "e2e-sealed" from ReverseAccept.features)');
   if (!url) throw new TypeError('createReverseHost: url is required');
   if (!username) throw new TypeError('createReverseHost: username is required');
   if (!keyPair) throw new TypeError('createReverseHost: keyPair is required (the relay keys peers by fingerprint)');
@@ -99,6 +115,7 @@ export function createReverseHost({
   /** Ends every bridge of the live connection (the client's own `disconnect()` does not call its `onClose`). */
   let endAllBridges = () => {};
   let myFingerprint = null;
+  let myPublicKeyRaw = null;
   let closed = false;
   let timer = null;
   let backoff = BACKOFF_START_MS;
@@ -112,6 +129,8 @@ export function createReverseHost({
     const operatorLimit = () => (manyOperators() ? maxOperators : 1);
     /** Operators whose `accept` is still running: they count towards the cap. */
     const reserved = new Set();
+    /** challenge nonce (hex) -> resolves with the operator's ReverseProof (or null on timeout) */
+    const proofWaiters = new Map();
     operatorsNow = bridges;
 
     const endBridge = (fp) => {
@@ -140,25 +159,116 @@ export function createReverseHost({
       reserved.add(from);
       let ok = false;
       try {
-        try { ok = (await accept?.({ fingerprint: from, username: String(req.username ?? '') })) === true; } catch (e) { onLog(`[reverse] accept threw: ${e.message}`); }
+        // Who is this operator? The relay says (`from`); with proof the operator says so itself (#117).
+        const canProve = c.hasFeature(OPERATOR_PROOF_FEATURE) && Array.isArray(req.features) && req.features.includes(OPERATOR_PROOF_FEATURE);
+        if (requireOperatorProof && !canProve) { await refuse('operator proof required'); return; }
+        let proven = null;
+        let challenge = null;
+        if (canProve) {
+          const outcome = await challengeOperator(c, from);
+          if (outcome.error) { await refuse(outcome.error); return; }
+          ({ proven, challenge } = outcome);
+          // The relay's claim and the operator's own must agree: a relay that rewrote from_fingerprint is caught here.
+          if (proven.fingerprint !== from) { onLog(`[reverse] proof is by ${proven.fingerprint.slice(0, 12)}, the relay said ${from.slice(0, 12)}`); await refuse('operator proof does not match the identity the relay asserted'); return; }
+          if (proven.username !== String(req.username ?? '')) { await refuse('operator proof names another username than the relay asserted'); return; }
+        }
+        const who = { fingerprint: from, username: String(req.username ?? ''), proven: !!proven, ...(proven ? { publicKey: proven.publicKey } : {}) };
+        try { ok = (await accept?.(who)) === true; } catch (e) { onLog(`[reverse] accept threw: ${e.message}`); }
         if (!ok || bridges.size >= operatorLimit()) { await refuse('not accepted'); return; }
         c.trustRelayPeer(from);
-        const bridge = factory({
-          // With several operators every message names its recipient; with one the relay knows.
-          sendMessage: (m) => c.sendRelayControl(m, manyOperators() ? { to: from } : undefined),
-          authenticated: { username: String(req.username ?? 'operator'), fingerprint: from },
-          dataStreams: false,
-          e2e: e2eFor(c),
-        });
+        const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge);
         bridges.set(from, bridge);
-        onLog(`[reverse] bridged to ${from.slice(0, 12)}`);
+        onLog(`[reverse] bridged to ${from.slice(0, 12)}${proven ? ' (operator proven)' : ''}${requireOperatorProof ? ', sealed' : ''}`);
         await answer(reverseAccept({
           targetFingerprint: myFingerprint, username, capabilities, peerType, shellBackend,
           supportsAttach: false, supportsReplay: false, supportsEcho: false, supportsTermSync: false,
-          features: reportFeatures ? bridgeFeatures(c, e2eFor(c), manyOperators()) : undefined,
+          features: reportFeatures ? [...bridgeFeatures(c, e2eFor(c), manyOperators()), ...(proven && e2e !== false ? [E2E_SEALED_FEATURE] : [])] : undefined,
         }));
       } finally { reserved.delete(from); }
     };
+
+    /** Send a signed challenge, wait for the operator's proof and verify it. @returns {Promise<{ error?: string, proven?: object, challenge?: object }>} */
+    async function challengeOperator(conn, from) {
+      const issued = await createReverseChallenge({ keyPair }, from);
+      const key = Array.from(issued.nonce, (b) => b.toString(16).padStart(2, '0')).join('');
+      const proofMsg = new Promise((resolve) => { proofWaiters.set(key, resolve); });
+      const timer = setTimeout(() => { proofWaiters.get(key)?.(null); }, proofTimeoutMs);
+      timer.unref?.();
+      try {
+        await conn.sendRelayControl(reverseChallenge({ targetFingerprint: from, ...issued.fields }));
+        const msg = await proofMsg;
+        if (!msg) return { error: 'operator did not answer the challenge' };
+        const proven = await verifyOperatorProof(msg, issued);
+        if (!proven) return { error: 'operator proof does not verify' };
+        return { proven, challenge: issued };
+      } catch (e) {
+        onLog(`[reverse] challenge failed: ${e.message}`);
+        return { error: 'operator proof failed' };
+      } finally { clearTimeout(timer); proofWaiters.delete(key); }
+    }
+    c.onReverseProof = (m) => {
+      if (!(m.nonce instanceof Uint8Array)) return;
+      const key = Array.from(m.nonce, (b) => b.toString(16).padStart(2, '0')).join('');
+      proofWaiters.get(key)?.(m);
+    };
+
+    /**
+     * The connection for one bridged operator. A proven operator may seal the bridge (a signed `KeyExchange` for the
+     * challenge's session id); with `requireOperatorProof` it must, and until it has the host hears nothing else.
+     */
+    function makeBridge(conn, from, operatorName, proven, challenge) {
+      const to = () => (manyOperators() ? { to: from } : undefined);
+      let sealed = null;
+      const mustSeal = requireOperatorProof;
+      const base = factory({
+        // With several operators every message names its recipient; with one the relay knows.
+        sendMessage: async (m) => {
+          if (sealed) return conn.sendRelayControl(await sealed.seal(m), to());
+          if (mustSeal) return undefined; // nothing may leave a bridge that is not sealed yet
+          return conn.sendRelayControl(m, to());
+        },
+        authenticated: { username: operatorName, fingerprint: from },
+        dataStreams: false,
+        e2e: e2eFor(conn),
+      });
+      if (!proven || e2e === false) return base;
+
+      const responder = new E2EResponder({
+        signKey: keyPair.privateKey, hybrid: e2e.hybrid !== false, identity: myPublicKeyRaw,
+        initiator: { publicKey: proven.publicKey, require: true },
+      });
+      let chain = Promise.resolve();
+      let giveUp = null;
+      const fail = (why) => { onLog(`[reverse] sealed bridge with ${from.slice(0, 12)} failed: ${why}`); endBridge(from); };
+      if (mustSeal) {
+        giveUp = setTimeout(() => { if (!sealed) fail('no key exchange in time'); }, proofTimeoutMs * 2);
+        giveUp.unref?.();
+      }
+      return {
+        receiveMessage(msg) {
+          if (sealed) {
+            if (!sealed.isFrame(msg)) { onLog('[reverse] dropped a plaintext message on a sealed bridge'); return; }
+            chain = chain.then(async () => base.receiveMessage(await sealed.open(msg))).catch((e) => onLog(`[reverse] dropped a sealed frame: ${e.message}`));
+            return;
+          }
+          if (msg.type === MSG.KEY_EXCHANGE && msg.session_id === challenge.sessionId) {
+            chain = chain.then(async () => {
+              const result = await responder.respond(msg, (reply) => conn.sendRelayControl(reply, to()));
+              if (result.key) {
+                sealed = new SealedBridge({ key: result.key, sessionId: challenge.sessionId, role: 'responder' });
+                clearTimeout(giveUp);
+                onLog(`[reverse] bridge to ${from.slice(0, 12)} sealed${result.hybrid ? ' (hybrid)' : ''}`);
+              }
+            }).catch((e) => fail(e.message));
+            return;
+          }
+          if (mustSeal) { onLog(`[reverse] dropped a message that is not sealed (type ${msg.type}) on a bridge that must be`); return; }
+          base.receiveMessage(msg);
+        },
+        bindStream: (s) => base.bindStream?.(s),
+        close() { clearTimeout(giveUp); responder.close(); base.close(); },
+      };
+    }
     c.onClose = () => {
       endAll();
       if (operatorsNow === bridges) operatorsNow = new Map();
@@ -196,7 +306,8 @@ export function createReverseHost({
     async start() {
       if (client) throw new Error('createReverseHost: already started');
       closed = false;
-      myFingerprint = await fingerprint(await exportPublicKeyRaw(keyPair.publicKey));
+      myPublicKeyRaw = await exportPublicKeyRaw(keyPair.publicKey);
+      myFingerprint = await fingerprint(myPublicKeyRaw);
       await dial();
       return { fingerprint: myFingerprint };
     },
