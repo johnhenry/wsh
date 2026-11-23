@@ -172,6 +172,23 @@ for (const relayKind of ['js', 'rust']) {
       }
     });
 
+    it('keeps all of the output of a command that exits right after writing it (the exit does not overtake the last reads)', async () => {
+      const [bob, host] = [await jsIdentity('bob'), await rustIdentity('host')];
+      const relay = await makeRelay([bob, host]);
+      await rustHost(relay, host, { flags: [...sealedProof, '--allow-operator', bob.fp.slice(0, 16)] });
+      const op = await login(relay, bob);
+      await until(async () => (await op.listPeers()).length, 'the host in the peer list');
+      const res = await op.reverseConnect(host.fp, 8000, { sealed: true });
+      assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
+      // The exit watcher and the output reader of a host session are independent: a child that writes and exits
+      // at once can have its exit handled before the reader has taken everything out of the pty.
+      for (let i = 0; i < 60; i++) {
+        const s = await op.openSession({ type: 'exec', command: 'sleep 0.05; echo ECHOED-BACK-QUOKKA' });
+        const out = await collectExec(s);
+        assert.match(out, /ECHOED-BACK-QUOKKA/, `run ${i}: the output was lost`);
+      }
+    });
+
     it('a host that requires proof does not take an operator that does not seal: its plain messages are not heard', async () => {
       const [bob, host] = [await jsIdentity('bob'), await rustIdentity('host')];
       const relay = await makeRelay([bob, host]);

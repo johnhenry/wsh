@@ -317,17 +317,15 @@ pub fn cleanup() {
 
 // ── local unix sockets ───────────────────────────────────────────────
 
-/// Tests only: `bind_local_unix` swaps the process umask for an instant; a test that creates files or
-/// directories holds the read side so it never races that swap.
-#[cfg(all(test, unix))]
-pub(crate) static UMASK_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-/// Create the listening socket for `path`: private from the first instant (umask around the
-/// one synchronous bind, then chmod), an existing file refused unless `replace` and then only a
-/// stale socket.
+/// Create the listening socket for `path`: private from the first instant, an existing file
+/// refused unless `replace` and then only a stale socket. The process umask is never touched (it
+/// is process-wide, and a file another thread makes in that instant gets the wrong mode): the
+/// socket is bound inside a fresh `0700` directory next to `path`, set to `0600` there, and then
+/// hard-linked to its name, which fails if something appeared at that name meanwhile. The same
+/// scheme as the server's `bind_private`.
 #[cfg(unix)]
 pub fn bind_local_unix(path: &str, replace: bool) -> Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
     let p = Path::new(path);
     match std::fs::symlink_metadata(p) {
         Ok(m) => {
@@ -347,28 +345,32 @@ pub fn bind_local_unix(path: &str, replace: bool) -> Result<tokio::net::UnixList
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot look at {path}")),
     }
-    // The window of the swapped mask is closed to the tests of this binary that make files and
-    // directories (they hold the read side of the gate: `crate::sharefs` tests): a directory made
-    // in that instant would be `0600`.
-    #[cfg(test)]
-    // (`try_write` in a loop, not `write`: a queued writer would block a test that takes the read side
-    // a second time while it holds it, and deadlock.)
-    let _gate = loop {
-        match UMASK_GATE.try_write() {
-            Ok(g) => break g,
-            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                std::thread::sleep(std::time::Duration::from_millis(1))
-            }
-        }
+    static STAGING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let parent = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
     };
-    // SAFETY: umask swaps a process-wide mask; nothing awaits between the two calls.
-    let old = unsafe { libc::umask(0o177) };
-    let bound = std::os::unix::net::UnixListener::bind(p);
-    unsafe { libc::umask(old) };
-    let l = bound.with_context(|| format!("cannot listen on {path}"))?;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot restrict {path} to its owner"))?;
+    let staging = parent.join(format!(
+        ".w{:x}{:x}",
+        std::process::id(),
+        STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .with_context(|| format!("cannot listen on {path}: no private directory next to it"))?;
+    let inner = staging.join("s");
+    let bound = (|| -> Result<std::os::unix::net::UnixListener> {
+        let l = std::os::unix::net::UnixListener::bind(&inner)
+            .with_context(|| format!("cannot listen on {path}"))?;
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot restrict {path} to its owner"))?;
+        std::fs::hard_link(&inner, p).with_context(|| format!("cannot listen on {path}"))?;
+        Ok(l)
+    })();
+    let _ = std::fs::remove_file(&inner);
+    let _ = std::fs::remove_dir(&staging);
+    let l = bound?;
     created()
         .lock()
         .expect("created")
@@ -883,6 +885,47 @@ mod tests {
             drop(l);
             cleanup();
             assert!(!p.exists());
+        }
+
+        /// The process umask is process-wide: a bind that swaps it hands a file or directory another
+        /// thread creates in that instant the wrong mode (a directory at `0600` cannot be entered).
+        #[tokio::test]
+        async fn binding_a_local_socket_never_changes_the_umask_other_threads_see() {
+            use std::os::unix::fs::PermissionsExt;
+            let _turn = turn();
+            let d = dir();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let binder = {
+                let (stop, root) = (stop.clone(), d.path().to_path_buf());
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        let mut n = 0;
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) && n < 20_000 {
+                            let p = root.join(format!("s{n}.sock"));
+                            drop(bind_local_unix(p.to_str().unwrap(), false).unwrap());
+                            let _ = std::fs::remove_file(&p);
+                            n += 1;
+                        }
+                    })
+                })
+            };
+            for i in 0..20_000 {
+                let sub = d.path().join(format!("d{i}"));
+                std::fs::create_dir(&sub).unwrap();
+                let mode = std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777;
+                std::fs::remove_dir(&sub).unwrap();
+                assert_eq!(
+                    mode & 0o700,
+                    0o700,
+                    "a directory made while a socket was bound came out {mode:o}"
+                );
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            binder.join().unwrap();
         }
 
         #[tokio::test]

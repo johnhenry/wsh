@@ -25,6 +25,8 @@ use wsh_core::messages::*;
 use wsh_core::peer_record::{build_peer_record_transcript, PeerRecord};
 
 const DEFAULT_PTY_REPLAY_LIMIT: usize = 256 * 1024;
+/// How long an exited child's output reader may take to reach the pty's EOF before Exit goes out.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// The host's own identity key (the one it logs in to the relay with): it signs the
 /// `ReverseChallenge` that makes an operator prove who it is (wsh #117).
@@ -744,22 +746,11 @@ impl ReverseHostRuntime {
     async fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<()> {
         match event {
             RuntimeEvent::OutputReady { channel_id } => {
-                let Some(session) = self.sessions.get_mut(&channel_id) else {
-                    return Ok(());
-                };
-
-                for data in session.take_pending_output() {
-                    self.client()?
-                        .send_fire_and_forget(Envelope {
-                            msg_type: MsgType::SessionData,
-                            payload: Payload::SessionData(SessionDataPayload { channel_id, data }),
-                        })
-                        .await
-                        .map_err(|err| anyhow::anyhow!("{err}"))?;
-                }
+                self.flush_output(channel_id).await?;
             }
             RuntimeEvent::Exited { channel_id, code } => {
                 if self.client.is_some() {
+                    self.drain_output(channel_id).await?;
                     self.client()?
                         .send_fire_and_forget(Envelope {
                             msg_type: MsgType::Exit,
@@ -780,6 +771,7 @@ impl ReverseHostRuntime {
             RuntimeEvent::ReadFailed { channel_id, error } => {
                 warn!(channel_id, "reverse host PTY read failed: {error}");
                 if self.client.is_some() {
+                    self.drain_output(channel_id).await?;
                     self.client()?
                         .send_fire_and_forget(Envelope {
                             msg_type: MsgType::Exit,
@@ -803,6 +795,35 @@ impl ReverseHostRuntime {
         }
 
         Ok(())
+    }
+
+    /// Send what the session's output reader has queued, in order.
+    async fn flush_output(&mut self, channel_id: u32) -> Result<()> {
+        let Some(session) = self.sessions.get_mut(&channel_id) else {
+            return Ok(());
+        };
+        for data in session.take_pending_output() {
+            self.client()?
+                .send_fire_and_forget(Envelope {
+                    msg_type: MsgType::SessionData,
+                    payload: Payload::SessionData(SessionDataPayload { channel_id, data }),
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+        }
+        Ok(())
+    }
+
+    /// The child has exited, but the output reader runs on its own and may not have taken the
+    /// last of its output out of the pty yet (a child that writes and exits at once, under load,
+    /// lost that output when Exit and Close went out first and the session was dropped). Give
+    /// the reader until the pty's EOF, bounded because a grandchild can keep the pty open, then
+    /// send what it queued, so that Exit follows all the output.
+    async fn drain_output(&mut self, channel_id: u32) -> Result<()> {
+        if let Some(ReverseHostSession::Pty(session)) = self.sessions.get_mut(&channel_id) {
+            let _ = timeout(OUTPUT_DRAIN_GRACE, &mut session.output_task).await;
+        }
+        self.flush_output(channel_id).await
     }
 
     async fn handle_open(&mut self, open: OpenPayload) -> Result<()> {
