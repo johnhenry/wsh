@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### `authorized_keys` options: the same key file gives the same answer on both hosts (#122, step one; JS and Rust change)
+
+The Rust `wsh-server` has read `restrict`, `permit-*`, `no-pty`, `command=` and `max-sessions=` from `authorized_keys` since the
+start; the Node host skipped every line that began with options, so `restrict,permit-exec ssh-ed25519 ...` parsed to no key there
+(failing closed, but not the same answer). Now both read the same syntax with the same rules, enforce the same options at their own
+entry points, and refuse a key whose options they do not understand. **No wire change**; no new option, feature string or message.
+Capabilities, expiry and per-target/gateway scoping are step two.
+
+- **Node host (`auth.authorizedKeys`, `createWshServer`, `createMemoryHost`):** lines with options are parsed (quoting: one options
+  token, spaces only inside double quotes, `\"` for a quote). Enforced at `Open` (`pty`, `exec`, `file` = upload and download, `rpc`),
+  `FileOp`, the rpc channels (`wsh-fs` needs file transfer, `mcp` needs MCP, `wsh-host` is open, another protocol only to a key that is
+  not restricted), `McpDiscover` (an empty list) and `McpCall`, and the relay entry points `ReverseRegister` / `ReverseList` /
+  `ReverseConnect` (a `ReverseReject` / `Error` with `relay not permitted for this key`). `command="..."` runs that command whatever
+  the client asked for; `max-sessions=N` counts the key's live pty/exec sessions over all its connections. New:
+  `parseAuthorizedKeyEntries(text)` (`{ entries, refused }`) from `@johnhenry/wsh/server`; `parseAuthorizedKeys` still returns bare
+  keys, now only for lines without options (it never hands out a key with its restrictions dropped).
+- **Unknown options fail closed, on both hosts.** An option that is not in the README table (`from=`, `permit-teleport`, a
+  differently-cased name, ...), a malformed value or a stray comma keeps the key off the allowlist and logs the reason with a stable
+  code (`unknown-option`, `bad-syntax`, `bad-value`, `duplicate-option`). Rust used to ignore an unknown option and grant the rest.
+- **Shared test vectors:** `spec/key-options.vectors.json` (a key line gives these permissions; a request is allowed or refused with
+  this code) is run by `test/key-options.test.mjs` and by `crates/wsh-server/src/auth/permissions.rs`; `test/rust/wsh-key-options.test.mjs`
+  drives every line against the real `wsh-server`.
+- **Rust `wsh-server` changes (lands in the next `rust-v` release), tightening only for keys that carry options:**
+  - an option it does not understand now refuses the key (was: ignored);
+  - `max-sessions=0`, `max-sessions=abc`, `command=""` refuse the key (were: ignored, i.e. no limit / forced empty command);
+  - single-quoted values (`command='ls'`) refuse the key (were: quotes trimmed); a quoted value with a space (`command="a b"`) now
+    works (the line was split at the first space and the key silently dropped); a tab may separate the fields;
+  - `permit-mcp` and `permit-relay` are enforced (they were parsed and ignored): a `restrict` key without them gets no MCP tools
+    and cannot register with, list or connect through the relay;
+  - a forced-command key gets no `FileOp` (it was served `list`); `max-sessions` counts pty and exec opens only (file and rpc opens
+    were refused too when the cap was reached);
+  - **a key with any restriction can no longer install a key (`AuthorizedKeyAdd`)**: the installed line has no options, so a
+    `restrict,permit-exec` or `command=` key could add an unrestricted key for itself.
+- **Defaults:** a key with no options is unchanged on both hosts. **Breaking for a deployment that relied on the old Rust leniency**
+  (a key line with an unknown option, `max-sessions=0`, single-quoted values) and for `restrict` keys that used MCP or the relay
+  without `permit-mcp` / `permit-relay`. A Node host that used to see such a line as "no key" now serves it, with its restrictions.
+- **A released peer:** nothing new crosses the wire. A released Node host skips every line with options (the key cannot log in), a
+  released Rust server applies the options as before except as listed above. Clients are unaffected.
+- Not covered (README, Security model): the gateway, targets and `AuthorizedKeyAdd` on the Node host (it has none) are not scoped per
+  key; `no-port-forwarding` is accepted and does nothing.
+
 ## 0.43.0 / Rust `rust-v0.14.0`
 
 ### Execution targets: `Open.target`, target discovery, `wsh --target` (#121; JS and Rust change)

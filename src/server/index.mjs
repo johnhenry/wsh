@@ -8,7 +8,7 @@
  * refused.
  */
 
-import { buildAuthorizer, parseAuthorizedKeys, authMethods, FailureLimiter } from './auth.mjs';
+import { buildAuthorizer, parseAuthorizedKeys, parseAuthorizedKeyEntries, authMethods, FailureLimiter } from './auth.mjs';
 import { loadHostKey } from './host-key.mjs';
 import { buildBackends } from './backends.mjs';
 import { SessionRegistry } from './sessions.mjs';
@@ -22,7 +22,7 @@ import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
 import { bindSocket } from './socket.mjs';
 import { TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH, CHANNEL_BINDING_KINDS } from '../channel-binding.mjs';
 
-export { parseAuthorizedKeys, STREAM_ANNOUNCE, mcpServerAdapter };
+export { parseAuthorizedKeys, parseAuthorizedKeyEntries, STREAM_ANNOUNCE, mcpServerAdapter };
 export { createReverseHost } from './reverse-host.mjs';
 export { generateSelfSignedCertificate } from './self-signed.mjs';
 
@@ -158,7 +158,7 @@ export function createWshServer({
 
   function start() {
     ready ??= (async () => {
-      const authorize = await buildAuthorizer(auth);
+      const authorize = await buildAuthorizer(auth, { log: onLog });
       host_ = hostKey ? await loadHostKey(hostKey) : null;
       if (sessionOptions) {
         const secret = sessionOptions.sessionSecret ?? sessionSecret;

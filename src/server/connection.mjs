@@ -39,6 +39,7 @@ import { acceptableBindings, bindingFeatures } from '../channel-binding.mjs';
 import { SealedBridge } from '../bridge-seal.mjs';
 import { refusalNotifier, validateOnRefused } from '../refusal.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
+import { checkKeyRequest } from '../key-options.mjs';
 import { SHARES_FEATURE, createShareSession } from '../shares.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -146,7 +147,9 @@ export function createConnectionFactory(cfg) {
   const ownBackends = { execRunner: cfg.execRunner, execOptions: cfg.execOptions, execEnv, pty: cfg.pty, ptyEnv, files: cfg.files, ownHost: true };
   /** One answer for a target that does not exist and for one the caller may not use: the reply does not say which targets exist. */
   const NO_SUCH_TARGET = 'no such target';
-  const targetCapabilities = (spec) => [...(spec.execRunner ? ['exec'] : []), ...(spec.pty ? ['pty'] : []), ...(spec.files ? ['file'] : []), ...(spec.endpoints ? ['endpoint'] : [])];
+  /** Every attached connection, for counting what a key holds open (`max-sessions`, #122). */
+  const liveConnections = new Set();
+  const targetCapabilities = (spec) =>[...(spec.execRunner ? ['exec'] : []), ...(spec.pty ? ['pty'] : []), ...(spec.files ? ['file'] : []), ...(spec.endpoints ? ['endpoint'] : [])];
 
   /**
    * Attach one connection. Two shapes:
@@ -166,6 +169,34 @@ export function createConnectionFactory(cfg) {
     };
     /** @type {Map<number, any>} */
     const channels = new Map();
+    const live = { channels, fingerprint: () => state.fingerprint };
+    liveConnections.add(live);
+
+    // ── What the key's authorized_keys options allow (#122) ──────────
+    // Looked up per request from the key this connection authenticated as (a bridged peer included); `null` = no options.
+    const keyPermissions = () => (state.fingerprint ? cfg.authorize.permissionsFor?.(state.fingerprint) ?? null : null);
+    /** pty/exec sessions this key holds open on this host: live unhosted channels of every connection, and hosted sessions. */
+    function activeSessionsFor(fingerprint) {
+      let n = 0;
+      for (const c of liveConnections) {
+        if (c.fingerprint() !== fingerprint) continue;
+        for (const ch of c.channels.values()) if (ch.keyed) n++;
+      }
+      if (cfg.sessions) n += cfg.sessions.listFor(fingerprint).filter((s) => s.state !== 'exited').length;
+      return n;
+    }
+    /**
+     * `null` when the key's options allow this request, else `{ code, reason }` (logged).
+     * @param {{ kind: string, channel?: string, protocol?: string }} req
+     */
+    function keyRefusal(req) {
+      const perms = keyPermissions();
+      if (!perms) return null;
+      const counts = req.kind === 'open' && (req.channel === 'pty' || req.channel === 'exec') && perms.maxSessions !== null;
+      const refusal = checkKeyRequest(perms, req, { activeSessions: counts ? activeSessionsFor(state.fingerprint) : 0 });
+      if (refusal) log(`key options refused ${req.kind}${req.channel ? ` ${req.channel}` : ''}${req.protocol ? ` ${req.protocol}` : ''} for ${state.username ?? '?'} (${refusal.code})`);
+      return refusal;
+    }
     /** FileOp `write`/`rename`s awaiting their FileChunk frames, by client-chosen channel id. */
     const fileWrites = new Map();
     /** AbortControllers of in-flight MCP calls: aborted on disconnect, counted for the cap. */
@@ -265,6 +296,7 @@ export function createConnectionFactory(cfg) {
     function shutdown(why) {
       if (state.closed) return;
       state.closed = true;
+      liveConnections.delete(live);
       clearTimeout(ttlTimer);
       // A hosted session survives its connection (it is detached, then expires or is resumed);
       // everything else dies with it.
@@ -616,6 +648,15 @@ export function createConnectionFactory(cfg) {
         await send(errorMsg({ code: 2, message: 'relay operations need a key login' }));
         return true;
       }
+      // The entry points to the relay (#122): a key without `permit-relay` cannot register, list or connect.
+      if (m.type === MSG.REVERSE_REGISTER || m.type === MSG.REVERSE_LIST || m.type === MSG.REVERSE_CONNECT) {
+        const refusal = keyRefusal({ kind: 'relay' });
+        if (refusal) {
+          if (m.type === MSG.REVERSE_CONNECT) await send(reverseReject({ targetFingerprint: String(m.target_fingerprint ?? ''), username: '', reason: refusal.reason }));
+          else await send(errorMsg({ code: 2, message: refusal.reason }));
+          return true;
+        }
+      }
       const h = hubHandle();
       switch (m.type) {
         case MSG.REVERSE_REGISTER: {
@@ -641,7 +682,8 @@ export function createConnectionFactory(cfg) {
 
     async function handleMcpDiscover() {
       let tools = [];
-      if (cfg.mcp) {
+      // A key without MCP (#122) sees no tools, as it would on a host that has none.
+      if (cfg.mcp && !keyRefusal({ kind: 'mcp' })) {
         try { tools = await cfg.mcp.list(state.username, principal()); } catch (e) { log(`mcp discover failed: ${e.message}`); }
       }
       return send(mcpTools({ tools }));
@@ -657,6 +699,7 @@ export function createConnectionFactory(cfg) {
       };
       const fail = (error) => reply({ success: false, error });
       if (!cfg.mcp) { fail('mcp is not enabled on this server'); return; }
+      { const refusal = keyRefusal({ kind: 'mcp' }); if (refusal) { fail(refusal.reason); return; } }
       if (mcpCalls.size >= cfg.mcp.maxConcurrent) { fail('too many concurrent MCP calls'); return; }
 
       const abort = new AbortController();
@@ -736,6 +779,10 @@ export function createConnectionFactory(cfg) {
         case 'exec': case 'pty': case 'file': {
           const r = await resolveTarget(target, m.kind);
           if (r.refuse) return send(openFail({ reason: r.refuse }));
+          // The key's options (#122). No await between this check and the channel being registered, so two opens cannot both
+          // pass `max-sessions` when only one slot is left.
+          const refusal = keyRefusal({ kind: 'open', channel: m.kind });
+          if (refusal) return send(openFail({ reason: refusal.reason }));
           if (m.kind === 'exec') return openExec(m, r.b, target);
           return m.kind === 'pty' ? openPty(m, r.b, target) : openFile(m, r.b);
         }
@@ -743,6 +790,10 @@ export function createConnectionFactory(cfg) {
           // rpc channels (`wsh-fs`, `wsh-host`, `mcp`) are the host's own, not per target.
           if (target !== undefined) return send(openFail({ reason: 'rpc channels do not take a target' }));
           if (requireTarget) return send(openFail({ reason: 'a target is required' }));
+          {
+            const refusal = keyRefusal({ kind: 'open', channel: 'rpc', protocol: typeof m.command === 'string' ? m.command : '' });
+            if (refusal) return send(openFail({ reason: refusal.reason }));
+          }
           return openRpc(m);
         default: return send(openFail({ reason: `kind "${m.kind}" is not supported by this server` }));
       }
@@ -868,7 +919,8 @@ export function createConnectionFactory(cfg) {
 
     async function openExec(m, b, target) {
       if (!b.execRunner) return send(openFail({ reason: `exec is not enabled ${b.ownHost ? 'on this server' : 'for this target'}` }));
-      const command = String(m.command ?? '').trim();
+      // A key tied to one command (`command="..."`, #122) runs that, whatever the client asked for.
+      const command = keyPermissions()?.forcedCommand ?? String(m.command ?? '').trim();
       if (!command) return send(openFail({ reason: 'command is required for kind "exec"' }));
 
       const channelId = ++state.nextChannel;
@@ -889,6 +941,7 @@ export function createConnectionFactory(cfg) {
         if (/^(INT|TERM|KILL|HUP)$/.test(n) && signalCbs.length === 0) abort.abort();
       };
       const ch = {
+        keyed: !hosted, // counts toward the key's `max-sessions` (a hosted session is counted by the registry)
         kill: () => abort.abort(),
         signal: signalTo,
         bind(s) {
@@ -1079,6 +1132,7 @@ export function createConnectionFactory(cfg) {
         return send(openFail({ reason: `pty spawn failed: ${e.message}` }));
       }
       const ctl = {
+        keyed: !cfg.sessions, // counts toward the key's `max-sessions` (a hosted session is counted by the registry)
         // Bytes, not a `Buffer`: there is none in a browser (#133), and node-pty's streams take a Uint8Array as is.
         // A write to a process that has exited throws; that is expected and dropped, anything else is logged.
         input: (data) => {
@@ -1170,6 +1224,8 @@ export function createConnectionFactory(cfg) {
     async function handleFileOp(m) {
       const channelId = m.channel_id;
       const target = m.target ?? undefined;
+      const refusal = keyRefusal({ kind: 'file-op' });
+      if (refusal) return send(fileResult({ channelId, success: false, errorMessage: refusal.reason }));
       const r0 = await resolveTarget(target, 'file');
       if (r0.refuse) return send(fileResult({ channelId, success: false, errorMessage: r0.refuse }));
       const files = r0.b.files;

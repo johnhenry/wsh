@@ -3,31 +3,41 @@
  * Ed25519 public keys (SSH `authorized_keys` style) and/or a custom callback.
  */
 
-import {
-  parseSSHPublicKey, extractRawFromSSHWire, fingerprint,
-} from '../auth.mjs';
+import { fingerprint } from '../auth.mjs';
+import { parseAuthorizedKeyLine } from '../key-options.mjs';
 
 /**
- * Parse an `authorized_keys`-style blob (one `ssh-ed25519 AAAA... [comment]`
- * per line; blank lines and `#` comments ignored) into raw 32-byte keys.
- * Malformed lines are skipped rather than failing the whole list.
+ * Parse an `authorized_keys`-style blob (one `[options] ssh-ed25519 AAAA... [comment]` per line; blank lines and `#` comments
+ * ignored) into entries `{ key, options, permissions, line }` (raw 32-byte key, the raw options token or `null`, what the
+ * options allow -- see `src/key-options.mjs` -- and the 1-based line number).
+ *
+ * A line this host cannot make sense of never yields a usable key: one whose options it does not understand is listed in
+ * `refused` (`{ line, code, reason, key }`), and a malformed one or another key type is skipped. The same rules and vectors as
+ * the Rust server's (`spec/key-options.vectors.json`).
+ *
+ * @param {string} text
+ * @returns {{ entries: Array<{ key: Uint8Array, options: string | null, permissions: object, line: number }>, refused: Array<{ line: number, code: string, reason: string, key: Uint8Array }> }}
+ */
+export function parseAuthorizedKeyEntries(text) {
+  const entries = [];
+  const refused = [];
+  String(text ?? '').split('\n').forEach((raw, i) => {
+    const r = parseAuthorizedKeyLine(raw);
+    if (r.refused) refused.push({ line: i + 1, ...r.refused, key: r.key });
+    else if (r.key) entries.push({ key: r.key, options: r.options, permissions: r.permissions, line: i + 1 });
+  });
+  return { entries, refused };
+}
+
+/**
+ * The raw 32-byte keys of the lines of an `authorized_keys`-style blob that carry NO options. A line with options is not
+ * returned (its restrictions would be lost): use `parseAuthorizedKeyEntries` for those. Malformed lines are skipped.
  *
  * @param {string} text
  * @returns {Uint8Array[]}
  */
 export function parseAuthorizedKeys(text) {
-  const keys = [];
-  for (const raw of String(text ?? '').split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    try {
-      const parsed = parseSSHPublicKey(line);
-      keys.push(extractRawFromSSHWire(parsed.data));
-    } catch {
-      // skip malformed line
-    }
-  }
-  return keys;
+  return parseAuthorizedKeyEntries(text).entries.filter((e) => e.options === null).map((e) => e.key);
 }
 
 /**
@@ -43,11 +53,19 @@ export function parseAuthorizedKeys(text) {
  *   authorizedKeys?: string | Uint8Array | Array<string | Uint8Array>,
  *   authorize?: (who: {username: string, fingerprint: string, publicKey: Uint8Array}) => boolean | Promise<boolean>,
  * }} auth
- * @returns {Promise<(who: {username: string, fingerprint: string, publicKey: Uint8Array}) => Promise<boolean>>}
+ * The function also carries `permissionsFor(fingerprint)`: what the key's `authorized_keys` options allow (`null` for a key
+ * without options, a raw key, or a custom `authorize`: full access). A line whose options this host does not understand puts
+ * no key on the list and is logged with its reason (`log`).
+ *
+ * @param {{ log?: (line: string) => void }} [opts]
+ * @returns {Promise<((who: {username: string, fingerprint: string, publicKey: Uint8Array}) => Promise<boolean>) & { permissionsFor(fingerprint: string | null | undefined): object | null }>}
  */
-export async function buildAuthorizer(auth) {
-  if (typeof auth === 'function') return async (who) => (await auth(who)) === true;
-  if (!auth) return async () => false;
+export async function buildAuthorizer(auth, { log = () => {} } = {}) {
+  /** @type {Map<string, object>} */
+  const perms = new Map();
+  const withPerms = (fn) => Object.assign(fn, { permissionsFor: (fp) => (fp ? perms.get(fp) ?? null : null) });
+  if (typeof auth === 'function') return withPerms(async (who) => (await auth(who)) === true);
+  if (!auth) return withPerms(async () => false);
 
   /** @type {Set<string> | null} */
   let allowed = null;
@@ -55,23 +73,33 @@ export async function buildAuthorizer(auth) {
     allowed = new Set();
     const items = Array.isArray(auth.authorizedKeys) ? auth.authorizedKeys : [auth.authorizedKeys];
     for (const item of items) {
-      const raws = typeof item === 'string' ? parseAuthorizedKeys(item) : [item];
-      for (const raw of raws) {
+      let list;
+      if (typeof item === 'string') {
+        const { entries, refused } = parseAuthorizedKeyEntries(item);
+        for (const r of refused) log(`authorized_keys line ${r.line}: key refused (${r.code}): ${r.reason}`);
+        list = entries;
+      } else {
+        list = [{ key: item, permissions: null }];
+      }
+      for (const { key: raw, permissions } of list) {
         if (!(raw instanceof Uint8Array) || raw.byteLength !== 32) {
           throw new TypeError('createWshServer: auth.authorizedKeys entries must be ssh-ed25519 lines or raw 32-byte Ed25519 keys');
         }
-        allowed.add(await fingerprint(raw));
+        const fp = await fingerprint(raw);
+        // The first entry for a key decides what it may do, as on the Rust server.
+        if (!allowed.has(fp) && permissions) perms.set(fp, permissions);
+        allowed.add(fp);
       }
     }
   }
   const custom = typeof auth.authorize === 'function' ? auth.authorize : null;
-  if (!allowed && !custom) return async () => false;
+  if (!allowed && !custom) return withPerms(async () => false);
 
-  return async (who) => {
+  return withPerms(async (who) => {
     if (allowed && !allowed.has(who.fingerprint)) return false;
     if (custom) return (await custom(who)) === true;
     return true;
-  };
+  });
 }
 
 /**
