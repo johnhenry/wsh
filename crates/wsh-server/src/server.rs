@@ -222,6 +222,8 @@ pub struct WshServer {
     file_uploads: Arc<RwLock<HashMap<u32, FileUploadState>>>,
     /// Typed rpc channels (`Open { kind: "rpc" }`); `None` when `[rpc] enabled = false`.
     rpc: Option<Arc<RpcSettings>>,
+    /// This server's own identity (`[server] host_key`); `None` = it proves nothing.
+    identity: Option<Arc<crate::host_key::HostIdentity>>,
 }
 
 /// State for an in-progress file upload (Open{kind: File, command: "upload:..."}).
@@ -264,6 +266,18 @@ impl WshServer {
         } else {
             info!(count = authorized_keys.len(), "loaded authorized keys");
         }
+
+        let identity = match &config.host_key_path {
+            Some(path) => {
+                let id = crate::host_key::HostIdentity::load_or_create(
+                    path,
+                    config.require_channel_binding,
+                )?;
+                info!(fingerprint = %id.fingerprint, path = %path.display(), "host key loaded");
+                Some(Arc::new(id))
+            }
+            None => None,
+        };
 
         // Session manager
         let sessions = Arc::new(SessionManager::new(
@@ -382,6 +396,7 @@ impl WshServer {
             next_channel_id: Arc::new(AtomicU32::new(1)),
             file_uploads: Arc::new(RwLock::new(HashMap::new())),
             rpc,
+            identity,
         })
     }
 
@@ -666,7 +681,12 @@ impl WshServer {
             .map(|k| k.fingerprint.clone())
             .collect();
         let features = self.build_feature_list(false);
-        let hello_result = handshake::handle_hello(&hello, &server_fingerprints, Some(&features))?;
+        let hello_result = handshake::handle_hello(
+            &hello,
+            &server_fingerprints,
+            Some(&features),
+            self.identity.as_deref(),
+        )?;
 
         // Send SERVER_HELLO with the real session id, then CHALLENGE. This
         // used to deliberately skip SERVER_HELLO (falling back to a shared
@@ -754,6 +774,8 @@ impl WshServer {
             self.config.session_ttl,
             self.config.allow_pubkey,
             self.config.allow_password,
+            &hello_result.acceptable_bindings,
+            hello_result.binding_required,
         ) {
             Ok(mut result) => {
                 result.username = hello.username.clone();
@@ -1641,6 +1663,7 @@ impl WshServer {
                                             &hello,
                                             &server_fingerprints,
                                             Some(&features),
+                                            self.identity.as_deref(),
                                         ) {
                                             Ok(r) => r,
                                             Err(e) => break 'session Err(e),
@@ -1729,6 +1752,8 @@ impl WshServer {
                                             self.config.session_ttl,
                                             self.config.allow_pubkey,
                                             self.config.allow_password,
+                                            &hello_result.acceptable_bindings,
+                                            hello_result.binding_required,
                                         ) {
                                             Ok(mut result) => {
                                                 result.username = hello.username.clone();
@@ -4725,6 +4750,8 @@ mod wisp_reverse_connect_e2e_tests {
             rpc_fs_max_file_bytes: 1024,
             mcp_tools: Vec::new(),
             client_env: crate::client_env::ClientEnvPolicy::default(),
+            host_key_path: None,
+            require_channel_binding: false,
         }
     }
 

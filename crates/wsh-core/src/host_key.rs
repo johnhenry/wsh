@@ -17,10 +17,10 @@
 //! anyone from repeating a fingerprint they saw. [`verify_advert`] treats such a host as having
 //! no host key, and refuses a host that advertises a key it cannot prove.
 
+use crate::identity::fingerprint;
+use crate::{WshError, WshResult};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
-use wsh_core::identity::fingerprint;
-use wsh_core::{WshError, WshResult};
 
 pub const HOST_KEY_NONCE_PREFIX: &str = "host-key-nonce:";
 pub const HOST_KEY_PREFIX: &str = "host-key:";

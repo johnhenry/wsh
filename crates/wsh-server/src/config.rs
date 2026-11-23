@@ -82,6 +82,18 @@ pub struct ServerSection {
     /// (a trailing `*` makes a prefix). See [`crate::client_env`].
     #[serde(default)]
     pub client_env: Option<crate::client_env::ClientEnvSetting>,
+    /// Path of this server's own Ed25519 identity (PKCS#8 PEM, the same file format the Node host
+    /// reads). Created with mode 0600 on first start. Absent = no host key: the server sends no
+    /// `host_fingerprint` and proves nothing, as every release before it did (wsh #59, #145).
+    /// Turning it on makes new clients verify and pin this host; a client that pinned the old
+    /// `fingerprints[0]` guess will report the host key as changed.
+    #[serde(default)]
+    pub host_key: Option<String>,
+    /// Accept a login only if the client's signature is bound to this connection (the host key
+    /// that proved itself; wsh #119). Needs `host_key`. A released client that cannot bind is
+    /// refused -- turn this on only when every client is new enough.
+    #[serde(default)]
+    pub require_channel_binding: bool,
 }
 
 impl Default for ServerSection {
@@ -94,6 +106,8 @@ impl Default for ServerSection {
             session_ttl: default_session_ttl(),
             idle_timeout: default_idle_timeout(),
             client_env: None,
+            host_key: None,
+            require_channel_binding: false,
         }
     }
 }
@@ -438,6 +452,10 @@ pub struct ServerConfig {
     pub mcp_tools: Vec<McpToolSection>,
     /// Which `Open.env` variables are applied. See [`crate::client_env`].
     pub client_env: crate::client_env::ClientEnvPolicy,
+    /// The host key file (tilde-expanded); `None` = no host identity. See [`ServerSection::host_key`].
+    pub host_key_path: Option<PathBuf>,
+    /// See [`ServerSection::require_channel_binding`].
+    pub require_channel_binding: bool,
 }
 
 impl ServerConfig {
@@ -551,6 +569,13 @@ impl ServerConfig {
             ));
         }
         warn_about_gateway(&file_config.gateway, gateway_reverse_bind_addr);
+        if file_config.server.require_channel_binding && file_config.server.host_key.is_none() {
+            return Err(wsh_core::WshError::Other(
+                "config: [server] require_channel_binding = true needs [server] host_key: the server \
+                 has nothing to bind a login to without its own key, so nobody could log in"
+                    .into(),
+            ));
+        }
 
         Ok(Self {
             port,
@@ -579,6 +604,8 @@ impl ServerConfig {
             rpc_fs_max_file_bytes: file_config.rpc.fs_max_file_bytes,
             mcp_tools: file_config.mcp.tools,
             client_env,
+            host_key_path: file_config.server.host_key.as_deref().map(expand_tilde_str),
+            require_channel_binding: file_config.server.require_channel_binding,
         })
     }
 }
