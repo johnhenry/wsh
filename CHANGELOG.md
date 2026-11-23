@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.37.0 / Rust `rust-v0.7.0`
+## Unreleased
 
 ### Rust: identity parity, part 1 (#145)
 
@@ -53,6 +53,8 @@ unchanged. **The Rust `wsh-server` changes one default (`client_env`) and one va
   pipes), `ttl` 0, and `Signal` ending a running command on a pty and on pipes while an unknown name is ignored; unit tests
   cover the allow-list, the config line above, signal names and `--via` parsing. `test/rust/wsh-cli.test.mjs` trusts the
   generated certificate through `SSL_CERT_FILE` instead of `WSH_INSECURE_LOOPBACK_TLS`.
+
+## 0.37.0 / Rust `rust-v0.7.0`
 
 ### npm package: gateway forwarding (#120, #123, #98, #124)
 - **Security fix and behaviour change: the Node gateway checks the resolved address.** The `gateway` option of
