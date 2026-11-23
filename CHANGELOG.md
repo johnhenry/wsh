@@ -2,10 +2,9 @@
 
 ## Unreleased
 
-- **Security fix (GHSA-4cr8-m4h6-2545) and behaviour change: the Node gateway checks the resolved address.** The
-  `gateway` option of `createWshServer` matched `allow` against the NAME a client sent and dialled that name, so an allowed
-  name that resolved (or was made to resolve, between check and connect) to a loopback, link-local or private address, or
-  a `"*"` rule, reached services inside the host's network. Now the host resolves the name once, drops every address that
+- **Security fix and behaviour change: the Node gateway checks the resolved address.** The `gateway` option of
+  `createWshServer` matched `allow` against the NAME a client sent and dialled that name; it now checks the address the
+  name resolves to as well. The host resolves the name once, drops every address that
   is not globally routable, and connects to the address it checked (never the name again). "Not globally routable" covers
   IPv4 loopback, private, link-local, CGNAT, documentation, benchmarking, multicast and reserved ranges, IPv6 loopback,
   unspecified, ULA, link-local, site-local, multicast, documentation and deprecated ranges, and IPv4 wrapped in IPv6

@@ -1,4 +1,4 @@
-// test/gateway-address-policy.test.mjs -- GHSA-4cr8-m4h6-2545: the gateway's destination policy is applied to the
+// test/gateway-address-policy.test.mjs -- the gateway's destination policy is applied to the
 // address a name resolves to (resolved once, connected to as checked), not only to the name the client sent.
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';

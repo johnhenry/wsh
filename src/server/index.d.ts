@@ -398,7 +398,7 @@ export interface WshServerOptions {
    * `socks` dials through a SOCKS5 proxy (e.g. Tor at `127.0.0.1:9050`) with the name left unresolved; `ResolveDns` is then
    * refused. UDP and TCP reverse tunnels are answered with a failure. Off by default.
    *
-   * The ADDRESS a name resolves to is checked too (GHSA-4cr8-m4h6-2545): the host resolves once, refuses every address
+   * The ADDRESS a name resolves to is checked too: the host resolves once, refuses every address
    * that is not globally routable (loopback, private, link-local, CGNAT, ULA, multicast, reserved, and IPv4 wrapped as
    * mapped / NAT64 / 6to4 IPv6) unless `allowPrivate` or an IP-literal `allow` entry says so, and connects to that
    * address. `ResolveDns` answers are filtered the same way. Gateway data is flow controlled (`gateway-credit`).
