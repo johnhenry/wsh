@@ -84,6 +84,8 @@ export interface WshConnectionConfig extends Partial<WshResolvedBackends> {
   bindTimeoutMs?: number;
   /** Folders the operator offers (`wsh --share`, #159): called once per share; listing it makes the host state `shares`. */
   onShare?: WshOnShare;
+  /** Told once per connection this host turned away, with a stable reason code (#163). */
+  onRefused?: WshOnRefused;
   log?: (line: string) => void;
   [key: string]: unknown;
 }
@@ -227,3 +229,15 @@ export interface WshShareFs extends WshFileBackend {
 
 /** Called once per share the operator offers (#159). Mount `fs` where you like; `who` is the authenticated operator. */
 export type WshOnShare = (name: string, fs: WshShareFs, who: { username: string | null; fingerprint: string | null }) => void | Promise<void>;
+
+/** The stable reason codes of `onRefused` (#163). New ones may be added; none is renamed. */
+export const REFUSAL_REASONS: readonly WshRefusalReason[];
+export type WshRefusalReason =
+  | 'not-sealed' | 'unauthorized' | 'binding-required' | 'bad-signature' | 'method-disabled' | 'rate-limited' | 'bad-request'
+  | 'seal-failed' | 'busy' | 'proof-required' | 'proof-failed';
+/**
+ * Called once per connection a host turned away (#163): `reason` is a stable code, `who` what is known of the peer (a
+ * refusal before the login names no one), `detail` human text that is not stable. Not for parsing `onLog`.
+ * Reverse hosts also use `busy`, `proof-required`, `proof-failed`; a sealed session that fails mid-way reports `seal-failed`.
+ */
+export type WshOnRefused = (refusal: { reason: WshRefusalReason; who: { username?: string; fingerprint?: string; address?: string }; detail: string }) => void;
