@@ -158,6 +158,39 @@ export interface WshServerGatewayOptions {
   endpoints?: Record<string, WshGatewayEndpointHandler | { open: WshGatewayEndpointHandler; authorize?: (who: WshGatewayWho) => boolean | Promise<boolean> }>;
   /** `false`: no TCP or DNS at all (an endpoints-only gateway). Default true. */
   tcp?: boolean;
+  /**
+   * TCP reverse tunnels (`ListenRequest`). OFF unless given (`true` = the defaults). The host binds `bindAddr` (default
+   * 127.0.0.1) and ignores the client's `bind_addr` unless it is listed in `allowBindAddrs`; `ports` (default `[0, "1024-65535"]`)
+   * is what a client may ask for, privileged ports only if listed.
+   */
+  reverse?: boolean | {
+    enabled?: boolean;
+    bindAddr?: string;
+    allowBindAddrs?: string[];
+    ports?: Array<number | string>;
+    /** Reverse listeners per client (default 4). */
+    maxListeners?: number;
+    /** Open connections per listener (default 16); the next one is closed unannounced. */
+    maxConnectionsPerListener?: number;
+    /** `listen()` backlog (default 8). */
+    backlog?: number;
+    /** An accepted connection with no traffic either way for this long is closed (default 300000; 0 = never). */
+    idleMs?: number;
+  };
+  /** Bounds of UDP flows (`OpenUdp`); all rates drop, not queue. */
+  udp?: {
+    /** Use WebTransport datagrams for a flow when the transport and the client have them (default true). */
+    datagrams?: boolean;
+    /** Concurrent UDP flows per client (default 16). */
+    maxFlows?: number;
+    /** Datagrams per second per flow (500), per client (2000), both directions. `Infinity` = unlimited. */
+    packetsPerSecondPerFlow?: number;
+    packetsPerSecondPerClient?: number;
+    /** Payload bytes per second per client, both directions (default 4 MiB): bounds amplification. */
+    bytesPerSecondPerClient?: number;
+    /** A reply that does not fit one datagram: 'reliable' sends it on the control stream (default), 'drop' drops it and counts it. */
+    oversize?: 'reliable' | 'drop';
+  };
 }
 
 export interface WshServerPtyOptions {
@@ -530,6 +563,8 @@ export interface WshServer {
   rotateCertificate(options?: { activate?: boolean }): Promise<{ current: WshServerCertificateInfo; next: WshServerCertificateInfo | null }>;
   /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */
   peerFingerprints(): string[];
+  /** Counters of the gateway's UDP flows (datagrams in/out, drops by cause, oversize handling) and reverse listeners; null without a gateway. */
+  gatewayStats(): { udp: Record<string, number>; reverse: Record<string, number> } | null;
   /** The advertised host identity; `null` before `listen()` resolves or without a `hostKey`. */
   hostKey(): WshServerHostKey | null;
 }

@@ -54,6 +54,52 @@ unchanged. **The Rust `wsh-server` changes one default (`client_env`) and one va
   cover the allow-list, the config line above, signal names and `--via` parsing. `test/rust/wsh-cli.test.mjs` trusts the
   generated certificate through `SSL_CERT_FILE` instead of `WSH_INSECURE_LOOPBACK_TLS`.
 
+## 0.38.0
+
+### npm package: TCP reverse tunnels and UDP over WebTransport datagrams (#98, #124)
+- **TCP reverse tunnels on the Node host (#98).** `ListenRequest { listener_id, port, bind_addr }` was answered with a
+  `ListenFail`; it is now served when `createWshServer({ gateway: { reverse: {...} } })` is set. **Off by default** (a
+  separate switch from outbound gateway use). The host announces each inbound connection with `InboundOpen` (the real
+  `peer_addr` / `peer_port`), the client answers `InboundAccept { gateway_id }` or `InboundReject`, and data flows with the
+  same `GatewayCredit` rules as any gateway connection. Policy: the host binds `reverse.bindAddr` (default `127.0.0.1`) and
+  **ignores the client's `bind_addr`** (its wire default is `"0.0.0.0"`) unless it is listed in `reverse.allowBindAddrs`,
+  as the Rust server does with `reverse_bind_addr`; `reverse.ports` (default `[0, "1024-65535"]`, a given list replaces it,
+  nothing below 1024 unless named); `maxListeners` 4 per client, `maxConnectionsPerListener` 16, `backlog` 8, `idleMs`
+  300000; listeners close with the client. Each refusal says why in `ListenFail.reason`. Reverse connections count against
+  `maxConnections`. A host with only `reverse` (`allow: []`) advertises `gateway`. Client: `client.listenTcp(port,
+  { bindAddr?, onConnection(duplex, { peer, peerPort }) })` resolving `{ port, close() }` (like `listenUnix`).
+- **UDP as WebTransport datagrams (#124), feature `gateway-datagram`.** When the transport is WebTransport and both ends
+  list `gateway-datagram` (client in `Hello.features` if its transport has datagrams; host in `ServerHello.features` if it
+  is on WebTransport, serves UDP and `udp.datagrams` is not false), `OpenUdp` payloads travel as WebTransport datagrams:
+  the datagram is the 4-byte big-endian `gateway_id` and then the UDP payload. No retransmission, no head-of-line blocking
+  against other flows, not metered by `GatewayCredit`; `OpenUdp`/`GatewayOk`/`GatewayFail`/`GatewayClose` stay on the
+  control stream. WebSocket, an older peer, or `udp.datagrams: false` keep the reliable path unchanged. The limit comes
+  from the transport's `maxDatagramSize` (about 1207 payload bytes on QUIC), read per payload; a larger payload goes on the
+  control stream by default (`udp.oversize: 'reliable'`; the choice and why are in the README), or is dropped and counted
+  with `udp.oversize: 'drop'` / `openUdp(h, p, { oversize: 'drop' })` (`send()` then rejects with `RangeError`).
+  `client.openUdp()` now returns a `UdpFlow` (still `readable` / `writable` / `close` / `destroy` / `closed`) with
+  `send(bytes) => Promise<boolean>`, `transport`, `maxDatagramSize`, `stats`, and explicit drop semantics (a slow reader
+  loses the newest past 128 queued datagrams). `WshTransport` gained `supportsDatagrams`, `maxDatagramSize`,
+  `sendDatagram()` and `onDatagram`; `createWshServer` gained `gatewayStats()`.
+  - **Bounds** (`gateway.udp`): `maxFlows` 16 per client, `packetsPerSecondPerFlow` 500, `packetsPerSecondPerClient` 2000,
+    `bytesPerSecondPerClient` 4 MiB/s (both directions; the amplification bound), `udpIdleMs` 60 s. Over a limit a datagram
+    is dropped and counted. These apply to the reliable path as well, **which is a behaviour change for UDP flows on the
+    reliable path** (previously only the flow cap `maxConnections` and the receive queue applied).
+  - **One destination, never a relay:** the same name rule and resolved-address policy as TCP; the host's socket is
+    `connect()`ed to the checked address, so replies are accepted only from that address and port.
+  - **Wire additions:** feature string `gateway-datagram` (both directions of negotiation); the datagram layout above. No
+    new control message and no new field. Documented in `spec/wsh-v1.yaml` (descriptions of `OpenUdp` and `ListenRequest`).
+  - **Rust must still implement** (see the README capability matrix): `gateway-datagram` on WebTransport, the datagram
+    layout, `maxDatagramSize` handling, and the rate / flow bounds; for reverse tunnels a port allow-list and per-client
+    listener, per-listener connection and idle bounds.
+  - **Tests:** `test/gateway-reverse.test.mjs`, `test/gateway-datagram.test.mjs` (a real HTTP/3 connection from the Node
+    WebTransport client to the host: DNS-sized and limit-sized datagrams, a 1252-byte payload, loss shims on both
+    directions, oversize, rate / flow / idle bounds, policy, a third party's datagram not delivered, WebSocket fallback),
+    and `test/browser/udp-datagrams.spec.mjs` (Chromium over HTTP/3 with `serverCertificateHashes`). Every new rule was
+    broken once to see its test fail.
+  - **Bundle size:** `.` +5.0 kB minified / +1.4 kB gzip (client reverse and UDP API, datagram flow, transport hooks);
+    `./host` +0.2 kB / +0.1 kB gzip; budgets in `scripts/bundle-budget.json` updated by exactly that.
+
 ## 0.37.0 / Rust `rust-v0.7.0`
 
 ### npm package: gateway forwarding (#120, #123, #98, #124)
