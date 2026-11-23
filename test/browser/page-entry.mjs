@@ -94,7 +94,7 @@ function memoryFs(initial) {
   };
 }
 
-window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {} } = {}) => {
+window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, firstOutputDelayMs = 0 } = {}) => {
   const log = [];
   const ptyCalls = [];
   const fs = memoryFs(initialFiles);
@@ -114,6 +114,8 @@ window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = f
         await new Promise((resolve) => io.onInputEnd(resolve));
         return 0;
       }
+      // (a spec driving a RELEASED Rust CLI asks for a pause here: releases up to rust-v0.6.0 drop output that arrives in the same burst as OpenOk, #135)
+      if (firstOutputDelayMs) await new Promise((resolve) => setTimeout(resolve, firstOutputDelayMs));
       await io.write(`ran:${command}\n`);
       return 3;
     },
