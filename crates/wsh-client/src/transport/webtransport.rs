@@ -6,7 +6,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use rustls::crypto::ring;
 use wtransport::endpoint::endpoint_side;
 use wtransport::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
 
@@ -108,7 +107,7 @@ impl WebTransportSession {
 }
 
 fn install_rustls_crypto_provider() {
-    let _ = ring::default_provider().install_default();
+    super::install_crypto_provider();
 }
 
 impl TransportSession for WebTransportSession {
