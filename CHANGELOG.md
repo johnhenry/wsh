@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Rust `rust-v0.8.0`
 
 ### Rust: host identity, channel binding and operator proof (#145, part 3: steps 1-4)
 
