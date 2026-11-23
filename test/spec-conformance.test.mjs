@@ -89,8 +89,8 @@ describe('the spec reader actually read the spec', () => {
   // finding nothing to check.
   it('finds the full set of message types the README advertises', () => {
     // wsh #59 added two: AuthorizedKeyAdd, AuthorizedKeyResult. wsh #89 added ReverseClose. wsh #108 added McpCancel.
-    assert.equal(Object.keys(spec.byName).length, 99);
-    assert.equal(spec.byCode.size, 99);
+    assert.equal(Object.keys(spec.byName).length, 103);
+    assert.equal(spec.byCode.size, 103);
   });
 
   it('agrees with messages.gen.mjs about opcodes', () => {

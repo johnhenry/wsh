@@ -67,6 +67,9 @@ pub enum MsgType {
     DetachOk = 0x61,
     DetachFail = 0x62,
 
+    OpenUnix = 0x63,
+    OpenEndpoint = 0x64,
+    ListenUnix = 0x65,
     OpenTcp = 0x70,
     OpenUdp = 0x71,
     ResolveDns = 0x72,
@@ -82,6 +85,7 @@ pub enum MsgType {
     ListenFail = 0x7c,
     ListenClose = 0x7d,
     GatewayData = 0x7e,
+    GatewayCredit = 0x7f,
 
     GuestInvite = 0x80,
     GuestJoin = 0x81,
@@ -193,6 +197,9 @@ impl TryFrom<u8> for MsgType {
             0x60 => Ok(Self::Detach),
             0x61 => Ok(Self::DetachOk),
             0x62 => Ok(Self::DetachFail),
+            0x63 => Ok(Self::OpenUnix),
+            0x64 => Ok(Self::OpenEndpoint),
+            0x65 => Ok(Self::ListenUnix),
             0x70 => Ok(Self::OpenTcp),
             0x71 => Ok(Self::OpenUdp),
             0x72 => Ok(Self::ResolveDns),
@@ -208,6 +215,7 @@ impl TryFrom<u8> for MsgType {
             0x7c => Ok(Self::ListenFail),
             0x7d => Ok(Self::ListenClose),
             0x7e => Ok(Self::GatewayData),
+            0x7f => Ok(Self::GatewayCredit),
             0x80 => Ok(Self::GuestInvite),
             0x81 => Ok(Self::GuestJoin),
             0x82 => Ok(Self::GuestRevoke),
@@ -250,7 +258,7 @@ impl TryFrom<u8> for MsgType {
 pub fn is_relay_forwardable(t: MsgType) -> bool {
     matches!(
         t,
-        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::McpCancel | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::FileResult | MsgType::FileChunk | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff | MsgType::KeyExchange | MsgType::EncryptedFrame
+        MsgType::Open | MsgType::OpenOk | MsgType::OpenFail | MsgType::Close | MsgType::Exit | MsgType::Resize | MsgType::Signal | MsgType::SessionData | MsgType::GatewayData | MsgType::GatewayCredit | MsgType::GatewayOk | MsgType::GatewayFail | MsgType::GatewayClose | MsgType::McpDiscover | MsgType::McpTools | MsgType::McpCall | MsgType::McpResult | MsgType::McpCancel | MsgType::ReverseAccept | MsgType::ReverseReject | MsgType::GuestJoin | MsgType::GuestRevoke | MsgType::CopilotAttach | MsgType::CopilotDetach | MsgType::FileOp | MsgType::FileResult | MsgType::FileChunk | MsgType::PolicyEval | MsgType::EchoAck | MsgType::EchoState | MsgType::TermSync | MsgType::TermDiff | MsgType::KeyExchange | MsgType::EncryptedFrame
     )
 }
 
@@ -368,6 +376,9 @@ pub enum Payload {
     Detach(DetachPayload),
     DetachOk(DetachOkPayload),
     DetachFail(DetachFailPayload),
+    OpenUnix(OpenUnixPayload),
+    OpenEndpoint(OpenEndpointPayload),
+    ListenUnix(ListenUnixPayload),
     OpenTcp(OpenTcpPayload),
     OpenUdp(OpenUdpPayload),
     ResolveDns(ResolveDnsPayload),
@@ -383,6 +394,7 @@ pub enum Payload {
     ListenFail(ListenFailPayload),
     ListenClose(ListenClosePayload),
     GatewayData(GatewayDataPayload),
+    GatewayCredit(GatewayCreditPayload),
     GuestInvite(GuestInvitePayload),
     GuestJoin(GuestJoinPayload),
     GuestRevoke(GuestRevokePayload),
@@ -476,6 +488,9 @@ impl Payload {
             MsgType::Detach => Ok(Self::Detach(ciborium::from_reader(cursor)?)),
             MsgType::DetachOk => Ok(Self::DetachOk(ciborium::from_reader(cursor)?)),
             MsgType::DetachFail => Ok(Self::DetachFail(ciborium::from_reader(cursor)?)),
+            MsgType::OpenUnix => Ok(Self::OpenUnix(ciborium::from_reader(cursor)?)),
+            MsgType::OpenEndpoint => Ok(Self::OpenEndpoint(ciborium::from_reader(cursor)?)),
+            MsgType::ListenUnix => Ok(Self::ListenUnix(ciborium::from_reader(cursor)?)),
             MsgType::OpenTcp => Ok(Self::OpenTcp(ciborium::from_reader(cursor)?)),
             MsgType::OpenUdp => Ok(Self::OpenUdp(ciborium::from_reader(cursor)?)),
             MsgType::ResolveDns => Ok(Self::ResolveDns(ciborium::from_reader(cursor)?)),
@@ -491,6 +506,7 @@ impl Payload {
             MsgType::ListenFail => Ok(Self::ListenFail(ciborium::from_reader(cursor)?)),
             MsgType::ListenClose => Ok(Self::ListenClose(ciborium::from_reader(cursor)?)),
             MsgType::GatewayData => Ok(Self::GatewayData(ciborium::from_reader(cursor)?)),
+            MsgType::GatewayCredit => Ok(Self::GatewayCredit(ciborium::from_reader(cursor)?)),
             MsgType::GuestInvite => Ok(Self::GuestInvite(ciborium::from_reader(cursor)?)),
             MsgType::GuestJoin => Ok(Self::GuestJoin(ciborium::from_reader(cursor)?)),
             MsgType::GuestRevoke => Ok(Self::GuestRevoke(ciborium::from_reader(cursor)?)),
@@ -993,6 +1009,29 @@ pub struct DetachFailPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct OpenUnixPayload {
+    pub gateway_id: u32,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenEndpointPayload {
+    pub gateway_id: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenUnixPayload {
+    pub listener_id: u32,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenTcpPayload {
     pub gateway_id: u32,
     pub host: String,
@@ -1117,6 +1156,13 @@ pub struct GatewayDataPayload {
     pub gateway_id: u32,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCreditPayload {
+    pub gateway_id: u32,
+    pub bytes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
