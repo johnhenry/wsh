@@ -5,6 +5,7 @@
 
 pub mod channel_binding;
 pub mod codec;
+pub mod e2e_exchange;
 pub mod error;
 pub mod gateway_credit;
 pub mod host_key;

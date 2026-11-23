@@ -351,6 +351,8 @@ pub struct IdentityPolicy {
     pub allow_operators: Vec<String>,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
     pub operator_proof: OperatorProofMode,
+    /// Reverse operator: seal the bridge (`--sealed`).
+    pub sealed: bool,
 }
 
 /// Whether `wsh reverse-connect` offers to prove its identity to the peer.

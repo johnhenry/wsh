@@ -62,6 +62,8 @@ pub struct ReverseHostOptions {
     pub allowed_operators: Vec<String>,
     /// This host's identity key. Without it no challenge can be issued.
     pub identity: Option<IdentityKey>,
+    /// Offer X25519+ML-KEM-768 to an operator that asks for it (it may still seal with X25519 alone).
+    pub hybrid: bool,
 }
 
 impl Default for ReverseHostOptions {
@@ -77,6 +79,7 @@ impl Default for ReverseHostOptions {
             require_operator_proof: false,
             allowed_operators: Vec::new(),
             identity: None,
+            hybrid: true,
         }
     }
 }
@@ -152,7 +155,13 @@ impl ReverseHostOptions {
         }
     }
 
-    fn reverse_accept_payload(&self, request: ReverseConnectPayload) -> ReverseAcceptPayload {
+    /// `sealable`: this bridge can be sealed (the operator proved its key), so the accept says so
+    /// (`e2e`, `e2e-sign`, `e2e-sealed`): an operator that asks for a sealed bridge needs it.
+    fn reverse_accept_payload(
+        &self,
+        request: ReverseConnectPayload,
+        sealable: bool,
+    ) -> ReverseAcceptPayload {
         ReverseAcceptPayload {
             target_fingerprint: request.target_fingerprint,
             username: request.username,
@@ -163,7 +172,13 @@ impl ReverseHostOptions {
             supports_replay: self.supports_replay,
             supports_echo: self.supports_echo,
             supports_term_sync: self.supports_term_sync,
-            features: None,
+            features: sealable.then(|| {
+                vec![
+                    wsh_core::e2e_exchange::E2E_FEATURE.to_string(),
+                    wsh_core::e2e_exchange::E2E_SIGN_FEATURE.to_string(),
+                    wsh_core::operator_proof::E2E_SEALED_FEATURE.to_string(),
+                ]
+            }),
         }
     }
 
@@ -261,6 +276,15 @@ pub async fn run_with_service(
             Some(event) = service.event_rx.recv() => {
                 service.runtime.handle_runtime_event(event).await?;
             }
+            // A sealed frame that does not open (forged, tampered with, replayed): the relay is
+            // not honest, and the bridge is over.
+            _ = service.runtime.bridge_sealed_event() => {
+                service.runtime.on_sealed();
+            }
+            _ = service.runtime.bridge_failed() => {
+                warn!("a sealed frame did not open: ending the bridge");
+                service.runtime.end_bridge().await?;
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("reverse host runtime received Ctrl+C");
                 service.shutdown().await;
@@ -320,7 +344,18 @@ struct PendingProof {
     deadline: tokio::time::Instant,
 }
 
+/// A bridge with a proven operator that may be sealed (wsh #117, #145): this host answers the
+/// operator's signed `KeyExchange` for the challenge's session id.
+struct HostSealing {
+    session_id: String,
+    /// Set with `--require-operator-proof`: the bridge is dropped if no key exchange arrives by then.
+    give_up: Option<tokio::time::Instant>,
+    sealed: bool,
+}
+
 struct ReverseHostRuntime {
+    /// The bridge being sealed, or sealed, with the operator served now.
+    sealing: Option<HostSealing>,
     client: Option<Arc<WshClient>>,
     event_tx: Option<mpsc::UnboundedSender<RuntimeEvent>>,
     options: ReverseHostOptions,
@@ -342,6 +377,7 @@ impl ReverseHostRuntime {
             event_tx: None,
             status_tx: None,
             active_request: None,
+            sealing: None,
             pending_proof: None,
             sessions: HashMap::new(),
             gateway_connections: HashMap::new(),
@@ -363,6 +399,10 @@ impl ReverseHostRuntime {
     }
 
     async fn detach_client(&mut self) {
+        self.sealing = None;
+        if let Some(client) = &self.client {
+            client.end_sealing();
+        }
         self.client = None;
         self.event_tx = None;
         self.status_tx = None;
@@ -420,7 +460,7 @@ impl ReverseHostRuntime {
                     .send_fire_and_forget(Envelope {
                         msg_type: MsgType::ReverseAccept,
                         payload: Payload::ReverseAccept(
-                            self.options.reverse_accept_payload(request),
+                            self.options.reverse_accept_payload(request, false),
                         ),
                     })
                     .await
@@ -473,7 +513,7 @@ impl ReverseHostRuntime {
         if !self.options.allows_operator(&from) {
             return self.reject(&request, "operator not allowed").await;
         }
-        self.accept_request(request).await
+        self.accept_request(request, None).await
     }
 
     async fn reject(&mut self, request: &ReverseConnectPayload, reason: &str) -> Result<()> {
@@ -491,7 +531,11 @@ impl ReverseHostRuntime {
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
-    async fn accept_request(&mut self, request: ReverseConnectPayload) -> Result<()> {
+    async fn accept_request(
+        &mut self,
+        request: ReverseConnectPayload,
+        proven: Option<(wsh_core::operator_proof::ProvenOperator, String)>,
+    ) -> Result<()> {
         info!(
             requester = %request.username,
             target = %request.target_fingerprint,
@@ -507,13 +551,87 @@ impl ReverseHostRuntime {
         client
             .trust_relay_peer(request.from_fingerprint.clone())
             .await;
+        // A proven operator may seal the bridge: its signed `KeyExchange` for the challenge's
+        // session id is answered here. With `--require-operator-proof` nothing else is heard,
+        // or sent, until it has (the gate is on before the accept leaves).
+        self.sealing = None;
+        client.end_sealing();
+        let sealable = match (&proven, &self.options.identity) {
+            (Some((operator, session_id)), Some(identity)) => {
+                let must = self.options.require_operator_proof;
+                let responder = wsh_client::E2eResponder::new(
+                    Some((*identity.0).clone()),
+                    self.options.hybrid,
+                    Some(identity.0.verifying_key().to_bytes()),
+                    Some(wsh_client::InitiatorAuth {
+                        public_key: operator.public_key,
+                        require: true,
+                    }),
+                );
+                client.begin_sealing_as_responder(session_id.clone(), must, responder);
+                self.sealing = Some(HostSealing {
+                    session_id: session_id.clone(),
+                    give_up: must.then(|| tokio::time::Instant::now() + PROOF_TIMEOUT * 2),
+                    sealed: false,
+                });
+                true
+            }
+            _ => false,
+        };
         client
             .send_fire_and_forget(Envelope {
                 msg_type: MsgType::ReverseAccept,
-                payload: Payload::ReverseAccept(self.options.reverse_accept_payload(request)),
+                payload: Payload::ReverseAccept(
+                    self.options.reverse_accept_payload(request, sealable),
+                ),
             })
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
+
+    /// Resolves when the bridge being set up is sealed; never when none is.
+    async fn bridge_sealed_event(&self) {
+        match (
+            &self.client,
+            self.sealing.as_ref().is_some_and(|s| !s.sealed),
+        ) {
+            (Some(client), true) => client.bridge_sealed_event().await,
+            _ => std::future::pending::<()>().await,
+        }
+    }
+
+    fn on_sealed(&mut self) {
+        if let Some(sealing) = self.sealing.as_mut() {
+            sealing.sealed = true;
+            sealing.give_up = None;
+        }
+        println!("Bridge sealed: the relay carries ciphertext only.");
+    }
+
+    /// Resolves when the sealed bridge failed; never when there is none.
+    async fn bridge_failed(&self) {
+        match (&self.client, self.sealing.is_some()) {
+            (Some(client), true) => client.bridge_failed().await,
+            _ => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Drop the bridge: its processes, its key, and the operator's claim on this host.
+    async fn end_bridge(&mut self) -> Result<()> {
+        self.sealing = None;
+        if let Some(client) = &self.client {
+            client.end_sealing();
+            // Nothing this operator (or a relay speaking for it) sends is heard any more.
+            if let Some(request) = &self.active_request {
+                client.untrust_relay_peer(&request.from_fingerprint).await;
+            }
+        }
+        let ids: Vec<u32> = self.sessions.keys().copied().collect();
+        for id in ids {
+            self.drop_session(id).await;
+        }
+        self.active_request = None;
         Ok(())
     }
 
@@ -559,19 +677,39 @@ impl ReverseHostRuntime {
         if !self.options.allows_operator(&proven.fingerprint) {
             return self.reject(&request, "operator not allowed").await;
         }
-        self.accept_request(request).await
+        let session_id = pending.issued.session_id.clone();
+        self.accept_request(request, Some((proven, session_id)))
+            .await
     }
 
     /// When the pending challenge stops waiting (for the run loop's timer).
     fn proof_deadline(&self) -> Option<tokio::time::Instant> {
-        self.pending_proof.as_ref().map(|p| p.deadline)
+        let proof = self.pending_proof.as_ref().map(|p| p.deadline);
+        let seal = self.sealing.as_ref().and_then(|s| s.give_up);
+        match (proof, seal) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     async fn expire_proof(&mut self) -> Result<()> {
-        if let Some(p) = self.pending_proof.take() {
-            return self
-                .reject(&p.request, "operator did not answer the challenge")
-                .await;
+        let now = tokio::time::Instant::now();
+        if let Some(p) = self.pending_proof.as_ref() {
+            if p.deadline <= now {
+                let p = self.pending_proof.take().expect("checked above");
+                return self
+                    .reject(&p.request, "operator did not answer the challenge")
+                    .await;
+            }
+        }
+        if self
+            .sealing
+            .as_ref()
+            .and_then(|s| s.give_up)
+            .is_some_and(|t| t <= now)
+        {
+            warn!("no key exchange in time: dropping the bridge that must be sealed");
+            return self.end_bridge().await;
         }
         Ok(())
     }

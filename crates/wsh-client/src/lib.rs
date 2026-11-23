@@ -29,6 +29,7 @@
 //! ```
 
 pub mod auth;
+pub mod bridge_seal;
 pub mod client;
 pub mod e2e;
 pub mod e2e_frame;
@@ -37,6 +38,7 @@ pub mod gateway;
 pub mod keystore;
 pub mod known_hosts;
 pub mod mcp;
+pub mod seal_gate;
 pub mod session;
 pub mod share;
 pub mod stream_frame;
@@ -46,8 +48,14 @@ pub mod virtual_session;
 pub use wsh_core::{channel_binding, host_key};
 
 // Re-export primary public types.
-pub use client::{ConnectConfig, FirstUse, GatewayHandle, RemoteSessionInfo, WshClient};
-pub use e2e::{E2eKeyExchange, ALGORITHM_HYBRID, ALGORITHM_X25519};
+pub use client::{
+    ConnectConfig, FirstUse, GatewayHandle, RemoteSessionInfo, ReverseConnectOptions,
+    ReverseOutcome, SealOptions, WshClient,
+};
+pub use e2e::{
+    E2eKeyExchange, E2eOptions, E2eResponder, InitiatorAuth, Responded, ALGORITHM_HYBRID,
+    ALGORITHM_X25519,
+};
 pub use e2e_frame::RoleTag;
 pub use gateway::{GatewayListener, GatewayStream, PendingInbound};
 pub use keystore::{KeyInfo, KeyStore};
