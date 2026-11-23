@@ -33,7 +33,7 @@ describe('onRefused (host option)', () => {
     });
     try {
       const client = await host.connect({ username: 'alice', keyPair: alice.keyPair, sealSession: false });
-      await assert.rejects(client.openEndpoint('echo', { timeout: 1500 }));
+      await assert.rejects(client.openEndpoint('echo', { timeoutMs: 1500 }));
       await until(() => refused.length, 'the refusal');
       assert.equal(refused.length, 1, 'one refusal per connection, however many plain messages arrive');
       assert.equal(refused[0].reason, 'not-sealed');
