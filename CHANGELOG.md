@@ -5,7 +5,7 @@
 Rust workspace only (`wsh`, `wsh-server`, `wsh-client`); the npm package and the wire protocol are unchanged, and no
 message or field was added. **The Rust `wsh-server` changes three defaults. Read "Breaking" before upgrading it.**
 
-### Breaking: Rust `wsh-server` defaults (private advisories GHSA-89hv-m54m-49wj, GHSA-hx95-3p5g-2vwg)
+### Breaking: Rust `wsh-server` defaults
 
 - **The gateway is off, and allows no destination when on.** Before: `[gateway] enabled = true`,
   `allowed_destinations = ["*"]`, so any authorized key could open TCP/UDP connections and DNS lookups from the host,
