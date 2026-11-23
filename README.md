@@ -1449,7 +1449,7 @@ instead of dragging its own toolchain and CI job into an unrelated
 browser-app repo. It was previously deleted from clawser by accident
 (2026-03-14) and restored (2026-07-05) before this move.
 
-Four crates, workspace-versioned (currently `0.8.0`):
+Four crates, workspace-versioned (currently `0.9.0`):
 
 | Crate | Kind | Description |
 |-------|------|--------------|

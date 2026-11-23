@@ -1,6 +1,6 @@
 # Changelog
 
-## Rust `rust-v0.8.0`
+## Rust `rust-v0.9.0`
 
 ### Rust: host identity, channel binding and operator proof (#145, part 3: steps 1-4)
 
@@ -30,6 +30,8 @@ strings (`host-key-nonce:`, `host-key:`, `host-key-sig:`, `channel-binding:host`
   proof before accepting, and take `--require-operator-proof` and `--allow-operator <fingerprint>`. A reattach by the same
   operator now also needs the same `from_fingerprint`. **Not done: the sealed bridge (`e2e-sealed`) and signed `KeyExchange`
   halves**, so proof says who connected, not that later plain messages came from them.
+
+## Rust `rust-v0.8.0`
 
 ### Rust: identity parity, part 1 (#145)
 
