@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Rust: the sealed bridge (#145, step 5)
+
+Rust workspace and tests only (no `src/` change); negotiated by existing feature strings, so released peers keep working.
+
+- **Sealed bridge, both halves signed, byte-compatible with JS.** `wsh_core::e2e_exchange` (the two `KeyExchange` transcripts;
+  vectors printed by `src/e2e-exchange.mjs`), `wsh_client::E2eResponder` and `WshClient::initiate_e2e_with` (verify the peer's
+  signed half, sign the initiator half), `bridge_seal::SealedBridge` (a frame sealed by JS opens in Rust and the reverse) and
+  `seal_gate::SealGate`: every control message that would cross the relay leaves as an `EncryptedFrame` on channel 0, in send order;
+  a plain message on a sealed bridge is dropped; nothing that names a command is sent before the key exists.
+- **`wsh reverse-connect --sealed`** (new flag): needs operator proof and a peer that states `e2e-sealed`; fails at once with a sentence
+  and sends nothing otherwise. Hybrid X25519+ML-KEM-768, negotiated down to X25519 as JS does.
+- **Rust host:** `ReverseAccept.features` lists `e2e`, `e2e-sign`, `e2e-sealed` once it has proven the operator.
+  **Behaviour change:** `--require-operator-proof` now also REQUIRES the sealed bridge (the JS rule): an operator that proves but does
+  not seal is no longer served plain; its plain messages are not heard, and a bridge that has not sealed within 10 s is dropped.
+  **A frame that does not open (tampered, replayed, reordered) closes the bridge** (the JS host drops the frame and ignores the rest).
+- Not done here: sealing a direct or pipe-relayed connection and gateway data outside a reverse bridge (#155).
+
 ## 0.38.1
 
 ### JS: `operator-proof` is offered only to a peer that advertises it (npm change)

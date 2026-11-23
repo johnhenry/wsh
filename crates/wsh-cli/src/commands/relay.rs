@@ -524,19 +524,45 @@ pub async fn run_connect(
         target_peer.username, target_peer.fingerprint_short, effective_relay, port
     );
 
-    let response = client
-        .reverse_connect(
+    let sealed = crate::commands::common::identity_policy().sealed;
+    if sealed && !offer_proof {
+        anyhow::bail!(
+            "--sealed needs operator proof, which is not offered here: {} (nothing was sent). \
+             Pass --operator-proof to offer it to a peer that does not advertise it.",
+            if !client
+                .has_feature(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE)
+                .await
+            {
+                "this relay does not carry it"
+            } else if matches!(mode, crate::commands::common::OperatorProofMode::Never) {
+                "--no-operator-proof was given"
+            } else {
+                "the peer does not advertise `operator-proof`"
+            }
+        );
+    }
+    let outcome = client
+        .reverse_connect_with(
             connect_request,
-            operator_key.as_ref().map(|k| (k, username.as_str())),
+            wsh_client::ReverseConnectOptions {
+                operator: operator_key.as_ref().map(|k| (k, username.as_str())),
+                require_peer_proof: false,
+                sealed: sealed.then_some(wsh_client::SealOptions { hybrid: true }),
+            },
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to reverse-connect to peer")?;
 
-    let accept = parse_reverse_connect_response(response.payload)?;
+    let accept = parse_reverse_connect_response(outcome.response.payload)?;
     println!(
-        "Peer accepted reverse connection. Backend: {}",
-        reverse_accept_summary(&accept)
+        "Peer accepted reverse connection. Backend: {}{}",
+        reverse_accept_summary(&accept),
+        if outcome.sealed {
+            " (bridge sealed)"
+        } else {
+            ""
+        }
     );
 
     let (cols, rows) = term::get_terminal_size();

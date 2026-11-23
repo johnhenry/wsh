@@ -17,9 +17,10 @@ use wsh_core::error::{WshError, WshResult};
 use wsh_core::messages::*;
 
 use crate::auth;
-use crate::e2e::{combine_hybrid_secret, E2eKeyExchange, ALGORITHM_HYBRID};
+use crate::e2e::{combine_hybrid_secret, E2eKeyExchange, E2eOptions, ALGORITHM_HYBRID};
 use crate::gateway::GatewayHub;
 use crate::known_hosts::{HostStatus, KnownHosts};
+use crate::seal_gate::SealGate;
 use crate::session::{ControlAction, SessionInfo, SessionOpts, WshSession};
 use crate::transport::{self, AnyTransport};
 
@@ -207,6 +208,34 @@ fn take_matching_waiter(waiters: &mut Vec<Waiter>, envelope: &Envelope) -> Optio
     Some(waiters.remove(idx))
 }
 
+/// Options of [`WshClient::reverse_connect_with`].
+#[derive(Default, Clone, Copy)]
+pub struct ReverseConnectOptions<'a> {
+    /// The login key and username to answer a challenge with.
+    pub operator: Option<(&'a ed25519_dalek::SigningKey, &'a str)>,
+    /// Refuse the bridge unless the peer signed a challenge.
+    pub require_peer_proof: bool,
+    /// Seal the bridge (needs `operator` and a request that offers `operator-proof`).
+    pub sealed: Option<SealOptions>,
+}
+
+/// How to seal a bridge.
+#[derive(Clone, Copy)]
+pub struct SealOptions {
+    /// Offer X25519+ML-KEM-768 (the peer may still answer with classical X25519).
+    pub hybrid: bool,
+}
+
+/// What [`WshClient::reverse_connect_with`] learned.
+pub struct ReverseOutcome {
+    /// The peer's `ReverseAccept` or `ReverseReject`.
+    pub response: Envelope,
+    /// The peer's challenge, verified: it proved it holds this key.
+    pub peer_proven: Option<wsh_core::operator_proof::VerifiedChallenge>,
+    /// Is the bridge sealed?
+    pub sealed: bool,
+}
+
 pub struct WshClient {
     /// The underlying transport session (enum dispatch, not dyn).
     transport: Arc<Mutex<AnyTransport>>,
@@ -250,6 +279,8 @@ pub struct WshClient {
     channel_binding_kinds: Vec<&'static str>,
     /// Connections and listeners opened through the host (see [`crate::gateway`]).
     gateway: Arc<GatewayHub>,
+    /// Seals what crosses a sealed bridge (wsh #117, #145); off until a bridge is set up.
+    seal: Arc<SealGate>,
 }
 
 /// Opens connections through the host and listens on it; cheap to clone, usable from any task.
@@ -407,6 +438,7 @@ impl WshClient {
             Arc::new(Mutex::new(HashSet::new()));
         let early: EarlyShared = Arc::new(Mutex::new(EarlyChannels::default()));
         let gateway = Arc::new(GatewayHub::new(outgoing_tx.clone()));
+        let seal: Arc<SealGate> = Arc::default();
 
         let mut client = Self {
             transport: transport.clone(),
@@ -424,6 +456,7 @@ impl WshClient {
             relay_message_rx,
             accepted_relay_peers: accepted_relay_peers.clone(),
             gateway: gateway.clone(),
+            seal: seal.clone(),
             early: early.clone(),
             host_key: None,
             host_key_newly_pinned: false,
@@ -451,6 +484,7 @@ impl WshClient {
             let accepted_relay_peers = accepted_relay_peers.clone();
             let early = early.clone();
             let gateway = gateway.clone();
+            let seal = seal.clone();
 
             tokio::spawn(async move {
                 Self::dispatch_loop(
@@ -466,6 +500,7 @@ impl WshClient {
                     accepted_relay_peers,
                     early,
                     gateway,
+                    seal,
                 )
                 .await;
             })
@@ -603,12 +638,79 @@ impl WshClient {
         request: ReverseConnectPayload,
         operator: Option<(&ed25519_dalek::SigningKey, &str)>,
     ) -> WshResult<Envelope> {
+        Ok(self
+            .reverse_connect_with(
+                request,
+                ReverseConnectOptions {
+                    operator,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .response)
+    }
+
+    /// [`reverse_connect`](Self::reverse_connect) that can also require the peer's proof and
+    /// SEAL the bridge (wsh #117, #145): with `sealed`, a signed `KeyExchange` for the
+    /// challenge's session id follows the accept, and from then on everything that would cross
+    /// the relay travels as an `EncryptedFrame` on channel 0. Nothing that names a command, a
+    /// path or a session is sent before the key exists (the gate is on from before the request
+    /// leaves), and nothing plain is heard afterwards. The peer must have signed its challenge and
+    /// state `e2e-sealed` in its `ReverseAccept`, else the call fails and nothing was sent.
+    pub async fn reverse_connect_with(
+        &self,
+        request: ReverseConnectPayload,
+        opts: ReverseConnectOptions<'_>,
+    ) -> WshResult<ReverseOutcome> {
+        let sealed = opts.sealed;
+        let must_prove = sealed.is_some() || opts.require_peer_proof;
+        let offers_proof = request.features.as_ref().is_some_and(|f| {
+            f.iter()
+                .any(|f| f == wsh_core::operator_proof::OPERATOR_PROOF_FEATURE)
+        });
+        if must_prove && (opts.operator.is_none() || !offers_proof) {
+            return Err(WshError::Other(format!(
+                "reverse_connect: {} needs operator proof offered (a key login, and a relay and peer that carry it) -- nothing was sent",
+                if sealed.is_some() { "a sealed bridge" } else { "requiring the peer's proof" }
+            )));
+        }
         let target = request.target_fingerprint.clone();
         let (accept_rx, reject_rx, mut challenge_rx) = (
             self.register_waiter(MsgType::ReverseAccept).await,
             self.register_waiter(MsgType::ReverseReject).await,
             self.register_waiter(MsgType::ReverseChallenge).await,
         );
+        if sealed.is_some() {
+            // From before the request leaves: nothing but the key exchange may cross until the key exists.
+            self.seal.begin(String::new(), true);
+            self.seal.set_close_on_failure(true);
+        }
+        let result = self
+            .reverse_connect_inner(
+                request,
+                &opts,
+                &target,
+                accept_rx,
+                reject_rx,
+                &mut challenge_rx,
+            )
+            .await;
+        match &result {
+            Ok(o) if o.sealed => {}
+            _ => self.seal.end(),
+        }
+        result
+    }
+
+    async fn reverse_connect_inner(
+        &self,
+        request: ReverseConnectPayload,
+        opts: &ReverseConnectOptions<'_>,
+        target: &str,
+        accept_rx: oneshot::Receiver<Envelope>,
+        reject_rx: oneshot::Receiver<Envelope>,
+        challenge_rx: &mut oneshot::Receiver<Envelope>,
+    ) -> WshResult<ReverseOutcome> {
         self.send_control_message(Envelope {
             msg_type: MsgType::ReverseConnect,
             payload: Payload::ReverseConnect(request),
@@ -618,19 +720,28 @@ impl WshClient {
         let deadline = time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
         let mut answered = false;
-        loop {
+        let mut verified: Option<wsh_core::operator_proof::VerifiedChallenge> = None;
+        let response = loop {
             tokio::select! {
-                r = &mut accept_rx => return r.map_err(|_| WshError::Transport("response channel dropped".into())),
-                r = &mut reject_rx => return r.map_err(|_| WshError::Transport("response channel dropped".into())),
-                challenge = &mut challenge_rx, if !answered => {
+                r = &mut accept_rx => break r.map_err(|_| WshError::Transport("response channel dropped".into()))?,
+                r = &mut reject_rx => {
+                    let rejected = r.map_err(|_| WshError::Transport("response channel dropped".into()))?;
+                    return Ok(ReverseOutcome { response: rejected, peer_proven: None, sealed: false });
+                }
+                challenge = &mut *challenge_rx, if !answered => {
                     answered = true;
                     let challenge = challenge.map_err(|_| WshError::Transport("response channel dropped".into()))?;
-                    let (Some((key, username)), Payload::ReverseChallenge(msg)) = (operator, &challenge.payload) else {
+                    let (Some((key, username)), Payload::ReverseChallenge(msg)) = (opts.operator, &challenge.payload) else {
                         continue;
                     };
                     let own = wsh_core::fingerprint(&key.verifying_key().to_bytes());
-                    let verified = wsh_core::operator_proof::verify_challenge(msg, &target, &own)?;
-                    let proof = wsh_core::operator_proof::create_proof(key, &verified, username);
+                    let v = wsh_core::operator_proof::verify_challenge(msg, target, &own)?;
+                    let proof = wsh_core::operator_proof::create_proof(key, &v, username);
+                    if opts.sealed.is_some() {
+                        // the bridge's session is the challenge's: only its key exchange may cross now
+                        self.seal.begin(v.session_id.clone(), true);
+                    }
+                    verified = Some(v);
                     self.send_control_message(Envelope {
                         msg_type: MsgType::ReverseProof,
                         payload: Payload::ReverseProof(proof),
@@ -639,7 +750,133 @@ impl WshClient {
                 }
                 _ = &mut deadline => return Err(WshError::Timeout),
             }
+        };
+
+        let Payload::ReverseAccept(accept) = &response.payload else {
+            return Ok(ReverseOutcome {
+                response,
+                peer_proven: verified,
+                sealed: false,
+            });
+        };
+        if opts.require_peer_proof && verified.is_none() {
+            return Err(WshError::AuthFailed(
+                "reverse_connect: the peer did not prove its identity (require_peer_proof) -- nothing was sent over the bridge".into(),
+            ));
         }
+        if let Some(v) = &verified {
+            if !accept.target_fingerprint.is_empty()
+                && accept.target_fingerprint != v.peer_fingerprint
+            {
+                return Err(WshError::AuthFailed(
+                    "reverse_connect: the relay named a different peer than the one that signed the challenge".into(),
+                ));
+            }
+        }
+        // Only RelayForward-wrapped messages from a peer this operator accepted are unwrapped.
+        let peer = verified
+            .as_ref()
+            .map(|v| v.peer_fingerprint.clone())
+            .unwrap_or_else(|| accept.target_fingerprint.clone());
+        if !peer.is_empty() {
+            self.trust_relay_peer(peer).await;
+        }
+        let Some(seal) = opts.sealed else {
+            return Ok(ReverseOutcome {
+                response,
+                peer_proven: verified,
+                sealed: false,
+            });
+        };
+        let (Some(v), Some((key, _))) = (verified.clone(), opts.operator) else {
+            return Err(WshError::AuthFailed(
+                "reverse_connect: a sealed bridge needs the peer to answer with a challenge (does it support operator proof?)".into(),
+            ));
+        };
+        let states_sealed = accept.features.as_ref().is_some_and(|f| {
+            f.iter()
+                .any(|f| f == wsh_core::operator_proof::E2E_SEALED_FEATURE)
+        });
+        if !states_sealed {
+            return Err(WshError::AuthFailed(format!(
+                "reverse_connect: the peer does not state \"{}\", so a sealed bridge is not available -- nothing was sent",
+                wsh_core::operator_proof::E2E_SEALED_FEATURE
+            )));
+        }
+        let algorithm = if seal.hybrid {
+            ALGORITHM_HYBRID
+        } else {
+            crate::e2e::ALGORITHM_X25519
+        };
+        let exchanged = self
+            .initiate_e2e_with(
+                &v.session_id,
+                algorithm,
+                Duration::from_secs(10),
+                E2eOptions {
+                    verify_peer: Some(v.peer_public_key),
+                    sign_as: Some(key),
+                    responder_identity: Some(v.peer_public_key),
+                },
+            )
+            .await?;
+        self.seal.install(crate::bridge_seal::SealedBridge::new(
+            exchanged.shared_secret,
+            v.session_id.clone(),
+            crate::e2e_frame::RoleTag::Initiator,
+        ));
+        Ok(ReverseOutcome {
+            response,
+            peer_proven: verified,
+            sealed: true,
+        })
+    }
+
+    /// A bridge for `session_id` is being set up on this connection (the peer side of a sealed
+    /// bridge; see [`reverse_connect_with`](Self::reverse_connect_with) for the operator side).
+    /// With `must`, nothing but its key exchange crosses until [`install_bridge`](Self::install_bridge).
+    pub fn begin_sealing(&self, session_id: String, must: bool) {
+        self.seal.begin(session_id, must);
+    }
+
+    /// The peer side of a sealed bridge: answer the operator's signed `KeyExchange` for
+    /// `session_id` with `responder` (inside the dispatch loop, so the key is in place before the
+    /// next frame is read); `must`: nothing else crosses until then.
+    pub fn begin_sealing_as_responder(
+        &self,
+        session_id: String,
+        must: bool,
+        responder: crate::e2e::E2eResponder,
+    ) {
+        self.seal.begin_responder(session_id, must, responder);
+    }
+
+    /// Resolves once a bridge set up with
+    /// [`begin_sealing_as_responder`](Self::begin_sealing_as_responder) is sealed.
+    pub async fn bridge_sealed_event(&self) {
+        self.seal.wait_sealed().await;
+    }
+
+    /// The bridge key exists: from here everything crossing the relay is sealed.
+    pub fn install_bridge(&self, bridge: crate::bridge_seal::SealedBridge) {
+        self.seal.install(bridge);
+    }
+
+    /// The bridge is over: plain again.
+    pub fn end_sealing(&self) {
+        self.seal.end();
+    }
+
+    /// Is the bridge on this connection sealed?
+    pub fn bridge_sealed(&self) -> bool {
+        self.seal.is_sealed()
+    }
+
+    /// Resolves once the sealed bridge failed: a frame did not open (forged, tampered with,
+    /// replayed or reordered), so the relay is not honest and nothing crosses the bridge any
+    /// more. On the operator side the connection is closed as well.
+    pub async fn bridge_failed(&self) {
+        self.seal.wait_failed().await;
     }
 
     /// Send a control message and wait for a specific response type (public API).
@@ -1116,7 +1353,34 @@ impl WshClient {
         algorithm: &str,
         timeout: Duration,
     ) -> WshResult<E2eKeyExchange> {
+        self.initiate_e2e_with(session_id, algorithm, timeout, E2eOptions::default())
+            .await
+    }
+
+    /// [`initiate_e2e`](Self::initiate_e2e) with both halves signed (wsh #117, #145):
+    /// `verify_peer` is the peer's long-term Ed25519 key -- the exchange is refused unless the
+    /// peer signed its half with it (a relay that swaps either ephemeral key cannot); `sign_as`
+    /// signs this (initiator) half with the operator's key, naming the responder it means to
+    /// reach (`responder_identity`, default `verify_peer`). The transcripts are those of
+    /// `src/e2e-exchange.mjs` ([`wsh_core::e2e_exchange`]).
+    pub async fn initiate_e2e_with(
+        &self,
+        session_id: &str,
+        algorithm: &str,
+        timeout: Duration,
+        opts: E2eOptions<'_>,
+    ) -> WshResult<E2eKeyExchange> {
         let want_hybrid = algorithm == ALGORITHM_HYBRID;
+
+        // Register both waiters before ANY await: two peers establishing E2E at once, or a host
+        // whose ML-KEM ciphertext follows its reply at once, send into a window in which a
+        // message no waiter is listening for is routed elsewhere (wsh #33).
+        let round1_rx = self.register_waiter(MsgType::KeyExchange).await;
+        let round2_rx = if want_hybrid {
+            Some(self.register_waiter(MsgType::KeyExchange).await)
+        } else {
+            None
+        };
 
         // Generate an ephemeral X25519 key pair (and, for hybrid, a fresh
         // ML-KEM-768 key pair too).
@@ -1131,6 +1395,28 @@ impl WshClient {
         };
         let local_kem_public_bytes = local_kem.as_ref().map(|(_dk, ek)| ek.to_bytes().to_vec());
 
+        // The initiator signs its half too when it has a signer and knows whom it is talking to.
+        let signature = match opts.sign_as {
+            Some(key) => {
+                let responder = opts
+                    .responder_identity
+                    .or(opts.verify_peer)
+                    .ok_or_else(|| {
+                        WshError::Other(
+                            "initiate_e2e: sign_as needs responder_identity or verify_peer".into(),
+                        )
+                    })?;
+                Some(wsh_core::e2e_exchange::sign_initiator(
+                    key,
+                    session_id,
+                    algorithm,
+                    &local_public_bytes,
+                    &responder,
+                ))
+            }
+            None => None,
+        };
+
         let round1 = Envelope {
             msg_type: MsgType::KeyExchange,
             payload: Payload::KeyExchange(KeyExchangePayload {
@@ -1139,13 +1425,11 @@ impl WshClient {
                 session_id: session_id.to_string(),
                 kem_public_key: local_kem_public_bytes,
                 kem_ciphertext: None,
-                signature: None,
+                signature,
             }),
         };
-
-        let peer_round1 = self
-            .send_and_wait_for(round1, MsgType::KeyExchange, timeout)
-            .await?;
+        self.send_control_message(round1).await?;
+        let peer_round1 = Self::await_waiter(round1_rx, timeout).await?;
         let peer = match peer_round1.payload {
             Payload::KeyExchange(p) => p,
             _ => {
@@ -1164,6 +1448,28 @@ impl WshClient {
                 peer_public_key.len()
             ))
         })?;
+
+        let mut peer_authenticated = false;
+        if let Some(identity) = opts.verify_peer {
+            if !wsh_core::e2e_exchange::verify_key_exchange_signature(
+                &identity,
+                peer.signature.as_deref(),
+                session_id,
+                algorithm,
+                &local_public_bytes,
+                &peer_public_key,
+            ) {
+                return Err(WshError::AuthFailed(if peer.signature.is_none() {
+                    "initiate_e2e: the peer did not sign its key exchange (verify_peer was given)"
+                        .into()
+                } else {
+                    "initiate_e2e: the peer's key exchange signature does not verify against verify_peer"
+                        .into()
+                }));
+            }
+            peer_authenticated = true;
+        }
+
         let peer_x25519_public = X25519PublicKey::from(peer_public_array);
         let x25519_shared = ephemeral_secret.diffie_hellman(&peer_x25519_public);
         let x25519_secret_bytes = *x25519_shared.as_bytes();
@@ -1176,8 +1482,7 @@ impl WshClient {
 
             // Lexicographic byte comparison: Rust's `Ord` on `&[u8]`
             // already compares elementwise then by length, matching the
-            // JS `compareBytes` helper exactly, so no separate comparator
-            // is needed here.
+            // JS `compareBytes` helper exactly.
             let is_encapsulator = local_public_bytes < peer_public_key;
 
             let kem_shared_secret: [u8; 32] = if is_encapsulator {
@@ -1202,7 +1507,11 @@ impl WshClient {
                     WshError::Other("ML-KEM-768 shared secret was not 32 bytes".into())
                 })?
             } else {
-                let peer_round2 = self.wait_for(MsgType::KeyExchange, timeout).await?;
+                let peer_round2 = Self::await_waiter(
+                    round2_rx.expect("registered when hybrid was wanted"),
+                    timeout,
+                )
+                .await?;
                 let ct_payload = match peer_round2.payload {
                     Payload::KeyExchange(p) => p,
                     _ => {
@@ -1231,6 +1540,7 @@ impl WshClient {
             peer_public_key,
             shared_secret,
             hybrid: hybrid_active,
+            peer_authenticated,
         })
     }
 
@@ -1739,6 +2049,7 @@ impl WshClient {
         accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
         early: EarlyShared,
         gateway: Arc<GatewayHub>,
+        seal: Arc<SealGate>,
     ) {
         loop {
             let is_connected = { *connected.lock().await };
@@ -1749,6 +2060,8 @@ impl WshClient {
             tokio::select! {
                 // Handle outgoing control messages
                 Some(frame) = outgoing_rx.recv() => {
+                    // A sealed bridge: what leaves is sealed, in this (the sending) order.
+                    let Some(frame) = seal.outgoing(frame) else { continue };
                     let mut t = transport.lock().await;
                     if let Err(e) = t.send_control(&frame).await {
                         tracing::error!("failed to send control message: {}", e);
@@ -1790,6 +2103,7 @@ impl WshClient {
 
                     match frame_encode(&envelope) {
                         Ok(frame) => {
+                            let Some(frame) = seal.outgoing(frame) else { continue };
                             let mut t = transport.lock().await;
                             if let Err(e) = t.send_control(&frame).await {
                                 tracing::error!("failed to send action: {}", e);
@@ -1811,6 +2125,11 @@ impl WshClient {
                             match decode_envelope(&data) {
                                 Ok(envelope) => {
                                     tracing::trace!(msg_type = ?envelope.msg_type, "control message");
+                                    // A plain message a relay may forward is not heard on a bridge that is sealed.
+                                    if seal.drop_unwrapped(&envelope) {
+                                        tracing::warn!(msg_type = ?envelope.msg_type, "dropping an unwrapped plaintext message on a sealed bridge");
+                                        continue;
+                                    }
                                     Self::handle_incoming(
                                         envelope,
                                         &response_tx,
@@ -1821,7 +2140,14 @@ impl WshClient {
                                         &accepted_relay_peers,
                                         &early,
                                         &gateway,
+                                        &seal,
                                     ).await;
+                                    if seal.has_failed() && seal.closes_on_failure() {
+                                        tracing::error!("the sealed bridge failed: closing the connection");
+                                        let mut c = connected.lock().await;
+                                        *c = false;
+                                        break;
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("failed to decode control message: {}", e);
@@ -1863,6 +2189,7 @@ impl WshClient {
         accepted_relay_peers: &'a Arc<Mutex<HashSet<String>>>,
         early: &'a EarlyShared,
         gateway: &'a Arc<GatewayHub>,
+        seal: &'a Arc<SealGate>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             // Unwrap RelayForward: only deliver the inner message if it came
@@ -1885,6 +2212,19 @@ impl WshClient {
                     }
                     match decode_envelope(&p.inner) {
                         Ok(inner) if is_relay_forwardable(inner.msg_type) => {
+                            // A sealed bridge (#117, #145): `from_fingerprint` is whatever the relay stamped, so
+                            // plain traffic proves nothing -- only frames of the bridge (and, while it is being
+                            // set up, its key exchange) are heard.
+                            let gated = seal.incoming_forwarded(inner);
+                            // The key exchange's replies (this side is the responder) leave in order, plain.
+                            for reply in gated.replies {
+                                if let Ok(frame) = frame_encode(&reply) {
+                                    let _ = outgoing_tx.send(frame).await;
+                                }
+                            }
+                            let Some(inner) = gated.deliver else {
+                                return;
+                            };
                             Self::handle_incoming(
                                 inner,
                                 response_tx,
@@ -1895,6 +2235,7 @@ impl WshClient {
                                 accepted_relay_peers,
                                 early,
                                 gateway,
+                                seal,
                             )
                             .await;
                         }
@@ -2405,6 +2746,7 @@ mod tests {
             &Arc::new(Mutex::new(HashSet::new())),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .await;
 
@@ -2442,6 +2784,7 @@ mod tests {
             &Arc::new(Mutex::new(HashSet::new())),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .await;
 
@@ -2470,6 +2813,7 @@ mod tests {
             &None,
             &Some(relay_tx),
             &Arc::new(Mutex::new(HashSet::new())),
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
@@ -2544,6 +2888,7 @@ mod tests {
                 &client.accepted_relay_peers,
                 &client.early,
                 &client.gateway,
+                &client.seal,
             )
             .await;
         }
@@ -2607,6 +2952,7 @@ mod tests {
             &rig.accepted_relay_peers,
             &rig.client.early,
             &rig.client.gateway,
+            &rig.client.seal,
         )
         .await;
         assert!(relay_rx.try_recv().is_ok());
@@ -2679,6 +3025,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(4);
 
         let client = WshClient {
+            seal: Default::default(),
             transport: Arc::new(Mutex::new(crate::transport::AnyTransport::Test(
                 crate::transport::TestTransport,
             ))),
@@ -2782,6 +3129,7 @@ mod tests {
         let accepted_relay_peers = Arc::new(Mutex::new(HashSet::new()));
 
         let client = WshClient {
+            seal: Default::default(),
             transport: Arc::new(Mutex::new(crate::transport::AnyTransport::Test(
                 crate::transport::TestTransport,
             ))),
@@ -2847,6 +3195,7 @@ mod tests {
                     &None,
                     &None,
                     &accepted_relay_peers,
+                    &Default::default(),
                     &Default::default(),
                     &Default::default(),
                 )
@@ -2947,6 +3296,7 @@ mod tests {
                 &None,
                 &None,
                 &accepted_relay_peers,
+                &Default::default(),
                 &Default::default(),
                 &Default::default(),
             )
