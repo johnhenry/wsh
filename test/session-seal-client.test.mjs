@@ -130,7 +130,7 @@ describe('the JS client seals a session (sealSession)', () => {
   it('a host that REQUIRES sealing serves a client that opted out of nothing: false is refused and opens nothing', async () => {
     const s = await setup({ sealSession: 'require' });
     const c = await login(s, { sealSession: false });
-    await assert.rejects(c.openEndpoint('probe', { timeout: 1500 }));
+    await assert.rejects(c.openEndpoint('probe', { timeoutMs: 1500 }));
     assert.equal(s.probes.count, 0, 'the endpoint was never opened');
   });
 
@@ -164,7 +164,7 @@ describe('the JS client seals a session (sealSession)', () => {
     const s2 = await setup({ sealSession: 'require', relayHooks: { toClient: strip } });
     const c = await login(s2); // auto: it believed the relay, and the host that requires sealing serves it nothing
     assert.equal(c.sessionSealed, false);
-    await assert.rejects(c.openEndpoint('probe', { timeout: 1500 }));
+    await assert.rejects(c.openEndpoint('probe', { timeoutMs: 1500 }));
     assert.equal(s2.probes.count, 0);
   });
 
@@ -203,7 +203,7 @@ describe('a hostile relay cannot work with a sealed session', () => {
     let closed = false; c.onClose = () => { closed = true; };
     assert.equal(await echo(c, 'warm up'), 'warm up');
     armed = true;
-    await assert.rejects(c.openEndpoint('probe', { timeout: 3000 }));
+    await assert.rejects(c.openEndpoint('probe', { timeoutMs: 3000 }));
     await until(() => s.logs.some((l) => /did not open/.test(l)), `the host to refuse the frame: ${s.logs.join(' | ')}`);
     await until(() => closed, 'the client to learn the session is over');
     assert.equal(s.probes.count, 0);
@@ -236,7 +236,7 @@ describe('a hostile relay cannot work with a sealed session', () => {
     const c = await login(s, { sealSession: true });
     assert.equal(await echo(c, 'warm up'), 'warm up');
     replay = true;
-    await c.openEndpoint('probe', { timeout: 3000 }).catch(() => {});
+    await c.openEndpoint('probe', { timeoutMs: 3000 }).catch(() => {});
     await until(() => s.logs.some((l) => /did not open/.test(l)), `the host to refuse the replay: ${s.logs.join(' | ')}`);
   });
 

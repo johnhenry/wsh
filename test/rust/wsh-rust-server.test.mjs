@@ -1966,9 +1966,15 @@ describe('Rust wsh-server McpCancel (wsh #110)', () => {
     while (Date.now() < end) { if (await fn()) return true; await sleep(20); }
     return false;
   };
-  // A process that has exited but not been reaped (zombie) counts as stopped.
+  // A process that has exited but not been reaped (zombie) counts as stopped. `ps -o stat=` prints the state letter on
+  // Linux and macOS alike (there is no /proc on macOS, which made every pid look dead there); it prints nothing, and
+  // exits 1, for a pid that no longer exists.
   const alive = (pid) => {
-    try { return !/^\d+ \(.*\) [ZX] /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; }
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      const stat = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      return stat !== '' && !/^[ZX]/.test(stat);
+    } catch { return false; }
   };
   const readPid = (file) => (existsSync(file) ? Number(readFileSync(file, 'utf8').trim()) : NaN);
 

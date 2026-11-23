@@ -1297,7 +1297,7 @@ closes the channel when received.
 | Protocol | Methods |
 |---|---|
 | `wsh-host` | `host.info` -> `{ version, protocol, features (this connection's ServerHello), hostFingerprint, user, rpc }`; `host.ping` -> `{ time }` |
-| `wsh-fs` | `stat`, `list`, `mkdir`, `remove`, `rename { path, newPath }`, `write { path, data, offset? }`, `upload { path, data, offset? }` (offset omitted/0 creates or truncates, later offsets continue in place: chunk big files), `read { path, offset?, length? }` and `download { path }` (the bytes arrive as `$/progress` chunks of at most 64 KiB; the result is `{ size, offset, length, eof }`). Same confinement as `fs`: no traversal or symlink escapes, `readOnly`, `maxFileBytes`; policy refusals are `-32003`. |
+| `wsh-fs` | `stat`, `list` (entries sorted by name in UTF-16 code-unit order on every platform and on both hosts: upper case before lower case, whatever the filesystem's case rules), `mkdir`, `remove`, `rename { path, newPath }`, `write { path, data, offset? }`, `upload { path, data, offset? }` (offset omitted/0 creates or truncates, later offsets continue in place: chunk big files), `read { path, offset?, length? }` and `download { path }` (the bytes arrive as `$/progress` chunks of at most 64 KiB; the result is `{ size, offset, length, eof }`). Same confinement as `fs`: no traversal or symlink escapes, `readOnly`, `maxFileBytes`; policy refusals are `-32003`. |
 | `mcp` | The MCP JSON-RPC surface verbatim; see below |
 
 When a host advertises `rpc-protocol:wsh-fs`, `fileStat` / `fileList` / `fileRead` /
