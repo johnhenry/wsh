@@ -177,6 +177,23 @@ for (const [routeName, route] of routes) {
       await s.cli.stop();
     });
 
+    it('fs.root is the shared directory as typed (made tidy), per share; --share-hide-path leaves it undefined and the share works (#164)', async () => {
+      const a = tmpDir(); const b = tmpDir();
+      tree(a, { 'x.txt': 'xx' }); tree(b, { 'y.txt': 'yy' });
+      const s = await session(route, [`one=${a}/`, `two=${b.replace(/\/([^/]+)$/, '//./$1')}:rw`]);
+      assert.equal((await s.shares.share('one')).root, a);
+      assert.equal((await s.shares.share('two')).root, b);
+      assert.equal(dec(await (await s.shares.share('one')).readFile('/x.txt')), 'xx');
+      await s.cli.stop();
+
+      const hidden = await session(route, [`one=${a}`, `two=${b}`], { extraArgs: ['--share-hide-path'] });
+      const one = await hidden.shares.share('one');
+      assert.equal(one.root, undefined);
+      assert.equal((await hidden.shares.share('two')).root, undefined);
+      assert.equal(dec(await one.readFile('/x.txt')), 'xx');
+      await hidden.cli.stop();
+    });
+
     it('lists with attributes, reads small and large files (checksum), and sees a host-side edit on the next read', async () => {
       const dir = tmpDir();
       const big = crypto.randomBytes(20 * MiB + 17);

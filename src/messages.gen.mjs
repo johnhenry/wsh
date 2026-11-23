@@ -991,14 +991,10 @@ export function authorizedKeyResult({ success, added = false, errorMessage } = {
   return msg;
 }
 
-export function shareOffer({ shares, writable = [], maxInflight, maxBytes } = {}) {
-  return {
-    type: MSG.SHARE_OFFER,
-    shares,
-    writable,
-    max_inflight: maxInflight,
-    max_bytes: maxBytes,
-  };
+export function shareOffer({ shares, writable = [], maxInflight, maxBytes, paths } = {}) {
+  const msg = { type: MSG.SHARE_OFFER, shares, writable, max_inflight: maxInflight, max_bytes: maxBytes };
+  if (paths !== undefined) msg.paths = paths;
+  return msg;
 }
 
 export function shareRequest({ requestId, share, op, path, to, handle, offset, length, mode, flags = [], cursor, attr = {}, data } = {}) {

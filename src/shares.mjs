@@ -25,6 +25,18 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ERRNOS = new Set(['ENOENT', 'EEXIST', 'ENOTDIR', 'EISDIR', 'ENOTEMPTY', 'EACCES', 'EPERM', 'EROFS', 'EINVAL', 'EBADF', 'ELOOP',
   'ENAMETOOLONG', 'ENOSPC', 'EMFILE', 'EBUSY', 'EAGAIN', 'EXDEV', 'EFBIG', 'ENOTSUP', 'ESTALE', 'EIO']);
 const MAX_SHARES = 16;
+const MAX_ROOT_BYTES = 4096;
+
+/**
+ * The advisory root path of each share from `ShareOffer.paths` (#164): an array exactly as long as `shares`, each entry an
+ * absolute string of at most 4096 bytes without NUL. Anything else is `undefined` (never an error): the host cannot verify it.
+ * @returns {Array<string | undefined>}
+ */
+function offeredRoots(paths, count) {
+  const none = new Array(count).fill(undefined);
+  if (!Array.isArray(paths) || paths.length !== count) return none;
+  return paths.map((p) => (typeof p === 'string' && p.startsWith('/') && !p.includes('\0') && new TextEncoder().encode(p).length <= MAX_ROOT_BYTES ? p : undefined));
+}
 const MAX_INFLIGHT = 64;
 const MIN_BYTES = 4096;
 const MAX_BYTES = 4 * 1024 * 1024;
@@ -231,7 +243,7 @@ function wireAttr(c = {}) {
  * ("/"-separated; a leading "/" means the root); `..` is refused by the operator's client. Errors are `ShareError`s
  * with `.code` an errno-like string (`ENOENT`, `EROFS`, ...).
  */
-function createShareFs(core, name, writable, signal) {
+function createShareFs(core, name, writable, signal, root) {
   const call = (op, fields) => core.call(name, op, fields);
   const norm = (p) => { if (typeof p !== 'string') throw new ShareError('EINVAL', 'a path must be a string'); return p; };
   const maxFileBytes = DEFAULT_MAX_FILE_BYTES;
@@ -240,6 +252,8 @@ function createShareFs(core, name, writable, signal) {
     name,
     /** Whether the operator offered writes. */
     writable,
+    /** The share's root path on the operator's machine, as the operator typed it, or undefined. ADVISORY and unverified (#164). */
+    get root() { return root; },
     maxFileBytes,
     /** Aborted when the connection to the operator ends. */
     signal,
@@ -392,8 +406,9 @@ export function createShareSession({ send, onShare, who, log = () => {}, timeout
     }
     const writable = new Set(Array.isArray(m.writable) ? m.writable.filter((n) => names.includes(n)) : []);
     core.configure({ maxInflight: clampInt(m.max_inflight, 1, MAX_INFLIGHT), maxBytes: clampInt(m.max_bytes, MIN_BYTES, MAX_BYTES) });
-    for (const name of names) {
-      const fs = createShareFs(core, name, writable.has(name), abort.signal);
+    const roots = offeredRoots(m.paths, names.length);
+    for (const [i, name] of names.entries()) {
+      const fs = createShareFs(core, name, writable.has(name), abort.signal, roots[i]);
       shares.set(name, fs);
       Promise.resolve()
         .then(() => onShare(name, fs, who()))
