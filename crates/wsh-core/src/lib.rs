@@ -20,6 +20,11 @@ pub mod remote_runtime;
 pub mod token;
 pub mod transport;
 
+/// `ServerHello.features` of a relay that serves several operators per peer, and
+/// `ReverseAccept.features` of a peer that does: it addresses each message to one operator with
+/// `RelayForward.to_fingerprint` and understands `ReverseClose` (wsh #89, #93).
+pub const RELAY_MULTI_OPERATOR_FEATURE: &str = "relay-multi-operator";
+
 // Re-export commonly used items at crate root.
 pub use codec::{cbor_decode, cbor_encode, decode_envelope, frame_encode, FrameDecoder};
 pub use error::{WshError, WshResult};

@@ -125,6 +125,14 @@ struct Cli {
     #[arg(long = "allow-operator", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
     allow_operators: Vec<String>,
 
+    /// Reverse host (`wsh reverse`, `wsh agent run`): serve up to N operators at once, each with
+    /// its own sessions (default 1). Only on a relay that advertises `relay-multi-operator`
+    /// (`wsh-server` with `[relay] max_operators_per_peer` above 1, or the JS relay with
+    /// `maxOperatorsPerPeer`); any other relay is served one operator at a time. Not with
+    /// `--require-operator-proof`: that needs a sealed bridge, and a seal is one per connection.
+    #[arg(long = "max-operators", global = true, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=64))]
+    max_operators: u64,
+
     /// `wsh reverse-connect`: always offer to prove this operator's identity to the peer (needed
     /// for a peer that does not advertise `operator-proof`, such as a JS host).
     #[arg(long = "operator-proof", global = true)]
@@ -399,6 +407,7 @@ async fn main() {
         require_channel_binding: cli.require_channel_binding,
         require_operator_proof: cli.require_operator_proof,
         allow_operators: cli.allow_operators.clone(),
+        max_operators: cli.max_operators as usize,
         operator_proof: if cli.operator_proof {
             commands::common::OperatorProofMode::Always
         } else if cli.no_operator_proof {

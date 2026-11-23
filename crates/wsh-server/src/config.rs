@@ -21,6 +21,37 @@ pub struct ConfigFile {
     pub rpc: RpcSection,
     #[serde(default)]
     pub mcp: McpSection,
+    #[serde(default)]
+    pub relay: RelaySection,
+}
+
+/// `[relay]` section: how the relay (started with `--enable-relay`) bridges operators to peers.
+///
+/// ```toml
+/// [relay]
+/// max_operators_per_peer = 4
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelaySection {
+    /// How many operators one peer may be bridged to at once (wsh #93). Default: `1`, the relay
+    /// as it always was. Above 1 the relay advertises `relay-multi-operator`; only a peer that
+    /// states the same feature in its `ReverseAccept` (it then addresses each message to one
+    /// operator with `RelayForward.to_fingerprint` and is told with `ReverseClose` when one
+    /// leaves) is bridged to several, every other peer stays at one.
+    #[serde(default = "default_relay_max_operators")]
+    pub max_operators_per_peer: usize,
+}
+
+fn default_relay_max_operators() -> usize {
+    1
+}
+
+impl Default for RelaySection {
+    fn default() -> Self {
+        Self {
+            max_operators_per_peer: default_relay_max_operators(),
+        }
+    }
 }
 
 /// `[mcp]` section: command-line tools offered over `McpDiscover` / `McpCall`.
@@ -102,6 +133,9 @@ pub struct ServerSection {
     #[serde(default)]
     pub seal_session: SealSession,
 }
+
+/// The most operators `[relay] max_operators_per_peer` may allow one peer.
+pub const MAX_RELAY_OPERATORS_PER_PEER: usize = 64;
 
 /// `[server] seal_session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -429,6 +463,8 @@ pub struct ServerConfig {
     pub idle_timeout: u64,
     /// Whether the relay (peer-to-peer forwarding) subsystem is enabled.
     pub enable_relay: bool,
+    /// See [`RelaySection::max_operators_per_peer`].
+    pub relay_max_operators_per_peer: usize,
     /// Whether public-key authentication is accepted.
     pub allow_pubkey: bool,
     /// Whether password authentication is accepted.
@@ -526,6 +562,7 @@ impl ServerConfig {
                     gateway: GatewaySection::default(),
                     rpc: RpcSection::default(),
                     mcp: McpSection::default(),
+                    relay: RelaySection::default(),
                 }
             }
         } else {
@@ -535,6 +572,7 @@ impl ServerConfig {
                 gateway: GatewaySection::default(),
                 rpc: RpcSection::default(),
                 mcp: McpSection::default(),
+                relay: RelaySection::default(),
             }
         };
 
@@ -607,6 +645,12 @@ impl ServerConfig {
             ));
         }
 
+        if !(1..=MAX_RELAY_OPERATORS_PER_PEER).contains(&file_config.relay.max_operators_per_peer) {
+            return Err(wsh_core::WshError::Other(format!(
+                "config: [relay] max_operators_per_peer must be between 1 and {MAX_RELAY_OPERATORS_PER_PEER}"
+            )));
+        }
+
         Ok(Self {
             port,
             cert_path: expand_tilde_str(&cert_str),
@@ -615,6 +659,7 @@ impl ServerConfig {
             session_ttl,
             idle_timeout,
             enable_relay: cli_enable_relay,
+            relay_max_operators_per_peer: file_config.relay.max_operators_per_peer,
             allow_pubkey: file_config.auth.allow_pubkey,
             allow_password: file_config.auth.allow_password,
             gateway_enabled: file_config.gateway.enabled,
@@ -862,6 +907,23 @@ reverse_bind_addr = "0.0.0.0"
         let result = ServerConfig::load(Some(&path), None, None, None, None, None, None, false);
         std::fs::remove_dir_all(&dir).ok();
         result.err().expect("config is refused").to_string()
+    }
+
+    #[test]
+    fn the_relay_takes_one_operator_per_peer_unless_the_config_says_more() {
+        assert_eq!(load_defaults().relay_max_operators_per_peer, 1);
+        assert_eq!(load("").relay_max_operators_per_peer, 1);
+        assert_eq!(
+            load("[relay]\nmax_operators_per_peer = 4\n").relay_max_operators_per_peer,
+            4
+        );
+        for bad in ["0", "65", "-1"] {
+            let err = load_err(&format!("[relay]\nmax_operators_per_peer = {bad}\n"));
+            assert!(
+                err.contains("max_operators_per_peer"),
+                "{bad} is refused: {err}"
+            );
+        }
     }
 
     #[test]
