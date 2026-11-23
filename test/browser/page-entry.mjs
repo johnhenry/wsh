@@ -111,7 +111,7 @@ function pageEndpoints(record) {
   };
 }
 
-window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding, firstOutputDelayMs = 0 } = {}) => {
+window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding } = {}) => {
   const log = [];
   const record = { opened: [] };
   const ptyCalls = [];
@@ -133,8 +133,6 @@ window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = f
         await new Promise((resolve) => io.onInputEnd(resolve));
         return 0;
       }
-      // (a spec driving a RELEASED Rust CLI asks for a pause here: releases up to rust-v0.6.0 drop output that arrives in the same burst as OpenOk, #135)
-      if (firstOutputDelayMs) await new Promise((resolve) => setTimeout(resolve, firstOutputDelayMs));
       await io.write(`ran:${command}\n`);
       return 3;
     },

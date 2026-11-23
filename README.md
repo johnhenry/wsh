@@ -375,13 +375,30 @@ mistaken for (or smuggled as) a file-system path or an abstract-namespace name, 
 consulted for it; the registered names are an allow-list by construction. `who` is the authenticated
 `{ username, fingerprint }`, so the embedder can authorise per call (throw to refuse, or `{ open, authorize(who) }`).
 
-**Rust side: JS only for now.** `wsh-server` does not advertise `gateway-unix`, `gateway-endpoints` or `gateway-credit`,
-and `wsh` has no `-L` / `-R` with unix sockets yet. What it must implement: `OpenUnix { gateway_id, path }` and
-`ListenUnix { listener_id, path, replace? }` (answer with the existing `GatewayOk`/`GatewayFail` and `ListenOk` with
-`actual_port: 0`/`ListenFail`; accepted connections announced with `InboundOpen` and answered by `InboundAccept`'s
-`gateway_id`), the same path policy and `0600`/unlink rules, `GatewayCredit` (256 KiB initial credit per direction when
-the client's `Hello.features` lists `gateway-credit`), and in the CLI `-L [bind:]port:/remote.sock`,
-`-L /local.sock:/remote.sock`, `-R /remote.sock:host:port` and `-R /remote.sock:/local.sock`.
+**Rust side.** The Rust `wsh-server` serves the same messages with the same policy (`[gateway]`, off unless
+`enabled = true`; `gateway-unix` is advertised only when a socket is listed):
+
+```toml
+[gateway]
+enabled = true
+unix_connect = ["/var/run/docker.sock", "/run/user/1000/wsh/"]  # OpenUnix: exact path, "/dir/" prefix, or "@abstract" (Linux)
+unix_listen = ["/run/user/1000/wsh/"]                            # ListenUnix: sockets a client may ask the host to create
+unix_replace_stale = false      # replace a stale socket file only if the request asks AND this is true
+unix_max_listeners = 4          # per client connection
+max_buffered_bytes = 4194304    # per connection, for a peer without gateway-credit (at least 262144)
+max_client_buffered_bytes = 33554432
+```
+
+The checks are the Node host's: paths judged after `realpath` of the parent, a `..` segment refused, the target must be a
+socket and not a symlink, created sockets are `0600` and unlinked on close, a socket that something still accepts on is
+never replaced, a file that is not a socket is never touched; a bad pattern (`/`, a relative path, `..`) stops the server
+at start-up. `GatewayCredit` is served with 256 KiB per direction when the client lists `gateway-credit`; without it the
+host closes a connection that has more than `max_buffered_bytes` of unconsumed client data (or the client more than
+`max_client_buffered_bytes`). The `gateway_id` and `listener_id` tables are per client connection (before, one table was
+shared by every client). A Rust host does not offer named endpoints.
+
+The CLI forwards like OpenSSH (see [Rust implementation](#running-a-command-with-wsh)): `wsh -L /tmp/docker.sock:/var/run/docker.sock user@host`,
+`wsh -N -L 2375:/var/run/docker.sock user@host`, `wsh -N -L /tmp/d.sock:endpoint=docker --via wss://relay/r/<id> user@host`.
 
 ### TLS (`wss://`) and host extensions
 
@@ -1457,6 +1474,36 @@ disconnects. `wsh connect` ends when the remote session does. Diagnostics go to 
 never into the command's stdout. TLS uses the platform trust store, and `SSL_CERT_FILE` points it at another certificate (how a self-signed host is trusted); a plain
 `ws://` URL is accepted only for a loopback host.
 
+### Forwarding with `wsh -L` / `-R` / `-N`
+
+Modelled on OpenSSH. The forwards live as long as the connection does (`wsh -L ... user@host` also runs the command or
+shell; `-N` only forwards, until Ctrl-C), work with `--via` (the pipe relay carries them like anything else), and may be
+repeated:
+
+```sh
+wsh -L 8080:db.internal:5432 alice@host                  # [bind_addr:]port:host:hostport  (the HOST connects to db.internal)
+wsh -N -L /tmp/docker.sock:/var/run/docker.sock alice@host     # local unix socket -> a unix socket on the host
+wsh -N -L 127.0.0.1:2375:/var/run/docker.sock alice@host       # local TCP port -> a unix socket on the host
+wsh -N -L /tmp/db.sock:db.internal:5432 alice@host             # local unix socket -> TCP the host reaches
+wsh -N -L /tmp/docker.sock:endpoint=docker --via wss://relay/r/<id> alice@tab.example   # a NAMED ENDPOINT of an in-page host
+wsh -N -R /run/user/1000/wsh/app.sock:127.0.0.1:3000 alice@host # the HOST listens on a unix socket; connections come here
+wsh -N -R 9000:localhost:3000 alice@host                        # the host listens on a TCP port (loopback by default)
+```
+
+A named endpoint is written `endpoint=NAME` as the remote end of `-L` (`NAME`: letters, digits, `.`, `_`, `-`; at most 64).
+The `=` cannot occur in a host name, a port or a path, so it can never be mistaken for a host called "endpoint" (that is
+`endpoint:80`), and `@NAME` is already the Linux abstract-namespace socket (`-L 8080:@name`). A host with no file system
+(an in-page host) offers endpoints instead of unix sockets; `wsh -L ...:endpoint=docker` plus `DOCKER_HOST=unix:///tmp/docker.sock`
+is the shape of reaching a daemon behind one. `-R` cannot name an endpoint (a host offers those, it does not listen on them).
+
+Local TCP listeners bind `127.0.0.1` unless `bind_addr` says otherwise (`*` or `0.0.0.0` listens on every interface, and `wsh`
+warns). Local unix sockets are created `0600`, removed on exit (a killed `wsh` leaves its file), and an existing file at the
+path is **refused** unless `--replace-socket` is given, which replaces only a stale socket: never a live one, never a file that
+is not a socket. With `-R`, `--replace-socket` asks the host to replace its own stale socket (its policy decides). A host that
+cannot do what a forward needs says so (`this host does not offer unix-socket forwarding`, `no such endpoint`, `not allowed by
+the gateway policy`); a malformed spec exits with status 2 before anything is dialled. Up to 128 forwarded connections are
+open at once. `-L`/`-R`/`-N` apply to `wsh [user@]host [command...]` and `wsh connect` only.
+
 ### Capability matrix: JS SDK vs Rust CLI/client
 
 Two implementations of one protocol will always have *some* asymmetry --
@@ -1480,9 +1527,9 @@ than left to be found.
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side; several operators per peer and the signed `KeyExchange` are JS-relay only for now |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
-| Unix-domain socket forwarding, both directions; named endpoints (#120) | `client.openUnix()`, `listenUnix()`, `forwardUnix()` (Node: `-L`/`-R` shapes with unix and TCP ends mixed), `openEndpoint()`; host: `gateway: { unix, endpoints }`, `createMemoryHost({ endpoints })` | none yet (`wsh -L` / `-R` with sockets are not implemented) | **JS only for now.** Wire: `OpenUnix`, `OpenEndpoint`, `ListenUnix` behind the `gateway-unix` / `gateway-endpoints` host features; the Rust server and CLI must implement them (message handling, the path policy, `-L`/`-R` flags) as described under [Gateway](#unix-domain-sockets-streamlocal-and-named-endpoints) |
-| Gateway flow control (#123) | credit per connection (`GatewayCredit`, feature `gateway-credit`); host caps for peers without it | none: the Rust forwarder has bounded in-process queues but no per-connection credit and no per-client byte cap | **JS only for now** (negotiated, so a Rust peer on either side keeps today's unmetered behaviour) |
-| TCP reverse tunnels (`ListenRequest`, #98) | `@johnhenry/wsh/server` `gateway.reverse` (off by default; loopback unless the operator lists addresses; port allow-list, nothing below 1024 unless named; bounded listeners/connections/backlog/idle); client `listenTcp(port, { onConnection })` | `wsh-server` `[gateway] enable_reverse_tunnels` + `reverse_bind_addr` (off by default, loopback, client `bind_addr` ignored); no port allow-list; no per-listener connection, backlog or idle bounds beyond `max_connections` | **Wire-unified** (`ListenRequest`/`ListenOk`/`ListenFail`/`InboundOpen`/`InboundAccept`; the JS host sends the real `peer_addr`/`peer_port`). **Rust still needs**: a port allow-list and per-client listener / per-listener connection / idle bounds to match the JS host, and credit (`gateway-credit`) on accepted connections |
+| Unix-domain socket forwarding, both directions; named endpoints (#120) | `client.openUnix()`, `listenUnix()`, `forwardUnix()` (Node: `-L`/`-R` shapes with unix and TCP ends mixed), `openEndpoint()`; host: `gateway: { unix, endpoints }`, `createMemoryHost({ endpoints })` | `wsh-server` serves `OpenUnix`/`ListenUnix` (`[gateway] unix_connect`, `unix_listen`, `unix_replace_stale`, `unix_max_listeners`; same policy as the Node host); `wsh-client` has `open_tcp`/`open_unix`/`open_endpoint`/`listen_unix`/`listen_tcp`; CLI `wsh -L` / `-R` / `-N` with TCP, unix and `endpoint=NAME` ends, also through `--via` | **Wire-unified, both directions** (#145). A Rust host does not offer named endpoints (an in-page host does); the CLI reaches them. See [Forwarding with `wsh -L`](#forwarding-with-wsh--l---r---n) |
+| Gateway flow control (#123) | credit per connection (`GatewayCredit`, feature `gateway-credit`); host caps for peers without it | `wsh-server` and `wsh-client`: 256 KiB per direction when both list `gateway-credit`; without it, per-connection and per-client byte caps (`max_buffered_bytes` 4 MiB, `max_client_buffered_bytes` 32 MiB) close the connection that exceeds them | **Wire-unified, negotiated**; an older peer on either side keeps working under the caps. `OpenUdp` flows are metered too (a datagram without credit is dropped) |
+| TCP reverse tunnels (`ListenRequest`, #98) | `@johnhenry/wsh/server` `gateway.reverse` (off by default; loopback unless the operator lists addresses; port allow-list, nothing below 1024 unless named; bounded listeners/connections/backlog/idle); client `listenTcp(port, { onConnection })` | `wsh-server` `[gateway] enable_reverse_tunnels` + `reverse_bind_addr` (off by default, loopback, client `bind_addr` ignored); no port allow-list; no per-listener connection, backlog or idle bounds beyond `max_connections` | **Wire-unified** (`ListenRequest`/`ListenOk`/`ListenFail`/`InboundOpen`/`InboundAccept`; the JS host sends the real `peer_addr`/`peer_port`). **Rust still needs**: a port allow-list and per-client listener / per-listener connection / idle bounds to match the JS host. Accepted connections are metered by `gateway-credit` now |
 | UDP (`OpenUdp`) as WebTransport datagrams (#124) | `client.openUdp()` over WebTransport when both ends list `gateway-datagram`: payloads are datagrams (4-byte flow id + payload), read from `maxDatagramSize`; oversize goes on the control stream (or drops); bounds: flows, packet and byte rates, idle; policy as TCP. Host: `gateway.udp`; Playwright test from Chromium | `wsh-server` serves `OpenUdp` over the reliable control stream only (one `GatewayData` per datagram); no datagrams, no rate bounds | **JS only for now** (negotiated by `gateway-datagram`, so a Rust peer keeps the reliable path). **Rust must implement**: list `gateway-datagram` in `ServerHello.features` on a WebTransport connection, accept/send datagrams `[gateway_id u32 BE][payload]` for `OpenUdp` flows when the client listed it (ignore the id of an unknown flow), read `maxDatagramSize` and send a bigger payload as `GatewayData` (or drop, by config), `connect()` the UDP socket to the checked address, and the same rate/flow bounds |
 | Gateway destination policy by resolved address | `@johnhenry/wsh/server` `gateway`: resolved address checked, `allowPrivate` | fixed in the Rust release after `rust-v0.6.0`: a loopback/private/link-local/ULA/CGNAT/unspecified/multicast address is refused after resolution unless a rule names it, and the server connects to the address it checked | **Same rule on both sides** (a Rust server released before that still has the name-only check) |
 | Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | none: the Rust relay neither carries `ReverseChallenge`/`ReverseProof` nor lists the feature, and the Rust agent/client send and answer neither | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); the Rust types are regenerated (and `ReverseConnect.features` is `None` there) but no Rust peer implements it yet |
@@ -1746,6 +1793,14 @@ What this does **not** protect against:
   `Signal` goes only to the process group of a channel the sending connection
   controls. This does not make a command safe to run: an authorized key still
   runs commands as the server's user.
+- **Forwarding (`wsh -L`/`-R`, `OpenUnix`, `ListenUnix`) lends the host's reach, not a sandbox.** Listing a socket in
+  `unix_connect` gives every authorized key everything that socket's service can do: Docker's socket is root on the
+  machine. The policy checks the path, not the peer, and cannot close the instant between the check and the connect
+  (allow only directories no other local user can write to). It is not per key and has no rate limit beyond
+  `max_connections`. `wsh -L` publishes a local port or socket to whoever can reach it: loopback by default, but an explicit
+  `bind_addr` of `0.0.0.0` (the CLI warns) hands the forward to the network, and a local unix socket is `0600` only against
+  other users, not against your own processes. A forwarded connection is as private as the wsh connection under it (a pipe
+  relay sees it unless the legs are TLS). The Rust host binds a created socket inside a private `0700` directory and links it into place, so it is never visible with a looser mode and the process umask is not touched.
 - **Rust `wsh-server`'s `AuthOk.ttl` is 0 and its `token` is opaque** (as the
   JS host's, above): nothing is promised or enforced at connection level; do not
   treat the token as a credential.

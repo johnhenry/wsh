@@ -1265,18 +1265,29 @@ fn bind_abstract(_name: &str) -> std::io::Result<tokio::net::UnixListener> {
     ))
 }
 
-/// Bind a unix socket that is private from the first instant: a socket's mode is the process umask
-/// at bind time, so the umask is tightened around the one synchronous `bind` (nothing awaits in
-/// between) and the mode is then set explicitly as well.
+/// Bind a unix socket that is private from the first instant, WITHOUT touching the process umask
+/// (it is process-wide: changing it would give files other threads create in that instant the wrong
+/// mode). The socket is bound inside a fresh `0700` directory next to the target, set to `0600`
+/// there, and then hard-linked to its final name: the link fails if something appeared at that name
+/// meanwhile, so nothing is ever replaced, and no one else could reach the socket before it was private.
 #[cfg(unix)]
 fn bind_private(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
-    // SAFETY: umask only swaps a process-wide mask; it has no memory-safety preconditions.
-    let old = unsafe { libc::umask(0o177) };
-    let bound = std::os::unix::net::UnixListener::bind(path);
-    unsafe { libc::umask(old) };
-    let l = bound?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a socket path needs a directory"))?;
+    let staging = parent.join(format!(".w{:08x}", rand::random::<u32>()));
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let inner = staging.join("s");
+    let result = (|| -> std::io::Result<std::os::unix::net::UnixListener> {
+        let l = std::os::unix::net::UnixListener::bind(&inner)?;
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::hard_link(&inner, path)?;
+        Ok(l)
+    })();
+    let _ = std::fs::remove_file(&inner);
+    let _ = std::fs::remove_dir(&staging);
+    let l: std::os::unix::net::UnixListener = result?;
     l.set_nonblocking(true)?;
     tokio::net::UnixListener::from_std(l)
 }

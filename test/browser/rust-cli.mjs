@@ -6,6 +6,7 @@
 import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
@@ -93,3 +94,28 @@ export function runWsh(bin, home, args, { timeoutMs = 30_000, insecureLoopbackTl
 }
 
 export { readFile };
+
+/**
+ * A `wsh` built from this checkout, for specs that need what no release has yet (`-L` forwarding, #145): set WSH_CLI_BIN
+ * to its path. Returns null when unset (the spec then falls back to the released CLI or skips), and fails loudly when it is
+ * set to something that is not there.
+ */
+export function localRustCli(env = process.env) {
+  const p = env.WSH_CLI_BIN;
+  if (!p) return null;
+  if (!existsSync(p)) throw new Error(`WSH_CLI_BIN=${p} does not exist`);
+  return { path: p, tag: 'local build' };
+}
+
+/** Like `runWsh`, but returns the running child (stderr collected on it) for a command that stays up, such as `-N -L`. */
+export function spawnWsh(bin, home, args, { insecureLoopbackTls = true } = {}) {
+  const child = spawn(bin, args, {
+    env: { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), PATH: process.env.PATH ?? '', ...(insecureLoopbackTls ? { WSH_INSECURE_LOOPBACK_TLS: '1' } : {}) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.out = ''; child.err = '';
+  child.stdout.on('data', (d) => { child.out += d; });
+  child.stderr.on('data', (d) => { child.err += d; });
+  child.exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  return child;
+}
