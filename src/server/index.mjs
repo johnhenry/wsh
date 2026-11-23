@@ -82,7 +82,7 @@ function tlsChannelBinding(socket) {
  * @param {{ allow: string[], maxConnections?: number, connectTimeoutMs?: number, socks?: string | { host: string, port: number } }} [options.gateway]
  *   Answer the gateway opcodes (OpenTcp, ResolveDns, GatewayData/Close): the client opens TCP connections and resolves
  *   names from this host. Default deny: a destination must match `allow` (`"*"`, `"host"`, `"host:port"`). `socks` dials
- *   through a SOCKS5 proxy (Tor) with the name unresolved. UDP and reverse tunnels are refused. Off unless given. See `gateway.mjs`.
+ *   through a SOCKS5 proxy (Tor) with the name unresolved. UDP (`udp`: bounds, WebTransport datagrams) and TCP reverse tunnels (`reverse`, off unless given) are served. Off unless given. See `gateway.mjs`.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {number} [options.connectionTtlMs=0] - End every authenticated connection this long after login (0 = never).
  *   Advertised as `AuthOk.ttl` in whole seconds, rounded up; the client reads it as `client.authTtl`.
@@ -282,6 +282,11 @@ export function createWshServer({
     rotateCertificate(options) {
       if (!wt) return Promise.reject(new Error('rotateCertificate: there is no WebTransport listener (configure `webTransport` and `listen()`)'));
       return wt.rotateCertificate(options);
+    },
+
+    /** Counters of the gateway's UDP flows and reverse listeners (drops by cause, oversize handling), or `null` without a gateway. */
+    gatewayStats() {
+      return gatewayCfg ? JSON.parse(JSON.stringify(gatewayCfg.stats)) : null;
     },
 
     /** Fingerprints of the peers currently registered with this relay (`[]` when it is not one). */

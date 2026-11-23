@@ -21,10 +21,15 @@
  * `src/gateway-channel.mjs`); with an older peer the host bounds its buffering by `maxBufferedBytes` per connection
  * and `maxClientBufferedBytes` per client and closes a connection that exceeds them.
  *
- * `OpenUdp` is served over the same reliable control stream (one GatewayData = one datagram; same destination policy;
- * a datagram the client cannot take fast enough is dropped; idle flows are closed after `udpIdleMs`). WebTransport
- * datagrams are not used yet (#124). Not implemented, and answered with a clean ListenFail rather than silence: TCP
- * reverse tunnels (`ListenRequest`).
+ * `OpenUdp` flows go to ONE destination chosen at open (same destination policy as TCP, resolved-address check
+ * included; replies are accepted only from that address and port, the socket is `connect()`ed to it). Over a
+ * WebSocket (or any peer without "gateway-datagram") one GatewayData is one datagram on the reliable control stream; over
+ * WebTransport, when both ends list "gateway-datagram", the payloads are WebTransport datagrams with a 4-byte flow-id
+ * header (`src/gateway-datagram.mjs`), so loss on one flow delays no other and nothing is retransmitted. Bounds
+ * (`udp: {...}`): flows per client, packets per second per flow and per client, bytes per second per client, idle flows
+ * closed after `udpIdleMs`; a payload bigger than the datagram limit goes on the reliable stream (or is dropped, by `udp.oversize`).
+ *
+ * `reverse: {...}` (off unless given): TCP reverse tunnels (`ListenRequest`), see `reverse-policy.mjs`.
  *
  * `socks`: dial through a SOCKS5 proxy (`'host:port'`, `socks5://host:port` or `{ host, port }`), e.g. a local Tor
  * client (`127.0.0.1:9050`). Commands carry the destination as a domain name (ATYP 3), so name resolution happens at
@@ -39,6 +44,12 @@ import {
   GATEWAY_FAIL, HALF_CLOSE_GRACE_MS, gatewayFeatures, createGatewayCore, normalizeGatewayLimits, normalizeEndpoints,
 } from './gateway-core.mjs';
 import { isPublicAddress, parseCidr, addressInCidr, parseIp, sameAddress } from './address-guard.mjs';
+import { normalizeReverse, reversePortAllowed, reversePortRefusal, reverseBindAddress } from './reverse-policy.mjs';
+import { normalizeUdp, newGatewayStats } from './udp-policy.mjs';
+import { TokenBucket, encodeDatagram, decodeDatagram, MAX_UDP_PAYLOAD, GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
+
+export { normalizeReverse, reversePortAllowed } from './reverse-policy.mjs';
+export { normalizeUdp } from './udp-policy.mjs';
 
 // Loaded on first use so that importing the connection handler (which serves the gateway opcodes)
 // does not pull `node:net` into a browser bundle (see `src/memory-host.mjs`).
@@ -55,7 +66,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const MAX_PENDING_INBOUND = 16;
 const INBOUND_ACCEPT_TIMEOUT_MS = 30_000;
 const DEFAULT_UDP_IDLE_MS = 60_000;
-const MAX_DATAGRAM = 65507;
+const MAX_DATAGRAM = MAX_UDP_PAYLOAD;
 const UDP_OUTBOX_BYTES = 256 * 1024;
 
 /** @param {string|{host:string,port:number}} socks */
@@ -232,6 +243,8 @@ export async function dialChecked(cfg, host, port, explicitLiteral, timeoutMs = 
  * @param {number} [opts.maxClientBufferedBytes=33554432]  the same, summed over one client's connections
  * @param {string|{host:string,port:number}} [opts.socks]  dial through this SOCKS5 proxy (Tor)
  * @param {{ connect?: string[], listen?: string[], replaceStale?: boolean, maxListeners?: number }} [opts.unix]  unix-domain sockets (see unix-policy.mjs)
+ * @param {boolean | object} [opts.reverse]  TCP reverse tunnels, off unless given (see reverse-policy.mjs)
+ * @param {object} [opts.udp]  UDP bounds (see udp-policy.mjs)
  * @param {Record<string, Function | { open: Function, authorize?: Function }>} [opts.endpoints]  named virtual endpoints
  * @param {boolean} [opts.tcp=true]  false: no TCP or DNS at all (an endpoints-only host such as the memory host)
  * @param {(line: string) => void} [opts.log]
@@ -264,6 +277,9 @@ export function normalizeGateway(opts) {
     maxClientBufferedBytes,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     udpIdleMs: opts.udpIdleMs ?? DEFAULT_UDP_IDLE_MS,
+    udp: normalizeUdp(opts.udp),
+    reverse: normalizeReverse(opts.reverse),
+    stats: newGatewayStats(),
     socks: parseSocks(opts.socks),
     tcp: opts.tcp !== false,
     unix,
@@ -398,11 +414,23 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     }
   }
 
-  // ── UDP over the reliable path ───────────────────────────────────
-  // One GatewayData is one datagram. This rides the ordered, reliable control stream, so it has the head-of-line
-  // blocking and retransmission a UDP user does not expect (WebTransport datagrams are #124's second half); what it
-  // does keep is UDP's loss model toward the origin side: a datagram the client cannot take fast enough is DROPPED
-  // here rather than buffered, and one the client sends beyond what fits in a datagram is dropped.
+  // ── UDP ──────────────────────────────────────────────────────────
+  // A flow is one connect()ed UDP socket: one destination, fixed at OpenUdp, whose address passed the resolved-address
+  // policy; the kernel delivers nothing to it from any other address or port, so the host is no relay to arbitrary peers.
+  // Payloads travel as WebTransport datagrams when both ends negotiated "gateway-datagram" (no retransmission, no
+  // head-of-line blocking between flows), else one GatewayData per datagram on the reliable control stream. Both
+  // directions are rate-limited (token buckets: per flow, per client, and bytes per client) and a datagram over a limit
+  // is dropped and counted, as a congested network would. What a client cannot take fast enough is dropped, never buffered.
+
+  const udpCfg = cfg.udp;
+  const stats = cfg.stats.udp;
+  const clientPackets = new TokenBucket(udpCfg.packetsPerSecondPerClient, Math.max(udpCfg.packetsPerSecondPerClient / 4, 32));
+  const clientBytes = new TokenBucket(udpCfg.bytesPerSecondPerClient, Math.max(udpCfg.bytesPerSecondPerClient / 4, 65536));
+  /** gateway_id -> handler for a datagram that arrived for the flow. */
+  const udpFlows = new Map();
+  const udpPending = new Set();
+  let peerDatagrams = false;
+  const datagramsOn = () => peerDatagrams && udpCfg.datagrams && !!ctx.datagrams;
 
   async function openUdp(m) {
     const id = m.gateway_id;
@@ -417,7 +445,9 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       log(`gateway: refused udp ${m.host}:${m.port} (not on the allow list)`);
       return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'destination not allowed by the gateway policy');
     }
+    if (udpFlows.size + udpPending.size >= udpCfg.maxFlows) return fail(id, GATEWAY_FAIL.QUEUE_FULL, `too many UDP flows (limit ${udpCfg.maxFlows})`);
     if (active() >= cfg.maxConnections) return fail(id, GATEWAY_FAIL.QUEUE_FULL, 'too many gateway connections');
+    udpPending.add(id);
     pending.add(id);
     let sock;
     let address;
@@ -427,34 +457,50 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       sock = dgram.createSocket(address.includes(':') ? 'udp6' : 'udp4');
       await new Promise((resolve, reject) => { sock.once('error', reject); sock.connect(m.port, address, () => { sock.off('error', reject); resolve(); }); });
     } catch (e) {
-      pending.delete(id);
+      pending.delete(id); udpPending.delete(id);
       try { sock?.close(); } catch { /* not open */ }
       if (e.code === GATEWAY_FAIL.POLICY_DENIED) log(`gateway: refused udp ${m.host}:${m.port} (${e.message})`);
       return fail(id, typeof e.code === 'number' ? e.code : GATEWAY_FAIL.HOST_UNREACHABLE, String(e.message).slice(0, 200));
     }
-    pending.delete(id);
+    pending.delete(id); udpPending.delete(id);
     if (closed) { sock.close(); return undefined; }
     attachDatagrams(id, sock);
-    log(`gateway: ${id} -> udp ${m.host}:${m.port}${address !== m.host ? ` (${address})` : ''}`);
+    stats.flowsOpened++;
+    log(`gateway: ${id} -> udp ${m.host}:${m.port}${address !== m.host ? ` (${address})` : ''}${datagramsOn() ? ' (datagrams)' : ''} (local port ${sock.address().port})`);
     return reply(gatewayOk({ gatewayId: id, resolvedAddr: address }));
   }
 
   function attachDatagrams(id, sock) {
     let idle = null;
     const touch = () => { clearTimeout(idle); idle = setTimeout(() => channel.destroy('idle timeout'), cfg.udpIdleMs); idle.unref?.(); };
+    const flowPackets = new TokenBucket(udpCfg.packetsPerSecondPerFlow, Math.max(udpCfg.packetsPerSecondPerFlow / 4, 16));
+    const useDatagrams = datagramsOn();
+    /** All three buckets must have room; a datagram over any limit is dropped. */
+    const admit = (n) => {
+      if (flowPackets.take(1) && clientPackets.take(1) && clientBytes.take(n)) return true;
+      stats.rateDropped++;
+      return false;
+    };
     const outbox = [];
     let outboxBytes = 0;
     let pumping = false;
     const channel = makeChannel(id, {
-      onData: (bytes) => {
+      onData: (bytes) => { // a payload on the reliable stream (the only path without datagrams; the oversize path with them)
         touch();
-        if (bytes.byteLength > MAX_DATAGRAM) { channel.consumed(bytes.byteLength); return; }
+        if (bytes.byteLength > MAX_DATAGRAM || !admit(bytes.byteLength)) { channel.consumed(bytes.byteLength); return; }
+        stats.reliableFromClient++;
         sock.send(bytes, () => channel.consumed(bytes.byteLength));
       },
       onRemoteClose: () => channel.destroy(), // UDP has no half-close
-      onClose: () => { clearTimeout(idle); try { sock.close(); } catch { /* closed */ } },
+      onClose: () => { clearTimeout(idle); udpFlows.delete(id); try { sock.close(); } catch { /* closed */ } },
     });
     conns.set(id, { channel, sock: null });
+    udpFlows.set(id, (payload) => { // a datagram from the client
+      touch();
+      if (payload.byteLength > MAX_DATAGRAM || !admit(payload.byteLength)) return;
+      stats.datagramsFromClient++;
+      sock.send(payload);
+    });
     async function pump() {
       if (pumping) return;
       pumping = true;
@@ -468,7 +514,18 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     }
     sock.on('message', (d) => {
       touch();
+      if (!admit(d.length)) return;
+      if (useDatagrams) {
+        const frame = encodeDatagram(id, d);
+        if (frame.length <= ctx.datagrams.maxSize()) {
+          if (ctx.datagrams.send(frame)) stats.datagramsToClient++; else stats.backpressureDropped++;
+          return;
+        }
+        if (udpCfg.oversize === 'drop') { stats.oversizeDropped++; log(`gateway ${id}: dropped a ${d.length}-byte reply that does not fit a datagram (${ctx.datagrams.maxSize() - 4} bytes)`); return; }
+        stats.oversizeReliable++;
+      }
       if (outboxBytes + d.length > UDP_OUTBOX_BYTES) return; // the client is not keeping up: drop, as a network would
+      stats.reliableToClient++;
       outbox.push(d); outboxBytes += d.length;
       void pump();
     });
@@ -561,7 +618,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
         stat = await unix.statSocket(chk.path);
       }
       if (closed) { server.close(); if (stat) await unix.unlinkIfSocket(chk.path, stat); return undefined; }
-      const entry = { server, path: chk.path, abstract: chk.abstract, stat, pendingChannels: new Set() };
+      const entry = { server, kind: 'unix', path: chk.path, abstract: chk.abstract, stat, pendingChannels: new Set(), open: 0 };
       listeners.set(id, entry);
       server.on('connection', (sock) => onInbound(id, entry, sock));
       server.on('error', (e) => log(`gateway listener ${id}: ${e.message}`));
@@ -575,17 +632,58 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     }
   }
 
+  // ── TCP reverse tunnels ──────────────────────────────────────────
+
+  async function listenTcp(m) {
+    const id = m.listener_id;
+    if (!Number.isInteger(id) || !Number.isInteger(m.port) || m.port < 0 || m.port > 65535) return failListen(id, 'malformed ListenRequest');
+    if (!cfg.reverse) return failListen(id, 'reverse tunnels are not enabled on this gateway');
+    if (listeners.has(id) || pendingListeners.has(id)) return failListen(id, 'listener_id already in use');
+    const rev = cfg.reverse;
+    if (!reversePortAllowed(rev, m.port)) { log(`gateway: refused reverse listen on port ${m.port} (port policy)`); return failListen(id, reversePortRefusal(rev, m.port)); }
+    let tcpCount = pendingListeners.size;
+    for (const l of listeners.values()) if (l.kind === 'tcp') tcpCount++;
+    if (tcpCount >= rev.maxListeners) return failListen(id, `too many reverse listeners (limit ${rev.maxListeners})`);
+    pendingListeners.add(id);
+    let server;
+    try {
+      const net = await loadNet();
+      const host = reverseBindAddress(rev, m.bind_addr);
+      if (host !== m.bind_addr) log(`gateway: reverse listen: ignoring the client's bind address ${JSON.stringify(String(m.bind_addr).slice(0, 64))}, binding ${host}`);
+      server = net.createServer();
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ port: m.port, host, backlog: rev.backlog }, () => { server.off('error', reject); resolve(); }); });
+      if (closed) { server.close(); return undefined; }
+      const addr = server.address();
+      const entry = { server, kind: 'tcp', path: '', abstract: false, stat: null, pendingChannels: new Set(), open: 0 };
+      listeners.set(id, entry);
+      server.on('connection', (sock) => onInbound(id, entry, sock));
+      server.on('error', (e) => log(`gateway listener ${id}: ${e.message}`));
+      cfg.stats.reverse.listeners++;
+      log(`gateway: listening on ${host}:${addr.port} (reverse listener ${id})`);
+      return await reply(listenOk({ listenerId: id, actualPort: addr.port }));
+    } catch (e) {
+      try { server?.close(); } catch { /* not listening */ }
+      return failListen(id, e.code === 'EADDRINUSE' ? 'address in use' : e.code === 'EACCES' ? 'permission denied binding that port' : String(e.message).slice(0, 200));
+    } finally {
+      pendingListeners.delete(id);
+    }
+  }
+
   function onInbound(listenerId, entry, sock) {
-    if (closed || inbound.size >= MAX_PENDING_INBOUND || active() + inbound.size >= cfg.maxConnections) { sock.destroy(); return; }
+    const tcp = entry.kind === 'tcp';
+    const refuse = (why) => { if (tcp) cfg.stats.reverse.refusedConnections++; log(`gateway: reverse listener ${listenerId}: dropped a connection (${why})`); sock.destroy(); };
+    if (closed || inbound.size >= MAX_PENDING_INBOUND || active() + inbound.size >= cfg.maxConnections) return refuse('too many gateway connections');
+    if (tcp && entry.open >= cfg.reverse.maxConnectionsPerListener) return refuse(`listener is at its limit of ${cfg.reverse.maxConnectionsPerListener} connections`);
     sock.pause();
     sock.on('error', () => {});
     const channelId = ++nextInbound;
     const timer = setTimeout(() => { inbound.delete(channelId); entry.pendingChannels.delete(channelId); sock.destroy(); }, INBOUND_ACCEPT_TIMEOUT_MS);
     timer.unref?.();
+    if (tcp) { entry.open++; cfg.stats.reverse.accepted++; sock.once('close', () => { entry.open--; }); }
     sock.once('close', () => { if (inbound.get(channelId)?.sock === sock) { clearTimeout(timer); inbound.delete(channelId); entry.pendingChannels.delete(channelId); } });
     inbound.set(channelId, { sock, listenerId, timer });
     entry.pendingChannels.add(channelId);
-    void reply(inboundOpen({ listenerId, channelId, peerAddr: 'unix', peerPort: 0 }));
+    void reply(inboundOpen({ listenerId, channelId, peerAddr: tcp ? (sock.remoteAddress ?? '') : 'unix', peerPort: tcp ? (sock.remotePort ?? 0) : 0 }));
   }
 
   function inboundAccept(m) {
@@ -597,6 +695,11 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     const id = m.gateway_id;
     if (!Number.isInteger(id) || idInUse(id) || p.sock.destroyed || active() >= cfg.maxConnections) { p.sock.destroy(); return; }
     attachSocket(id, p.sock);
+    const rev = listeners.get(p.listenerId)?.kind === 'tcp' ? cfg.reverse : null;
+    if (rev && rev.idleMs > 0) {
+      // Inactivity in either direction ends the connection (the socket's own timeout counts reads and writes).
+      p.sock.setTimeout(rev.idleMs, () => { cfg.stats.reverse.idleClosed++; log(`gateway: reverse connection ${id} idle for ${rev.idleMs} ms, closing`); p.sock.destroy(); });
+    }
     p.sock.resume();
   }
 
@@ -618,7 +721,16 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
   }
 
   return {
-    setPeerFeatures: (features) => core.setPeerFeatures(features),
+    setPeerFeatures: (features) => { core.setPeerFeatures(features); peerDatagrams = Array.isArray(features) && features.includes(GATEWAY_DATAGRAM_FEATURE); },
+    /** A WebTransport datagram arrived from the client: [flow id][payload]. */
+    handleDatagram(bytes) {
+      if (closed) return;
+      const d = decodeDatagram(bytes);
+      if (!d) { stats.malformed++; return; }
+      const flow = datagramsOn() ? udpFlows.get(d.id) : undefined;
+      if (!flow) { stats.unknownFlow++; return; }
+      flow(d.payload);
+    },
     /** @returns {Promise<boolean>} true when the message was a gateway message this session consumed */
     async handle(m) {
       if (closed) return true;
@@ -627,7 +739,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
         case MSG.OPEN_UDP: await openUdp(m); return true;
         case MSG.OPEN_UNIX: await openUnix(m); return true;
         case MSG.RESOLVE_DNS: await resolveDns(m); return true;
-        case MSG.LISTEN_REQUEST: reply(listenFail({ listenerId: m.listener_id, reason: 'reverse tunnels are not supported by this gateway' })); return true;
+        case MSG.LISTEN_REQUEST: await listenTcp(m); return true;
         case MSG.LISTEN_UNIX: await listenUnix(m); return true;
         case MSG.LISTEN_CLOSE: await closeListener(m.listener_id); return true;
         case MSG.INBOUND_ACCEPT: inboundAccept(m); return true;

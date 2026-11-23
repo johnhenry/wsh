@@ -58,7 +58,8 @@ export function normalizeEndpointGateway(opts = {}) {
 /** Which gateway-related features a host with this config advertises (besides what the connection adds). */
 export function gatewayFeatures(cfg) {
   const f = [];
-  if (cfg.tcp) f.push('gateway');
+  // "gateway" also covers reverse tunnels (the Rust server lists nothing more specific for ListenRequest).
+  if (cfg.tcp || cfg.reverse) f.push('gateway');
   f.push(GATEWAY_CREDIT_FEATURE);
   if (cfg.unix) f.push('gateway-unix');
   if (cfg.endpoints) f.push('gateway-endpoints');

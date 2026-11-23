@@ -117,13 +117,42 @@ export async function startWebTransport({ options, host, attach, log }) {
 
     let controlWriter = null;
     const decoder = new FrameDecoder();
+    // Datagrams (#124): `createWritable()` is the standard sender (`writable` is the deprecated one); a sender that is
+    // not draining drops rather than queues, which is what a datagram is.
+    let dgWriter = null;
+    try {
+      const dg = session.datagrams;
+      if (dg && typeof dg.maxDatagramSize === 'number') dgWriter = (typeof dg.createWritable === 'function' ? dg.createWritable() : dg.writable).getWriter();
+    } catch { dgWriter = null; }
+    const datagrams = dgWriter ? {
+      send(bytes) {
+        if (closed || (dgWriter.desiredSize !== null && dgWriter.desiredSize <= 0)) return false;
+        dgWriter.write(bytes).catch(() => {});
+        return true;
+      },
+      maxSize: () => session.datagrams.maxDatagramSize,
+    } : null;
     conn = attach({
+      datagrams,
       sendMessage: (msg) => (controlWriter ? controlWriter.write(frameEncode(msg)) : undefined),
       remote: { address: session.peerAddress, headers: session.header ?? {} },
       closeTransport: () => { try { session.close(); } catch { /* already closed */ } },
       // A client that pinned this self-signed certificate can bind its login signature to it (#119).
       channelBinding: current?.hash ? { 'cert-hash': [current.hash] } : null,
     });
+
+    if (datagrams) {
+      (async () => {
+        const reader = session.datagrams.readable.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            conn.receiveDatagram(value);
+          }
+        } catch { /* session went away */ }
+      })();
+    }
 
     const incoming = session.incomingBidirectionalStreams.getReader();
     let first = true;

@@ -136,6 +136,24 @@ export class WshTransport {
     return this.#state;
   }
 
+  /** @type {function(Uint8Array): void} Callback for an unreliable datagram (WebTransport only). */
+  onDatagram = null;
+
+  /** True where this transport can carry unreliable datagrams (WebTransport); false for WebSocket and the rest. */
+  get supportsDatagrams() { return false; }
+
+  /** The largest datagram the connection can carry right now, in bytes (0 = none). Read it again before sending: it can change. */
+  get maxDatagramSize() { return 0; }
+
+  /**
+   * Send one datagram. Never waits and never queues without bound.
+   * @param {Uint8Array} bytes
+   * @returns {boolean} false when it was dropped (no datagram support, closed, or the sender is not draining)
+   */
+  sendDatagram(bytes) { // eslint-disable-line no-unused-vars
+    return false;
+  }
+
   /**
    * TLS keying material for channel binding (#119): `length` bytes exported with `label` (RFC 5705 / 8446 7.5), or
    * `null` where the platform does not expose it (every browser, and Node's own global `WebSocket`).
@@ -516,6 +534,16 @@ export class WebTransportTransport extends WshTransport {
     const controlStream = await wt.createBidirectionalStream();
     this.#controlWriter = controlStream.writable.getWriter();
 
+    // Datagrams: `createWritable()` is the standard sender, `writable` the deprecated one older engines have.
+    this.#datagramWriter = null;
+    try {
+      const dg = wt.datagrams;
+      if (dg && dg.readable) {
+        this.#datagramWriter = (typeof dg.createWritable === 'function' ? dg.createWritable() : dg.writable).getWriter();
+        this.#readDatagrams(dg.readable);
+      }
+    } catch { this.#datagramWriter = null; }
+
     // Start reading control messages in the background.
     this.#controlReaderDone = this.#readControlStream(controlStream.readable);
 
@@ -526,8 +554,40 @@ export class WebTransportTransport extends WshTransport {
     this.#monitorClosed(wt);
   }
 
+  /** @type {WritableStreamDefaultWriter|null} */
+  #datagramWriter = null;
+
+  /** @override */
+  get supportsDatagrams() { return this.#datagramWriter !== null; }
+
+  /** @override */
+  get maxDatagramSize() {
+    try { return this.#datagramWriter ? Number(this.#wt?.datagrams?.maxDatagramSize) || 0 : 0; } catch { return 0; }
+  }
+
+  /** @override */
+  sendDatagram(bytes) {
+    const w = this.#datagramWriter;
+    if (!w || this.state !== 'connected') return false;
+    if (w.desiredSize !== null && w.desiredSize <= 0) return false; // not draining: drop, do not queue
+    w.write(bytes).catch(() => {});
+    return true;
+  }
+
+  async #readDatagrams(readable) {
+    const reader = readable.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        try { this.onDatagram?.(value); } catch (err) { console.error('[wsh:transport] onDatagram handler error:', err); }
+      }
+    } catch { /* session closed */ }
+  }
+
   /** @override */
   async _doClose() {
+    this.#datagramWriter = null;
     this.#abort.abort();
     try {
       this.#controlWriter?.releaseLock?.();

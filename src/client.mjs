@@ -47,6 +47,7 @@ import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
 import { GatewayConnections } from './gateway-client.mjs';
 import { GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
+import { GATEWAY_DATAGRAM_FEATURE } from './gateway-datagram.mjs';
 import { cborDecode, cborEncode } from './cbor.mjs';
 import {
   RpcChannel, RpcError, RPC_ERROR, RPC_FEATURE, RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE,
@@ -634,7 +635,7 @@ export class WshClient {
       const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
       await transport.sendControl(
-        hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE] })
+        hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE, ...(transport.supportsDatagrams ? [GATEWAY_DATAGRAM_FEATURE] : [])] })
       );
       const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
@@ -1523,7 +1524,15 @@ export class WshClient {
 
   #gw() {
     this.#assertAuthenticated('gateway');
-    return (this.#gateway ??= new GatewayConnections({ send: (m) => this.sendControl(m), hasFeature: (f) => this.hasFeature(f) }));
+    return (this.#gateway ??= new GatewayConnections({
+      send: (m) => this.sendControl(m),
+      hasFeature: (f) => this.hasFeature(f),
+      // Datagrams for UDP flows: only on a transport that has them AND a host that listed "gateway-datagram".
+      datagrams: () => {
+        const t = this.#transport;
+        return t?.supportsDatagrams && this.hasFeature(GATEWAY_DATAGRAM_FEATURE) ? { send: (b) => t.sendDatagram(b), maxSize: () => t.maxDatagramSize } : null;
+      },
+    }));
   }
 
   /**
@@ -1549,13 +1558,29 @@ export class WshClient {
   async openTcp(host, port, opts) { return this.#gw().openTcp(host, port, opts); }
 
   /**
-   * A UDP flow to host:port FROM THE HOST over the reliable control stream: each chunk written or read is one datagram
-   * (at most 65507 bytes), so it is ordered and retransmitted (WebTransport datagrams are not used yet), and datagrams the
-   * receiver cannot keep up with are dropped by the host. Same destination policy as TCP.
+   * A UDP flow to ONE destination, host:port, FROM THE HOST (same destination policy as TCP). Each payload is one
+   * datagram, which MAY BE DROPPED: over WebTransport, when the host lists "gateway-datagram", payloads travel as WebTransport
+   * datagrams (unordered, not retransmitted, no head-of-line blocking against other flows); over WebSocket, or against a
+   * host without the feature, they ride the reliable control stream (ordered, retransmitted, and the host still drops
+   * what you cannot take fast enough). The result has `send(bytes) => Promise<boolean>`, `readable`, `writable`, `close()`,
+   * `transport` ('datagram' | 'stream'), `maxDatagramSize` and `stats`; see `UdpFlow`.
    * @param {string} host @param {number} port
-   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+   * @param {{ signal?: AbortSignal, timeoutMs?: number, oversize?: 'reliable' | 'drop' }} [opts]
+   *   `oversize`: what to do with a payload that does not fit one datagram: 'reliable' (default) sends it on the control
+   *   stream, 'drop' makes `send()` reject with a RangeError.
+   * @returns {Promise<import('./gateway-datagram.mjs').UdpFlow>}
    */
   async openUdp(host, port, opts) { return this.#gw().openUdp(host, port, opts); }
+
+  /**
+   * Ask the HOST to listen on a TCP port (a reverse tunnel, OpenSSH `-R`) and hand each connection to `onConnection(duplex, { peer, peerPort })`.
+   * Off unless the host's `gateway.reverse` is set; the host chooses the address it binds (loopback by default) and which ports are allowed.
+   * @param {number} port  0 = any port the host's policy allows
+   * @param {{ bindAddr?: string, onConnection: (duplex: import('./gateway-client.mjs').GatewayDuplex, info: { peer: string, peerPort: number }) => void, timeoutMs?: number }} opts
+   *   `bindAddr` is a request: the host ignores it unless its operator listed that address.
+   * @returns {Promise<{ port: number, close: () => Promise<void> }>}  `port` is the port the host bound
+   */
+  async listenTcp(port, opts) { return this.#gw().listenTcp(port, opts); }
 
   /**
    * Ask the host to listen on a unix-domain socket (OpenSSH `-R /remote.sock:...`) and hand each connection to
@@ -2635,6 +2660,7 @@ export class WshClient {
     transport.onControl = (msg) => this.#handleControl(msg);
     transport.onClose = () => this.#handleTransportClose();
     transport.onError = (err) => this.#handleTransportError(err);
+    transport.onDatagram = (bytes) => this.#gateway?.handleDatagram(bytes);
   }
 
   /**
@@ -2823,7 +2849,7 @@ export class WshClient {
     try {
       const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
-      await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE] }));
+      await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE, ...(this.#transport.supportsDatagrams ? [GATEWAY_DATAGRAM_FEATURE] : [])] }));
       const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
       const firstResponse = await this.#waitForMessage(

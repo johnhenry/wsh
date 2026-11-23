@@ -30,6 +30,7 @@ import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
 import { gatewayFeatures } from './gateway-core.mjs';
+import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
 import { acceptableBindings, bindingFeatures } from '../channel-binding.mjs';
@@ -128,7 +129,7 @@ export function createConnectionFactory(cfg) {
    *    `dataStreams: false` means there are no client-opened streams to bind, so exec output rides SessionData.
    *    `e2e` overrides `cfg.e2e` for this connection.
    */
-  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride, channelBinding = null }) {
+  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride, channelBinding = null, datagrams = null }) {
     const cid = ++counter;
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
@@ -159,7 +160,7 @@ export function createConnectionFactory(cfg) {
     // host in a page passes the endpoints-only session of `gateway-core.mjs` (`createMemoryHost({ endpoints })`).
     if (cfg.gateway && typeof cfg.createGatewaySession !== 'function') throw new TypeError('createConnectionFactory: gateway needs createGatewaySession (only @johnhenry/wsh/server provides one)');
     const gateway = cfg.gateway
-      ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log, { who: () => ({ username: state.username, fingerprint: state.fingerprint }) })
+      ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log, { who: () => ({ username: state.username, fingerprint: state.fingerprint }), datagrams })
       : null;
 
     const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
@@ -366,6 +367,8 @@ export function createConnectionFactory(cfg) {
         state.method = method;
         gateway?.setPeerFeatures(m.features);
         const features = hostFeatures(cfg, { dataStreams });
+        // UDP over datagrams only where this transport has them and the gateway serves (and allows) UDP.
+        if (datagrams && cfg.gateway?.tcp && cfg.gateway.udp?.datagrams) features.push(GATEWAY_DATAGRAM_FEATURE);
         let hostFingerprint;
         if (cfg.hostKey) {
           hostFingerprint = cfg.hostKey.fingerprint;
@@ -1072,6 +1075,8 @@ export function createConnectionFactory(cfg) {
 
     return {
       receive(bytes) { if (!state.closed) qmux?.receiveBytes(bytes); },
+      /** A transport datagram (WebTransport) arrived: only the gateway's UDP flows use them. */
+      receiveDatagram(bytes) { if (!state.closed && state.authed) gateway?.handleDatagram?.(bytes); },
       receiveMessage(msg) { if (!state.closed) chain = chain.then(() => handle(msg)).catch((e) => log(`handler error: ${e.message}`)); },
       bindStream: bindDataStream,
       close() { shutdownAfterQueue('transport closed'); },

@@ -1284,6 +1284,15 @@ export class WshTransport {
   /** Callback on transport error. */
   onError: ((err: Error) => void) | null;
 
+  /** Callback for an unreliable datagram (WebTransport only). */
+  onDatagram: ((bytes: Uint8Array) => void) | null;
+  /** True where the transport can carry unreliable datagrams (WebTransport). */
+  readonly supportsDatagrams: boolean;
+  /** The largest datagram the connection can carry now, in bytes (0 = none). Read it again before sending. */
+  readonly maxDatagramSize: number;
+  /** Send one datagram without waiting or queueing; false = dropped. */
+  sendDatagram(bytes: Uint8Array): boolean;
+
   /** Current transport state. */
   readonly state: 'disconnected' | 'connecting' | 'connected' | 'closed';
 
@@ -2125,6 +2134,19 @@ export interface WshGatewayDuplex {
   closed: Promise<string | undefined>;
 }
 
+/** A UDP flow (`client.openUdp()`): one chunk = one datagram, and a datagram may be dropped without notice. */
+export interface WshUdpFlow extends WshGatewayDuplex {
+  /** 'datagram': WebTransport datagrams. 'stream': the reliable control stream (WebSocket, or a host without `gateway-datagram`). */
+  readonly transport: 'datagram' | 'stream';
+  /** The largest payload that travels as one datagram right now (it can change; read it again). */
+  readonly maxDatagramSize: number;
+  /** Resolves true when handed to the transport, false when dropped locally. Rejects with RangeError for a payload over 65507 bytes (or over the datagram size with `oversize: 'drop'`). */
+  send(bytes: Uint8Array): Promise<boolean>;
+  stats: { sent: number; received: number; sentReliable: number; receivedReliable: number; sendDropped: number; receiveDropped: number };
+}
+/** Feature string for UDP over WebTransport datagrams. */
+export const GATEWAY_DATAGRAM_FEATURE: 'gateway-datagram';
+
 /** A GatewayFail / ListenFail as an Error: `code` 4 = refused by the host's policy, 7 = too many connections, 1 = refused by the target. */
 export class GatewayError extends Error { code: number }
 
@@ -2232,8 +2254,14 @@ export class WshClient {
   openEndpoint(name: string, opts?: WshGatewayOpenOptions): Promise<WshGatewayDuplex>;
   /** Connect to host:port FROM THE HOST (needs the host feature `gateway`; refused unless its `gateway.allow` lists it). */
   openTcp(host: string, port: number, opts?: WshGatewayOpenOptions): Promise<WshGatewayDuplex>;
-  /** A UDP flow to host:port FROM THE HOST over the reliable control stream: each chunk is one datagram (at most 65507 bytes); the host drops what the receiver cannot keep up with. */
-  openUdp(host: string, port: number, opts?: WshGatewayOpenOptions): Promise<WshGatewayDuplex>;
+  /**
+   * A UDP flow to ONE destination, host:port, FROM THE HOST. Datagram semantics: any payload may be dropped. Over WebTransport, when the
+   * host lists `gateway-datagram`, payloads are WebTransport datagrams (unordered, no retransmission, no head-of-line blocking between
+   * flows); otherwise they ride the reliable control stream. A payload too big for one datagram goes on the control stream unless `oversize: 'drop'`.
+   */
+  openUdp(host: string, port: number, opts?: WshGatewayOpenOptions & { oversize?: 'reliable' | 'drop' }): Promise<WshUdpFlow>;
+  /** Ask the host to listen on a TCP port (a reverse tunnel); needs `gateway` and the host's `gateway.reverse`. `bindAddr` is a request the host may ignore. */
+  listenTcp(port: number, opts: { bindAddr?: string; timeoutMs?: number; onConnection: (duplex: WshGatewayDuplex, info: { peer: string; peerPort: number }) => void }): Promise<{ port: number; close(): Promise<void> }>;
   /** Ask the host to listen on a unix-domain socket and hand each connection to `onConnection` (OpenSSH `-R`). */
   listenUnix(path: string, opts: { replace?: boolean; timeoutMs?: number; onConnection: (duplex: WshGatewayDuplex, info: { peer: string }) => void }): Promise<{ path: string; close(): Promise<void> }>;
   /**
