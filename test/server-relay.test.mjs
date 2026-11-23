@@ -137,7 +137,7 @@ describe('relay / reverse mode', () => {
       await startHost(url, { exec: undefined, fs: { root }, mcp: { tools: [{ name: 'add', description: 'a+b', inputSchema: { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } }, required: ['a', 'b'] }, call: ({ a, b }) => a + b }] } });
       const bob = await login(url, 'bob');
       const [peer] = await bob.listPeers();
-      assert.deepEqual(peer.capabilities.sort(), ['fs', 'tools']);
+      assert.deepEqual(peer.capabilities.sort(), ['fs', 'operator-proof', 'tools']);
       await bob.reverseConnect(peer.fingerprint);
       assert.equal((await bob.fileStat('a.txt')).success, true);
       assert.equal(dec.decode((await bob.fileRead('a.txt', 6, 4)).metadata.data), 'file');

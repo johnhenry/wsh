@@ -28,6 +28,7 @@
 import { cborEncode, cborDecode } from '../cbor.mjs';
 import { fingerprint as fingerprintOf, importPublicKeyRaw, verifyPeerRecord } from '../auth.mjs';
 import { MSG, isRelayForwardable, relayForward, reversePeers, reverseReject, reverseClose } from '../messages.gen.mjs';
+import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 
 export const DEFAULT_MAX_PEERS = 1024;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 8000;
@@ -253,7 +254,11 @@ export class RelayHub {
       from_fingerprint: operator.fingerprint,
     };
     // What the operator says it can do (#117), bounded; it is the operator's own claim and decides nothing here.
-    if (Array.isArray(msg.features) && msg.features.length <= MAX_OPERATOR_FEATURES && msg.features.every((f) => isStr(f, MAX_FEATURE_LENGTH))) forwarded.features = [...msg.features];
+    // Only to a peer that advertised `operator-proof` in its registered record: a released peer (rust-v0.6 to v0.8) rejects
+    // the field outright (its generated types deny unknown fields), which the operator would see as a timeout. Stripped,
+    // that peer answers as it always did, without a challenge; an operator that insists on proof then fails at once.
+    const peerCanProve = (target.meta.capabilities ?? []).includes(OPERATOR_PROOF_FEATURE);
+    if (peerCanProve && Array.isArray(msg.features) && msg.features.length <= MAX_OPERATOR_FEATURES && msg.features.every((f) => isStr(f, MAX_FEATURE_LENGTH))) forwarded.features = [...msg.features];
     target.handle.send(forwarded);
     this.log(`relay: ${operator.fingerprint.slice(0, 12)} -> ${target.meta.fingerprint.slice(0, 12)} requested`);
   }

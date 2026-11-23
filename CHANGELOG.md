@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.38.1
+
+### JS: `operator-proof` is offered only to a peer that advertises it (npm change)
+
+The JS relay and operator sent `ReverseConnect.features: ['operator-proof']` unconditionally. Released Rust hosts
+(`rust-v0.6` to `v0.8`) deny unknown fields, so an operator offering proof to one got a silent timeout.
+
+- A peer that can answer a challenge lists `operator-proof` in its registered capabilities (`connectReverse`, so
+  `createReverseHost` too; `operatorProof: false` leaves it out). **This is a registration change visible in `listPeers()`.**
+- `reverseConnect(fp, timeout, { proof })`: `'auto'` (default) offers only to a peer whose record lists it (one `listPeers()`
+  lookup, or pass `peerCapabilities`); `true` offers regardless; `false` never. `requirePeerProof` / `sealed` against a peer
+  that does not advertise it throw at once ("does not advertise "operator-proof" ... nothing was sent").
+- The relay forwards `features` only to a peer that registered `operator-proof`, and strips it otherwise (no new wire field).
+- **Behaviour change:** a JS host from npm 0.36-0.38 registers no such capability, so a new operator no longer offers proof
+  to it under `'auto'` and a `requireOperatorProof` host refuses it ("operator proof required") until it is upgraded;
+  `proof: true` does not help through this relay, which strips for it. Upgrade the host.
+- Spec text for `ListenUnix` now says what both hosts send: `InboundOpen` `peer_addr "unix"`, `peer_port 0`.
 
 ### Test: `npm run test:rust` can no longer hang a CI job (#152)
 
