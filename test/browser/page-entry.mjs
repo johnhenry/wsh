@@ -94,8 +94,26 @@ function memoryFs(initial) {
   };
 }
 
-window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, requireChannelBinding, firstOutputDelayMs = 0 } = {}) => {
+/** Named endpoints a page can offer: `echo` sends back what it receives; `count` reads to the end and answers with the byte count. */
+function pageEndpoints(record) {
+  return {
+    echo: async (duplex) => { record.opened.push({ name: 'echo', user: duplex.who.username }); await duplex.readable.pipeTo(duplex.writable); },
+    count: async (duplex) => {
+      record.opened.push({ name: 'count', user: duplex.who.username });
+      let n = 0;
+      const reader = duplex.readable.getReader();
+      for (;;) { const { done, value } = await reader.read(); if (done) break; n += value.byteLength; }
+      const writer = duplex.writable.getWriter();
+      await writer.write(enc.encode(String(n)));
+      await writer.close();
+    },
+    private: { open: async (duplex) => { await duplex.writable.close(); }, authorize: (who) => who.username === 'root' },
+  };
+}
+
+window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding, firstOutputDelayMs = 0 } = {}) => {
   const log = [];
+  const record = { opened: [] };
   const ptyCalls = [];
   const fs = memoryFs(initialFiles);
   let hostKeyOption;
@@ -137,11 +155,12 @@ window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = f
     hostKey: hostKeyOption,
     requireChannelBinding,
     sessions: sessions || undefined,
+    endpoints: endpoints ? pageEndpoints(record) : undefined,
     dataStreams,
     onLog: (l) => log.push(l),
   });
   const id = `h${++counter}`;
-  hosts.set(id, { host, log, ptyCalls, fs, hostKeyPair });
+  hosts.set(id, { host, log, ptyCalls, fs, hostKeyPair, record });
   return id;
 };
 /** Serve a WebSocket this page opens to `url` (the byte pipe): `accept(new WebSocket(url))`, the socket still connecting. */
@@ -151,9 +170,9 @@ window.h.serve = async (id, url, options) => {
   return socket.readyState;
 };
 window.h.hostInfo = async (id) => {
-  const { log, ptyCalls, fs, hostKeyPair } = hosts.get(id);
+  const { log, ptyCalls, fs, hostKeyPair, record } = hosts.get(id);
   return {
-    log, ptyCalls, files: Object.fromEntries([...fs.files].map(([k, v]) => [k, dec.decode(v)])),
+    log, ptyCalls, endpointsOpened: record.opened, files: Object.fromEntries([...fs.files].map(([k, v]) => [k, dec.decode(v)])),
     hostFingerprint: hostKeyPair ? await wsh.fingerprint(await wsh.exportPublicKeyRaw(hostKeyPair.publicKey)) : null,
     bufferType: typeof Buffer,
   };

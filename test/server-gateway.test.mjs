@@ -104,13 +104,13 @@ describe('gateway', () => {
 
   it('reports a refused connection with code 1', async () => {
     const dead = net.createServer(); const deadPort = await listen(dead); dead.close(); await sleep(20);
-    const { client, inbox } = await setup({ allow: ['*'] });
+    const { client, inbox } = await setup({ allow: ['*'], allowPrivate: ['127.0.0.0/8'] });
     await client.sendControl({ type: MSG.OPEN_TCP, gateway_id: 3, host: '127.0.0.1', port: deadPort });
     assert.equal((await until(() => inbox.find((m) => m.type === MSG.GATEWAY_FAIL), 'fail')).code, 1);
   });
 
   it('resolves a name (A) when allowed and refuses one that is not', async () => {
-    const { client, inbox } = await setup({ allow: ['localhost'] });
+    const { client, inbox } = await setup({ allow: ['localhost'], allowPrivate: ['127.0.0.0/8', '::1'] });
     await client.sendControl({ type: MSG.RESOLVE_DNS, gateway_id: 4, name: 'localhost', record_type: 'A' });
     const r = await until(() => inbox.find((m) => m.type === MSG.DNS_RESULT), 'dns');
     assert.ok(r.addresses.includes('127.0.0.1'));

@@ -45,6 +45,8 @@ import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature, initiato
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, verifyReverseChallenge, createOperatorProof } from './operator-proof.mjs';
 import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
+import { GatewayConnections } from './gateway-client.mjs';
+import { GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
 import { cborDecode, cborEncode } from './cbor.mjs';
 import {
   RpcChannel, RpcError, RPC_ERROR, RPC_FEATURE, RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE,
@@ -359,6 +361,9 @@ export class WshClient {
    */
   #bridgedFeatures = null;
 
+  /** @type {GatewayConnections|null} Created by the first openUnix()/openEndpoint()/openTcp()/listenUnix(). */
+  #gateway = null;
+
   /** @type {number|null} Ping interval handle. */
   #pingTimer = null;
 
@@ -629,7 +634,7 @@ export class WshClient {
       const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
       await transport.sendControl(
-        hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce] })
+        hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE] })
       );
       const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
@@ -1102,6 +1107,7 @@ export class WshClient {
     this.#stopPing();
     this.#state = STATE_CLOSED;
     this.#bridgedFeatures = null;
+    this.#gateway?.abandonAll('client disconnected');
 
     // Close all sessions concurrently.
     const closePromises = [];
@@ -1509,6 +1515,75 @@ export class WshClient {
   async sendControl(msg) {
     this.#assertAuthenticated('sendControl');
     await this.#transport.sendControl(msg);
+  }
+
+  // ── Gateway: unix sockets, named endpoints, TCP egress ──────────────
+  // Streams with backpressure over the gateway messages (`gateway-unix`, `gateway-endpoints`, `gateway`; credit-based
+  // flow control when both ends offer `gateway-credit`). See `gateway-client.mjs`.
+
+  #gw() {
+    this.#assertAuthenticated('gateway');
+    return (this.#gateway ??= new GatewayConnections({ send: (m) => this.sendControl(m), hasFeature: (f) => this.hasFeature(f) }));
+  }
+
+  /**
+   * Connect to a unix-domain socket on the HOST (OpenSSH streamlocal), if the host's policy lists the path.
+   * @param {string} path
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+   * @returns {Promise<import('./gateway-client.mjs').GatewayDuplex>} streams with backpressure; rejects with a `GatewayError` (`.code` 4 = refused by policy)
+   */
+  async openUnix(path, opts) { return this.#gw().openUnix(path, opts); }
+
+  /**
+   * Open the host's named virtual endpoint `name` (a host with no file system exposes these instead of sockets).
+   * @param {string} name
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+   */
+  async openEndpoint(name, opts) { return this.#gw().openEndpoint(name, opts); }
+
+  /**
+   * Connect to host:port FROM THE HOST (the gateway's TCP egress; refused unless the host's `gateway.allow` lists it).
+   * @param {string} host @param {number} port
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+   */
+  async openTcp(host, port, opts) { return this.#gw().openTcp(host, port, opts); }
+
+  /**
+   * A UDP flow to host:port FROM THE HOST over the reliable control stream: each chunk written or read is one datagram
+   * (at most 65507 bytes), so it is ordered and retransmitted (WebTransport datagrams are not used yet), and datagrams the
+   * receiver cannot keep up with are dropped by the host. Same destination policy as TCP.
+   * @param {string} host @param {number} port
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts]
+   */
+  async openUdp(host, port, opts) { return this.#gw().openUdp(host, port, opts); }
+
+  /**
+   * Ask the host to listen on a unix-domain socket (OpenSSH `-R /remote.sock:...`) and hand each connection to
+   * `onConnection(duplex)`. The host creates the socket 0600 and removes it when the listener or the connection closes.
+   * @param {string} path
+   * @param {{ replace?: boolean, onConnection: (duplex: import('./gateway-client.mjs').GatewayDuplex) => void, timeoutMs?: number }} opts
+   * @returns {Promise<{ path: string, close(): Promise<void> }>}
+   */
+  async listenUnix(path, opts) { return this.#gw().listenUnix(path, opts); }
+
+  /**
+   * Node only: forward between a local endpoint and a remote one, like `ssh -L` / `ssh -R` with unix sockets mixed in.
+   * `local` and `remote` are each a socket path (starts with "/" or "./") or `host:port`.
+   *   - `{ local: '/tmp/docker.sock', remote: '/var/run/docker.sock' }` listens locally and connects on the host.
+   *   - `{ local: '127.0.0.1:2375', remote: '/var/run/docker.sock' }` the same from a TCP port (`-L 127.0.0.1:2375:/var/run/docker.sock`).
+   *   - `{ local: '/tmp/x.sock', remote: 'db.internal:5432' }` the host's TCP egress, from a local socket.
+   *   - `{ reverse: true, remote: '/run/app.sock', local: '127.0.0.1:8080' }` the HOST listens on `remote` (a unix path) and
+   *     connections are made to `local` from here (`-R`).
+   * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, onError?: (err: Error) => void }} opts
+   * @returns {Promise<{ local: string, remote: string, address?: object, close(): Promise<void> }>}
+   */
+  async forwardUnix(opts) {
+    // The specifier is a variable on purpose: a bundler for the browser must not follow it into `node:net` / `node:fs`
+    // (the browser-bundle test fails on a Node built-in). Node resolves it relative to this file as usual.
+    const specifier = './forward-node.mjs';
+    let mod;
+    try { mod = await import(specifier); } catch (e) { throw new Error(`forwardUnix needs Node (${e?.message ?? e})`); }
+    return mod.forward(this, opts);
   }
 
   /**
@@ -2748,7 +2823,7 @@ export class WshClient {
     try {
       const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
-      await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce] }));
+      await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE] }));
       const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
       const firstResponse = await this.#waitForMessage(
@@ -3033,6 +3108,8 @@ export class WshClient {
 
     // Route gateway messages (0x70–0x7f) to the gateway handler.
     if (type >= 0x70 && type <= 0x7f) {
+      // Connections opened through openUnix()/openEndpoint()/openTcp()/listenUnix() own their ids.
+      if (this.#gateway?.handle(msg)) return;
       try {
         this.onGatewayMessage?.(msg);
       } catch (err) {
@@ -3189,6 +3266,7 @@ export class WshClient {
 
     this.#state = STATE_CLOSED;
     this.#bridgedFeatures = null;
+    this.#gateway?.abandonAll('transport closed');
     this.#stopPing();
     this.#rejectAllWaiters(new Error('Transport closed'));
 

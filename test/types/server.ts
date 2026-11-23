@@ -65,3 +65,15 @@ export { wtRotation, pins, rotated, wtOptions, wtOwnCert, wtInfo, selfSigned, re
 declare const upgraded: import('@johnhenry/wsh/server').WshAcceptableSocket;
 const acceptServer: WshServer = createWshServer({ auth: { authorizedKeys: 'ssh-ed25519 AAAA' } });
 void acceptServer.accept(upgraded, { remote: { address: '10.0.0.1', headers: {} } }).then((h) => h.close());
+
+// Gateway: address policy, flow-control caps, unix sockets, endpoints (#120, #123).
+createWshServer({
+  gateway: {
+    allow: ['broker.lan:1883'],
+    allowPrivate: ['10.0.0.0/8'],
+    maxBufferedBytes: 4 * 1024 * 1024,
+    maxClientBufferedBytes: 32 * 1024 * 1024,
+    unix: { connect: ['/var/run/docker.sock'], listen: ['/run/user/1000/wsh/'], replaceStale: false, maxListeners: 2 },
+    endpoints: { ping: async (duplex, who) => { void [duplex.readable, who.fingerprint]; } },
+  },
+});

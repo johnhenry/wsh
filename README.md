@@ -66,7 +66,7 @@ Or via CDN:
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
 - **Session recording** -- own JSON schema (asciicast-v2-shaped, not a playable asciicast file -- see note below) recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
-- **101 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
+- **105 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
 
 > **Session recording is asciicast-v2-shaped, but not an asciicast file.**
 > The JS `SessionRecorder.toJSON()` export borrows asciicast v2's vocabulary --
@@ -252,10 +252,77 @@ limit and sends `ttl: 0`. Before 0.36 it sent an unenforced 3600. The Rust
 
 ### Gateway (TCP and DNS egress from the host)
 
-`gateway: { allow: ['broker.lan:1883'], socks: '127.0.0.1:9050' }` makes the Node server answer the gateway opcodes, so a
-client (a browser tab via netway's `GatewayBackend`) can open TCP connections and resolve names from the host. Default
-deny; `allow` takes `"*"`, `"host"` or `"host:port"`. `socks` routes every dial through a SOCKS5 proxy (Tor) with the name
-unresolved. UDP and reverse tunnels are refused.
+`gateway: { allow: ['broker.lan:1883'], allowPrivate: ['10.0.0.0/8'], socks: '127.0.0.1:9050' }` makes the Node server
+answer the gateway opcodes, so a client (a browser tab via netway's `GatewayBackend`, or `client.openTcp()`) can open TCP
+connections and resolve names from the host. Default deny; `allow` takes `"*"`, `"host"` or `"host:port"`. `socks` routes
+every dial through a SOCKS5 proxy (Tor) with the name unresolved. TCP reverse tunnels are refused. `OpenUdp` is served
+(`client.openUdp(host, port)`: one chunk is one datagram, same destination policy, idle flows closed after `udpIdleMs`,
+default 60 s, not available through `socks`), but over the reliable control stream: it is ordered and retransmitted, and a
+datagram the client cannot take fast enough is dropped by the host. **WebTransport datagrams (the real UDP semantics) are
+not implemented yet (#124).**
+
+**The address is checked, not just the name.** The host resolves a name once, refuses every resolved address that is not
+globally routable (loopback, private, link-local, CGNAT, ULA, multicast, reserved, and IPv4 addresses wrapped as
+IPv4-mapped, NAT64 or 6to4 IPv6), and connects to the address it checked, so a name that resolves to something else a
+moment later cannot redirect the connection. Reaching private space is an explicit rule: `allowPrivate` (CIDR blocks or
+addresses) for names and `"*"`, or an `allow` entry that is itself an IP literal (`"127.0.0.1:1883"`), which permits
+exactly that address. `ResolveDns` answers are filtered with the same rule. Through `socks` the proxy resolves the name,
+so only IP literals can be checked there. See the Security model below and the CHANGELOG (this is a behaviour change).
+
+**Flow control.** Gateway data is metered in both directions when both ends offer the `gateway-credit` feature: each
+direction of each connection starts with 256 KiB of credit that the receiver tops up (`GatewayCredit`) as its
+application consumes data, so a slow reader stops its peer (the origin socket is paused, `write()` results and `drain`
+are honoured) instead of making the host buffer. Against a peer without the feature the host still holds the origin back
+by the transport's own backpressure and bounds what a client can make it hold with `maxBufferedBytes` (default 4 MiB per
+connection) and `maxClientBufferedBytes` (default 32 MiB per client), closing a connection that exceeds them.
+
+#### Unix-domain sockets (streamlocal) and named endpoints
+
+Modelled on OpenSSH's streamlocal forwarding. Off unless configured:
+
+```js
+createWshServer({ auth, gateway: {
+  allow: [],
+  unix: {
+    connect: ['/var/run/docker.sock'],          // OpenUnix: a client may connect to these (exact path, or "/dir/" prefix, or "@abstract")
+    listen: ['/run/user/1000/wsh/'],             // ListenUnix: a client may ask the host to create sockets under here
+    replaceStale: false,                         // a client may replace a STALE socket file only if it asks AND this is true
+  },
+  endpoints: { ping: async (duplex, who) => { /* ... */ } },   // named virtual endpoints, below
+} });
+```
+
+Paths are checked after `realpath` of the parent directory (so `/var/run` and `/private/var/run` agree and a symlinked
+directory cannot lead out of an allowed one), a `..` segment is refused, and the file must be a socket and not a symlink.
+The abstract namespace (`@name`) is refused unless listed. Sockets the host creates are mode `0600` (the umask is
+tightened while binding) and are unlinked when the listener closes or the connection ends; an existing socket file is
+replaced only when the request says `replace` AND `replaceStale` is on AND nothing accepts connections on it, and a file
+that is not a socket is never touched. Allow only directories no other local user can write to: the check cannot close
+the instant between it and the connect.
+
+```js
+const duplex = await client.openUnix('/var/run/docker.sock');       // web streams with backpressure
+await duplex.writable.getWriter().write(new TextEncoder().encode('GET /containers/json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'));
+// Node: ssh -L / -R shapes, unix and TCP ends mixed
+await client.forwardUnix({ local: '127.0.0.1:2375', remote: '/var/run/docker.sock' });     // -L 127.0.0.1:2375:/var/run/docker.sock
+await client.forwardUnix({ local: '/tmp/docker.sock', remote: '/var/run/docker.sock' });
+await client.forwardUnix({ reverse: true, remote: '/run/user/1000/wsh/app.sock', local: '127.0.0.1:8080' }); // -R
+```
+
+**Named virtual endpoints** are for a host with no file system (the memory host, a browser tab):
+`endpoints: { docker: (duplex, who) => ... }` registers handlers and a client reaches one with `client.openEndpoint('docker')`.
+It is its own message (`OpenEndpoint { name }`) rather than a reserved `OpenUnix` path so that a name can never be
+mistaken for (or smuggled as) a file-system path or an abstract-namespace name, and so a host's file-system policy is not
+consulted for it; the registered names are an allow-list by construction. `who` is the authenticated
+`{ username, fingerprint }`, so the embedder can authorise per call (throw to refuse, or `{ open, authorize(who) }`).
+
+**Rust side: JS only for now.** `wsh-server` does not advertise `gateway-unix`, `gateway-endpoints` or `gateway-credit`,
+and `wsh` has no `-L` / `-R` with unix sockets yet. What it must implement: `OpenUnix { gateway_id, path }` and
+`ListenUnix { listener_id, path, replace? }` (answer with the existing `GatewayOk`/`GatewayFail` and `ListenOk` with
+`actual_port: 0`/`ListenFail`; accepted connections announced with `InboundOpen` and answered by `InboundAccept`'s
+`gateway_id`), the same path policy and `0600`/unlink rules, `GatewayCredit` (256 KiB initial credit per direction when
+the client's `Hello.features` lists `gateway-credit`), and in the CLI `-L [bind:]port:/remote.sock`,
+`-L /local.sock:/remote.sock`, `-R /remote.sock:host:port` and `-R /remote.sock:/local.sock`.
 
 ### TLS (`wss://`) and host extensions
 
@@ -301,7 +368,9 @@ session.onData = (d) => console.log(new TextDecoder().decode(d));   // "ran hi"
 It is the real connection handler speaking QMux over an in-memory socket pair, so the client code you test is the code
 you ship. `host.createClient()` / `host.WebSocket` / `host.accept(socket)` / `createSocketPair()` are the lower-level pieces.
 Supported: `auth`, `exec` (a function; there is no shell), `pty`, `fs` and `hostKey` (injected, below), `mcp`,
-`extensions`, `rpc` and `sessions` (below). Not available in memory: `gateway`, `relay`, WebTransport, `exec: true` and
+`extensions`, `rpc`, `sessions` (below) and `endpoints` ([named virtual endpoints](#unix-domain-sockets-streamlocal-and-named-endpoints):
+`endpoints: { api: (duplex, who) => ... }`, reached with `client.openEndpoint('api')`, with flow control). Not available
+in memory: the TCP, DNS, UDP and unix-socket parts of `gateway`, `relay`, WebTransport, `exec: true` and
 `fs: { root }` (they need Node) and the `wsh-host` / `wsh-fs` rpc built-ins (use `@johnhenry/wsh/server`).
 
 **Injected backends**, shaped like the Node host's, so a page can be a real host (#114):
@@ -1273,7 +1342,7 @@ so options the platform gains later need no change here.
 
 | Export | Description |
 |--------|-------------|
-| `MSG` | 101 message type constants (hex opcodes) |
+| `MSG` | 105 message type constants (hex opcodes) |
 | `CHANNEL_KIND` | Channel types: `pty`, `exec`, `meta`, `file`, `tcp`, `udp`, `job` |
 | `AUTH_METHOD` | Auth methods: `pubkey`, `password` |
 | `cborEncode` / `cborDecode` | CBOR codec (maps, arrays, strings, ints, bytes, bools, null, floats) |
@@ -1345,6 +1414,9 @@ than left to be found.
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side; several operators per peer and the signed `KeyExchange` are JS-relay only for now |
 | Post-quantum E2E (experimental) | `initiateE2E()` (WebCrypto ML-KEM-768 or `@noble/post-quantum` fallback) | `E2eKeyExchange` (`ml-kem` crate) | **Wire-unified** algorithm and transcript; key material backends differ by platform necessity |
+| Unix-domain socket forwarding, both directions; named endpoints (#120) | `client.openUnix()`, `listenUnix()`, `forwardUnix()` (Node: `-L`/`-R` shapes with unix and TCP ends mixed), `openEndpoint()`; host: `gateway: { unix, endpoints }`, `createMemoryHost({ endpoints })` | none yet (`wsh -L` / `-R` with sockets are not implemented) | **JS only for now.** Wire: `OpenUnix`, `OpenEndpoint`, `ListenUnix` behind the `gateway-unix` / `gateway-endpoints` host features; the Rust server and CLI must implement them (message handling, the path policy, `-L`/`-R` flags) as described under [Gateway](#unix-domain-sockets-streamlocal-and-named-endpoints) |
+| Gateway flow control (#123) | credit per connection (`GatewayCredit`, feature `gateway-credit`); host caps for peers without it | none: the Rust forwarder has bounded in-process queues but no per-connection credit and no per-client byte cap | **JS only for now** (negotiated, so a Rust peer on either side keeps today's unmetered behaviour) |
+| Gateway destination policy by resolved address | `@johnhenry/wsh/server` `gateway`: resolved address checked, `allowPrivate` | fixed in the Rust release after `rust-v0.6.0`: a loopback/private/link-local/ULA/CGNAT/unspecified/multicast address is refused after resolution unless a rule names it, and the server connects to the address it checked | **Same rule on both sides** (a Rust server released before that still has the name-only check) |
 | Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | none: the Rust relay neither carries `ReverseChallenge`/`ReverseProof` nor lists the feature, and the Rust agent/client send and answer neither | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); the Rust types are regenerated (and `ReverseConnect.features` is `None` there) but no Rust peer implements it yet |
 | Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | none: no Rust host offers one and the Rust client signs with an empty binding | **Wire-unified, negotiated** (`channel-binding:<kind>` features); a Rust client logging in to a JS host that requires it is refused |
 | Pipe relay (#118) | `@johnhenry/wsh/pipe-relay` | none; the `wsh` CLI always dials `wss://<host>/` (#136), so it cannot reach `/r/<id>` -- it needs `--via` or to keep the URL path | **Deliberately a relay without wsh parsing** -- nothing to unify on the wire |
@@ -1453,7 +1525,24 @@ out explicitly below rather than left to be discovered.
   entry client-side and reports a `verified` boolean, independent of
   trusting the relay.
 
+- **The Node gateway checks where a connection goes, not only what it was called.** `gateway.allow` matches the name a
+  client sent, and then the address it resolves to must be globally routable (or permitted by `allowPrivate` or an
+  IP-literal rule); the connection is made to that checked address, and `ResolveDns` answers are filtered the same way.
+  Unix-domain sockets (`gateway.unix`) and named endpoints (`gateway.endpoints`) are off unless configured, are listed
+  paths or names only, and sockets the host creates are `0600`.
+
 **What is still yours:**
+
+- **What the gateway does NOT protect against.** A name that resolves to a *public* address is dialled as the client
+  asked, so `allow: ['*']` is an open proxy to the internet for every authorized client. Through `socks` the proxy
+  resolves the name, so the host cannot check the address (only IP literals are checked) and the proxy's own network
+  is the egress. The path check for unix sockets is made just before the connect: a local user who can write to an
+  allowed directory can still swap a path between the two, so list only directories that are not writable by others.
+  A client may open any listed socket as the host's user; a socket that speaks a powerful API (the Docker socket is
+  root on the host) is exactly as powerful for every authorized client, so list it only for clients you would give that
+  access. Named endpoints run embedder code with the caller's identity (`who`) but the handler decides what that
+  identity may do. A `wsh-server` built before the Rust release that followed `rust-v0.6.0` only matches the name, not the
+  resolved address (see the Rust defaults above): do not expose such a binary with a `"*"` allow list.
 
 - **Hybrid post-quantum E2E is experimental and not fully wired (in
   progress).** `initiateE2E(sessionId, 'X25519+ML-KEM-768')` combines
