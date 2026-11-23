@@ -1,5 +1,81 @@
 # Changelog
 
+## Unreleased
+
+- **Security fix (GHSA-4cr8-m4h6-2545) and behaviour change: the Node gateway checks the resolved address.** The
+  `gateway` option of `createWshServer` matched `allow` against the NAME a client sent and dialled that name, so an allowed
+  name that resolved (or was made to resolve, between check and connect) to a loopback, link-local or private address, or
+  a `"*"` rule, reached services inside the host's network. Now the host resolves the name once, drops every address that
+  is not globally routable, and connects to the address it checked (never the name again). "Not globally routable" covers
+  IPv4 loopback, private, link-local, CGNAT, documentation, benchmarking, multicast and reserved ranges, IPv6 loopback,
+  unspecified, ULA, link-local, site-local, multicast, documentation and deprecated ranges, and IPv4 wrapped in IPv6
+  (IPv4-mapped, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`). `ResolveDns` answers are filtered with the same rule, so the host
+  does not hand out internal addresses and a later `OpenTcp` to one is refused. `GatewayOk.resolved_addr` now carries the
+  address that was connected to.
+  - **Breaking for existing deployments:** a gateway that reached loopback or private space (`allow: ['*']` to a local
+    service, `allow: ['broker.lan:1883']` for a LAN broker, `localhost`) is now refused with `POLICY_DENIED` until you say
+    so explicitly: `gateway.allowPrivate: ['10.0.0.0/8', '127.0.0.1', ...]` (CIDR blocks or addresses), or an `allow`
+    entry that is itself an IP literal (`"192.168.1.5:1883"`, which permits exactly that address). Public destinations are
+    unaffected. Through `socks` the name still goes to the proxy unresolved (nothing to check); IP literals are checked.
+  - The Rust `wsh-server` gateway has the same gap (`check_connect` matches the name, `connect` resolves it again) and is
+    NOT fixed by this change.
+  - **Tests:** `test/gateway-address-guard.test.mjs` (the guard over IPv4, IPv6, mapped, NAT64, 6to4, malformed input),
+    `test/gateway-address-policy.test.mjs` (an allowed name resolving to loopback/private/link-local/mapped/NAT64 refused
+    after exactly one lookup; connect uses the checked address; literals and the odd numeric spellings; `allowPrivate`
+    and literal rules; ResolveDns filtering; SOCKS literals).
+- **Gateway flow control (#123), feature `gateway-credit`.** Gateway data was forwarded without regard to a slow reader
+  (`sock.on('data')` never paused, `write()`'s result ignored), so a slow peer on either side made the host buffer without
+  bound. Now each direction of each gateway connection is metered: `GatewayCredit { gateway_id, bytes }` (0x7f), 256 KiB
+  of initial credit per direction, returned as the receiver's application consumes data (for the host: when the origin
+  socket has taken it; for a client: when the stream is read). The origin socket is paused while a chunk waits for credit
+  or for the transport, and a peer that sends beyond its credit is closed. The client lists `gateway-credit` in
+  `Hello.features` and the host in `ServerHello.features`; credit is used only when both did. Against a peer without it
+  (every released client and host) the host holds the origin back by the transport's own write backpressure and bounds
+  what a client can make it hold: `gateway.maxBufferedBytes` (default 4 MiB per connection) and
+  `gateway.maxClientBufferedBytes` (default 32 MiB per client); a connection that exceeds one is closed with
+  `GatewayClose { reason: "buffer limit exceeded" }`. **Behaviour change:** an older client that bursts more than those
+  caps at an origin that does not read is now cut off instead of buffered without limit.
+  `GatewayClose` is now documented and implemented as a half-close (the closer sends no more, keeps receiving until the
+  peer's own `GatewayClose`), which is what the host already did with its 1 s grace.
+  - **Tests:** `test/gateway-flow-control.test.mjs` (credit unit tests; a fast origin with a stalled client: the origin
+    makes no progress and memory stays flat; a stalled origin with a fast client; an older peer, held back and capped;
+    overrun closed; a 24 MiB transfer completes).
+- **Unix-domain socket forwarding (#120), both directions, modelled on OpenSSH streamlocal. JS only for now.** New
+  messages: `OpenUnix { gateway_id, path }` (0x63), `ListenUnix { listener_id, path, replace? }` (0x65) and
+  `OpenEndpoint { gateway_id, name }` (0x64), behind host features `gateway-unix` and `gateway-endpoints`; they reuse
+  `GatewayOk/Fail/Close/Data/Credit` and, for listening, `ListenOk` (`actual_port: 0`) / `ListenFail` / `ListenClose` /
+  `InboundOpen` / `InboundAccept{gateway_id}`. An old peer ignores what it does not know and never sees them: a client sends
+  them only to a host that advertised the feature.
+  - Host policy (off by default): `gateway.unix: { connect: [...], listen: [...], replaceStale, maxListeners }`; exact paths,
+    `"/dir/"` prefixes, `"@abstract"` names (refused unless listed); checked after `realpath` of the parent, `..` refused,
+    the file must be a socket and not a symlink. Sockets the host creates are `0600` and unlinked on close or disconnect;
+    an existing socket is replaced only when the request says `replace` AND `replaceStale` is true AND it is stale (nothing
+    accepts on it); a non-socket file is never touched (the `StreamLocalBindUnlink` question: default no).
+  - Client: `client.openUnix(path)`, `openEndpoint(name)`, `openTcp(host, port)` (the TCP egress, same streams),
+    `listenUnix(path, { onConnection })`, each a web-streams duplex with backpressure; and under Node
+    `client.forwardUnix({ local, remote, reverse })` for the `ssh -L` / `-R` shapes with `host:port` and socket-path ends mixed
+    (`-L 127.0.0.1:2375:/var/run/docker.sock`).
+  - **Named virtual endpoints:** `createMemoryHost({ endpoints: { name: (duplex, who) => ... } })` (and `gateway.endpoints`
+    on the Node host) for a host with no file system; `who` is `{ username, fingerprint }`, and `{ open, authorize(who) }`
+    authorises per call. They are a separate message, not a reserved path, so a name cannot be confused with a file path and
+    the file-system policy is not involved. On the memory host the gateway offers endpoints only (no TCP, DNS or sockets).
+  - **Not done:** the Rust `wsh-server` and `wsh` CLI (`-L`/`-R` with sockets): the exact work is in the README
+    ([Gateway](README.md#unix-domain-sockets-streamlocal-and-named-endpoints)). UDP (#98, #124) is not in this change.
+  - **Tests:** `test/gateway-unix.test.mjs` (a fake Docker-style HTTP daemon on a real unix socket through `openUnix` and
+    `forwardUnix` in every TCP/unix mix, 20 MiB both ways, 24 concurrent connections, the connection cap, every policy
+    refusal including symlink escapes, `0600`, unlink on close and on disconnect, the stale-socket rules),
+    `test/gateway-endpoints.test.mjs` (memory host: who, allow-list, per-call authorisation, backpressure, disconnect).
+- **`OpenUdp` on the Node host (#98, first half of #124), over the existing reliable path.** `OpenUdp` used to be refused
+  with a `GatewayFail`; the gateway now serves it with the TCP destination policy (name rule, then the resolved address
+  checked and connected to as checked; not through `socks`). One `GatewayData` is one datagram (at most 65507 bytes); a
+  datagram the client cannot take fast enough is dropped by the host instead of buffered; idle flows close after
+  `gateway.udpIdleMs` (default 60000); flows count against `maxConnections`. Client: `client.openUdp(host, port)`.
+  No new messages or features. Because it rides the ordered, reliable control stream it has head-of-line blocking and
+  retransmission: **WebTransport datagrams, per-flow datagram ids, MTU handling and per-client rate bounds (the rest of
+  #124) are not implemented.** The Rust `wsh-server` already answers `OpenUdp`. Tests: `test/gateway-udp.test.mjs`.
+- The message count is 103 (`GatewayCredit`, `OpenUnix`, `OpenEndpoint`, `ListenUnix`); `spec/wsh-v1.yaml` and the three
+  generated outputs are updated. `src/memory-host.mjs` gains the `endpoints` option (one delimited change).
+
 ## 0.35.0
 
 - **`createMemoryHost({ rpc, sessions })`: typed RPC channels and detach/resume without Node (viaframe#592).** Both used

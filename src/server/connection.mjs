@@ -29,7 +29,7 @@ import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } f
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
-import { createGatewaySession } from './gateway.mjs';
+import { createGatewaySession, gatewayFeatures } from './gateway.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -43,7 +43,7 @@ export const STREAM_ANNOUNCE = 'stream-announce';
 export function hostFeatures(cfg, { dataStreams = true } = {}) {
   const features = dataStreams ? [STREAM_ANNOUNCE] : [];
   if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE);
-  if (cfg.gateway) features.push('gateway');
+  if (cfg.gateway) features.push(...gatewayFeatures(cfg.gateway));
   if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
   // End-to-end encryption (#90) is the virtual-mode EncryptedFrame layer, so it is offered where there are no
   // client-opened streams: over a relay bridge.
@@ -128,7 +128,9 @@ export function createConnectionFactory(cfg) {
     /** This connection as the relay hub sees it (created on first need). */
     let relayHandle = null;
 
-    const gateway = cfg.gateway ? createGatewaySession(cfg.gateway, (m) => send(m), log) : null;
+    const gateway = cfg.gateway
+      ? createGatewaySession(cfg.gateway, (m) => send(m), log, { who: () => ({ username: state.username, fingerprint: state.fingerprint }) })
+      : null;
 
     const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
 
@@ -317,6 +319,7 @@ export function createConnectionFactory(cfg) {
         }
         state.username = user;
         state.method = method;
+        gateway?.setPeerFeatures(m.features);
         const features = hostFeatures(cfg, { dataStreams });
         let hostFingerprint;
         if (cfg.hostKey) {

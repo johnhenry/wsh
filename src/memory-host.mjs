@@ -7,8 +7,9 @@
  * password auth, exec channels, MCP tools, extensions), speaking QMux over a pair of in-memory WebSocket-like
  * sockets -- so what a client does here is what it does against a server. It serves what a browser can: `exec` as a
  * function you provide (there is no shell), `mcp` tools, `extensions`, typed `rpc` channels (handler functions you
- * provide) and `sessions` (detach / attach / resume of exec sessions, output replayed from an in-memory ring buffer).
- * Not available: `pty`, `fs`, `gateway`, `relay`, `hostKey`, WebTransport, the `wsh-host` / `wsh-fs` rpc built-ins
+ * provide), `sessions` (detach / attach / resume of exec sessions, output replayed from an in-memory ring buffer) and
+ * `endpoints` (named virtual endpoints, the in-memory stand-in for unix sockets).
+ * Not available: `pty`, `fs`, the TCP/DNS/unix parts of `gateway`, `relay`, `hostKey`, WebTransport, the `wsh-host` / `wsh-fs` rpc built-ins
  * (they need Node; use `@johnhenry/wsh/server`).
  *
  * ```js
@@ -27,6 +28,7 @@ import { createConnectionFactory } from './server/connection.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
 import { createMcpHost } from './server/mcp.mjs';
 import { bindSocket } from './server/socket.mjs';
+import { normalizeGateway } from './server/gateway.mjs'; // [endpoints]
 import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
 
@@ -135,10 +137,16 @@ function createRegistry(sessions, log) {
  *   `createWshServer`, with the same defaults (300000 ms detached, 16 detached sessions, 1 MiB of replayable output
  *   per session). Off unless given: sessions then die with their connection. There is no `sessionSecret`: session
  *   tokens are random per session.
+ * @param {Record<string, ((duplex: object, who: { username: string | null, fingerprint: string | null }) => void | Promise<void>) | { open: Function, authorize?: (who: object) => boolean | Promise<boolean> }>} [options.endpoints]
+ *   Named virtual endpoints (a host with no file system exposes these instead of unix sockets): a client reaches one with
+ *   `client.openEndpoint(name)`. `duplex` is `{ readable, writable, close(), destroy(), closed, who }` (web streams with
+ *   backpressure) and `who` is the authenticated `{ username, fingerprint }`, so the handler can authorise per call:
+ *   throw synchronously to refuse, or give `{ open, authorize(who) }`. Only the names listed here exist (an allow-list by
+ *   construction); nothing else of the gateway (TCP, DNS, unix sockets) is on in memory.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
+export function createMemoryHost({ auth, exec, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
   if (exec === true) throw new TypeError('createMemoryHost: exec must be a function (run(command, io)); there is no shell to run `true` with');
   if (exec !== undefined && typeof exec !== 'function' && typeof exec?.run !== 'function') {
     throw new TypeError('createMemoryHost: exec must be a function or { run }');
@@ -156,10 +164,12 @@ export function createMemoryHost({ auth, exec, mcp, extensions, rpc, rpcMaxMessa
   };
   const methods = authMethods(auth);
   const mcpHost = mcp ? createMcpHost(mcp) : null;
+  // [endpoints] named virtual endpoints: the gateway with TCP and DNS off and only `OpenEndpoint` answered.
+  const gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeGateway({ tcp: false, endpoints });
 
   const ready = buildAuthorizer(auth).then((authorize) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: null, files: null, bindTimeoutMs, log: onLog,
-    methods, hostKey: null, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: null, sessions: registry, relay: null,
+    methods, hostKey: null, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, sessions: registry, relay: null,
   }));
   ready.catch(() => {});
 

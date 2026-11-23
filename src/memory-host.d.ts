@@ -2,7 +2,7 @@ import type { WshClient, RpcChannel } from './index.js';
 import type { WshSigner } from './index.js';
 import type {
   WshServerAuthOptions, WshServerPrincipal, WshServerMcpOptions, WshExecRunner, WshServerOptions,
-  WshAcceptableSocket, WshAcceptOptions,
+  WshAcceptableSocket, WshAcceptOptions, WshGatewayEndpointHandler as WshMemoryEndpointHandler,
 } from './server/index.js';
 
 export interface WshMemorySessionsOptions {
@@ -43,6 +43,13 @@ export interface WshMemoryHostOptions {
    * defaults as `createWshServer`. `true` for the defaults. Off unless given.
    */
   sessions?: true | false | null | WshMemorySessionsOptions;
+  /**
+   * Named virtual endpoints: a host with no file system exposes these instead of unix sockets; a client reaches one with
+   * `client.openEndpoint(name)`. The handler gets web streams with backpressure and `who` (the authenticated
+   * `{ username, fingerprint }`) and refuses by throwing; `{ open, authorize(who) }` authorises per call. Only the
+   * names listed exist. Nothing else of the gateway (TCP, DNS, unix sockets) is available in memory.
+   */
+  endpoints?: Record<string, WshMemoryEndpointHandler | { open: WshMemoryEndpointHandler; authorize?: (who: { username: string | null; fingerprint: string | null }) => boolean | Promise<boolean> }>;
   bindTimeoutMs?: number;
   onLog?: (line: string) => void;
 }
