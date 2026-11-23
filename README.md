@@ -4,9 +4,10 @@
 > Renamed to `@johnhenry/wsh` on import into the @johnhenry family. Unlike
 > other packages in this family, wsh did **not** restart its version at
 > `0.0.0` on adoption — it was already a mature, actively-depended-upon
-> release, so versioning continued forward and now stands at `0.17.0`. This
-> is a deliberate, permanent exception to the family's usual 0.0.0-restart
-> convention, not an oversight.
+> release, so versioning continued forward from there (see
+> [CHANGELOG.md](CHANGELOG.md) for the current version). This is a deliberate,
+> permanent exception to the family's usual 0.0.0-restart convention, not an
+> oversight.
 
 [![npm version](https://img.shields.io/npm/v/%40johnhenry%2Fwsh.svg)](https://www.npmjs.com/package/@johnhenry/wsh)
 [![CI](https://github.com/johnhenry/wsh/actions/workflows/ci.yml/badge.svg)](https://github.com/johnhenry/wsh/actions/workflows/ci.yml)
@@ -34,6 +35,8 @@ wsh is a pure-JS client library (with an optional Node server at `@johnhenry/wsh
 - [Rust implementation](#rust-implementation)
 - [Security model](#security-model)
 - [Browser Compatibility](#browser-compatibility)
+- [Browser tests and bundle size](#browser-tests-and-bundle-size)
+- [Related projects](#related-projects)
 - [Family](#family)
 - [License](#license)
 
@@ -112,8 +115,10 @@ server implementations can speak the same framing.
 ```js
 import { WshClient, generateKeyPair } from '@johnhenry/wsh';
 
-// Generate an Ed25519 key pair
-const keyPair = await generateKeyPair(true);
+// Generate an Ed25519 key pair. Non-extractable (the default): this page's code can sign with the private key
+// but nothing can read it out. Authorize it on the host by exporting the PUBLIC half
+// (`exportPublicKeySSH(keyPair.publicKey)`); keep keys across reloads with `WshKeyStore`.
+const keyPair = await generateKeyPair();
 
 // Connect to a wsh server
 const client = new WshClient();
@@ -153,7 +158,7 @@ await client.disconnect();
 ```js
 import { WshClient, generateKeyPair } from '@johnhenry/wsh';
 
-const keyPair = await generateKeyPair(true);
+const keyPair = await generateKeyPair(); // non-extractable; see Quick Start
 const { stdout, exitCode } = await WshClient.exec(
   'wss://shell.example.com',
   'ls -la /tmp',
@@ -274,9 +279,33 @@ session.onData = (d) => console.log(new TextDecoder().decode(d));   // "ran hi"
 
 It is the real connection handler speaking QMux over an in-memory socket pair, so the client code you test is the code
 you ship. `host.createClient()` / `host.WebSocket` / `host.accept(socket)` / `createSocketPair()` are the lower-level pieces.
-Supported: `auth`, `exec` (a function; there is no shell), `mcp`, `extensions`, `rpc` and `sessions` (below). Not
-available in memory: `pty`, `fs`, `gateway`, `relay`, `hostKey`, WebTransport and the `wsh-host` / `wsh-fs` rpc
-built-ins (use `@johnhenry/wsh/server`).
+Supported: `auth`, `exec` (a function; there is no shell), `pty`, `fs` and `hostKey` (injected, below), `mcp`,
+`extensions`, `rpc` and `sessions` (below). Not available in memory: `gateway`, `relay`, WebTransport, `exec: true` and
+`fs: { root }` (they need Node) and the `wsh-host` / `wsh-fs` rpc built-ins (use `@johnhenry/wsh/server`).
+
+**Injected backends**, shaped like the Node host's, so a page can be a real host (#114):
+
+- `pty: { spawn, shell?, cwd?, env?, term? }` -- `spawn` is `node-pty`'s `spawn(file, args, { name, cols, rows, cwd, env })`
+  or anything shaped like it, returning `{ onData(cb), onExit(cb), write(data), resize(cols, rows), kill(signal?) }`.
+  `write` receives a `Uint8Array` (there is no `Buffer` in a browser, and none is needed anywhere in the host). `shell` is
+  the `file` your `spawn` is called with (default `/bin/sh`).
+- `fs: { operate, readWhole, writeWhole, writeAt, openRange?, maxFileBytes? }` -- an object of operations, **not** a root path
+  (`fs: { root }` needs Node and is refused here). The types are `WshFileBackend` in `@johnhenry/wsh/host`; the file
+  operations (`list`, `stat`, `read`, `write`, `rename`, `mkdir`, `remove`) reach `operate` with the path exactly as the
+  client sent it, so **confining paths is the backend's job** -- see [Security model](#security-model).
+- `hostKey` -- a `CryptoKeyPair` (generate it with `generateKeyPair()` and the private key stays non-extractable), a signer
+  `{ publicKey, sign(data) }` for a key held elsewhere, or `true` for a fresh non-extractable key. Clients pin it as for
+  any host ([Host key](#host-key-fingerprint--tofu)); the proof is signed through `sign`, so the key never has to be readable.
+- `dataStreams` (default `true`) -- whether to offer client-opened QMux data streams. **Set it to `false` for a peer that
+  cannot open them: the released Rust client over WebSocket** (`wsh`, `rust-v0.6.0`: "WebSocket transport does not support
+  real data streams for this server", #132). Exec output then rides `SessionData` (`data_mode: "virtual"`, as over a relay
+  bridge) and `stream-announce` and `rpc` are not offered. It is an option rather than a negotiation because no released
+  client says whether it can open streams: the Rust client's `Hello` carries only `mcp` and `file-transfer`. The JS client works
+  either way. `host.accept(socket, { dataStreams })` overrides it per connection.
+
+**Serving a socket you opened yourself:** `host.accept(new WebSocket(url))` works on a socket that is still connecting (the
+host's first bytes are held until it opens). `accept()` of an in-page host through a relay or a byte pipe is what the
+[browser suite](#browser-tests-and-bundle-size) runs against the released Rust CLI.
 
 **`rpc`** takes handler functions only, `rpc: { calc: (channel, ctx) => channel.onRequest('add', ({ a, b }) => a + b) }`
 (the `RpcChannel` is the one `@johnhenry/wsh/server` hands its handlers), with `rpcMaxMessageBytes` (default 1 MiB) and
@@ -288,9 +317,38 @@ messages, `seq` counted in output bytes, and the same errors (unknown or expired
 of the session, an output gap). The limits and defaults are the server's: 300000 ms detached before a session is
 dropped, at most 16 detached sessions (the longest-detached is dropped first), 1 MiB of replayable output per session
 (a resume older than the ring is refused as a gap; `attachSession` gets the retained tail). The session list lives in
-the page's memory, so it ends with the page or `host.close()`. Differences from the server: no `pty`, no
-`sessionSecret` (tokens are random per session instead of HMAC-signed, so they cannot be checked across restarts), and
+the page's memory, so it ends with the page or `host.close()`. Differences from the server: no `sessionSecret` (tokens are random per session instead of HMAC-signed, so they cannot be checked across restarts), and
 the host still runs no command by itself: sessions only wrap whatever `exec` function you pass.
+
+### Browser entry points, the connection factory and bundle size
+
+Every `exports` entry except `./server` is browser-safe: no `node:*` import and no `Buffer` is reachable from it (a test
+bundles each one for the browser and fails if one is, `test/browser-bundle.test.mjs`), and `"sideEffects": false` lets a
+bundler drop what you do not use.
+
+| Entry | What it is |
+|---|---|
+| `@johnhenry/wsh` | the client (`WshClient`, `WshKeyStore`, ...) |
+| `@johnhenry/wsh/memory` | `createMemoryHost()`, a host in this realm (above) |
+| `@johnhenry/wsh/host` | the pieces under it, for your own transport: `createConnectionFactory(config)` -- the connection handler `createWshServer`, `createMemoryHost` and `createReverseHost` all run -- plus `bindSocket(socket, ready, { dataStreams })`, `resolveBackends()`, `resolveHostKey()`, `buildAuthorizer()` and `authMethods()`. It does not import the client |
+| `@johnhenry/wsh/reverse` | `createReverseHost()` for a page or Worker: dial out to a relay and serve the operator it bridges. The same function `@johnhenry/wsh/server` exports, minus `exec: true` and `fs: { root }` |
+| `@johnhenry/wsh/server` | Node only |
+
+```js
+import { createConnectionFactory, bindSocket, resolveBackends, buildAuthorizer, authMethods } from '@johnhenry/wsh/host';
+
+const auth = { authorizedKeys: [rawPublicKey] };
+const attach = createConnectionFactory({                      // authorize is required: there is no open default
+  authorize: await buildAuthorizer(auth), methods: authMethods(auth),
+  ...resolveBackends({ exec: async (command, io) => { await io.write('hi\n'); return 0; } }),
+});
+await bindSocket(upgradedSocket, Promise.resolve(attach), { dataStreams: false });   // or attach({ send, ... }) on a byte pipe
+```
+
+`npm run size` prints raw and gzip bytes per entry point (and a few single-import probes, which show tree-shaking at
+work) against `scripts/bundle-budget.json`; CI runs it and `npm test` fails a bundle more than 10% over its budget.
+`npm run size -- --update` rewrites the budget after a deliberate change. Sizes are of this package's own code:
+`@noble/post-quantum`, the optional ML-KEM backend, is left out of the measurement.
 
 ### Signing with a page-held signer
 
@@ -1113,6 +1171,7 @@ than left to be found.
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
 | Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | Rust `wsh-server` (`rust-v0.4.0`+): `wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set; no client yet in `wsh-client` | **No wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere; the Rust server serves it on WebSocket/QMux only |
 | Exec stdin + EOF, separate stderr | `exec({ stdin })`, `session.closeStdin()`, `session.onStderr` | none yet in `wsh-client` | **Wire-unified, negotiated** (#105): `Open.stdio = "pipes"` + `OpenOk.stderr_channel_id` + zero-length `SessionData` as EOF, offered by the `exec-pipes` `ServerHello` feature. `@johnhenry/wsh/server` needs none of it (stream-mode EOF); the Rust `wsh-server` (`rust-v0.5.0`+) runs such an exec on pipes, everything else on the PTY |
+| Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. Its `scp` download also reads a raw stream, not the `FileChunk` messages this host sends, so `wsh scp` from such a host does not work (`wsh ls` and exec do) |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side; several operators per peer and the signed `KeyExchange` are JS-relay only for now |
@@ -1248,6 +1307,17 @@ out explicitly below rather than left to be discovered.
   auth, or make sure the transport is actually encrypted, before sending a
   password.
 
+- **A host that lives in a page (`createMemoryHost`, `@johnhenry/wsh/reverse`) is only as trustworthy as the page.** A
+  non-extractable host key or client key keeps the private key from being *read*, not from being *used*: any script that
+  runs in the page (an XSS, a malicious dependency, an extension with page access) can still have it sign, which means
+  impersonate the host or log in as the user for as long as it runs. The injected `pty`, `fs` and `exec` backends are
+  code you wrote and run with the page's authority -- wsh authenticates who may call them, and confines nothing about what
+  they do: a file backend that resolves `..`, a `pty.spawn` that starts a real process, an `exec` that evals its
+  command are yours to make safe (the Node server's `fs: { root }` is the one with confinement built in, and the
+  browser-safe `fs` option takes no root). Pinning a page-held host key protects a client from the wrong host, not from
+  a byte pipe or relay between them reading and altering the bytes: confidentiality needs `wss://` or the end-to-end layer.
+  `dataStreams: false` changes how output is framed (as `SessionData`), not who is let in.
+
 ## Browser Compatibility
 
 Requires a browser (or Node.js 24+) with `TextEncoder`/`TextDecoder`,
@@ -1324,6 +1394,34 @@ The hybrid post-quantum path prefers native WebCrypto ML-KEM (Node 24.7+).
 browser the optional `@noble/post-quantum` dependency is what actually
 runs, loaded dynamically by `src/mlkem.mjs`. Treat it as required, not
 optional, if you want the hybrid handshake on the web today.
+
+## Browser tests and bundle size
+
+`npm test` is JS-only and needs no browser. `npm run test:browser` runs the real-Chromium suite (Playwright; install it
+once with `npx playwright install chromium`) and has its own CI job:
+
+- a browser client against a Node `createWshServer` over a real WebSocket: auth with a non-extractable key, exec, a pty with
+  resize, file transfer, and resuming a session after the socket drops;
+- a host that lives in the page, `createMemoryHost().accept(new WebSocket(url))`, joined to its operator by a tiny byte pipe
+  the test owns, driven by the JS client (exec, stdin, pty, files, a pinned non-extractable host key) **and by the released
+  Rust `wsh` CLI**: that test downloads the latest `rust-v*` release's archive for the platform from this repository's
+  GitHub releases, verifies it against the release's `SHA256SUMS`, and runs it with `HOME` pointed at a temp directory (so
+  it never touches `~/.wsh`). It is skipped, with the reason printed, on a platform with no release asset or when the
+  download fails, and fails (rather than skips) in CI. The released CLI only dials `wss://`, so the pipe terminates TLS with
+  a self-signed certificate and the CLI runs with its loopback-only `WSH_INSECURE_LOOPBACK_TLS=1`;
+- `WshKeyStore` with a non-extractable key surviving a reload and still authenticating.
+
+The bundle-size report is described under [Browser entry points](#browser-entry-points-the-connection-factory-and-bundle-size).
+
+## Related projects
+
+- **[`@johnhenry/browsermesh-netway`](https://github.com/johnhenry/browsermesh)** takes a `WshClient` as its gateway backend
+  (see [Family](#family) below).
+- **The Rust crates** in [`crates/`](crates) (`wsh-core`, `wsh-client`, `wsh-cli`, `wsh-server`) are a native
+  implementation of the same wire protocol, versioned separately (`rust-v*` tags) and generated from the same
+  `spec/wsh-v1.yaml`; see [Rust implementation](#rust-implementation) for what each side can do.
+- **[clawser](https://github.com/erisera-code/clawser)** downloads the Rust release binaries by their archive names and is
+  where the Rust workspace came from.
 
 ## Family
 
