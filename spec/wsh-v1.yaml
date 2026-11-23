@@ -2381,6 +2381,16 @@ messages:
           type: u32
           required: true
           description: "Largest data payload of one request or reply"
+        paths:
+          type: "string[]"
+          required: false
+          description: >
+            Optional, parallel to `shares`: each share's root directory on the operator's machine, as the operator
+            typed it, made absolute and lexically tidied (no "//", "." or trailing "/"). ADVISORY: the host cannot
+            verify it and the client still serves only the directory it opened. A client that does not want to reveal
+            paths omits the field (`wsh --share-hide-path`). A host uses it only when it is an array as long as
+            `shares` and the entry is an absolute string of at most 4096 bytes without NUL; anything else is
+            ignored, never an error. Older peers that do not know the field keep working.
 
     ShareRequest:
       code: 0xa9

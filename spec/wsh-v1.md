@@ -1428,6 +1428,7 @@ Category: **shares**
 | `writable` | `string[]` | no | `[]` |
 | `max_inflight` | `u32` | yes | — |
 | `max_bytes` | `u32` | yes | — |
+| `paths` | `string[]` | no | — |
 
 ### ShareRequest (`0xa9`)
 

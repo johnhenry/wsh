@@ -871,6 +871,20 @@ plain message from the host is dropped, a frame that does not open ends the conn
 is refused and datagrams are neither sent nor heard (UDP uses the reliable path). `'auto'` is not a guarantee, for the reason above;
 `true` is.
 
+#### Knowing who a host turned away: `onRefused` (#163)
+
+`createMemoryHost`, `createWshServer` and `createReverseHost` take `onRefused({ reason, who, detail })`, called once per
+connection the host turned away, so an embedder can tell the user why a terminal was refused without parsing `onLog`. `reason`
+is a stable code, the list is exported as `REFUSAL_REASONS` from `@johnhenry/wsh/host`: `not-sealed` (a plain client on a
+host that requires a sealed session, or a password login there), `unauthorized` (a key the host does not allow, a wrong
+password, or an operator a reverse host's `accept` turned down), `binding-required`, `bad-signature`, `method-disabled`,
+`rate-limited`, `bad-request`, `seal-failed` (a sealed session's key exchange failed or a frame did not open), and for a reverse
+host `busy`, `proof-required`, `proof-failed`. `who` holds what is known: `username`, `fingerprint` (a key login), `address` (when
+the transport gives one); a refusal before the login names no one. `detail` is human text and not stable. New codes may be added;
+none is renamed. It reports only what this host decided: it does not say what a relay in the middle dropped, a client
+that never reached the host, or a frame the host silently ignored on an already-sealed session (a plain message after sealing
+is dropped, as before, without a report).
+
 #### A pipe relay (`@johnhenry/wsh/pipe-relay`, #118)
 
 When you do not want the relay to be a party at all, use a pipe: the host dials the relay, the operator dials the
@@ -1494,7 +1508,7 @@ instead of dragging its own toolchain and CI job into an unrelated
 browser-app repo. It was previously deleted from clawser by accident
 (2026-03-14) and restored (2026-07-05) before this move.
 
-Four crates, workspace-versioned (currently `0.11.0`):
+Four crates, workspace-versioned (currently `0.12.0`):
 
 | Crate | Kind | Description |
 |-------|------|--------------|
@@ -1566,6 +1580,12 @@ stderr, what it shares and how (`wsh: sharing "src" = /home/me/project (read-onl
 command, applies to `wsh [user@]host [command...]` and `wsh connect` only (`scp`, `ls`, `sftp`, `copy-id` refuse it), and fails
 with a sentence when the host does not say it can use shares: a share that silently does not exist is worse than none. Unix only.
 
+**The path is sent too (#164).** The offer carries each share's root as an absolute path, as you typed it (made tidy: `//`, `.`
+and a trailing `/` removed; `..` is left as typed), so a host that was asked for `-v /home/me/project:/in` can recognise the share
+it belongs to (`fs.root`) instead of a hash in the share name. It is advisory (see [Security model](#security-model)): the host
+cannot verify it. To keep your directory layout to yourself add `--share-hide-path`: the offer then has no path (exactly what
+0.40.0 / `rust-v0.11.0` clients sent), `fs.root` is `undefined` on the host, and everything else works.
+
 **What the host can do.** Stat and lstat, readdir (every entry WITH its attributes, in pages), readlink, open and read (ranges; a
 small file's content rides the open, so reading it is one message), write, create, mkdir, rename, unlink, rmdir, setattr (mode,
 times, truncate) and close, each a bounded `ShareRequest` the host sends and the CLI answers with an errno-like code. At most 16
@@ -1598,9 +1618,17 @@ const host = createMemoryHost({
     const entries = await fs.readdir('/');           // [{ name, type, size, mode, mtimeMs, ... }] -- attributes included
     const pkg = JSON.parse(new TextDecoder().decode(await fs.readFile('/package.json')));
     if (fs.writable) await fs.writeFile('/out/built.txt', new TextEncoder().encode('done'));
+    if (fs.root === '/home/me/project') { /* a request for `-v /home/me/project:/in` is this share */ }
   },
 });
 ```
+
+`fs.root` (a string or `undefined`) is the directory's path on the operator's machine, as the operator typed it (#164). **It is
+advisory and unverified**: the operator's client sends it, the host cannot check it, and the CLI still enforces the real
+boundary (it serves only the directory it opened, whatever the path says). It is `undefined` when the client is older, sent
+`--share-hide-path`, or sent something the host does not accept: the host keeps a path only if it is an absolute string of at
+most 4096 bytes without a NUL and `paths` has exactly one entry per share; anything else is ignored, never an error. Use it to
+recognise a share, not to decide what is safe.
 
 `createMemoryHost`, `createWshServer` and `createReverseHost` take `onShare`; listing it makes the host state the feature
 `shares`, and a host without it never hears an offer. `fs` is an object of async operations (`stat`, `lstat`, `readlink`,
@@ -1622,7 +1650,7 @@ than left to be found.
 | Capability | JS SDK (browser) | Rust CLI/client | Unified via |
 |---|---|---|---|
 | Directory listing (`list`) | `WshFileTransfer.list()` | `wsh_client::file_transfer::list()`, `wsh ls`, `wsh sftp` | **Wire-unified**: `FileOp`/`FileResult` with the generated `FileEntry` type (wsh #59) -- both languages decode the same shape, including symlink targets |
-| Upload/download | `WshClient.upload()`/`.download()` | `file_transfer::upload()`/`download()`, `wsh scp` | **Wire-unified**: `FileChunk` over a `'file'`-kind channel (wsh #13) |
+| Upload/download | `WshClient.upload()`/`.download()` | `file_transfer::upload()`/`download()`, `wsh scp` | **Wire-unified**: `FileChunk` over a `'file'`-kind channel (wsh #13). Before the Rust client of the next `rust-v` release (#140) it read a raw stream (an 8-byte size, then the data) that no host sends, so `wsh scp` hung against every host (JS and `wsh-server`); the CLI is now tested against a Node host through a pipe relay and against `wsh-server` (`test/rust/wsh-cli-scp.test.mjs`), uploads and downloads of 0 B to 300 KiB |
 | Remove a remote file | `WshClient.fileRemove()` | `file_transfer::remove()`, `wsh sftp`'s `rm` | **Wire-unified**: `FileOp`/`FileResult` (`op: "remove"`) -- refused today by every `wsh-server` release ("not yet implemented"), the same refusal on both sides |
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed); the client sends `host-key-nonce`, verifies `host-key`/`host-key-sig`, pins only a proven key, and a first use needs `--accept-new-host-key` or a yes at a terminal (`--require-host-key` refuses a host with no proof); `wsh-server` has an opt-in host key (`[server] host_key`) | **Unified** (wsh #59, #145): both pin a PROVEN `ServerHello.host_fingerprint`. A Rust server with no `host_key` configured (the default, so released clients keep working) proves nothing |
@@ -1630,7 +1658,7 @@ than left to be found.
 | Exec stdin + EOF, separate stderr | `exec({ stdin })`, `session.closeStdin()`, `session.onStderr` | `SessionOpts { stdio: Some("pipes") }`, `WshSession::read_stderr()` / `close_stdin()`; `wsh host command` uses them whenever its stdin is a pipe or a file and the host offers `exec-pipes` | **Wire-unified, negotiated** (#105): `Open.stdio = "pipes"` + `OpenOk.stderr_channel_id` + zero-length `SessionData` as EOF, offered by the `exec-pipes` `ServerHello` feature. `@johnhenry/wsh/server` needs none of it (stream-mode EOF); the Rust `wsh-server` (`rust-v0.5.0`+) runs such an exec on pipes, everything else on the PTY. Against a host without `exec-pipes` the CLI still forwards stdin, but cannot tell the command it ended |
 | Signals and resize for a one-off command | `session.signal()`, `session.resize()` | `wsh host command` forwards SIGINT/SIGTERM/SIGHUP (the same signal twice disconnects); `wsh --tty host command` also forwards terminal resizes | **Wire-unified** (`Signal`, `Resize`). The Rust `wsh-server` delivers `Signal` (#145) to a pty session's foreground process group (what ^C reaches) and to an exec-on-pipes command's own process group, for `HUP INT QUIT TERM KILL USR1 USR2 WINCH CONT STOP TSTP ALRM` (with or without `SIG`); another name is ignored, and only the control attachment of the connection that owns the channel can send one. Not delivered on Windows |
 | Dial target | a URL | `wsh [user@]host` (dials `https://` then `wss://` on `--port`), or a full URL: `wsh wss://host:8443/rendezvous/ab12 command`, `ws://127.0.0.1:PORT/` | **CLI-only convenience**: a URL is dialled exactly as given (no transport fallback; `--port` and `--transport` do not apply). Plain `ws://` is accepted only to a loopback host |
-| Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. Its `scp` download also reads a raw stream, not the `FileChunk` messages this host sends, so `wsh scp` from such a host does not work (`wsh ls` and exec do) |
+| Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. `wsh scp` works against such a host with the Rust client of the next `rust-v` release (it speaks `FileChunk`, #140); a released `rust-v0.11.0` or older `wsh scp` hangs against it (`wsh ls` and exec work) |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side; several operators per peer and the signed `KeyExchange` are JS-relay only for now |
@@ -1643,8 +1671,9 @@ than left to be found.
 | Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | **Operator proof: yes.** The Rust relay lists `operator-proof` and carries `ReverseChallenge`/`ReverseProof`/`ReverseConnect.features`; `wsh reverse-connect` answers a challenge (`--operator-proof` / `--no-operator-proof`; by default only for a peer that registered the `operator-proof` capability, because a released Rust host cannot decode the field); `wsh reverse` / `wsh agent run` challenge, verify BEFORE accepting, and take `--require-operator-proof` and `--allow-operator`. **Sealed bridge and both signed `KeyExchange` halves: yes** (`wsh reverse-connect --sealed`; a host with an identity states `e2e` / `e2e-sign` / `e2e-sealed` in its `ReverseAccept` once it has proven the operator). The exchange is byte-identical to JS (transcripts compared against vectors printed by the JS code), hybrid X25519+ML-KEM-768 negotiated exactly as JS does, X25519 when the peer lists no ML-KEM key. A host started with `--require-operator-proof` REQUIRES the sealed bridge (the JS rule): until the key exists it hears and sends nothing but the key exchange, and drops a bridge that has not sealed in 10 s; an operator that does not seal gets no answer to its plain messages. Every message that would cross the relay travels as an `EncryptedFrame` on channel 0; a plain message (wrapped or not) is dropped; **a frame that does not open (tampered, replayed, reordered) closes the bridge** (stricter than the JS host, which drops the frame and ignores the rest). Not covered: a direct or pipe-relayed connection, and `GatewayData` outside a reverse bridge (#155) | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); both implementations seal a reverse bridge |
 | Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | Kind `host`: the client binds to the proven host key (`--require-channel-binding`, and it honours `channel-binding-required`), and `wsh-server` offers it and can require it (`[server] require_channel_binding`, needs `host_key`). `cert-hash` and `tls-exporter`: not in Rust (the Rust WebTransport client has no certificate-hash pinning; `ConnectConfig.cert_hash` binds it if a caller supplies one) | **Wire-unified, negotiated** (`channel-binding:<kind>` features); verified against the spec's test vectors |
 | Pipe relay (#118) | `@johnhenry/wsh/pipe-relay` | operator side only (#145): `wsh --via wss://relay/r/<id> user@host command...` (also `connect`, `scp`, `ls`, `sftp`, `copy-id`), or the URL as the target. The host side of a pipe is not implemented in Rust. As on a direct connection the Rust client verifies the host-key proof (`host-key` / `host-key-sig` over its own nonce) before sending a credential, pins only a proven key, and binds the login to it (channel binding `host`; `test/rust/wsh-cli-identity.test.mjs`); the pipe-relayed session itself is not sealed (see Security model). `wsh -N -L` exits non-zero when the host drops the session (#156), and the error lines show the relay and a shortened id, never the whole rendezvous id | **Deliberately a relay without wsh parsing** -- nothing to unify on the wire. `--via` keeps `user@host` as the identity: its key is recorded in `known_hosts` under `host:port` (what a direct connection uses), never under the relay's address; a URL target is recorded under the URL's own authority, i.e. the relay's. The URL is not saved to `last_session.json` (the id is a capability) |
-| Operator-side shared folders (`--share`, #159) | host side: `onShare(name, fs, who)` on `createMemoryHost` / `createWshServer` / `createReverseHost` (the host *uses* the operator's directories; `fs` is an object of async file operations, also shaped like an `fs` backend). The JS client does not offer shares | CLI side: `wsh --share NAME=/abs/dir[:ro\|:rw]` offers them (`wsh_client::share`, `wsh-cli`'s `sharefs`: descriptor-relative, never follows a link, see [Sharing a directory](#sharing-a-directory-with-the-host-wsh---share-159)); unix only. **A Rust host that uses shares: not built** (`wsh-server` does not state `shares`) | **Wire-unified, negotiated**: the host states the feature `shares`; the client sends one `ShareOffer` after login (opcodes `0xa8` `ShareOffer`, `0xa9` `ShareRequest`, host to client, `0xaa` `ShareReply`). No change notification, no sharing over `reverse-connect` |
+| Operator-side shared folders (`--share`, #159) | host side: `onShare(name, fs, who)` on `createMemoryHost` / `createWshServer` / `createReverseHost` (the host *uses* the operator's directories; `fs` is an object of async file operations, also shaped like an `fs` backend; `fs.root` is the operator's advisory, unverified path for the share, #164). The JS client does not offer shares | CLI side: `wsh --share NAME=/abs/dir[:ro\|:rw]` offers them, with each directory's path unless `--share-hide-path` (`wsh_client::share`, `wsh-cli`'s `sharefs`: descriptor-relative, never follows a link, see [Sharing a directory](#sharing-a-directory-with-the-host-wsh---share-159)); unix only. **A Rust host that uses shares: not built** (`wsh-server` does not state `shares`) | **Wire-unified, negotiated**: the host states the feature `shares`; the client sends one `ShareOffer` after login (opcodes `0xa8` `ShareOffer`, `0xa9` `ShareRequest`, host to client, `0xaa` `ShareReply`). No change notification, no sharing over `reverse-connect` |
 | Sealed session: any authenticated connection incl. gateway/endpoint data (#155) | host `sealSession: 'offer' \| 'require'` (stage b); client `connect(url, { sealSession: false \| 'auto' \| true })` (stage c) | `wsh --sealed ...` (or automatic against `e2e-session-required`) seals a direct or pipe-relayed session; `wsh-server` does not offer it yet | **Wire-unified, negotiated** (`e2e-session`, `e2e-session-required`, `KeyExchange` for the connection's session id, `EncryptedFrame` channel 0) |
+| Refusal event with stable reason codes (`onRefused`, #163) | `onRefused({ reason, who, detail })` on `createMemoryHost` / `createWshServer` / `createReverseHost`; `REFUSAL_REASONS` from `@johnhenry/wsh/host` | none: `wsh-server` and `wsh reverse` log a refusal, they have no callback (an embedding process has none) | **JS-only** -- a host-side callback of the embedding API, no wire change |
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |
@@ -1702,6 +1731,10 @@ wsh-cli-<target>.tar.gz      # binary: wsh
 plus one `SHA256SUMS` file covering every archive in the release. These
 names are a stable contract other repos (clawser) pin and download by --
 do not change them without coordinating downstream.
+
+`wsh --version` and `wsh-server --version` print the workspace version the binary was built from (`wsh 0.12.0`), which is the
+number in the `rust-vX.Y.Z` tag. Binaries of `rust-v0.9.0` to `rust-v0.10.0` printed a fixed `0.1.0`, so against one of those the
+version cannot be read from the binary (look for a flag in `wsh --help` instead).
 
 ## Security model
 
@@ -1930,6 +1963,11 @@ What this does **not** protect against:
   is sealed, #155); a host that is itself malicious software on a page can read what the page's other code can ask for. The
   JS side treats the CLI as untrusted too (window, size, shape and deadline of every reply are checked), but an embedder
   that mounts `fs` is responsible for what it does with the files.
+  **The root path (`ShareOffer.paths`, `fs.root`, #164) is a claim, not evidence.** By default the CLI tells the host where each
+  shared directory is on your machine (so it can map a bind-mount source onto a share); the host cannot verify it, a modified
+  client can send any string, and the CLI serves only the directory it opened whatever the path says. A host must use it to
+  recognise a share, never to decide what is safe to mount or run. It reveals your directory layout (a user name, a project
+  name) to the host and to a relay that is not sealed; `--share-hide-path` leaves it out.
 - **Rust `wsh-server`'s `AuthOk.ttl` is 0 and its `token` is opaque** (as the
   JS host's, above): nothing is promised or enforced at connection level; do not
   treat the token as a credential.

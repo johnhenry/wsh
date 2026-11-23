@@ -124,9 +124,45 @@ pub fn parse_spec(spec: &str) -> Result<ShareSpec, String> {
     }
     Ok(ShareSpec {
         name: name.to_string(),
-        path: PathBuf::from(path),
+        path: PathBuf::from(tidy_absolute(path)),
         writable,
     })
+}
+
+/// Lexically tidy an absolute path: collapse `//`, drop `.` components and a trailing `/`. `..` is
+/// left alone (a symlink could make resolving it here wrong). This is the path the host is told
+/// about (`ShareOffer.paths`, advisory) and the one the share is opened from.
+fn tidy_absolute(path: &str) -> String {
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    format!("/{}", parts.join("/"))
+}
+
+/// The `ShareOffer` for `specs`. `hide_path` leaves out `paths` (`--share-hide-path`), which is
+/// then exactly what a 0.40.0 / `rust-v0.11.0` client sent.
+pub fn build_offer(
+    specs: &[ShareSpec],
+    limits: &Limits,
+    hide_path: bool,
+) -> wsh_core::messages::ShareOfferPayload {
+    wsh_core::messages::ShareOfferPayload {
+        shares: specs.iter().map(|s| s.name.clone()).collect(),
+        writable: specs
+            .iter()
+            .filter(|s| s.writable)
+            .map(|s| s.name.clone())
+            .collect(),
+        max_inflight: limits.max_inflight,
+        max_bytes: limits.max_bytes as u32,
+        paths: (!hide_path).then(|| {
+            specs
+                .iter()
+                .map(|s| s.path.to_string_lossy().into_owned())
+                .collect()
+        }),
+    }
 }
 
 pub fn valid_name(name: &str) -> bool {

@@ -1554,6 +1554,8 @@ pub struct ShareOfferPayload {
     pub writable: Vec<String>,
     pub max_inflight: u32,
     pub max_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
