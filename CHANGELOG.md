@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.43.0 / Rust `rust-v0.14.0`
 
 ### Execution targets: `Open.target`, target discovery, `wsh --target` (#121; JS and Rust change)
 
