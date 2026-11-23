@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Rust relay and `wsh` peer: several operators per peer (#93; Rust change, no `src/` change)
+
+The Rust relay (`wsh-server --enable-relay`) and the Rust peer (`wsh reverse`, `wsh agent run`) now do what the JS relay and
+`createReverseHost` have done since 0.28 (#89). Lands in the next `rust-v` release. **Nothing changes unless you turn it on:**
+default `1` operator per peer on the relay, `1` on the peer.
+
+- **Relay: `[relay] max_operators_per_peer = n`** (1 to 64, default 1; there is no command-line flag). Above 1 the relay advertises
+  `relay-multi-operator` in its `ServerHello.features`; only a peer that states the same feature in its `ReverseAccept.features`
+  is bridged to several operators, any other peer stays at one. It routes a peer's `RelayForward` by `to_fingerprint` (checks the
+  inner like the JS relay does -- at most 8 MiB, decodes, a forwardable type -- and delivers it re-wrapped with the peer's own
+  authenticated key, never with `to_fingerprint`), drops a forward it cannot address (an unknown operator, or none while two or
+  more are bridged), and sends a peer that serves several a `ReverseClose { target_fingerprint, reason }` when one operator leaves
+  instead of ending anything.
+- **Relay, in every configuration: `e2e-sign` is advertised** in `ServerHello.features` (the relay already carried
+  `KeyExchange.signature`), so a JS `createReverseHost` now signs its half of an end-to-end exchange through a Rust relay
+  (before, it waited for a feature the Rust relay never listed).
+- **Relay, in every configuration: one request at a time, with reasons.** A second `ReverseConnect` to a peer that is bridged (and
+  cannot take more) or is answering another request, or from an operator that already has a bridge or request, is now answered by
+  the relay with a `ReverseReject` carrying the JS relay's `busy:` reasons; before, it was forwarded and the peer refused it, and
+  the relay's bookkeeping could point two operators at one peer. A request nobody answers stops blocking the peer after 8 s. Only
+  the peer a request went to can answer it (a `ReverseAccept` from the operator side used to be forwarded to the peer).
+  `ReverseAccept.features` is bounded (at most 64 entries of at most 128 bytes) before it is read.
+- **Peer: `--max-operators n`** (global flag of `wsh`, default 1, 1 to 64, for `wsh reverse` and `wsh agent run`). On a relay that
+  advertises `relay-multi-operator` the peer states it in `ReverseAccept.features`, serves each operator with its own runtime
+  (channels, processes, files, MCP, gateway state), addresses every message to the operator it answers
+  (`RelayForward.to_fingerprint`), takes each operator's `--allow-operator` and operator-proof decision on its own, and ends one
+  operator's work (processes killed) on `ReverseClose` while the others carry on. On a relay that does not advertise it, the
+  flag changes nothing. **Not supported with several operators: sealed bridges** (the connection holds one seal), so
+  `--max-operators` above 1 together with `--require-operator-proof` is refused at start, and an operator that insists on
+  `--sealed` is refused by such a peer.
+- **Fix found on the way (affects every Rust host): a running command was not killed when its channel closed**, or when the
+  operator went away. The kill took a lock the task that waits for the child holds until the child exits, so it waited for the
+  very process it was to kill, and the host stopped serving until the command ended by itself. It now kills through a separate
+  handle.
+- **A released peer or relay:** a multi-operator relay sends `ReverseClose` and addresses nothing to a peer that did not state
+  `relay-multi-operator`, so a released Rust peer (whose generated types reject unknown fields) never meets either; the relay never
+  delivers `to_fingerprint` to anyone; a new peer sends `to_fingerprint` only to a relay that advertised the feature, which a
+  released Rust relay (it drops a connection that sends the field) never does. A released operator sees nothing new except the
+  `busy:` `ReverseReject` where it used to get the peer's own refusal. Differences kept from the JS relay so nothing existing
+  changes: when an operator leaves a one-operator peer the Rust relay leaves the peer connected, and a peer that goes away leaves
+  its operators connected.
+- Tests: `crates/wsh-server/src/relay/bridges.rs` (the bookkeeping, unit tests), `[relay]` config tests, and
+  `test/rust/wsh-relay-multi-operator.test.mjs` (the Rust relay with JS peers and operators, the Rust peer on the Rust and the JS
+  relay, `wsh agent run`, the default relay, a peer that stated nothing, the refused combinations, the kill fix). README:
+  reverse mode, the capability matrix and the Security model.
+
 ### Tests: two failures on macOS, and `{ timeout }` passed to the gateway opens
 
 No wire change, no default changed, no behaviour change in the shipped code; the Rust server's `wsh-fs` `list` order is now documented.

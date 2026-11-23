@@ -46,8 +46,105 @@ impl PartialEq for IdentityKey {
 }
 impl Eq for IdentityKey {}
 
+/// The relay connection as one runtime uses it.
+///
+/// With `to` set (a peer that serves several operators, wsh #93) every message that crosses a bridge
+/// is written as a `RelayForward` addressed to that operator, and the relay delivers the inner
+/// message stamped with this peer's key; the handshake messages (`ReverseAccept`, `ReverseReject`)
+/// go as they are, the relay pairs them with the request they answer. Without it, a message is sent
+/// as it always was.
+#[derive(Clone)]
+struct PeerLink {
+    client: Arc<WshClient>,
+    to: Option<String>,
+}
+
+impl PeerLink {
+    fn new(client: Arc<WshClient>) -> Self {
+        Self { client, to: None }
+    }
+
+    fn addressed(client: Arc<WshClient>, operator: String) -> Self {
+        Self {
+            client,
+            to: Some(operator),
+        }
+    }
+
+    /// Does this link serve one of several operators?
+    fn is_multi(&self) -> bool {
+        self.to.is_some()
+    }
+
+    async fn send_fire_and_forget(&self, envelope: Envelope) -> wsh_core::WshResult<()> {
+        let crosses_bridge = is_relay_forwardable(envelope.msg_type)
+            && !matches!(
+                envelope.msg_type,
+                MsgType::ReverseAccept | MsgType::ReverseReject
+            );
+        match &self.to {
+            Some(operator) if crosses_bridge => {
+                let inner = wsh_core::cbor_encode(&envelope)?;
+                self.client
+                    .send_fire_and_forget(Envelope {
+                        msg_type: MsgType::RelayForward,
+                        payload: Payload::RelayForward(RelayForwardPayload {
+                            // the relay stamps the real sender; this is never read
+                            from_fingerprint: String::new(),
+                            inner,
+                            to_fingerprint: Some(operator.clone()),
+                        }),
+                    })
+                    .await
+            }
+            _ => self.client.send_fire_and_forget(envelope).await,
+        }
+    }
+
+    async fn has_feature(&self, feature: &str) -> bool {
+        self.client.has_feature(feature).await
+    }
+
+    async fn trust_relay_peer(&self, fingerprint: String) {
+        self.client.trust_relay_peer(fingerprint).await;
+    }
+
+    async fn untrust_relay_peer(&self, fingerprint: &str) {
+        self.client.untrust_relay_peer(fingerprint).await;
+    }
+
+    fn begin_sealing_as_responder(
+        &self,
+        session_id: String,
+        must: bool,
+        responder: wsh_client::E2eResponder,
+    ) {
+        self.client
+            .begin_sealing_as_responder(session_id, must, responder);
+    }
+
+    /// The seal is one per connection: a link that serves one of several operators never has one.
+    fn end_sealing(&self) {
+        if !self.is_multi() {
+            self.client.end_sealing();
+        }
+    }
+
+    async fn bridge_sealed_event(&self) {
+        self.client.bridge_sealed_event().await;
+    }
+
+    async fn bridge_failed(&self) {
+        self.client.bridge_failed().await;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReverseHostOptions {
+    /// How many operators this host serves at once (`--max-operators`). Above 1 it states
+    /// `relay-multi-operator` to a relay that advertises it (wsh #93); a relay that does not
+    /// is served one operator at a time, as before. Default 1.
+    pub max_operators: usize,
     pub capabilities: Vec<String>,
     pub peer_type: String,
     pub shell_backend: String,
@@ -71,6 +168,7 @@ pub struct ReverseHostOptions {
 impl Default for ReverseHostOptions {
     fn default() -> Self {
         Self {
+            max_operators: 1,
             capabilities: vec!["shell".to_string(), "exec".to_string()],
             peer_type: "host".to_string(),
             shell_backend: "pty".to_string(),
@@ -159,11 +257,26 @@ impl ReverseHostOptions {
 
     /// `sealable`: this bridge can be sealed (the operator proved its key), so the accept says so
     /// (`e2e`, `e2e-sign`, `e2e-sealed`): an operator that asks for a sealed bridge needs it.
+    /// `multi`: this host serves several operators on this relay, and says so
+    /// (`relay-multi-operator`): the relay then addresses each operator's messages to it and tells
+    /// it with `ReverseClose` when one leaves.
     fn reverse_accept_payload(
         &self,
         request: ReverseConnectPayload,
         sealable: bool,
+        multi: bool,
     ) -> ReverseAcceptPayload {
+        let mut features = Vec::new();
+        if sealable {
+            features.extend([
+                wsh_core::e2e_exchange::E2E_FEATURE.to_string(),
+                wsh_core::e2e_exchange::E2E_SIGN_FEATURE.to_string(),
+                wsh_core::operator_proof::E2E_SEALED_FEATURE.to_string(),
+            ]);
+        }
+        if multi {
+            features.push(wsh_core::RELAY_MULTI_OPERATOR_FEATURE.to_string());
+        }
         ReverseAcceptPayload {
             target_fingerprint: request.target_fingerprint,
             username: request.username,
@@ -174,13 +287,9 @@ impl ReverseHostOptions {
             supports_replay: self.supports_replay,
             supports_echo: self.supports_echo,
             supports_term_sync: self.supports_term_sync,
-            features: sealable.then(|| {
-                vec![
-                    wsh_core::e2e_exchange::E2E_FEATURE.to_string(),
-                    wsh_core::e2e_exchange::E2E_SIGN_FEATURE.to_string(),
-                    wsh_core::operator_proof::E2E_SEALED_FEATURE.to_string(),
-                ]
-            }),
+            // absent, not empty, when there is nothing to say: a host without either feature
+            // sends the accept it always sent
+            features: (!features.is_empty()).then_some(features),
         }
     }
 
@@ -246,37 +355,52 @@ pub async fn run_with_service(
     relay_message_rx: &mut mpsc::Receiver<Envelope>,
     status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
 ) -> Result<ReverseHostRunOutcome> {
-    service.attach_client(client, status_tx).await;
+    // A host that may serve several operators does so only on a relay that says it can
+    // (`relay-multi-operator` in its ServerHello); on any other it serves one, as it always did.
+    if service.runtime.options.max_operators > 1
+        && client
+            .has_feature(wsh_core::RELAY_MULTI_OPERATOR_FEATURE)
+            .await
+    {
+        info!(
+            max_operators = service.runtime.options.max_operators,
+            "serving several operators on this relay"
+        );
+        service.enter_multi(client, status_tx);
+    } else {
+        service.attach_client(client, status_tx).await;
+    }
     let mut reverse_channel_closed = false;
     let mut relay_channel_closed = false;
 
     loop {
+        let proof_deadline = service.proof_deadline();
         tokio::select! {
             envelope = reverse_connect_rx.recv(), if !reverse_channel_closed => {
                 match envelope {
-                    Some(envelope) => match envelope.payload {
-                        Payload::ReverseProof(proof) => service.runtime.handle_reverse_proof(proof).await?,
-                        _ => service.runtime.handle_reverse_connect(envelope).await?,
-                    },
+                    Some(envelope) => service.on_reverse_envelope(envelope).await?,
                     None => reverse_channel_closed = true,
                 }
             }
             envelope = relay_message_rx.recv(), if !relay_channel_closed => {
                 match envelope {
-                    Some(envelope) => service.runtime.handle_relay_message(envelope).await?,
+                    Some(envelope) => service.on_relay_envelope(envelope).await?,
                     None => relay_channel_closed = true,
                 }
             }
             _ = async {
-                match service.runtime.proof_deadline() {
+                match proof_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                service.runtime.expire_proof().await?;
+                service.expire_proofs().await?;
             }
             Some(event) = service.event_rx.recv() => {
                 service.runtime.handle_runtime_event(event).await?;
+            }
+            Some((operator, event)) = service.operator_event_rx.recv() => {
+                service.on_operator_event(operator, event).await;
             }
             // A sealed frame that does not open (forged, tampered with, replayed): the relay is
             // not honest, and the bridge is over.
@@ -302,19 +426,44 @@ pub async fn run_with_service(
     }
 }
 
+/// One operator of a host that serves several (wsh #93): its own runtime, so its channels,
+/// processes and files are its own, and the task that tags the runtime's events with the operator.
+struct OperatorRuntime {
+    runtime: ReverseHostRuntime,
+    forwarder: tokio::task::JoinHandle<()>,
+}
+
+/// The relay connection of a host that serves several operators.
+struct MultiOperator {
+    client: Arc<WshClient>,
+    status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
+    /// By the operator's fingerprint, as the relay stamped it.
+    operators: HashMap<String, OperatorRuntime>,
+    reported_sessions: usize,
+}
+
 pub struct ReverseHostService {
     runtime: ReverseHostRuntime,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     event_rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    /// Set while this host serves several operators on the relay it is connected to; the
+    /// single `runtime` is then not used.
+    multi: Option<MultiOperator>,
+    operator_event_tx: mpsc::UnboundedSender<(String, RuntimeEvent)>,
+    operator_event_rx: mpsc::UnboundedReceiver<(String, RuntimeEvent)>,
 }
 
 impl ReverseHostService {
     pub fn new(options: ReverseHostOptions) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (operator_event_tx, operator_event_rx) = mpsc::unbounded_channel();
         Self {
             runtime: ReverseHostRuntime::new(options),
             event_tx,
             event_rx,
+            multi: None,
+            operator_event_tx,
+            operator_event_rx,
         }
     }
 
@@ -324,17 +473,256 @@ impl ReverseHostService {
         status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
     ) {
         self.runtime
-            .attach_client(client, status_tx, self.event_tx.clone())
+            .attach_client(PeerLink::new(client), status_tx, self.event_tx.clone())
             .await;
     }
 
+    fn enter_multi(
+        &mut self,
+        client: Arc<WshClient>,
+        status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
+    ) {
+        // Each relayed message then arrives with the operator that wrote it.
+        client.tag_relay_origin(true);
+        self.multi = Some(MultiOperator {
+            client,
+            status_tx,
+            operators: HashMap::new(),
+            reported_sessions: 0,
+        });
+    }
+
     async fn detach_client(&mut self) {
+        if let Some(mut multi) = self.multi.take() {
+            for (_, mut op) in multi.operators.drain() {
+                op.runtime.shutdown().await;
+                op.forwarder.abort();
+            }
+            return;
+        }
         self.runtime.detach_client().await;
     }
 
     pub async fn shutdown(&mut self) {
+        if let Some(multi) = self.multi.as_mut() {
+            for (_, mut op) in multi.operators.drain() {
+                op.runtime.shutdown().await;
+                op.forwarder.abort();
+            }
+        }
         self.runtime.shutdown().await;
     }
+
+    /// A `ReverseConnect`, `ReverseProof` (or, with several operators, `ReverseClose`) from the relay.
+    async fn on_reverse_envelope(&mut self, envelope: Envelope) -> Result<()> {
+        if self.multi.is_none() {
+            return match envelope.payload {
+                Payload::ReverseProof(proof) => self.runtime.handle_reverse_proof(proof).await,
+                _ => self.runtime.handle_reverse_connect(envelope).await,
+            };
+        }
+        match &envelope.payload {
+            Payload::ReverseConnect(request) => {
+                let operator = request.from_fingerprint.clone();
+                self.operator_for(&operator, Some(request)).await?;
+                if let Some(op) = self.operator_mut(&operator) {
+                    if let Err(err) = op.runtime.handle_reverse_connect(envelope).await {
+                        warn!(operator = %short(&operator), "serving a reverse connect failed: {err:#}");
+                    }
+                }
+            }
+            Payload::ReverseProof(proof) => {
+                let operator = proof.from_fingerprint.clone().unwrap_or_default();
+                if let Payload::ReverseProof(proof) = envelope.payload {
+                    if let Some(op) = self.operator_mut(&operator) {
+                        if let Err(err) = op.runtime.handle_reverse_proof(proof).await {
+                            warn!(operator = %short(&operator), "an operator proof failed: {err:#}");
+                        }
+                    }
+                }
+            }
+            // That operator left: its processes go with it; the others carry on.
+            Payload::ReverseClose(close) => {
+                let operator = close.target_fingerprint.clone();
+                debug!(operator = %short(&operator), "relay: an operator left");
+                if let Some(multi) = self.multi.as_mut() {
+                    // nothing from it is heard any more, whether or not it had a runtime
+                    multi.client.untrust_relay_peer(&operator).await;
+                    if let Some(mut op) = multi.operators.remove(&operator) {
+                        info!(operator = %short(&operator), "operator left: ending its bridge");
+                        let _ = op.runtime.end_bridge().await;
+                        op.runtime.shutdown().await;
+                        op.forwarder.abort();
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.settle().await;
+        Ok(())
+    }
+
+    /// A relayed message (tagged with the operator that wrote it) with several operators; the bare
+    /// message, as always, otherwise.
+    async fn on_relay_envelope(&mut self, envelope: Envelope) -> Result<()> {
+        if self.multi.is_none() {
+            return self.runtime.handle_relay_message(envelope).await;
+        }
+        let Payload::RelayForward(forward) = envelope.payload else {
+            return Ok(());
+        };
+        let Some(op) = self.operator_mut(&forward.from_fingerprint) else {
+            debug!(
+                from = %short(&forward.from_fingerprint),
+                "dropping a message from an operator this host is not serving"
+            );
+            return Ok(());
+        };
+        match wsh_core::decode_envelope(&forward.inner) {
+            Ok(inner) => {
+                if let Err(err) = op.runtime.handle_relay_message(inner).await {
+                    warn!(operator = %short(&forward.from_fingerprint), "serving an operator's message failed: {err:#}");
+                }
+            }
+            Err(err) => warn!("dropping a relayed message that does not decode: {err}"),
+        }
+        self.settle().await;
+        Ok(())
+    }
+
+    async fn on_operator_event(&mut self, operator: String, event: RuntimeEvent) {
+        if let Some(op) = self.operator_mut(&operator) {
+            if let Err(err) = op.runtime.handle_runtime_event(event).await {
+                warn!(operator = %short(&operator), "serving a session event failed: {err:#}");
+            }
+        }
+        self.settle().await;
+    }
+
+    fn operator_mut(&mut self, operator: &str) -> Option<&mut OperatorRuntime> {
+        self.multi.as_mut()?.operators.get_mut(operator)
+    }
+
+    /// The runtime for `operator`, made when it is new. A new operator over the host's cap is
+    /// refused with the reason the relay gives at its own cap.
+    async fn operator_for(
+        &mut self,
+        operator: &str,
+        request: Option<&ReverseConnectPayload>,
+    ) -> Result<()> {
+        let max = self.runtime.options.max_operators;
+        let Some(multi) = self.multi.as_mut() else {
+            return Ok(());
+        };
+        if multi.operators.contains_key(operator) {
+            return Ok(());
+        }
+        if multi.operators.len() >= max {
+            if let Some(request) = request {
+                let link = PeerLink::new(multi.client.clone());
+                link.send_fire_and_forget(Envelope {
+                    msg_type: MsgType::ReverseReject,
+                    payload: Payload::ReverseReject(ReverseRejectPayload {
+                        target_fingerprint: request.target_fingerprint.clone(),
+                        username: request.username.clone(),
+                        reason: format!("busy: this host already serves its maximum of {max} operators (retry when one leaves)"),
+                    }),
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
+            }
+            return Ok(());
+        }
+        let mut runtime = ReverseHostRuntime::new(self.runtime.options.clone());
+        // This operator's events reach the run loop tagged with it.
+        let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+        let tagged = self.operator_event_tx.clone();
+        let name = operator.to_string();
+        let forwarder = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if tagged.send((name.clone(), event)).is_err() {
+                    break;
+                }
+            }
+        });
+        runtime
+            .attach_client(
+                PeerLink::addressed(multi.client.clone(), operator.to_string()),
+                multi.status_tx.clone(),
+                tx,
+            )
+            .await;
+        multi
+            .operators
+            .insert(operator.to_string(), OperatorRuntime { runtime, forwarder });
+        Ok(())
+    }
+
+    /// After something happened to the operators: forget those that have nothing (a refused
+    /// request leaves an empty runtime) and report the sessions of all of them together.
+    async fn settle(&mut self) {
+        let Some(multi) = self.multi.as_mut() else {
+            return;
+        };
+        let idle: Vec<String> = multi
+            .operators
+            .iter()
+            .filter(|(_, op)| op.runtime.is_idle())
+            .map(|(fp, _)| fp.clone())
+            .collect();
+        for fp in idle {
+            if let Some(op) = multi.operators.remove(&fp) {
+                op.forwarder.abort();
+            }
+        }
+        let sessions: usize = multi
+            .operators
+            .values()
+            .map(|op| op.runtime.sessions.len())
+            .sum();
+        if sessions != multi.reported_sessions {
+            multi.reported_sessions = sessions;
+            if let Some(tx) = &multi.status_tx {
+                let _ = tx
+                    .send(ReverseHostStatusEvent::SessionCountChanged {
+                        active_sessions: sessions,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// When the earliest pending challenge or sealing deadline of any operator falls due.
+    fn proof_deadline(&self) -> Option<tokio::time::Instant> {
+        let single = self.runtime.proof_deadline();
+        let many = self
+            .multi
+            .iter()
+            .flat_map(|m| m.operators.values())
+            .filter_map(|op| op.runtime.proof_deadline())
+            .min();
+        match (single, many) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    async fn expire_proofs(&mut self) -> Result<()> {
+        self.runtime.expire_proof().await?;
+        if let Some(multi) = self.multi.as_mut() {
+            for (fp, op) in multi.operators.iter_mut() {
+                if let Err(err) = op.runtime.expire_proof().await {
+                    warn!(operator = %short(fp), "expiring a challenge failed: {err:#}");
+                }
+            }
+        }
+        self.settle().await;
+        Ok(())
+    }
+}
+
+fn short(fingerprint: &str) -> &str {
+    &fingerprint[..fingerprint.len().min(12)]
 }
 
 /// How long an operator has to answer a challenge.
@@ -358,11 +746,15 @@ struct HostSealing {
 struct ReverseHostRuntime {
     /// The bridge being sealed, or sealed, with the operator served now.
     sealing: Option<HostSealing>,
-    client: Option<Arc<WshClient>>,
+    client: Option<PeerLink>,
     event_tx: Option<mpsc::UnboundedSender<RuntimeEvent>>,
     options: ReverseHostOptions,
     status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
     active_request: Option<ReverseConnectPayload>,
+    /// This runtime accepted its operator and has not ended the bridge (it outlives the operator's
+    /// sessions: `active_request` is cleared with the last one). Only a host serving several
+    /// operators reads it.
+    bridged: bool,
     /// A request whose operator has been challenged and has not answered yet (wsh #117).
     pending_proof: Option<PendingProof>,
     sessions: HashMap<u32, ReverseHostSession>,
@@ -379,6 +771,7 @@ impl ReverseHostRuntime {
             event_tx: None,
             status_tx: None,
             active_request: None,
+            bridged: false,
             sealing: None,
             pending_proof: None,
             sessions: HashMap::new(),
@@ -390,7 +783,7 @@ impl ReverseHostRuntime {
 
     async fn attach_client(
         &mut self,
-        client: Arc<WshClient>,
+        client: PeerLink,
         status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
         event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     ) {
@@ -417,7 +810,7 @@ impl ReverseHostRuntime {
         }
     }
 
-    fn client(&self) -> Result<Arc<WshClient>> {
+    fn client(&self) -> Result<PeerLink> {
         self.client
             .clone()
             .context("reverse host runtime is not currently bound to a relay client")
@@ -461,9 +854,11 @@ impl ReverseHostRuntime {
                 client
                     .send_fire_and_forget(Envelope {
                         msg_type: MsgType::ReverseAccept,
-                        payload: Payload::ReverseAccept(
-                            self.options.reverse_accept_payload(request, false),
-                        ),
+                        payload: Payload::ReverseAccept(self.options.reverse_accept_payload(
+                            request,
+                            false,
+                            client.is_multi(),
+                        )),
                     })
                     .await
                     .map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -549,6 +944,7 @@ impl ReverseHostRuntime {
         })
         .await;
         self.active_request = Some(request.clone());
+        self.bridged = true;
         let client = self.client()?;
         client
             .trust_relay_peer(request.from_fingerprint.clone())
@@ -558,8 +954,9 @@ impl ReverseHostRuntime {
         // or sent, until it has (the gate is on before the accept leaves).
         self.sealing = None;
         client.end_sealing();
+        // (A host that serves several operators cannot: the seal is one per connection.)
         let sealable = match (&proven, &self.options.identity) {
-            (Some((operator, session_id)), Some(identity)) => {
+            (Some((operator, session_id)), Some(identity)) if !client.is_multi() => {
                 let must = self.options.require_operator_proof;
                 let responder = wsh_client::E2eResponder::new(
                     Some((*identity.0).clone()),
@@ -583,9 +980,11 @@ impl ReverseHostRuntime {
         client
             .send_fire_and_forget(Envelope {
                 msg_type: MsgType::ReverseAccept,
-                payload: Payload::ReverseAccept(
-                    self.options.reverse_accept_payload(request, sealable),
-                ),
+                payload: Payload::ReverseAccept(self.options.reverse_accept_payload(
+                    request,
+                    sealable,
+                    client.is_multi(),
+                )),
             })
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -634,6 +1033,7 @@ impl ReverseHostRuntime {
             self.drop_session(id).await;
         }
         self.active_request = None;
+        self.bridged = false;
         Ok(())
     }
 
@@ -1300,7 +1700,20 @@ impl ReverseHostRuntime {
         }
     }
 
+    /// Nothing is bridged, pending or running here (a runtime made for a request that was refused).
+    fn is_idle(&self) -> bool {
+        !self.bridged
+            && self.active_request.is_none()
+            && self.pending_proof.is_none()
+            && self.sessions.is_empty()
+            && self.gateway_connections.is_empty()
+    }
+
     async fn emit_session_count(&self) {
+        // One of several operators: the service reports all of them together.
+        if self.client.as_ref().is_some_and(|c| c.is_multi()) {
+            return;
+        }
         self.notify_status(ReverseHostStatusEvent::SessionCountChanged {
             active_sessions: self.sessions.len(),
         })
@@ -1415,7 +1828,7 @@ impl ReverseHostSession {
         }
     }
 
-    async fn replay_to_client(&self, client: &Arc<WshClient>, channel_id: u32) -> Result<()> {
+    async fn replay_to_client(&self, client: &PeerLink, channel_id: u32) -> Result<()> {
         if let Self::Pty(session) = self {
             let replay = session.replay_bytes();
             session.clear_pending_output();
@@ -2040,7 +2453,7 @@ fn try_parse_download_header(buf: &[u8]) -> Result<Option<(PathBuf, usize)>> {
 }
 
 fn spawn_tcp_gateway(
-    client: Arc<WshClient>,
+    client: PeerLink,
     gateway_id: u32,
     stream: TcpStream,
 ) -> ReverseGatewayConnection {
@@ -2097,7 +2510,7 @@ fn spawn_tcp_gateway(
 }
 
 fn spawn_udp_gateway(
-    client: Arc<WshClient>,
+    client: PeerLink,
     gateway_id: u32,
     socket: UdpSocket,
 ) -> ReverseGatewayConnection {
@@ -2206,6 +2619,9 @@ struct LocalPty {
     master_writer: std::sync::Mutex<Box<dyn Write + Send>>,
     master: std::sync::Mutex<Box<dyn MasterPty + Send>>,
     child: std::sync::Mutex<Box<dyn portable_pty::Child + Send>>,
+    /// Kills the child without the `child` lock: the task that waits for the child holds that
+    /// lock until the child exits, so a kill that took it waited for the very process it was to kill.
+    killer: std::sync::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
 }
 
 impl LocalPty {
@@ -2249,11 +2665,13 @@ impl LocalPty {
             .take_writer()
             .context("failed to take PTY writer")?;
 
+        let killer = child.clone_killer();
         Ok(Self {
             master_reader: std::sync::Mutex::new(reader),
             master_writer: std::sync::Mutex::new(writer),
             master: std::sync::Mutex::new(pair.master),
             child: std::sync::Mutex::new(child),
+            killer: std::sync::Mutex::new(killer),
         })
     }
 
@@ -2299,11 +2717,11 @@ impl LocalPty {
     }
 
     fn kill_blocking(&self) -> Result<()> {
-        let mut child = self
-            .child
+        let mut killer = self
+            .killer
             .lock()
-            .map_err(|_| anyhow::anyhow!("PTY child lock poisoned"))?;
-        child.kill()?;
+            .map_err(|_| anyhow::anyhow!("PTY killer lock poisoned"))?;
+        killer.kill()?;
         Ok(())
     }
 

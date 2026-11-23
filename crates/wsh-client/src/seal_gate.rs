@@ -50,6 +50,10 @@ pub struct SealGate {
     sealed: Notify,
     /// The operator side: a failed bridge ends the connection (there is nothing left to talk to).
     close_on_failure: AtomicBool,
+    /// A peer that serves several operators (wsh #93) must know WHICH operator a forwarded message
+    /// came from: with this on, a forwarded message that goes to the relay-message channel stays
+    /// wrapped in the `RelayForward` the relay sent (its `from_fingerprint` is the sender).
+    tag_relay_origin: AtomicBool,
 }
 
 impl Default for SealGate {
@@ -59,6 +63,7 @@ impl Default for SealGate {
             failed: Notify::new(),
             sealed: Notify::new(),
             close_on_failure: AtomicBool::new(false),
+            tag_relay_origin: AtomicBool::new(false),
         }
     }
 }
@@ -264,6 +269,15 @@ impl SealGate {
 
     pub fn closes_on_failure(&self) -> bool {
         self.close_on_failure.load(Ordering::Acquire)
+    }
+
+    /// Keep the sender of a forwarded message (see the field).
+    pub fn set_tag_relay_origin(&self, on: bool) {
+        self.tag_relay_origin.store(on, Ordering::Release);
+    }
+
+    pub fn tags_relay_origin(&self) -> bool {
+        self.tag_relay_origin.load(Ordering::Acquire)
     }
 
     pub fn is_sealed(&self) -> bool {
