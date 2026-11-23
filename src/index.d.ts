@@ -1946,6 +1946,8 @@ export interface WshConnectReverseOptions {
     fs?: boolean;
     tools?: boolean;
   };
+  /** List `operator-proof` in the registered capabilities (key logins only; default true): this peer can answer an operator's challenge. */
+  operatorProof?: boolean;
   peerType?: string;
   shellBackend?: string;
   supportsAttach?: boolean;
@@ -2416,8 +2418,10 @@ export class WshClient {
     targetFingerprint: string,
     timeout?: number,
     opts?: {
-      /** `'auto'` (default): prove when the relay carries it and the peer asks; `false`: never; `true`: refuse if the relay cannot carry it. */
+      /** `'auto'` (default): offer proof when the relay carries it and the peer's registered record lists `operator-proof`; `false`: never; `true`: offer regardless of the record (the relay still strips it for a peer that did not advertise it) and refuse if the relay cannot carry it. */
       proof?: 'auto' | boolean;
+      /** The peer's capability list, when the caller already holds it (skips the `listPeers()` lookup `'auto'` makes). */
+      peerCapabilities?: string[];
       /** Refuse the bridge unless the peer signed its challenge (so it proved its key to this operator). */
       requirePeerProof?: boolean;
       /**

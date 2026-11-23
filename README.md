@@ -780,7 +780,16 @@ set from the operator's login at the relay) and the host's `accept` trusts it:
 fine for a relay you run, not for a shared one. Two opt-ins close that, and both
 are negotiated by feature strings so every released peer keeps working
 (the Rust relay never lists `operator-proof`, so the operator simply does not
-offer it there):
+offer it there).
+
+**Who is offered proof.** `ReverseConnect.features` is a field a released Rust host (`rust-v0.6` to `v0.8`) cannot decode
+(`deny_unknown_fields`: it drops the connection, which looks like a timeout). So a peer lists `operator-proof` in its
+registered capabilities when it can answer a challenge (JS hosts and, since `rust-v0.9`, Rust hosts with an identity),
+`reverseConnect()` offers proof only to a peer whose record lists it (`proof: 'auto'`, looked up with `listPeers()`;
+`peerCapabilities` skips the lookup, `proof: true` offers regardless, `proof: false` never), and the JS relay strips the
+field for a peer that did not advertise it. `requirePeerProof` and `sealed` against such a peer fail at once with a
+sentence and send nothing. A JS host from npm 0.36-0.38 does not list the capability yet, so proof to it needs an upgrade
+of the host.
 
 ```js
 // host: do not take the operator's identity from the relay.

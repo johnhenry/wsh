@@ -1234,6 +1234,8 @@ export class WshClient {
    * @param {object} [opts.expose] - Capabilities to expose { shell, exec, fs, tools }
    * @param {string} [opts.peerType]
    * @param {string} [opts.shellBackend]
+   * @param {boolean} [opts.operatorProof=true] list `operator-proof` in the registered capabilities (a key login only): this
+   *   peer can answer an operator's challenge. A hand-written handler that never challenges passes `false`.
    * @param {boolean} [opts.supportsAttach]
    * @param {boolean} [opts.supportsReplay]
    * @param {boolean} [opts.supportsEcho]
@@ -1253,6 +1255,7 @@ export class WshClient {
     supportsReplay,
     supportsEcho,
     supportsTermSync,
+    operatorProof = true,
     ...hostKeyOpts
   } = {}) {
     // Authenticate normally first.
@@ -1267,6 +1270,9 @@ export class WshClient {
 
     // Export public key for peer identification.
     const cred = await resolveSigner({ keyPair, signer });
+    // A peer that can answer an operator's challenge says so in its signed record: a released peer cannot decode
+    // `ReverseConnect.features`, so an operator (and the relay) states the field only to a peer that lists this.
+    if (cred && operatorProof) capabilities.push(OPERATOR_PROOF_FEATURE);
     this.#signer = cred;
     this.#loginUsername = username;
     let publicKey = null;
@@ -1359,12 +1365,21 @@ export class WshClient {
   /**
    * Initiate a reverse connection and wait for accept/reject.
    *
+   * Offering proof (`ReverseConnect.features: ['operator-proof']`) needs a key login, a relay that carries it, and a peer
+   * whose registered record lists `operator-proof`: a released Rust host (v0.6 to v0.8) rejects the field outright. Options:
+   *  - `proof`: `'auto'` (default; offer to a peer that advertises it, looked up with `listPeers()`), `true` (offer anyway;
+   *    the relay still strips it for a peer that did not advertise), `false` (never offer).
+   *  - `requirePeerProof` / `sealed`: fail at once, with a sentence, when the peer does not advertise it.
+   *  - `peerCapabilities`: the peer's capability list, when the caller already has it (skips the lookup).
+   *
    * @param {string} targetFingerprint
    * @param {number} [timeout=10000]
+   * @param {{ proof?: 'auto'|boolean, requirePeerProof?: boolean, sealed?: boolean|object, peerCapabilities?: string[] }} [opts]
    * @returns {Promise<object>}
    */
-  async reverseConnect(targetFingerprint, timeout = DEFAULT_OPEN_TIMEOUT, { proof = 'auto', requirePeerProof = false, sealed = false } = {}) {
+  async reverseConnect(targetFingerprint, timeout = DEFAULT_OPEN_TIMEOUT, { proof = 'auto', requirePeerProof = false, sealed = false, peerCapabilities } = {}) {
     this.#assertAuthenticated('reverseConnect');
+    if (proof !== 'auto' && typeof proof !== 'boolean') throw new TypeError("reverseConnect: proof must be 'auto', true or false");
 
     // Proving this operator's identity to the PEER (wsh #117) needs a relay that carries the challenge and a key to sign with.
     const relayCarriesProof = this.#serverFeatures.includes(OPERATOR_PROOF_FEATURE);
@@ -1373,7 +1388,6 @@ export class WshClient {
       throw new Error(`reverseConnect: this relay does not carry operator proof (no "${OPERATOR_PROOF_FEATURE}" in its features), so ${sealOpts ? 'a sealed bridge' : 'proof'} is not available -- nothing was sent`);
     }
     if ((sealOpts || requirePeerProof || proof === true) && !this.#signer) throw new Error('reverseConnect: proof needs a key login (a password login has nothing to sign with)');
-    const offerProof = proof !== false && relayCarriesProof && !!this.#signer;
 
     // A sealed bridge sends nothing that names a command, a path or a session before the key exists: from here on a
     // message the relay may forward is refused locally until the bridge key is in place.
@@ -1395,6 +1409,24 @@ export class WshClient {
     let response = null;
     let challenge = null;
     try {
+      // A released peer (rust-v0.6 to v0.8) drops the connection on a ReverseConnect with a field it does not know, so the
+      // offer is made only to a peer whose registered record lists `operator-proof` ('auto'), or when the caller insists
+      // (`proof: true`). The relay checks the same on its side and strips the field for a peer that did not advertise it.
+      let peerCanProve = proof === true;
+      if (!peerCanProve && proof === 'auto' && relayCarriesProof && this.#signer) {
+        let caps = peerCapabilities;
+        if (!Array.isArray(caps)) {
+          const peers = await this.listPeers(timeout).catch(() => []);
+          const hits = peers.filter((p) => p.fingerprint === targetFingerprint || (targetFingerprint.length >= 8 && String(p.fingerprint ?? '').startsWith(targetFingerprint)));
+          caps = hits.length === 1 ? hits[0].capabilities : [];
+        }
+        peerCanProve = caps.includes(OPERATOR_PROOF_FEATURE);
+        if ((sealOpts || requirePeerProof) && !peerCanProve) {
+          throw new Error(`reverseConnect: the peer does not advertise "${OPERATOR_PROOF_FEATURE}" in its registered record (a host older than operator proof, or one that cannot answer a challenge), so ${sealOpts ? 'a sealed bridge' : 'proof'} is not available -- nothing was sent`);
+        }
+      }
+      const offerProof = proof !== false && relayCarriesProof && !!this.#signer && peerCanProve;
+
       const ownFingerprint = this.#signer ? await computeFingerprint(this.#signer.publicKeyRaw) : null;
       // Register before sending: the answer can follow the request closely.
       const first = this.#waitForMessage(
@@ -1425,7 +1457,7 @@ export class WshClient {
       }
 
       if (response.type === MSG.REVERSE_ACCEPT) {
-        if (requirePeerProof && !challenge) throw new Error('reverseConnect: the peer did not prove its identity (requirePeerProof) -- nothing was sent over the bridge');
+        if (requirePeerProof && !challenge) throw new Error(`reverseConnect: the peer did not prove its identity (requirePeerProof)${proof === true ? `; the relay does not pass the offer to a peer that does not advertise "${OPERATOR_PROOF_FEATURE}"` : ''} -- nothing was sent over the bridge`);
         if (challenge && response.target_fingerprint !== challenge.peerFingerprint) throw new Error('reverseConnect: the relay named a different peer than the one that signed the challenge');
         if (sealOpts) {
           if (!challenge) throw new Error('reverseConnect: a sealed bridge needs the peer to answer with a challenge (does it require operator proof support?)');
