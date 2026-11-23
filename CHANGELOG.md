@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+Identity: who is on the other end, and what a relay can do about it. Everything wire-visible is optional and negotiated
+by feature strings, so released clients (npm 0.35.0, Rust `rust-v0.6.0`) and hosts keep working; the one default that
+changes is `clientEnv` below, and it is breaking.
+
+- **BREAKING default: `clientEnv` is an allow-list (#126).** A client's `openSession({ env })` used to be applied
+  whole to the command or shell the host ran, so a client could set `PATH`, `LD_PRELOAD` or `BASH_ENV` and defeat a host
+  that restricts what runs (`exec` as a function, a fixed command set). The default is now `TERM`, `COLORTERM`, `LANG`,
+  `LANGUAGE` and `LC_*` (sshd's `AcceptEnv` shape), for `exec` and, new, for `pty`. `exec: { clientEnv: true }` restores
+  the old behaviour; `false` accepts nothing; an array of names or `PREFIX_*` patterns (replacing the default list) or a
+  predicate `(name, value) => boolean` takes anything in between. Names must be plain identifiers; at most 64 variables
+  of at most 4096 bytes are considered. Hosts that passed `clientEnv: false` are unchanged. The Rust `wsh-server` still
+  applies whatever environment the client sends.
+- **`AuthOk.ttl` is true, `AuthOk.token` is honest (#125).** The fields stay on the wire (released peers require them, so
+  removing them would break the Rust client), but they no longer promise what nothing delivered. `ttl` is the lifetime the
+  host enforces: `createWshServer({ connectionTtlMs })` ends every authenticated connection that long after login and
+  advertises it in whole seconds (rounded up; `client.authTtl`); without it the host sends `ttl: 0` ("no limit
+  promised") instead of an unenforced 3600. `token` is documented as an opaque per-connection value with no authority
+  -- nothing accepts it back; `Resume` and `Attach` use the per-session token from `OpenOk`. The spec text no longer
+  says "a signed session token". The Rust `wsh-server` still sends an unenforced `session_ttl` and an HMAC no one checks.
+- **Channel binding (#119).** The auth transcript's `channel_binding` slot, empty since 0.1, is populated with what
+  each transport offers: the `host` key the client saw prove possession (a relay presenting its own key binds to its
+  own), the pinned WebTransport `cert-hash`, and a `tls-exporter` (Node on both ends, over `wss://` the process serves
+  itself; browsers and Node's global `WebSocket` cannot compute it). Negotiated with `channel-binding:<kind>` and
+  `channel-binding-required` features in `ServerHello` -- no new field, empty binding when nothing is offered, so the
+  transcript released peers sign is unchanged. `createWshServer({ requireChannelBinding: true | [kinds] })` refuses an
+  unbound login with a reason; `connect(url, { requireChannelBinding })` refuses to sign one (it also defeats an
+  intermediary that strips the host's offer). `client.channelBinding` says what a login covered. Spec text and two test
+  vectors under `Auth`. Does not protect a login nobody requires binding for, password logins, or anything through a
+  TLS-terminating proxy (for `tls-exporter`); the Rust server and client neither offer nor compute one.
+- **Operator proof to the peer, and sealed bridges (#117; see #93).** In reverse mode the host's `accept` trusted the
+  relay's `from_fingerprint`. New optional messages `ReverseChallenge` (0x58) and `ReverseProof` (0x59) and
+  `ReverseConnect.features`: the host sends a challenge signed with its own key (so the operator knows whom it is
+  proving itself to, and that the host saw the operator's own fingerprint -- a rewritten `from_fingerprint` shows up);
+  the operator signs the host's key, its own key, its username and the host's single-use nonce and session id; the host
+  verifies it **before `accept`**, and `accept` now receives `{ fingerprint, username, proven, publicKey }`. A relay lists
+  `operator-proof` in its `ServerHello` and carries the two messages (the JS relay does; the Rust relay does not, so the
+  operator does not offer there). `createReverseHost({ requireOperatorProof: true })` makes it mandatory *and* seals the
+  bridge: `KeyExchange.signature` is now also signed by the **initiator** (a different label, so it cannot pass for the
+  responder's), the host verifies it against the proven operator key, and the `KeyExchange` for the bridge (session id =
+  the challenge's) keys a channel on which every message that would cross the relay travels as an `EncryptedFrame` with
+  `channel_id` 0 and a strict counter; the host drops plaintext. `client.reverseConnect(fp, timeout, { proof, sealed,
+  requirePeerProof })`; nothing that names a command, a path or a session is sent before the key exists. Before this
+  `Open` (command, environment) and `OpenOk` (resume token) crossed the relay in the clear until a per-session
+  `initiateE2E`. By default a host still serves operators that do not prove themselves, and a new operator/host pair
+  now exchanges the challenge automatically and the host states `e2e-sealed` in `ReverseAccept.features` (a visible
+  extra string). README: [Operator proof and sealed bridges](README.md#operator-proof-and-sealed-bridges-117) has the
+  table of what a relay can and cannot do, with and without it. Not in the Rust `wsh-server` / `wsh` (regenerated
+  types only; `ReverseConnect.features` is `None` there).
+- **Pipe relay (#118).** `@johnhenry/wsh/pipe-relay`: `createPipeRelay()` pairs one host connection and one operator
+  connection by an unguessable rendezvous id (`newRendezvousId()`, `pipeUrl()`) and copies WebSocket messages both ways with
+  backpressure, bounded in waiting halves, rendezvous time, idle time, lifetime, bytes, message size and early bytes. It
+  parses nothing of wsh, so the host authenticates the operator itself, exactly as on a direct connection, and the
+  operator can pin the host key. The module has no imports (`ws`, `node:http` and `node:https` are loaded lazily by
+  `listen()`), and a test walks its module graph to keep it so. The Rust `wsh` CLI always dials `wss://<host>/` (#136), so it
+  cannot use it until it grows `--via` or keeps the URL path.
+- **Not done:** #122 (per-key capabilities shared by both hosts) is left for a later change; the design is in the PR
+  description. The Rust side of #117, #119 and #125.
+- **Tests:** `test/client-env.test.mjs`, `test/auth-ok-ttl.test.mjs`, `test/channel-binding.test.mjs` (vectors; a
+  relaying and a TLS-terminating intermediary against hosts that do and do not require binding; WebTransport `cert-hash`),
+  `test/pipe-relay.test.mjs` (module graph, rendezvous, every bound, backpressure, then the same authentication
+  checks directly and through the pipe, including pinning and an impostor host), `test/operator-proof.test.mjs` (a hostile relay
+  that rewrites `from_fingerprint`, replays a proof, swaps the operator's key and injects an `Open` against a host that
+  requires proof; what the relay can and cannot read of a sealed bridge). The existing relay-bridge test now also sees
+  `e2e-sealed` among a proven host's bridged features.
+
 ## 0.35.0
 
 - **`createMemoryHost({ rpc, sessions })`: typed RPC channels and detach/resume without Node (viaframe#592).** Both used
