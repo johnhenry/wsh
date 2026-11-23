@@ -210,7 +210,7 @@ describe('a sealed session through a pipe relay that copies bytes', () => {
     const h2 = createMemoryHost({ auth: { authorizedKeys: `${await exportPublicKeySSH(kp.publicKey)} u` }, exec: async () => 0, hostKey: true, dataStreams: false, sealSession: 'require', endpoints: { probe: () => { counters.probe += 1; } } });
     closers.push(() => h2.close());
     const c = await h2.connect({ username: 'u', keyPair: kp, sealSession: false });
-    await assert.rejects(c.openEndpoint('probe', { timeout: 1500 }));
+    await assert.rejects(c.openEndpoint('probe', { timeoutMs: 1500 }));
     assert.equal(counters.probe, 0, 'the endpoint was never opened');
     void host;
   });

@@ -274,7 +274,8 @@ impl FileAccess {
         Ok(self.entry_for(&full, &name).await?)
     }
 
-    /// `list`: the sorted entries of a directory.
+    /// `list`: the entries of a directory, sorted by name in UTF-16 code-unit order (what the JS host's `Array.sort()`
+    /// does), on every platform: never the filesystem's own order or case folding, so a listing is deterministic.
     pub async fn list(&self, client_path: &str) -> Result<Vec<Value>, FsError> {
         let dir = self
             .resolve_inside(if client_path.is_empty() {
@@ -664,7 +665,10 @@ mod tests {
         let (_o, root) = setup("list");
         std::fs::write(root.join("b"), "").unwrap();
         std::fs::create_dir(root.join("c")).unwrap();
-        std::fs::write(root.join("B"), "").unwrap();
+        // Distinct names that do not differ only by case: "b" and "B" are one file on a case-insensitive filesystem
+        // (macOS, Windows), so a test that creates both cannot tell the sort from the filesystem. The order is UTF-16
+        // code units, so an upper-case name sorts before a lower-case one on every platform.
+        std::fs::create_dir(root.join("Zed")).unwrap();
         let fs = FileAccess::new(&root, false, 1 << 20).unwrap();
         let names: Vec<String> = fs
             .list("")
@@ -676,7 +680,7 @@ mod tests {
                 _ => panic!(),
             })
             .collect();
-        assert_eq!(names, vec!["B", "a.txt", "b", "c"]);
+        assert_eq!(names, vec!["Zed", "a.txt", "b", "c"]);
         let e = fs.stat("c").await.unwrap();
         assert_eq!(super::super::get(&e, "type"), Some(&text("directory")));
         assert!(matches!(fs.list("a.txt").await, Err(FsError::Io(_))));

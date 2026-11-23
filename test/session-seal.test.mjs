@@ -27,7 +27,7 @@ describe('sealSession (host option)', () => {
           const d = await client.openEndpoint('echo');
           d.destroy();
         } else {
-          await assert.rejects(client.openEndpoint('echo', { timeout: 1500 }));
+          await assert.rejects(client.openEndpoint('echo', { timeoutMs: 1500 }));
         }
         await client.disconnect().catch(() => {});
       } finally { await host.close(); }

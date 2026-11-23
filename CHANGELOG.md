@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Tests: two failures on macOS, and `{ timeout }` passed to the gateway opens
+
+No wire change, no default changed, no behaviour change in the shipped code; the Rust server's `wsh-fs` `list` order is now documented.
+
+- **Rust `rpc::fs::tests::list_is_sorted_and_typed`** created `b` and `B`, which are one file on a case-insensitive filesystem (macOS, Windows), so the
+  test failed there. The code was right and the test wrong: a listing is sorted by name in UTF-16 code-unit order (the JS host's `Array.sort()`, so upper
+  case before lower case) on every platform, never in the filesystem's order. The test now uses names that do not differ only by case, and the
+  README's `wsh-fs` row and the `list` doc comment state the order.
+- **`test/rust` McpCancel "stops a long-running tool mid-way"** read `/proc/<pid>/stat` to tell whether the tool was running, and there is no `/proc`
+  on macOS, so every process looked dead ("running before the cancel" failed). It now asks `ps -o stat=`, which works on Linux and macOS.
+- **`{ timeout }` to `openEndpoint`** in `test/session-seal*.test.mjs`, `test/host-refused.test.mjs` and `test/rust/wsh-session-seal.test.mjs` was
+  ignored (the option is `timeoutMs`), so those refusals waited the 10 s default. Fixed, and `test/test-hygiene.test.mjs` fails on the same mistake
+  in any gateway open/listen call under `test/`.
+
 ## 0.42.0 / Rust `rust-v0.13.0`
 
 ### Rust `wsh-server`: seal a whole session end to end, `[server] seal_session` (#155 stage c, part 2; Rust change)
