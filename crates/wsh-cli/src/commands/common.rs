@@ -501,6 +501,8 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
             Ok(client) => {
                 // `-L` / `-R`: the forwards live as long as this connection does.
                 crate::commands::forward::start_configured(&client).await?;
+                // `--share`: offer the folders for the life of this connection.
+                crate::commands::share::start_configured(&client).await?;
                 return Ok(client);
             }
             Err(err) => errors.push(format!("{label}: {err}")),

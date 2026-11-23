@@ -270,6 +270,18 @@ impl GatewayHandle {
         self.features.lock().await.iter().any(|f| f == feature)
     }
 
+    /// Offer folders to the host (`wsh --share`, #159): sends the `ShareOffer` and answers the
+    /// host's file requests with `provider` for the life of the connection. Needs the host's
+    /// `shares` feature; an offer is made once.
+    pub async fn offer_shares(
+        &self,
+        provider: std::sync::Arc<dyn crate::share::ShareProvider>,
+        offer: wsh_core::messages::ShareOfferPayload,
+    ) -> WshResult<()> {
+        let features = self.features().await;
+        self.hub.shares.offer(&features, provider, offer).await
+    }
+
     /// Open a TCP connection FROM the host to `host:port` (needs the host's `gateway` feature
     /// and a destination its policy allows). `wsh -L [bind:]port:host:hostport`.
     pub async fn open_tcp(
@@ -1924,6 +1936,7 @@ impl WshClient {
                     | MsgType::ListenOk
                     | MsgType::ListenFail
                     | MsgType::InboundOpen
+                    | MsgType::ShareRequest
             ) && gateway.on_message(&envelope).await
             {
                 return;

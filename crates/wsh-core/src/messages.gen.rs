@@ -136,6 +136,10 @@ pub enum MsgType {
 
     AuthorizedKeyAdd = 0x9f,
     AuthorizedKeyResult = 0xa0,
+
+    ShareOffer = 0xa8,
+    ShareRequest = 0xa9,
+    ShareReply = 0xaa,
 }
 
 impl From<MsgType> for u8 {
@@ -253,6 +257,9 @@ impl TryFrom<u8> for MsgType {
             0x9e => Ok(Self::TerminalConfig),
             0x9f => Ok(Self::AuthorizedKeyAdd),
             0xa0 => Ok(Self::AuthorizedKeyResult),
+            0xa8 => Ok(Self::ShareOffer),
+            0xa9 => Ok(Self::ShareRequest),
+            0xaa => Ok(Self::ShareReply),
             _ => Err(format!("unknown message type: 0x{v:02x}")),
         }
     }
@@ -434,6 +441,9 @@ pub enum Payload {
     TerminalConfig(TerminalConfigPayload),
     AuthorizedKeyAdd(AuthorizedKeyAddPayload),
     AuthorizedKeyResult(AuthorizedKeyResultPayload),
+    ShareOffer(ShareOfferPayload),
+    ShareRequest(ShareRequestPayload),
+    ShareReply(ShareReplyPayload),
     Empty(EmptyPayload),
 }
 
@@ -548,6 +558,9 @@ impl Payload {
             MsgType::TerminalConfig => Ok(Self::TerminalConfig(ciborium::from_reader(cursor)?)),
             MsgType::AuthorizedKeyAdd => Ok(Self::AuthorizedKeyAdd(ciborium::from_reader(cursor)?)),
             MsgType::AuthorizedKeyResult => Ok(Self::AuthorizedKeyResult(ciborium::from_reader(cursor)?)),
+            MsgType::ShareOffer => Ok(Self::ShareOffer(ciborium::from_reader(cursor)?)),
+            MsgType::ShareRequest => Ok(Self::ShareRequest(ciborium::from_reader(cursor)?)),
+            MsgType::ShareReply => Ok(Self::ShareReply(ciborium::from_reader(cursor)?)),
         }
     }
 }
@@ -1531,6 +1544,75 @@ pub struct AuthorizedKeyResultPayload {
     pub added: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareOfferPayload {
+    pub shares: Vec<String>,
+    #[serde(default)]
+    pub writable: Vec<String>,
+    pub max_inflight: u32,
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareRequestPayload {
+    pub request_id: u32,
+    pub share: String,
+    pub op: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    #[serde(default)]
+    pub flags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub attr: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub data: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareReplyPayload {
+    pub request_id: u32,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errno: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub attr: serde_json::Value,
+    #[serde(default = "default_share_reply_entries")]
+    pub entries: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "option_bytes")]
+    pub data: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eof: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+fn default_share_reply_entries() -> serde_json::Value {
+    Default::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

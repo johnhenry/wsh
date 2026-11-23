@@ -38,6 +38,7 @@ pub mod keystore;
 pub mod known_hosts;
 pub mod mcp;
 pub mod session;
+pub mod share;
 pub mod stream_frame;
 pub mod transport;
 pub mod virtual_session;

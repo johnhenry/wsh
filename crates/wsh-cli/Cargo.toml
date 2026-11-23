@@ -28,6 +28,9 @@ libc = "0.2"
 toml = "0.8"
 hex = "0.4"
 portable-pty = "0.9"
+# Descriptor-relative file access for `--share` (openat with O_NOFOLLOW per component). Already in
+# the dependency graph (dialoguer -> tempfile -> rustix 1.x); MIT OR Apache-2.0 (LLVM exception).
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 assert_cmd = "2"
