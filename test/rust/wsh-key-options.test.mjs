@@ -173,7 +173,9 @@ for (let from = 0; from < cases.length; from += CHUNK) {
           return;
         }
         const c = await login(keyPair);
-        const can = new Set(v.can);
+        // A key with a capability list is served only what the list also names (`fs:read` is what a list needs).
+        const named = v.capabilities ?? null;
+        const can = new Set(v.can.filter((c) => named === null || named.includes({ pty: 'pty', exec: 'exec', fileTransfer: 'fs:read' }[c] ?? c)));
         const run = async () => {
           const s = await c.openSession({ type: 'exec', command: 'echo vector-ok' });
           return new Promise((resolve) => { const out = []; s.onData = (d) => out.push(dec.decode(d)); s.onClose = () => resolve(out.join('')); });

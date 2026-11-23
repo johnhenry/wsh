@@ -19,7 +19,7 @@ import {
   MSG, serverHello, challenge, authOk, authFail, openOk, openFail, sessionData,
   exit as exitMsg, close as closeMsg, encryptedFrame as encryptedFrameMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
   presence as presenceMsg, error as errorMsg, sessionList, detachOk, detachFail, reversePeers, reverseReject,
-  targetList as targetListMsg,
+  targetList as targetListMsg, gatewayFail, listenFail,
 } from '../messages.gen.mjs';
 import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
@@ -31,7 +31,7 @@ import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } f
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
-import { gatewayFeatures } from './gateway-core.mjs';
+import { gatewayFeatures, GATEWAY_FAIL } from './gateway-core.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
@@ -166,6 +166,8 @@ export function createConnectionFactory(cfg) {
     const state = {
       sessionId: randomUUID(), nonce: null, username: authenticated?.username ?? null, authed: !!authenticated,
       closed: false, nextChannel: 0, fingerprint: authenticated?.fingerprint ?? null,
+      /** What `authorize()` granted, when it returned a capability set instead of `true` (#122). */
+      grant: null,
     };
     /** @type {Map<number, any>} */
     const channels = new Map();
@@ -185,17 +187,48 @@ export function createConnectionFactory(cfg) {
       if (cfg.sessions) n += cfg.sessions.listFor(fingerprint).filter((s) => s.state !== 'exited').length;
       return n;
     }
+    /** What this connection may do: its key's options, and what `authorize()` granted (#122, step two); each narrows the other. */
+    const permissionSets = () => [keyPermissions(), state.grant].filter(Boolean);
+    /** First refusal of `req` by any of the sets, or null; `silent` skips the log and `onRefused` (discovery filters). */
+    function refusalOf(req, silent) {
+      for (const perms of permissionSets()) {
+        const counts = req.kind === 'open' && (req.channel === 'pty' || req.channel === 'exec') && perms.maxSessions !== null;
+        const refusal = checkKeyRequest(perms, req, { activeSessions: counts ? activeSessionsFor(state.fingerprint) : 0 });
+        if (!refusal) continue;
+        if (!silent) {
+          const what = `${req.kind}${req.channel ? ` ${req.channel}` : ''}${req.protocol ? ` ${req.protocol}` : ''}`;
+          log(`key permissions refused ${what} for ${state.username ?? '?'} (${refusal.code}${refusal.capability ? `: ${refusal.capability}` : ''})`);
+          // #122: the embedder hears of it with a stable reason (`not-permitted`; `key-expired` for a key past its `expires`).
+          notifyRefused(refusal.code === 'key-expired' ? 'key-expired' : 'not-permitted', { username: state.username, fingerprint: state.fingerprint, address: remote.address }, `${refusal.code}: ${refusal.reason} (${what})`);
+        }
+        return refusal;
+      }
+      return null;
+    }
     /**
-     * `null` when the key's options allow this request, else `{ code, reason }` (logged).
-     * @param {{ kind: string, channel?: string, protocol?: string }} req
+     * `null` when the key's options and capabilities allow this request, else `{ code, reason, capability? }` (logged, and
+     * reported through `onRefused`). Requests are described in `checkKeyRequest`.
+     * @param {object} req
      */
-    function keyRefusal(req) {
-      const perms = keyPermissions();
-      if (!perms) return null;
-      const counts = req.kind === 'open' && (req.channel === 'pty' || req.channel === 'exec') && perms.maxSessions !== null;
-      const refusal = checkKeyRequest(perms, req, { activeSessions: counts ? activeSessionsFor(state.fingerprint) : 0 });
-      if (refusal) log(`key options refused ${req.kind}${req.channel ? ` ${req.channel}` : ''}${req.protocol ? ` ${req.protocol}` : ''} for ${state.username ?? '?'} (${refusal.code})`);
-      return refusal;
+    const keyRefusal = (req) => refusalOf(req, false);
+    /** Whether this request would be allowed, without saying anything about it (what a discovery answer lists). */
+    const keyAllows = (req) => refusalOf(req, true) === null;
+    /** The reply that refuses a gateway message the key's capabilities do not cover (`GatewayFail` / `ListenFail`), or null. */
+    function gatewayRefusal(m) {
+      let req; let listener = false;
+      switch (m.type) {
+        case MSG.OPEN_TCP: req = { kind: 'tcp', host: m.host, port: m.port }; break;
+        case MSG.OPEN_UDP: req = { kind: 'udp', host: m.host, port: m.port }; break;
+        case MSG.RESOLVE_DNS: req = { kind: 'dns', name: m.name }; break;
+        case MSG.OPEN_UNIX: req = { kind: 'unix', path: m.path }; break;
+        case MSG.OPEN_ENDPOINT: req = { kind: 'endpoint', name: m.name, target: m.target ?? undefined }; break;
+        case MSG.LISTEN_REQUEST: req = { kind: 'listen-tcp', port: m.port }; listener = true; break;
+        case MSG.LISTEN_UNIX: req = { kind: 'listen-unix', path: m.path }; listener = true; break;
+        default: return null;
+      }
+      const refusal = keyRefusal(req);
+      if (!refusal) return null;
+      return listener ? listenFail({ listenerId: m.listener_id, reason: refusal.reason }) : gatewayFail({ gatewayId: m.gateway_id, code: GATEWAY_FAIL.POLICY_DENIED, message: refusal.reason });
     }
     /** FileOp `write`/`rename`s awaiting their FileChunk frames, by client-chosen channel id. */
     const fileWrites = new Map();
@@ -359,7 +392,12 @@ export function createConnectionFactory(cfg) {
         m = inner;
       }
       if (await handleRelay(m)) return;
-      if (gateway && await gateway.handle(m)) return;
+      if (gateway) {
+        // What the key's capabilities allow of the gateway (#122), before the gateway's own policy is asked.
+        const refusal = gatewayRefusal(m);
+        if (refusal) return send(refusal);
+        if (await gateway.handle(m)) return;
+      }
       if (shares && shares.handle(m)) return;
       switch (m.type) {
         case MSG.PING: return send(pong({ id: m.id }));
@@ -541,6 +579,13 @@ export function createConnectionFactory(cfg) {
           allowed = await cfg.authorize({ username: state.username, fingerprint: fp, publicKey: m.public_key });
         } catch (e) { log(`authorize threw: ${e.message}`); }
         if (!allowed) return refuse('key not authorized', 'unauthorized', claimed);
+        // `authorize` may answer with a capability set (`{ permissions }` from `buildAuthorizer`): it narrows what the key's own options allow.
+        const grant = typeof allowed === 'object' ? allowed.permissions ?? null : null;
+        // A key past its `expires` does not log in (#122).
+        for (const perms of [cfg.authorize.permissionsFor?.(fp) ?? null, grant]) {
+          if (perms && checkKeyRequest(perms, { kind: 'login' })) return refuse('key has expired', 'key-expired', claimed);
+        }
+        state.grant = grant;
         state.authed = true;
         state.fingerprint = fp;
         state.publicKey = m.public_key;
@@ -683,8 +728,10 @@ export function createConnectionFactory(cfg) {
     async function handleMcpDiscover() {
       let tools = [];
       // A key without MCP (#122) sees no tools, as it would on a host that has none.
-      if (cfg.mcp && !keyRefusal({ kind: 'mcp' })) {
+      if (cfg.mcp && keyAllows({ kind: 'mcp' })) {
         try { tools = await cfg.mcp.list(state.username, principal()); } catch (e) { log(`mcp discover failed: ${e.message}`); }
+        // A key with `mcp:<tool>` capabilities is told only of those tools.
+        tools = tools.filter((t) => keyAllows({ kind: 'mcp-tool', tool: t.name }));
       }
       return send(mcpTools({ tools }));
     }
@@ -699,7 +746,7 @@ export function createConnectionFactory(cfg) {
       };
       const fail = (error) => reply({ success: false, error });
       if (!cfg.mcp) { fail('mcp is not enabled on this server'); return; }
-      { const refusal = keyRefusal({ kind: 'mcp' }); if (refusal) { fail(refusal.reason); return; } }
+      { const refusal = keyRefusal({ kind: 'mcp-call', tool: typeof m.tool === 'string' ? m.tool : '' }); if (refusal) { fail(refusal.reason); return; } }
       if (mcpCalls.size >= cfg.mcp.maxConcurrent) { fail('too many concurrent MCP calls'); return; }
 
       const abort = new AbortController();
@@ -765,6 +812,8 @@ export function createConnectionFactory(cfg) {
       if (!targetTable) return send(errorMsg({ code: 3, message: 'this host has no targets' }));
       const out = [];
       for (const [name, spec] of targetTable) {
+        // A key with capabilities is told only of the targets it holds (`target:NAME`).
+        if (!keyAllows({ kind: 'target', name })) continue;
         const r = await resolveTarget(name, 'list');
         if (r.refuse) continue;
         out.push({ name, ...(spec.description !== undefined ? { description: spec.description } : {}), capabilities: targetCapabilities(spec) });
@@ -777,11 +826,15 @@ export function createConnectionFactory(cfg) {
       const target = m.target ?? undefined;
       switch (m.kind) {
         case 'exec': case 'pty': case 'file': {
+          // The key's options and capabilities (#122): asked before the target is looked up (a key without `target:NAME` learns
+          // nothing about whether it exists), and again once it is, because no await may separate the `max-sessions` check from
+          // the channel being registered (two opens must not both pass when one slot is left).
+          const req = { kind: 'open', channel: m.kind, target, direction: m.kind === 'file' ? (String(m.command ?? '').startsWith('download:') ? 'download' : 'upload') : undefined };
+          const early = keyRefusal(req);
+          if (early) return send(openFail({ reason: early.reason }));
           const r = await resolveTarget(target, m.kind);
           if (r.refuse) return send(openFail({ reason: r.refuse }));
-          // The key's options (#122). No await between this check and the channel being registered, so two opens cannot both
-          // pass `max-sessions` when only one slot is left.
-          const refusal = keyRefusal({ kind: 'open', channel: m.kind });
+          const refusal = keyAllows(req) ? null : keyRefusal(req);
           if (refusal) return send(openFail({ reason: refusal.reason }));
           if (m.kind === 'exec') return openExec(m, r.b, target);
           return m.kind === 'pty' ? openPty(m, r.b, target) : openFile(m, r.b);
@@ -1224,7 +1277,7 @@ export function createConnectionFactory(cfg) {
     async function handleFileOp(m) {
       const channelId = m.channel_id;
       const target = m.target ?? undefined;
-      const refusal = keyRefusal({ kind: 'file-op' });
+      const refusal = keyRefusal({ kind: 'file-op', op: m.op, target });
       if (refusal) return send(fileResult({ channelId, success: false, errorMessage: refusal.reason }));
       const r0 = await resolveTarget(target, 'file');
       if (r0.refuse) return send(fileResult({ channelId, success: false, errorMessage: r0.refuse }));

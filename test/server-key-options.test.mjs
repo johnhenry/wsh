@@ -228,7 +228,7 @@ describe('authorized_keys options on the Node host (#122)', () => {
     clients.push(denied);
     await new Promise((r) => setTimeout(r, 150));
     assert.ok(!server.peerFingerprints().includes(keys.execOnly.fp), 'a key without permit-relay never registers');
-    assert.ok(logs.some((l) => /key options refused relay/.test(l) && /relay-not-permitted/.test(l)), logs.join('\n'));
+    assert.ok(logs.some((l) => /key permissions refused relay/.test(l) && /relay-not-permitted/.test(l)), logs.join('\n'));
 
     // ... and cannot list or connect either
     const mute = await login('execOnly');
