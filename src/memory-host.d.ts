@@ -28,7 +28,7 @@ export interface WshMemoryRpcContext {
 
 export interface WshMemoryHostOptions {
   /** As for `createWshServer`. Omitted = refuse everyone. */
-  auth?: WshServerAuthOptions | ((who: WshServerPrincipal) => boolean | Promise<boolean>);
+  auth?: WshServerAuthOptions | ((who: WshServerPrincipal) => boolean | { capabilities?: string | string[]; expires?: string | Date | number } | Promise<boolean | { capabilities?: string | string[]; expires?: string | Date | number }>);
   /** `run(command, io)`; there is no shell in memory, so there is no `true`. */
   exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: WshClientEnv };
   /** `node-pty`-shaped `{ spawn }`, injected (a browser has no pty of its own). Input arrives at `write` as a `Uint8Array`. Off unless given. */

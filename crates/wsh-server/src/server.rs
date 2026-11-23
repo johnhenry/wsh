@@ -3,6 +3,7 @@
 //! Owns the server secret (for token signing), session manager, relay subsystem,
 //! and MCP bridge. Coordinates the lifecycle of all incoming connections.
 
+use crate::auth::permissions::KeyRequest;
 use crate::config::{SealSession, ServerConfig};
 use crate::gateway::policy::{GatewayPolicy, GatewayPolicyEnforcer};
 use crate::gateway::GatewaySession;
@@ -281,6 +282,9 @@ impl WshServer {
             warn!(error = %e, "failed to load authorized_keys, no pubkey auth available");
             Vec::new()
         });
+        // wsh #122: a key whose options this server does not understand is not loaded (fail closed, with a logged reason).
+        let authorized_keys =
+            crate::auth::permissions::refuse_keys_with_bad_options(authorized_keys);
 
         if authorized_keys.is_empty() {
             warn!("no authorized keys loaded — pubkey authentication will fail");
@@ -2289,17 +2293,9 @@ impl WshServer {
         protocol: &str,
         rpc_sessions: &mut RpcSessions,
     ) -> Envelope {
-        let key_options = self
-            .authorized_keys
-            .iter()
-            .find(|k| k.fingerprint == ctx.fingerprint)
-            .and_then(|k| k.options.as_deref());
-        let permissions = crate::auth::permissions::KeyPermissions::from_options(
-            ctx.fingerprint.clone(),
-            key_options,
-        );
-        if permissions.forced_command.is_some() {
-            return rpc_open_fail("key is restricted to forced exec command");
+        let permissions = self.key_permissions(&ctx.fingerprint);
+        if let Err(refusal) = permissions.check(KeyRequest::OpenRpc(protocol), 0) {
+            return rpc_open_fail(&refusal.reason);
         }
         let allow_fs = permissions.has_scope(&crate::auth::permissions::SessionScope::FileTransfer);
         let next = self.next_channel_id.clone();
@@ -2308,6 +2304,64 @@ impl WshServer {
             move || next.fetch_add(1, Ordering::Relaxed),
             allow_fs,
         )
+    }
+
+    /// What the authorized_keys options of the key `fingerprint` allow (wsh #122). The first line for a key decides, as on the
+    /// Node host; a key without options, or one that logged in some other way, has full access.
+    fn key_permissions(&self, fingerprint: &str) -> crate::auth::permissions::KeyPermissions {
+        let key_options = self
+            .authorized_keys
+            .iter()
+            .find(|k| k.fingerprint == fingerprint)
+            .and_then(|k| k.options.as_deref());
+        crate::auth::permissions::KeyPermissions::from_options(fingerprint.to_string(), key_options)
+    }
+
+    /// The reply that refuses a gateway message the key's capabilities do not cover (`GatewayFail` / `ListenFail`), or `None`
+    /// (wsh #122, step two). Asked before the gateway's own policy; a key without a capability list is not affected.
+    /// This server has no named endpoints or targets, so `OpenEndpoint` is refused here whatever the key holds, and
+    /// the gateway answers a target it does not have.
+    fn gateway_key_refusal(&self, fingerprint: &str, envelope: &Envelope) -> Option<Envelope> {
+        let permissions = self.key_permissions(fingerprint);
+        let (request, gateway_id, listener_id) = match &envelope.payload {
+            Payload::OpenTcp(p) => (KeyRequest::Tcp(&p.host, p.port), Some(p.gateway_id), None),
+            Payload::OpenUdp(p) => (KeyRequest::Udp(&p.host, p.port), Some(p.gateway_id), None),
+            Payload::ResolveDns(p) => (KeyRequest::Dns(&p.name), Some(p.gateway_id), None),
+            Payload::OpenUnix(p) => (KeyRequest::Unix(&p.path), Some(p.gateway_id), None),
+            Payload::OpenEndpoint(p) => (
+                KeyRequest::Endpoint(&p.name, p.target.as_deref()),
+                Some(p.gateway_id),
+                None,
+            ),
+            Payload::ListenRequest(p) => (KeyRequest::ListenTcp(p.port), None, Some(p.listener_id)),
+            Payload::ListenUnix(p) => (KeyRequest::ListenUnix(&p.path), None, Some(p.listener_id)),
+            _ => return None,
+        };
+        let refusal = permissions.check(request, 0).err()?;
+        warn!(
+            fingerprint = %&fingerprint[..8.min(fingerprint.len())],
+            code = refusal.code,
+            capability = refusal.capability.as_deref().unwrap_or(""),
+            "gateway request refused by the key's permissions"
+        );
+        Some(match (gateway_id, listener_id) {
+            (Some(gateway_id), _) => Envelope {
+                msg_type: MsgType::GatewayFail,
+                payload: Payload::GatewayFail(GatewayFailPayload {
+                    gateway_id,
+                    code: 4,
+                    message: refusal.reason,
+                }),
+            },
+            (_, Some(listener_id)) => Envelope {
+                msg_type: MsgType::ListenFail,
+                payload: Payload::ListenFail(ListenFailPayload {
+                    listener_id,
+                    reason: refusal.reason,
+                }),
+            },
+            _ => return None,
+        })
     }
 
     /// Allocate a unique connection ID, skipping 0 (reserved as sentinel).
@@ -2611,6 +2665,44 @@ impl WshServer {
 
         match (&envelope.msg_type, &envelope.payload) {
             // ── Reverse peer messages ───────────────────────────────
+            // wsh #122: a key without `permit-relay` cannot register, list or connect (the answers are the Node host's).
+            (MsgType::ReverseRegister | MsgType::ReverseList, _)
+                if self
+                    .key_permissions(&ctx.fingerprint)
+                    .check(KeyRequest::Relay, 0)
+                    .is_err() =>
+            {
+                warn!(
+                    fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                    "relay request refused by the key's options"
+                );
+                Ok(Some(Envelope {
+                    msg_type: MsgType::Error,
+                    payload: Payload::Error(ErrorPayload {
+                        code: 2,
+                        message: "relay not permitted for this key".into(),
+                    }),
+                }))
+            }
+            (MsgType::ReverseConnect, Payload::ReverseConnect(p))
+                if self
+                    .key_permissions(&ctx.fingerprint)
+                    .check(KeyRequest::Relay, 0)
+                    .is_err() =>
+            {
+                warn!(
+                    fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                    "relay request refused by the key's options"
+                );
+                Ok(Some(Envelope {
+                    msg_type: MsgType::ReverseReject,
+                    payload: Payload::ReverseReject(ReverseRejectPayload {
+                        target_fingerprint: p.target_fingerprint.clone(),
+                        username: String::new(),
+                        reason: "relay not permitted for this key".into(),
+                    }),
+                }))
+            }
             (MsgType::ReverseRegister, Payload::ReverseRegister(p)) => {
                 // Verify the peer's self-signed record before accepting
                 // registration at all (wsh #17) -- p.public_key must belong
@@ -3081,79 +3173,37 @@ impl WshServer {
                 }
                 let cols = p.cols.unwrap_or(80);
                 let rows = p.rows.unwrap_or(24);
-                // Look up key options for permission enforcement
-                let key_options = self
-                    .authorized_keys
-                    .iter()
-                    .find(|k| k.fingerprint == ctx.fingerprint)
-                    .and_then(|k| k.options.as_deref());
-                let permissions = crate::auth::permissions::KeyPermissions::from_options(
-                    ctx.fingerprint.clone(),
-                    key_options,
-                );
-
-                // Check PTY permission
-                if p.kind == ChannelKind::Pty && !permissions.allow_pty {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::OpenFail,
-                        payload: Payload::OpenFail(OpenFailPayload {
-                            reason: "PTY not permitted for this key".into(),
-                        }),
-                    }));
-                }
-                // Check scope for PTY and Exec separately.
-                if p.kind == ChannelKind::Pty
-                    && !permissions.has_scope(&crate::auth::permissions::SessionScope::Shell)
-                {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::OpenFail,
-                        payload: Payload::OpenFail(OpenFailPayload {
-                            reason: "shell access not permitted for this key".into(),
-                        }),
-                    }));
-                }
-                if p.kind == ChannelKind::Exec
-                    && !permissions.has_scope(&crate::auth::permissions::SessionScope::Exec)
-                    && !permissions.has_scope(&crate::auth::permissions::SessionScope::Shell)
-                {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::OpenFail,
-                        payload: Payload::OpenFail(OpenFailPayload {
-                            reason: "exec access not permitted for this key".into(),
-                        }),
-                    }));
-                }
-                // Check file transfer scope
-                if p.kind == ChannelKind::File
-                    && !permissions.has_scope(&crate::auth::permissions::SessionScope::FileTransfer)
-                {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::OpenFail,
-                        payload: Payload::OpenFail(OpenFailPayload {
-                            reason: "file transfer not permitted for this key".into(),
-                        }),
-                    }));
-                }
-                // Enforce forced command semantics.
-                if permissions.forced_command.is_some() && p.kind != ChannelKind::Exec {
-                    return Ok(Some(Envelope {
-                        msg_type: MsgType::OpenFail,
-                        payload: Payload::OpenFail(OpenFailPayload {
-                            reason: "key is restricted to forced exec command".into(),
-                        }),
-                    }));
-                }
-                // Enforce key-specific session cap if present.
-                if let Some(max_sessions) = permissions.max_sessions {
-                    let active_for_key =
-                        self.sessions.count_for_fingerprint(&ctx.fingerprint).await;
-                    if active_for_key >= max_sessions {
+                // The key's authorized_keys options (wsh #122), the same table as the Node host's.
+                let permissions = self.key_permissions(&ctx.fingerprint);
+                let request = match p.kind {
+                    ChannelKind::Pty => Some(KeyRequest::OpenPty),
+                    ChannelKind::Exec => Some(KeyRequest::OpenExec),
+                    ChannelKind::File => Some(KeyRequest::OpenFile {
+                        upload: !p
+                            .command
+                            .as_deref()
+                            .is_some_and(|c| c.starts_with("download:")),
+                    }),
+                    // Any other kind is not this key's business: a key tied to one command gets nothing else.
+                    _ if permissions.forced_command.is_some() => Some(KeyRequest::OpenRpc("")),
+                    _ => None,
+                };
+                if let Some(request) = request {
+                    let active_for_key = if permissions.max_sessions.is_some() {
+                        self.sessions.count_for_fingerprint(&ctx.fingerprint).await
+                    } else {
+                        0
+                    };
+                    if let Err(refusal) = permissions.check(request, active_for_key) {
+                        warn!(
+                            fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                            code = refusal.code,
+                            "open refused by the key's options"
+                        );
                         return Ok(Some(Envelope {
                             msg_type: MsgType::OpenFail,
                             payload: Payload::OpenFail(OpenFailPayload {
-                                reason: format!(
-                                    "max sessions for this key reached ({max_sessions})"
-                                ),
+                                reason: refusal.reason,
                             }),
                         }));
                     }
@@ -3642,16 +3692,44 @@ impl WshServer {
 
             // ── MCP messages ────────────────────────────────────────
             (MsgType::McpDiscover, Payload::McpDiscover(_)) => {
+                // wsh #122: a key without MCP sees no tools, as it would on a server that has none.
+                let permissions = self.key_permissions(&ctx.fingerprint);
+                let permitted = permissions.check(KeyRequest::Mcp, 0).is_ok();
                 let bridge = self.mcp_bridge.read().await;
-                let mut tools = bridge.list_tools();
+                let mut tools = if permitted {
+                    bridge.list_tools()
+                } else {
+                    vec![]
+                };
                 let proxy = self.mcp_proxy.read().await;
-                tools.extend(proxy.list_tools());
+                if permitted {
+                    tools.extend(proxy.list_tools());
+                    // A key with `mcp:<tool>` capabilities is told only of those tools.
+                    tools.retain(|t| permissions.check(KeyRequest::McpTool(&t.name), 0).is_ok());
+                }
                 Ok(Some(Envelope {
                     msg_type: MsgType::McpTools,
                     payload: Payload::McpTools(McpToolsPayload { tools }),
                 }))
             }
             (MsgType::McpCall, Payload::McpCall(p)) => {
+                if let Err(refusal) = self
+                    .key_permissions(&ctx.fingerprint)
+                    .check(KeyRequest::McpCall(&p.tool), 0)
+                {
+                    warn!(
+                        fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                        code = refusal.code,
+                        "MCP call refused by the key's options"
+                    );
+                    return Ok(Some(Envelope {
+                        msg_type: MsgType::McpResult,
+                        payload: Payload::McpResult(McpResultPayload {
+                            call_id: p.call_id.clone(),
+                            result: serde_json::json!({ "success": false, "error": refusal.reason }),
+                        }),
+                    }));
+                }
                 let bridge = self.mcp_bridge.clone();
                 let proxy = self.mcp_proxy.clone();
                 let call = p.clone();
@@ -3688,6 +3766,9 @@ impl WshServer {
             // and the answers go out through the connection's outbound queue, so nothing here
             // waits on a connect.
             (msg_type, _) if GatewaySession::serves(*msg_type) => {
+                if let Some(refusal) = self.gateway_key_refusal(&ctx.fingerprint, &envelope) {
+                    return Ok(Some(refusal));
+                }
                 ctx.gateway.handle(envelope.clone());
                 Ok(None)
             }
@@ -4630,15 +4711,7 @@ impl WshServer {
                 // no FileTransfer scope) could still `list()` real directory
                 // entries. Mirror the Open<File> check exactly so both paths
                 // enforce the same scope the same way.
-                let key_options = self
-                    .authorized_keys
-                    .iter()
-                    .find(|k| k.fingerprint == ctx.fingerprint)
-                    .and_then(|k| k.options.as_deref());
-                let permissions = crate::auth::permissions::KeyPermissions::from_options(
-                    ctx.fingerprint.clone(),
-                    key_options,
-                );
+                let permissions = self.key_permissions(&ctx.fingerprint);
 
                 let result_payload = if p.target.is_some() {
                     // wsh #121: this server has no execution targets (it never advertises
@@ -4651,9 +4724,7 @@ impl WshServer {
                         entries: vec![],
                         error_message: Some("this host has no targets".to_string()),
                     }
-                } else if !permissions
-                    .has_scope(&crate::auth::permissions::SessionScope::FileTransfer)
-                {
+                } else if let Err(refusal) = permissions.check(KeyRequest::FileOp(&p.op), 0) {
                     // Named refusal identifying the missing "fs" capability
                     // (wsh #58: "an unauthorized fs capability must be
                     // reported as a named refusal, never rendered as an
@@ -4665,10 +4736,14 @@ impl WshServer {
                         success: false,
                         metadata: serde_json::Value::Object(Default::default()),
                         entries: vec![],
-                        error_message: Some(format!(
-                            "file operation {:?} requires the \"fs\" capability, which this key does not have (file transfer not permitted for this key)",
-                            p.op
-                        )),
+                        error_message: Some(if refusal.code == "file-transfer-not-permitted" {
+                            format!(
+                                "file operation {:?} requires the \"fs\" capability, which this key does not have (file transfer not permitted for this key)",
+                                p.op
+                            )
+                        } else {
+                            refusal.reason
+                        }),
                     }
                 } else if p.op == "list" {
                     // wsh #59: "list" is now a real implementation (see
@@ -4907,7 +4982,24 @@ impl WshServer {
 
             // ── Authorized-key management (wsh #59) ─────────────────
             (MsgType::AuthorizedKeyAdd, Payload::AuthorizedKeyAdd(p)) => {
-                let result = self.handle_authorized_key_add(&p).await;
+                // wsh #122: the key installed has no options, so only a key that is not restricted may install one.
+                let result = if let Err(refusal) = self
+                    .key_permissions(&ctx.fingerprint)
+                    .check(KeyRequest::KeyAdmin, 0)
+                {
+                    warn!(
+                        fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
+                        code = refusal.code,
+                        "AuthorizedKeyAdd refused by the key's options"
+                    );
+                    AuthorizedKeyResultPayload {
+                        success: false,
+                        added: false,
+                        error_message: Some(refusal.reason),
+                    }
+                } else {
+                    self.handle_authorized_key_add(&p).await
+                };
                 Ok(Some(Envelope {
                     msg_type: MsgType::AuthorizedKeyResult,
                     payload: Payload::AuthorizedKeyResult(result),

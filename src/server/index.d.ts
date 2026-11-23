@@ -14,14 +14,26 @@ export interface WshServerPrincipal {
   publicKey: Uint8Array;
 }
 
+/** What `authorize()` may return instead of `true` (#122): a capability list, and/or an expiry. */
+export interface WshCapabilityGrant {
+  /** `exec`, `pty`, `relay`, `fs:read`, `fs:write`, `gateway:tcp:<host>:<port>`, `gateway:udp:<host>:<port>`, `gateway:listen:tcp:<port>`, `unix:<path>`, `unix:listen:<path>`, `endpoint:<name>`, `mcp:<tool>`, `target:<name>`, `rpc:<protocol>`; an array, or a comma-separated string. */
+  capabilities?: string | string[];
+  expires?: string | Date | number;
+}
+
 export interface WshServerAuthOptions {
   /**
    * Keys allowed to connect: `ssh-ed25519 AAAA... [comment]` lines (an
    * `authorized_keys` file's text works), raw 32-byte keys, or an array of either.
    */
   authorizedKeys?: string | Uint8Array | Array<string | Uint8Array>;
-  /** Extra policy, run after the signature verifies (and after the allowlist, when given). */
-  authorize?: (who: WshServerPrincipal) => boolean | Promise<boolean>;
+  /**
+   * Extra policy, run after the signature verifies (and after the allowlist, when given). Return `true` to admit, or a
+   * capability set (#122) to admit with less: the key may do only what it names, on top of what its `authorized_keys` options
+   * allow (it never widens them). Same grammar as `capabilities="..."` in a key line; `expires` is an RFC 3339 string, a
+   * `Date` or epoch milliseconds (whole seconds are used). A set that is not understood refuses the login (logged).
+   */
+  authorize?: (who: WshServerPrincipal) => boolean | WshCapabilityGrant | Promise<boolean | WshCapabilityGrant>;
   /**
    * Enable password login: return `true` to admit. Sent in the clear inside the
    * connection -- serve over `wss://` / a trusted link. Use a constant-time
@@ -406,7 +418,7 @@ export interface WshServerOptions {
   /** Port (default `0` = pick a free one; read it back from `address()`). */
   port?: number;
   /** Who may connect. Omitted = every connection is refused. A function is shorthand for `{ authorize }`. */
-  auth?: WshServerAuthOptions | ((who: WshServerPrincipal) => boolean | Promise<boolean>);
+  auth?: WshServerAuthOptions | ((who: WshServerPrincipal) => boolean | WshCapabilityGrant | Promise<boolean | WshCapabilityGrant>);
   /** Enable `exec` sessions. `true`, options, or a custom runner. Off by default. */
   exec?: true | WshServerExecOptions | WshExecRunner;
   /** Enable `pty` sessions by injecting a pty implementation. Off by default. */
@@ -591,8 +603,43 @@ export interface WshServer {
 
 export function createWshServer(options?: WshServerOptions): WshServer;
 
-/** Parse `authorized_keys`-style text into raw 32-byte Ed25519 keys (malformed lines skipped). */
+/**
+ * Parse `authorized_keys`-style text into the raw 32-byte Ed25519 keys of the lines that carry NO options (malformed lines
+ * skipped). A line with options is not returned, because its restrictions would be lost: use `auth.authorizedKeys` (which
+ * enforces them) or `parseAuthorizedKeyEntries`.
+ */
 export function parseAuthorizedKeys(text: string): Uint8Array[];
+
+/** What an `authorized_keys` line's options allow (wsh #122; the same on the Rust `wsh-server`). */
+export interface KeyPermissions {
+  /** A pty shell. */
+  pty: boolean;
+  /** `exec` channels. */
+  exec: boolean;
+  /** MCP discovery and calls. */
+  mcp: boolean;
+  /** File channels, `FileOp` and `wsh-fs`. */
+  fileTransfer: boolean;
+  /** Relay registration, listing and connecting. */
+  relay: boolean;
+  /** `command="..."`: the only command the key may run (replaces what the client asks for). */
+  forcedCommand: string | null;
+  /** `max-sessions=N`: most live pty/exec sessions the key may hold at once. */
+  maxSessions: number | null;
+  /** `capabilities="..."` (#122, step two): `null` when the line has none; else the list, default-deny (only what it names). */
+  capabilities: string[] | null;
+  /** `expires="..."`: the epoch second from which the key is refused, or `null`. */
+  expires: number | null;
+}
+
+/**
+ * Parse `authorized_keys`-style text, options included. `refused` lists the lines whose options this host does not
+ * understand (`code`: `unknown-option`, `bad-syntax`, `bad-value`, `duplicate-option`); those keys are not let in.
+ */
+export function parseAuthorizedKeyEntries(text: string): {
+  entries: Array<{ key: Uint8Array; options: string | null; permissions: KeyPermissions; line: number }>;
+  refused: Array<{ line: number; code: string; reason: string; key: Uint8Array }>;
+};
 
 /** ServerHello feature: the host discovers client-opened exec data streams itself (no primer byte). */
 export const STREAM_ANNOUNCE: 'stream-announce';

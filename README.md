@@ -250,6 +250,102 @@ ends every authenticated connection `n` ms after login and advertises it
 limit and sends `ttl: 0`. Before 0.36 it sent an unenforced 3600. The Rust
 `wsh-server` still sends its `session_ttl` setting unenforced.
 
+### Authorized-key options (#122)
+
+`auth.authorizedKeys` takes `authorized_keys` lines with options, and reads them the way the Rust `wsh-server` does: **the same
+key file gives the same answer on both hosts.** The two parsers share one set of test vectors
+(`spec/key-options.vectors.json`: a key line gives these permissions, a request is allowed or refused with this code), run by the
+JS suite and by a Rust test, so they cannot drift.
+
+```
+restrict,permit-exec,max-sessions=2  ssh-ed25519 AAAA... ci@build
+command="/usr/bin/uptime"            ssh-ed25519 AAAA... monitor
+no-pty                               ssh-ed25519 AAAA... alice
+```
+
+A line is `[options] ssh-ed25519 <base64> [comment]`. The options are one token (spaces only inside double quotes) of
+comma-separated items, each `name` or `name=value`; a value is `"..."` (`\"` is a quote, any other backslash is literal) or, for
+values without spaces, a bare word. Single quotes are not quotes. Names are case-sensitive.
+
+| Option | Meaning | Node host (`@johnhenry/wsh/server`) | Rust `wsh-server` |
+|---|---|---|---|
+| *(none)* | full access: everything the host is configured to offer | as before | as before |
+| `restrict` | grant nothing; add back with `permit-*` | all entries below | all entries below |
+| `permit-pty` | a pty shell, and commands (a shell can run them) | `Open` kind `pty`, `exec` | `Open` kind `pty`, `exec` |
+| `permit-exec` | `exec` channels | `Open` kind `exec` | `Open` kind `exec` |
+| `permit-file-transfer` | file channels, `FileOp`, `wsh-fs` | `Open` kind `file` (upload, download), `FileOp`, rpc `wsh-fs` | the same |
+| `permit-mcp` | MCP discovery and calls | `McpDiscover` (an empty list otherwise), `McpCall`, rpc `mcp` | `McpDiscover`, `McpCall` (no rpc `mcp`) |
+| `permit-relay` | relay registration, listing and connecting | `ReverseRegister`, `ReverseList`, `ReverseConnect` (`relay`) | the same (`--enable-relay`) |
+| *(any restriction)* | a key that is not wholly unrestricted may not install another key | no `AuthorizedKeyAdd` handler | `AuthorizedKeyAdd` (the installed line has no options, so it would otherwise mint an unrestricted key) |
+| `no-pty` | no pty, even when otherwise permitted | `Open` kind `pty` | `Open` kind `pty` |
+| `command="..."` | the only command the key may run; it replaces what the client asks for, and the key gets no pty, files, MCP, relay or rpc | `Open` (exec only), `FileOp`, rpc | the same |
+| `max-sessions=N` (N >= 1) | at most N live pty/exec sessions for the key, over all its connections | counted on this host (detached hosted sessions too) | counted by the session manager |
+| `no-agent-forwarding`, `no-port-forwarding`, `no-X11-forwarding`, `no-user-rc` | accepted, **no effect** (see below) | ignored | ignored |
+
+Without `restrict`, the `permit-*` options change nothing. Another rpc protocol (one the embedder added) is open only to a key
+that is not restricted at all; `wsh-host` is open to every key but a forced-command one.
+
+**An option this host does not understand refuses the key**: it is not on the allowlist, and the reason is logged (the Node
+host's `onLog`, the Rust server's log: `key refused ... code=unknown-option`). It is never skipped and then granted. The same
+for a malformed value: `max-sessions=0` (it used to mean "no limit" on the Rust server), an empty `command=""`, an option given
+twice, a stray comma. Refusal codes: `unknown-option`, `bad-syntax`, `bad-value`, `duplicate-option`. A line whose options
+cannot be separated from the key (an unterminated quote) or whose key is not `ssh-ed25519` is skipped. If a key appears on
+several lines the first decides.
+
+`parseAuthorizedKeys(text)` still returns bare keys, and now only for lines **without** options (it never hands out a key with
+its restrictions dropped); `parseAuthorizedKeyEntries(text)` returns `{ entries, refused }` with each key's permissions.
+
+Not covered by `restrict` and the `permit-*` options (see [Security model](#security-model)): the **gateway** (TCP, DNS, unix,
+endpoints, reverse listeners) and the **targets**, so `restrict` and `no-port-forwarding` do not stop a key from using a gateway
+the host has turned on; scope them with `capabilities` below. `no-port-forwarding` is accepted for ssh compatibility and does nothing.
+
+#### Capabilities and expiry (#122, step two)
+
+Two more options give a key a finer, **default-deny** licence. Nothing changes for a key line that has neither.
+
+```
+capabilities="exec,fs:read,gateway:tcp:db.internal:5432,mcp:search"  ssh-ed25519 AAAA... ci@build
+expires="2030-01-01T00:00:00Z"                                      ssh-ed25519 AAAA... contractor
+```
+
+`capabilities="a,b,c"` (comma-separated, no spaces) lists what the key may do; **once the option is present the key may do only
+that**, on top of what its other options allow (the two are ANDed: `restrict,permit-exec,capabilities="exec,pty"` still has no
+pty). `capabilities=""` is a key that may do nothing. `expires="<RFC 3339>"` (`2030-01-01T00:00:00Z` or with an offset; whole
+seconds; upper-case `T`/`Z`) refuses the key from that second: at login, and for every request after it. An unknown capability, a
+malformed argument or a bad timestamp refuses the key (logged with the code `unknown-capability`, `bad-capability` or
+`bad-value`), as unknown options do.
+
+| Capability | What it allows | Entry points (Node host / Rust `wsh-server`) |
+|---|---|---|
+| `exec` | `exec` channels | `Open` kind `exec` / the same |
+| `pty` | a pty shell (does **not** imply `exec`) | `Open` kind `pty` / the same |
+| `fs:read` | stat, list, read, download | `FileOp` `stat` `list` `read`, `Open` kind `file` download / the same |
+| `fs:write` | write, mkdir, remove, rename, upload (does not read) | `FileOp` `write` `mkdir` `remove` `rename` (an op nobody knows is a write), `Open` kind `file` upload / the same |
+| `gateway:tcp:<host>:<port>` | `OpenTcp` to that destination; also `ResolveDns` for a host that matches | the Node gateway / the Rust gateway |
+| `gateway:udp:<host>:<port>` | `OpenUdp` to that destination | the same |
+| `gateway:listen:tcp:<port>` | a reverse TCP listener (`ListenRequest`) on that port | `gateway.reverse` / `enable_reverse_tunnels` |
+| `unix:<path>` , `unix:listen:<path>` | connect to, or listen on, that unix socket | `OpenUnix` / `ListenUnix` |
+| `endpoint:<name>` | a named endpoint | Node host only: the Rust server has none and refuses every `OpenEndpoint`, whatever a key holds |
+| `mcp:<tool>` | list and call that tool (`mcp:*`: every tool, and the `mcp` rpc channel) | `McpDiscover` lists only these, `McpCall` / the same |
+| `target:<name>` | name that target in `Open`, `FileOp`, `OpenEndpoint`; `ListTargets` shows only these | Node host only: the Rust server has no targets and refuses a request that names one |
+| `rpc:<protocol>` | open that rpc protocol (`wsh-host`, or an embedder's own) | `Open` kind `rpc` / the same |
+| `relay` | register, list and connect through the relay | `ReverseRegister` `ReverseList` `ReverseConnect` / the same |
+
+`<host>` is a name, an IP literal (IPv6 in brackets), `*`, or `*.suffix` (any subdomain, not the apex; the name is compared
+case-insensitively as the client sent it, so resolution is the gateway's `allow` policy's business). `<port>` is a number or `*`.
+`<path>` is absolute with no `.` or `..`, exact or ending in `/*` (anything below that directory). `<name>`/`<tool>` are exact or `*`.
+The `wsh-fs` rpc channel puts read and write methods on one channel, so it needs **both** `fs:read` and `fs:write`; a client without
+both falls back to `FileOp` and the file channels, which are checked per operation. A request with no target runs on the host's own
+backends and needs no `target:` capability (use `requireTarget` to confine keys to targets). Installing a key (`AuthorizedKeyAdd`) is never
+allowed for a key with a capability list. A custom `authorize` on `createWshServer` / `createMemoryHost` may return `{ capabilities,
+expires }` instead of `true`: the same grammar, narrowing the key's own options (it never widens them).
+
+Refusals name the missing capability (`missing capability fs:write`, `missing capability gateway:tcp:db.internal:22`) in the answer
+the client already gets (`OpenFail`, a failed `FileResult`, `GatewayFail`, `ListenFail`, an MCP result, a relay `Error` /
+`ReverseReject`, `AuthFail` for an expired key), and the Node host reports each one to `onRefused` with the stable reason
+`not-permitted` (`detail`: `capability-missing: missing capability exec (open exec)`), or `key-expired`. The Rust server logs them.
+`capabilities` and `expires` apply to **key logins**: a password login has no key and is not narrowed by them.
+
 ### Gateway (TCP and DNS egress from the host)
 
 `gateway: { allow: ['broker.lan:1883'], allowPrivate: ['10.0.0.0/8'], socks: '127.0.0.1:9050' }` makes the Node server
@@ -1780,6 +1876,8 @@ than left to be found.
 | Refusal event with stable reason codes (`onRefused`, #163) | `onRefused({ reason, who, detail })` on `createMemoryHost` / `createWshServer` / `createReverseHost`; `REFUSAL_REASONS` from `@johnhenry/wsh/host` | none: `wsh-server` and `wsh reverse` log a refusal, they have no callback (an embedding process has none) | **JS-only** -- a host-side callback of the embedding API, no wire change |
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
+| `authorized_keys` options (#122): `restrict`, `permit-*`, `no-pty`, `command=`, `max-sessions=` | `auth.authorizedKeys` lines with options on `createWshServer` / `createMemoryHost`; `parseAuthorizedKeyEntries()` | `wsh-server` reads `~/.wsh/authorized_keys` (then `~/.ssh/authorized_keys`) | **Same rules and the same vectors on both hosts** (`spec/key-options.vectors.json`, run by the JS suite and a Rust test); an option that is not understood keeps the key out, on both. See [Authorized-key options](#authorized-key-options-122) for the per-host column |
+| Per-key capabilities and expiry (#122): `capabilities="..."`, `expires="..."`; `authorize()` may return a set | every entry the host has: `Open` kinds, `FileOp` read vs write, gateway TCP/UDP/unix/endpoint open and listen, MCP discovery and calls, targets, rpc channels, relay; refusals through `onRefused` (`not-permitted`, `key-expired`) | the same, except **no endpoints and no targets** (`endpoint:` / `target:` parse and grant nothing; such requests are refused); refusals are logged, there is no callback; no `authorize` | **Same grammar, same vectors, same refusal codes on both hosts**; default-deny only for a key whose line has `capabilities`. Neither covers sessions already open, see [Security model](#security-model) |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |
 | Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | N/A -- Rust dials a cert its own TLS stack already trusts, or `--generate-cert`'s self-signed cert out of band | **Deliberately not unified** -- this is a browser-specific WebTransport API shape, not a wire-protocol concept |
 
@@ -1893,6 +1991,29 @@ out explicitly below rather than left to be discovered.
   isolation a target gives is your backends'. `requireTarget` does not cover the gateway, MCP or `Attach`; without it a request with no
   target runs on the host's own backends, which any authenticated key can use, so a deployment that confines a key to one target must set
   `requireTarget` (or leave the host with no backends of its own). The Rust `wsh-server` has no targets and refuses any request that names one.
+- **A key's `authorized_keys` options mean the same on both hosts, and a line that is not understood never grants anything (#122).**
+  `restrict`, `permit-*`, `no-pty`, `command=` and `max-sessions=` are enforced at every entry the table in
+  [Authorized-key options](#authorized-key-options-122) lists (`Open`, `FileOp`, the rpc channels, MCP, the relay entry
+  points, installing a key), with the shared vectors run by both test suites. An option that is not understood -- or a value
+  that is malformed, such as `max-sessions=0` -- keeps the key out altogether and is logged. They do NOT scope the gateway
+  (TCP, DNS, unix, endpoints, reverse listeners) or the targets: a key that may not run commands can still use a gateway the host
+  turned on, and `no-port-forwarding` is accepted and ignored. A key's permissions are read when the host starts (the Rust
+  server) or when `createWshServer` is built (the Node host): editing the file does not change a running host. They limit what a
+  key can ask for, not what a command it may run can do: `permit-exec` runs any command the client names (use `command=` to fix
+  it), as the host's user.
+- **Per-key capabilities and expiry narrow what a key may ask for; they are not a sandbox (#122).** `capabilities="..."` (and what
+  `authorize` returns) is default-deny at the entry points in the [capability table](#capabilities-and-expiry-122-step-two), on both
+  hosts, with the same vectors. What they do NOT protect against: (1) **what a granted capability can reach.** `exec` runs any
+  command as the host's user, `fs:write` writes anywhere the `fs` root allows, `gateway:tcp:*:*` is an open proxy -- a capability is
+  as strong as the backend behind it; the gateway's own policy (`allow`, resolved-address checks, unix paths) and the `fs` root still
+  apply on top, and the capability only narrows. (2) **Things already open.** `expires` is checked at login and at every request; it
+  does not close a connection, a running command, a forwarded stream or a reverse listener that was open when the key expired
+  (use `connectionTtlMs` for that), and an `Attach` / `Resume` / `Signal` / `Resize` of a session the key already owns, session
+  sharing, recordings and `Detach` are not gated by capabilities. (3) **Host names are compared as the client wrote them**:
+  `gateway:tcp:db.internal:5432` constrains the name a client sends, not where a granted name resolves (the gateway's address
+  policy does that). (4) **Password logins** are not narrowed (no key). (5) **Clock:** `expires` trusts the host's clock. (6) A key
+  file is read when the host starts (Rust) or is built (Node): editing it does not change a running host. (7) The Rust server has no
+  endpoints or targets: `endpoint:` and `target:` are accepted in a key line (so one file serves both hosts) and grant nothing there.
 - **Several operators per peer share one peer, and the relay decides who is who (#93).** Off unless both the relay
   (`maxOperatorsPerPeer`, `[relay] max_operators_per_peer`) and the peer (`maxOperators`, `--max-operators`) are
   set above 1. The relay stamps each message with its own record of the sender's authenticated key and removes

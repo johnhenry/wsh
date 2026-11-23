@@ -38,34 +38,53 @@ fn parse_authorized_key_line(line: &str) -> Option<AuthorizedKey> {
         return None;
     }
 
-    let parts: Vec<&str> = line.splitn(3, ' ').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-
-    // Check if first field is options (not a key type)
-    let (options, key_type, key_data, comment) = if parts[0].starts_with("ssh-") {
-        (
-            None,
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts.get(2).unwrap_or(&"").to_string(),
-        )
-    } else if parts.len() >= 3 {
-        // First field is options, re-parse from after options
-        let after_opts: Vec<&str> = line[parts[0].len()..].trim().splitn(3, ' ').collect();
-        if after_opts.len() < 2 {
+    // `[options] ssh-ed25519 <base64> [comment]`, fields separated by spaces or tabs. The options are one token that ends at
+    // the first whitespace outside double quotes (a `\"` inside quotes is a quote), so `command="a b"` is one option. The
+    // same rule as the Node host's `parseAuthorizedKeyLine` (spec/key-options.vectors.json).
+    let is_key_start = |s: &str| {
+        s.strip_prefix("ssh-ed25519")
+            .is_some_and(|r| r.starts_with([' ', '\t']))
+    };
+    let (options, rest) = if is_key_start(line) {
+        (None, line)
+    } else {
+        let mut in_quote = false;
+        let mut end = None;
+        let mut chars = line.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if in_quote {
+                if c == '\\' && matches!(chars.peek(), Some((_, '"'))) {
+                    chars.next();
+                } else if c == '"' {
+                    in_quote = false;
+                }
+            } else if c == '"' {
+                in_quote = true;
+            } else if c == ' ' || c == '\t' {
+                end = Some(i);
+                break;
+            }
+        }
+        // An unterminated quote (or no key after the options) leaves nothing to act on.
+        let end = end?;
+        let rest = line[end..].trim();
+        if !is_key_start(rest) {
             return None;
         }
-        (
-            Some(parts[0].to_string()),
-            after_opts[0].to_string(),
-            after_opts[1].to_string(),
-            after_opts.get(2).unwrap_or(&"").to_string(),
-        )
-    } else {
-        return None;
+        (Some(line[..end].to_string()), rest)
     };
+
+    let (key_type, after) = rest.split_once([' ', '\t'])?;
+    let after = after.trim_start();
+    let (key_data, comment) = match after.split_once([' ', '\t']) {
+        Some((k, c)) => (k, c.trim()),
+        None => (after, ""),
+    };
+    let (key_type, key_data, comment) = (
+        key_type.to_string(),
+        key_data.to_string(),
+        comment.to_string(),
+    );
 
     // Only support ed25519
     if key_type != "ssh-ed25519" {
@@ -80,6 +99,9 @@ fn parse_authorized_key_line(line: &str) -> Option<AuthorizedKey> {
 
     // Extract the raw 32-byte key from SSH wire format to compute fingerprint
     let raw_key = extract_raw_ed25519(&raw)?;
+    if raw_key.len() != 32 {
+        return None;
+    }
     let fingerprint = identity::fingerprint(&raw_key);
 
     Some(AuthorizedKey {
@@ -292,6 +314,34 @@ mod tests {
         let content = format!("# comment\n\nssh-ed25519 {} test\n", TEST_KEY_B64);
         let keys = parse_authorized_keys(&content);
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn options_are_one_token_that_may_hold_quoted_spaces() {
+        let line = format!(
+            "restrict,command=\"echo \\\"a b\\\"\"\t{TEST_KEY_B64_LINE} user@host",
+            TEST_KEY_B64_LINE = format!("ssh-ed25519 {TEST_KEY_B64}")
+        );
+        let keys = parse_authorized_keys(&line);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].options.as_deref(),
+            Some("restrict,command=\"echo \\\"a b\\\"\"")
+        );
+        assert_eq!(keys[0].comment, "user@host");
+    }
+
+    #[test]
+    fn an_unterminated_quote_in_the_options_is_not_a_key() {
+        let line = format!("command=\"oops ssh-ed25519 {TEST_KEY_B64}");
+        assert!(parse_authorized_keys(&line).is_empty());
+    }
+
+    #[test]
+    fn options_in_front_of_another_key_type_are_skipped() {
+        assert!(
+            parse_authorized_keys("restrict ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ a").is_empty()
+        );
     }
 
     #[test]

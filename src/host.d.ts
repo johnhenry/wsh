@@ -261,10 +261,12 @@ export type WshOnShare = (name: string, fs: WshShareFs, who: { username: string 
 export const REFUSAL_REASONS: readonly WshRefusalReason[];
 export type WshRefusalReason =
   | 'not-sealed' | 'unauthorized' | 'binding-required' | 'bad-signature' | 'method-disabled' | 'rate-limited' | 'bad-request'
-  | 'seal-failed' | 'busy' | 'proof-required' | 'proof-failed';
+  | 'seal-failed' | 'busy' | 'proof-required' | 'proof-failed' | 'key-expired' | 'not-permitted';
 /**
  * Called once per connection a host turned away (#163): `reason` is a stable code, `who` what is known of the peer (a
  * refusal before the login names no one), `detail` human text that is not stable. Not for parsing `onLog`.
  * Reverse hosts also use `busy`, `proof-required`, `proof-failed`; a sealed session that fails mid-way reports `seal-failed`.
+ * `key-expired` (a key past its `expires`, at login or later) and `not-permitted` (a request the key's options or capabilities do not
+ * allow; `detail` names the missing capability) are not per connection: `not-permitted` can come any number of times on one (#122).
  */
 export type WshOnRefused = (refusal: { reason: WshRefusalReason; who: { username?: string; fingerprint?: string; address?: string }; detail: string }) => void;

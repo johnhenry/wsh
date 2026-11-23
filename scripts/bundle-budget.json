@@ -6,16 +6,16 @@
       "gzip": 48916
     },
     "./memory": {
-      "raw": 213029,
-      "gzip": 65972
+      "raw": 229133,
+      "gzip": 71335
     },
     "./host": {
-      "raw": 107845,
-      "gzip": 35329
+      "raw": 124124,
+      "gzip": 40847
     },
     "./reverse": {
-      "raw": 205075,
-      "gzip": 63166
+      "raw": 215989,
+      "gzip": 66580
     },
     ". (generateKeyPair only)": {
       "raw": 404,
@@ -26,8 +26,8 @@
       "gzip": 40005
     },
     "./host (createConnectionFactory only)": {
-      "raw": 89421,
-      "gzip": 29373
+      "raw": 100327,
+      "gzip": 32803
     }
   }
 }

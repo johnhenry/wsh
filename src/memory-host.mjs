@@ -228,7 +228,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   // A target's own endpoints (#121) need the endpoints-only gateway too, even when the host has none of its own.
   if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({})), targetEndpoints: true };
 
-  const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
+  const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
     methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused,
     targets: targetTable, requireTarget: mustHaveTarget,
