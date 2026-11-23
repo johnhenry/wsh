@@ -453,9 +453,10 @@ impl ServerConfig {
                 ))
             })?;
         let password_hashes = parse_password_hashes(&file_config.auth);
-        let client_env =
-            crate::client_env::ClientEnvPolicy::from_setting(file_config.server.client_env.as_ref())
-                .map_err(wsh_core::WshError::Other)?;
+        let client_env = crate::client_env::ClientEnvPolicy::from_setting(
+            file_config.server.client_env.as_ref(),
+        )
+        .map_err(wsh_core::WshError::Other)?;
         if client_env == crate::client_env::ClientEnvPolicy::Everything {
             warn!("[server] client_env = true: a client can set any environment variable (PATH, LD_PRELOAD...) for what it runs");
         }
@@ -594,14 +595,20 @@ mod tests {
         for cfg in [load_defaults(), load("")] {
             assert_eq!(cfg.client_env, ClientEnvPolicy::default());
             let kept = cfg.client_env.filter(Some(
-                &[("PATH".to_string(), "/x".to_string()), ("LC_ALL".to_string(), "C".to_string())].into(),
+                &[
+                    ("PATH".to_string(), "/x".to_string()),
+                    ("LC_ALL".to_string(), "C".to_string()),
+                ]
+                .into(),
             ));
             assert_eq!(kept.unwrap().keys().collect::<Vec<_>>(), ["LC_ALL"]);
         }
         // The exact line the CHANGELOG gives:
         let cfg = load("[server]\nclient_env = true\n");
         assert_eq!(cfg.client_env, ClientEnvPolicy::Everything);
-        let kept = cfg.client_env.filter(Some(&[("PATH".to_string(), "/x".to_string())].into()));
+        let kept = cfg
+            .client_env
+            .filter(Some(&[("PATH".to_string(), "/x".to_string())].into()));
         assert!(kept.unwrap().contains_key("PATH"));
     }
 

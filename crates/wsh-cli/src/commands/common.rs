@@ -79,6 +79,9 @@ pub struct ResolvedTarget {
     /// The URL exactly as the user gave it, when the target was a full URL
     /// (`wss://host/path`) rather than `[user@]host`.
     pub explicit_url: Option<String>,
+    /// The `known_hosts` key (`host:port`) to record the host's fingerprint under when the
+    /// URL dialled is not the host's own address (`--via`). `None`: the URL's authority.
+    pub known_host: Option<String>,
 }
 
 /// Persisted "last session" metadata used by session-oriented commands.
@@ -182,6 +185,7 @@ fn parse_url_target(target: &str) -> Result<Option<ResolvedTarget>> {
         fallback_urls: Vec::new(),
         transport: Some(transport.to_string()),
         explicit_url: Some(url),
+        known_host: None,
     }))
 }
 
@@ -221,9 +225,32 @@ fn parse_port(port: &str) -> Result<u16> {
         .with_context(|| format!("invalid port '{port}'"))
 }
 
+/// The operator side of a pipe relay (`--via`), set once from the command line. A process-wide
+/// value so every command that dials a `[user@]host` reaches the host through it without each
+/// one threading another argument.
+static VIA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Remember `--via <url>` for the rest of this process.
+pub fn set_via(url: String) {
+    let _ = VIA.set(url);
+}
+
 /// Resolve `[user@]host` + transport into a concrete connection URL, or take a full
-/// URL (`wss://host:port/path`) as it is.
+/// URL (`wss://host:port/path`) as it is. With `--via`, the URL is the pipe relay's and the
+/// host stays `[user@]host` (see [`apply_via`]).
 pub fn resolve_target(target: &str, port: u16, transport: Option<&str>) -> Result<ResolvedTarget> {
+    let resolved = resolve_target_direct(target, port, transport)?;
+    match VIA.get() {
+        Some(via) => apply_via(resolved, via),
+        None => Ok(resolved),
+    }
+}
+
+fn resolve_target_direct(
+    target: &str,
+    port: u16,
+    transport: Option<&str>,
+) -> Result<ResolvedTarget> {
     if let Some(resolved) = parse_url_target(target)? {
         return Ok(resolved);
     }
@@ -239,7 +266,76 @@ pub fn resolve_target(target: &str, port: u16, transport: Option<&str>) -> Resul
         fallback_urls: urls,
         transport,
         explicit_url: None,
+        known_host: None,
     })
+}
+
+/// Dial `via` -- the operator URL of a pipe relay, `wss://relay/r/<id>` -- instead of the
+/// host, and keep `[user@]host` as the identity.
+///
+/// The relay's address says nothing about who answers at the other end, so the host key is
+/// recorded in `known_hosts` under `host:port` of the target (the same key a direct connection
+/// uses), not under the relay's authority. A pipe relay is WebSocket only and the dial has no
+/// fallback; `--transport` does not apply. The rendezvous id is a capability for the pipe, so
+/// the URL is not saved to `last_session.json`.
+pub fn apply_via(mut resolved: ResolvedTarget, via: &str) -> Result<ResolvedTarget> {
+    if resolved.explicit_url.is_some() {
+        anyhow::bail!(
+            "--via needs a user@host target (the host's identity), not a URL: a URL would be \
+             the relay's"
+        );
+    }
+    let relay = parse_url_target(via)?.with_context(|| {
+        format!("--via expects a URL like wss://relay.example.com/r/<id>, got '{via}'")
+    })?;
+    if relay.transport.as_deref() != Some("ws") {
+        anyhow::bail!("--via: a pipe relay is reached over WebSocket (wss://), not '{via}'");
+    }
+    if via.contains('@') {
+        anyhow::bail!("--via: put the user in the target (user@host), not in the relay URL");
+    }
+    let (path, query) = match relay.url.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (relay.url.as_str(), ""),
+    };
+    if query
+        .split('&')
+        .any(|p| p.starts_with("role=") && p != "role=operator")
+    {
+        anyhow::bail!(
+            "--via: '?role=host' is the HOST side of the pipe; the operator side has no role"
+        );
+    }
+    let mut segments = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .take(2)
+        .collect::<Vec<_>>();
+    segments.reverse();
+    let id_ok = |id: &str| {
+        (22..=128).contains(&id.len())
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    if !matches!(segments.as_slice(), ["r", id] if id_ok(id)) {
+        anyhow::bail!(
+            "--via: the URL must end in /r/<rendezvous id> (22-128 base64url characters), got '{}'",
+            relay.host
+        );
+    }
+
+    let host = if resolved.host.contains(':') && !resolved.host.starts_with('[') {
+        format!("[{}]", resolved.host)
+    } else {
+        resolved.host.clone()
+    };
+    resolved.known_host = Some(format!("{host}:{}", resolved.port));
+    resolved.url = relay.url;
+    resolved.fallback_urls = Vec::new();
+    resolved.transport = Some("ws".to_string());
+    resolved.explicit_url = None;
+    Ok(resolved)
 }
 
 /// Connect and authenticate a client for a resolved target.
@@ -247,6 +343,7 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
     let config = ConnectConfig {
         username: resolved.user.clone(),
         key_name: Some(identity.to_string()),
+        known_host: resolved.known_host.clone(),
         ..Default::default()
     };
 
@@ -490,6 +587,74 @@ mod tests {
         assert!(resolve_target("wss://host:notaport/", 4422, None).is_err());
         assert!(resolve_target("wss://user:secret@host/", 4422, None).is_err());
         assert!(resolve_target("@wss://host/", 4422, None).is_err());
+    }
+
+    // ── --via: a pipe relay (#118, #145) ─────────────────────────────
+
+    const ID: &str = "AbCdEfGhIjKlMnOpQrStUv"; // 22 base64url characters
+
+    #[test]
+    fn via_dials_the_relay_but_keeps_the_host_as_the_identity() {
+        let base = resolve_target("alice@build.example.com", 4422, None).unwrap();
+        let r = apply_via(base, &format!("wss://relay.example.com:8443/r/{ID}")).unwrap();
+        assert_eq!(r.url, format!("wss://relay.example.com:8443/r/{ID}"));
+        assert!(r.fallback_urls.is_empty());
+        assert_eq!(r.transport.as_deref(), Some("ws"));
+        assert_eq!(
+            (r.user.as_str(), r.host.as_str(), r.port),
+            ("alice", "build.example.com", 4422)
+        );
+        // The host key is recorded under the host, never under the relay.
+        assert_eq!(r.known_host.as_deref(), Some("build.example.com:4422"));
+        // The rendezvous id is a capability: it is not written to last_session.json.
+        assert_eq!(r.explicit_url, None);
+    }
+
+    #[test]
+    fn via_known_host_brackets_ipv6_and_follows_the_port_flag() {
+        let base = resolve_target("bob@[2001:db8::7]", 9000, None).unwrap();
+        let r = apply_via(base, &format!("wss://relay.example.com/r/{ID}")).unwrap();
+        assert_eq!(r.known_host.as_deref(), Some("[2001:db8::7]:9000"));
+    }
+
+    #[test]
+    fn via_may_sit_under_a_base_path_and_keeps_its_query() {
+        let base = resolve_target("alice@h", 4422, None).unwrap();
+        let r = apply_via(base, &format!("wss://relay.example.com/wsh/r/{ID}?x=1")).unwrap();
+        assert_eq!(r.url, format!("wss://relay.example.com/wsh/r/{ID}?x=1"));
+    }
+
+    #[test]
+    fn via_refuses_what_is_not_the_operator_side_of_a_pipe() {
+        let base = || resolve_target("alice@h", 4422, None).unwrap();
+        for bad in [
+            "wss://relay.example.com".to_string(), // no rendezvous id
+            "wss://relay.example.com/r/short".to_string(), // id too short
+            format!("wss://relay.example.com/r/{ID}?role=host"), // the HOST side of the pipe
+            format!("wss://relay.example.com/x/{ID}"), // not /r/<id>
+            format!("https://relay.example.com/r/{ID}"), // a pipe relay is WebSocket
+            format!("ws://relay.example.com/r/{ID}"), // plain text off loopback
+            format!("wss://user:pw@relay.example.com/r/{ID}"),
+            "not a url".to_string(),
+        ] {
+            assert!(apply_via(base(), &bad).is_err(), "{bad}");
+        }
+        assert!(apply_via(base(), &format!("ws://127.0.0.1:9/r/{ID}")).is_ok());
+    }
+
+    #[test]
+    fn via_cannot_be_combined_with_a_url_target() {
+        let url = resolve_target("wss://relay.example.com/x", 4422, None).unwrap();
+        let err = apply_via(url, &format!("wss://relay.example.com/r/{ID}")).unwrap_err();
+        assert!(err.to_string().contains("user@host"), "{err}");
+    }
+
+    #[test]
+    fn a_url_target_is_pinned_under_its_own_authority_which_for_a_relay_is_the_relay() {
+        // Documented limit: without --via the key is recorded under what was dialled.
+        let r =
+            resolve_target(&format!("alice@wss://relay.example.com/r/{ID}"), 4422, None).unwrap();
+        assert_eq!(r.known_host, None);
     }
 
     #[test]

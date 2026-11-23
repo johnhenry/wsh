@@ -3169,8 +3169,12 @@ impl WshServer {
                         .await
                     {
                         Ok(true) => {}
-                        Ok(false) => warn!(channel_id = p.channel_id, signal = %p.signal, "Signal not delivered (unknown name or the process is gone)"),
-                        Err(e) => warn!(channel_id = p.channel_id, error = %e, "Signal: session lookup failed"),
+                        Ok(false) => {
+                            warn!(channel_id = p.channel_id, signal = %p.signal, "Signal not delivered (unknown name or the process is gone)")
+                        }
+                        Err(e) => {
+                            warn!(channel_id = p.channel_id, error = %e, "Signal: session lookup failed")
+                        }
                     }
                 } else {
                     warn!(channel_id = p.channel_id, "Signal for unknown channel");

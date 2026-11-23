@@ -52,6 +52,12 @@ struct Cli {
     #[arg(long = "tty")]
     tty: bool,
 
+    /// Reach `[user@]host` through a pipe relay: the operator URL `wss://relay/r/<id>` (the
+    /// rendezvous id both sides were given). `user@host` stays the identity: its host key is
+    /// recorded in known_hosts under host:port, not under the relay's address.
+    #[arg(long = "via", global = true, value_name = "URL")]
+    via: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -294,6 +300,28 @@ async fn main() {
             Some(t)
         }
     });
+
+    if let Some(via) = cli.via.clone() {
+        // Only the commands that dial one `[user@]host` can go through a pipe relay.
+        let dials_a_host = match &cli.command {
+            None => true,
+            Some(
+                Command::Connect { .. }
+                | Command::CopyId { .. }
+                | Command::Scp { .. }
+                | Command::Ls { .. }
+                | Command::Sftp { .. },
+            ) => true,
+            Some(_) => false,
+        };
+        if !dials_a_host {
+            eprintln!(
+                "wsh: --via applies to `wsh [user@]host`, connect, scp, ls, sftp and copy-id only"
+            );
+            std::process::exit(2);
+        }
+        commands::common::set_via(via);
+    }
 
     let result = match cli.command {
         Some(Command::Connect { target }) => {

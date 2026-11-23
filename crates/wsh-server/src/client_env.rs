@@ -79,7 +79,10 @@ impl ClientEnvPolicy {
 
     /// Keep only what this policy accepts and what is well formed. `None` when
     /// nothing is left.
-    pub fn filter(&self, requested: Option<&HashMap<String, String>>) -> Option<HashMap<String, String>> {
+    pub fn filter(
+        &self,
+        requested: Option<&HashMap<String, String>>,
+    ) -> Option<HashMap<String, String>> {
         let requested = requested?;
         let mut out = HashMap::new();
         for (seen, (name, value)) in requested.iter().enumerate() {
@@ -117,7 +120,10 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn keys(m: Option<HashMap<String, String>>) -> Vec<String> {
@@ -142,7 +148,17 @@ mod tests {
             ("BASH_ENV", "/tmp/x"),
             ("LCX", "no, not LC_*"),
         ])));
-        assert_eq!(keys(got), ["COLORTERM", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM"]);
+        assert_eq!(
+            keys(got),
+            [
+                "COLORTERM",
+                "LANG",
+                "LANGUAGE",
+                "LC_ALL",
+                "LC_CTYPE",
+                "TERM"
+            ]
+        );
     }
 
     #[test]
@@ -161,7 +177,8 @@ mod tests {
 
     #[test]
     fn at_most_sixty_four_variables_are_taken() {
-        let many: HashMap<String, String> = (0..200).map(|i| (format!("V{i}"), "1".into())).collect();
+        let many: HashMap<String, String> =
+            (0..200).map(|i| (format!("V{i}"), "1".into())).collect();
         let got = ClientEnvPolicy::Everything.filter(Some(&many)).unwrap();
         assert_eq!(got.len(), MAX_ENV_VARS);
     }
@@ -169,8 +186,13 @@ mod tests {
     #[test]
     fn nothing_accepts_nothing_and_a_list_replaces_the_default() {
         let req = env(&[("TERM", "xterm"), ("EDITOR", "vi"), ("LC_ALL", "C")]);
-        assert_eq!(keys(ClientEnvPolicy::Nothing.filter(Some(&req))), Vec::<String>::new());
-        let only = ClientEnvPolicy::from_setting(Some(&ClientEnvSetting::Names(vec!["EDITOR".into()]))).unwrap();
+        assert_eq!(
+            keys(ClientEnvPolicy::Nothing.filter(Some(&req))),
+            Vec::<String>::new()
+        );
+        let only =
+            ClientEnvPolicy::from_setting(Some(&ClientEnvSetting::Names(vec!["EDITOR".into()])))
+                .unwrap();
         assert_eq!(keys(only.filter(Some(&req))), ["EDITOR"]);
     }
 
@@ -183,16 +205,25 @@ mod tests {
             client_env: Option<ClientEnvSetting>,
         }
         let t: Wrap = toml::from_str("client_env = true").unwrap();
-        assert_eq!(ClientEnvPolicy::from_setting(t.client_env.as_ref()).unwrap(), ClientEnvPolicy::Everything);
+        assert_eq!(
+            ClientEnvPolicy::from_setting(t.client_env.as_ref()).unwrap(),
+            ClientEnvPolicy::Everything
+        );
         let t: Wrap = toml::from_str("client_env = false").unwrap();
-        assert_eq!(ClientEnvPolicy::from_setting(t.client_env.as_ref()).unwrap(), ClientEnvPolicy::Nothing);
+        assert_eq!(
+            ClientEnvPolicy::from_setting(t.client_env.as_ref()).unwrap(),
+            ClientEnvPolicy::Nothing
+        );
         let t: Wrap = toml::from_str("client_env = [\"TERM\", \"LC_*\"]").unwrap();
         assert_eq!(
             ClientEnvPolicy::from_setting(t.client_env.as_ref()).unwrap(),
             ClientEnvPolicy::Names(vec!["TERM".into(), "LC_*".into()])
         );
         let t: Wrap = toml::from_str("").unwrap();
-        assert_eq!(ClientEnvPolicy::from_setting(t.client_env.as_ref()).unwrap(), ClientEnvPolicy::default());
+        assert_eq!(
+            ClientEnvPolicy::from_setting(t.client_env.as_ref()).unwrap(),
+            ClientEnvPolicy::default()
+        );
         assert!(toml::from_str::<Wrap>("client_env = \"all\"").is_err());
     }
 }
