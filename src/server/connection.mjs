@@ -24,12 +24,11 @@ import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES, MAX_ATTACHMENTS } from './constants.mjs';
-import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE } from '../client.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE } from '../features.mjs';
 import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
-import { createGatewaySession } from './gateway.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -73,14 +72,24 @@ const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n));
 const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
 
 /**
+ * The connection handler every host runs -- `createWshServer`, `createMemoryHost`, `createReverseHost` -- exported
+ * (as `@johnhenry/wsh/host`) for an embedder that wires its own transport: a WebSocket it opened itself, a
+ * `MessagePort`, a byte pipe to another process. It returns `attach(...)`, called once per connection; see below.
+ * Build the backends with `resolveBackends()` and the host key with `resolveHostKey()` (same entry point), and
+ * answer `authorize` yourself; for the common cases `createMemoryHost()` does all of this and `bindSocket()` does the
+ * socket side.
+ *
+ * Everything here is browser-safe: no `node:*` import and no `Buffer` is reachable from this module.
+ *
  * @param {object} cfg
- * @param {(who: object) => Promise<boolean>} cfg.authorize
- * @param {Function | null} cfg.execRunner
- * @param {object} cfg.execOptions
- * @param {object | null} cfg.pty - normalized (see pty.mjs)
- * @param {object | null} cfg.files - from createFileAccess
- * @param {{ pubkey: boolean, password: Function | null }} cfg.methods - which auth methods are on
- * @param {object | null} cfg.hostKey - from loadHostKey
+ * @param {(who: { username: string, fingerprint?: string, publicKey?: Uint8Array }) => Promise<boolean>} cfg.authorize - required;
+ *   decides who is let in (`buildAuthorizer` in `server/auth.mjs` builds one from `authorizedKeys` / a callback)
+ * @param {Function | null} [cfg.execRunner] - `run(command, io)`; null = exec is off
+ * @param {object} [cfg.execOptions] - `{ timeoutMs, clientEnv }` (default `{}`)
+ * @param {object | null} [cfg.pty] - normalized (see pty.mjs): `{ spawn, shell, cwd, env, term }`; null = pty is off
+ * @param {object | null} [cfg.files] - a file backend (see `normalizeFileBackend` in `host-backends.mjs`); null = file access is off
+ * @param {{ pubkey: boolean, password: Function | null }} [cfg.methods] - which auth methods are on (default pubkey only)
+ * @param {object | null} [cfg.hostKey] - from `resolveHostKey` / `loadHostKey`
  * @param {object | null} cfg.mcp - from createMcpHost
  * @param {{ protocols: Map<string, Function>, maxMessageBytes: number, maxInflight: number } | null} cfg.rpc - from createRpcHost
  * @param {{ signKey: CryptoKey | null, hybrid?: boolean } | null} cfg.e2e - answer KeyExchange and seal virtual-mode traffic (bridged connections only)
@@ -89,10 +98,18 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {object | null} cfg.relay - a RelayHub (see relay.mjs); null = not a relay
  * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
- * @param {number} cfg.bindTimeoutMs - how long exec output waits for the data stream
- * @param {(line: string) => void} cfg.log
+ * @param {number} [cfg.bindTimeoutMs=3000] - how long exec output waits for the data stream
+ * @param {(line: string) => void} [cfg.log]
  */
 export function createConnectionFactory(cfg) {
+  if (!cfg || typeof cfg.authorize !== 'function') throw new TypeError('createConnectionFactory: authorize(who) is required (a host that lets everyone in is not a default)');
+  cfg = {
+    ...cfg,
+    execOptions: cfg.execOptions ?? {},
+    methods: cfg.methods ?? { pubkey: true, password: null },
+    bindTimeoutMs: cfg.bindTimeoutMs ?? 3000,
+    log: cfg.log ?? (() => {}),
+  };
   let counter = 0;
 
   /**
@@ -128,7 +145,10 @@ export function createConnectionFactory(cfg) {
     /** This connection as the relay hub sees it (created on first need). */
     let relayHandle = null;
 
-    const gateway = cfg.gateway ? createGatewaySession(cfg.gateway, (m) => send(m), log) : null;
+    // The gateway needs Node sockets, so `gateway.mjs` is not imported here (a browser host must not pull it in):
+    // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`.
+    if (cfg.gateway && typeof cfg.createGatewaySession !== 'function') throw new TypeError('createConnectionFactory: gateway needs createGatewaySession (only @johnhenry/wsh/server provides one)');
+    const gateway = cfg.gateway ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log) : null;
 
     const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
 
@@ -841,7 +861,11 @@ export function createConnectionFactory(cfg) {
         return send(openFail({ reason: `pty spawn failed: ${e.message}` }));
       }
       const ctl = {
-        input: (data) => { try { proc.write(Buffer.from(data)); } catch { /* exited */ } },
+        // Bytes, not a `Buffer`: there is none in a browser (#133), and node-pty's streams take a Uint8Array as is.
+        // A write to a process that has exited throws; that is expected and dropped, anything else is logged.
+        input: (data) => {
+          try { proc.write(Uint8Array.from(data)); } catch (e) { log(`pty channel ${channelId}: input not written: ${e?.message ?? e}`); }
+        },
         resize: (c, r) => { try { proc.resize(c || cols, r || rows); } catch { /* exited */ } },
         signal: (name) => { try { proc.kill(`SIG${name.replace(/^SIG/, '').toUpperCase()}`); } catch { /* exited */ } },
         kill: () => { try { proc.kill(); } catch { /* exited */ } },
