@@ -36,6 +36,8 @@ futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 libc = "0.2"
 time = { version = "0.3", features = ["std"] }
+argon2 = "0.5"
+subtle = "2"
 
 [dev-dependencies]
 tokio = { workspace = true }

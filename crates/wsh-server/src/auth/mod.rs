@@ -1,5 +1,6 @@
 //! Authentication and authorization modules.
 
+pub mod password;
 pub mod permissions;
 pub mod rate_limit;
 

@@ -247,9 +247,10 @@ fn verify_pubkey_auth(
     })
 }
 
-/// Verify password-based authentication against config-defined hashes.
+/// Create the result of a password login the caller has already verified.
 ///
-/// Password hashes in config are stored as "sha256:<hex>" pairs.
+/// The hashes live in `[auth.password_hashes]` and are checked by
+/// `WshServer::check_password` (see `auth::password`); this only mints the token.
 /// The username is taken from the HELLO message that preceded AUTH.
 fn verify_password_auth(
     auth: &AuthPayload,
@@ -275,20 +276,6 @@ fn verify_password_auth(
         token,
         session_id: session_id.to_string(),
     })
-}
-
-/// Verify a password against a "sha256:<hex>" hash string.
-pub fn verify_password_hash(password: &str, hash: &str) -> bool {
-    if let Some(expected_hex) = hash.strip_prefix("sha256:") {
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let computed = hex::encode(hasher.finalize());
-        computed == expected_hex
-    } else {
-        // Unsupported hash format
-        warn!(format = %hash.split(':').next().unwrap_or("unknown"), "unsupported password hash format");
-        false
-    }
 }
 
 /// Build an AUTH_OK envelope.
