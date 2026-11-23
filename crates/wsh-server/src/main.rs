@@ -4,6 +4,7 @@
 //! clients via public key or password, and provides PTY-backed shell sessions.
 
 mod auth;
+mod client_env;
 mod config;
 mod gateway;
 mod handshake;
@@ -263,7 +264,18 @@ fn generate_self_signed_cert() -> Result<(PathBuf, PathBuf), Box<dyn std::error:
     let wsh_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".wsh");
-    std::fs::create_dir_all(&wsh_dir)?;
+    generate_self_signed_cert_in(&wsh_dir)
+}
+
+/// The certificate is a LEAF (not CA-flagged; `serverAuth` and
+/// `digitalSignature` only), so a TLS client that has been told to trust it
+/// (`SSL_CERT_FILE=~/.wsh/cert.pem` for the Rust CLI, `ca:` for Node) accepts
+/// it as a server certificate. Until this was fixed it was generated as a
+/// CA, which webpki refuses as an end entity (wsh #145).
+fn generate_self_signed_cert_in(
+    wsh_dir: &std::path::Path,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(wsh_dir)?;
 
     let cert_path = wsh_dir.join("cert.pem");
     let key_path = wsh_dir.join("key.pem");
@@ -281,7 +293,9 @@ fn generate_self_signed_cert() -> Result<(PathBuf, PathBuf), Box<dyn std::error:
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::days(1);
     params.not_after = now + time::Duration::days(13);
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.is_ca = rcgen::IsCa::ExplicitNoCa;
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     params.use_authority_key_identifier_extension = true;
 
     let key_pair = rcgen::KeyPair::generate()?;
@@ -289,6 +303,11 @@ fn generate_self_signed_cert() -> Result<(PathBuf, PathBuf), Box<dyn std::error:
 
     std::fs::write(&cert_path, cert.pem())?;
     std::fs::write(&key_path, key_pair.serialize_pem())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
 
     Ok((cert_path, key_path))
 }
@@ -310,5 +329,43 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         ctrl_c.await.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The generated development certificate has to work as a SERVER
+    /// certificate for a TLS client that trusts it: webpki refuses an end
+    /// entity that is flagged as a CA (`CaUsedAsEndEntity`).
+    #[test]
+    fn generated_cert_is_accepted_as_a_server_certificate() {
+        use rustls::pki_types::pem::PemObject;
+        install_rustls_crypto_provider();
+        let dir = std::env::temp_dir().join(format!("wsh-gen-cert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, _key) = generate_self_signed_cert_in(&dir).unwrap();
+        let pem = std::fs::read(&cert_path).unwrap();
+        let der = rustls::pki_types::CertificateDer::from_pem_slice(&pem).unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        for name in ["localhost", "127.0.0.1", "::1"] {
+            let server_name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+            rustls::client::danger::ServerCertVerifier::verify_server_cert(
+                &*verifier,
+                &der,
+                &[],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

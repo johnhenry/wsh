@@ -66,6 +66,7 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
             username: resolved.user.clone(),
             key_name: None,
             password: Some(password),
+            known_host: resolved.known_host.clone(),
             ..Default::default()
         },
     )

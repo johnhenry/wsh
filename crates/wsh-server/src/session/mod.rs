@@ -5,6 +5,7 @@ pub mod pipes;
 pub mod pty;
 pub mod recording;
 pub mod ring_buffer;
+pub mod signals;
 
 pub use manager::{AttachError, Attachment, Session, SessionInfo, SessionManager};
 pub use pty::PtyHandle;

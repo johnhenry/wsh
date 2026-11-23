@@ -31,6 +31,8 @@ pub struct PipeHandle {
     stdin_tx: mpsc::UnboundedSender<Option<Vec<u8>>>,
     kill_tx: mpsc::UnboundedSender<()>,
     parts: std::sync::Mutex<Option<PipeParts>>,
+    /// The child's pid; it leads its own process group (see `spawn`).
+    pid: Option<u32>,
 }
 
 impl PipeHandle {
@@ -48,12 +50,18 @@ impl PipeHandle {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own process group, so a `Signal` reaches the shell AND what the
+        // shell started (a shell that did not exec its last command would
+        // otherwise swallow SIGINT while `sleep` runs on).
+        #[cfg(unix)]
+        cmd.process_group(0);
         if let Some(env) = env {
             cmd.envs(env);
         }
         let mut child = cmd
             .spawn()
             .map_err(|e| WshError::Other(format!("failed to spawn command: {e}")))?;
+        let pid = child.id();
         let mut stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -81,7 +89,16 @@ impl PipeHandle {
                 stderr,
                 kill_rx,
             })),
+            pid,
         })
+    }
+
+    /// Deliver `sig` to the command's process group.
+    pub fn signal(&self, sig: i32) -> bool {
+        match self.pid {
+            Some(pid) => super::signals::kill_group(pid as i32, pid as i32, sig),
+            None => false,
+        }
     }
 
     /// Queue stdin bytes.
@@ -137,6 +154,18 @@ impl SessionIo {
                 p.kill();
                 Ok(())
             }
+        }
+    }
+
+    /// Deliver a named signal to the channel's process group. Names this
+    /// server does not deliver are refused (`false`).
+    pub fn signal(&self, name: &str) -> bool {
+        let Some(sig) = super::signals::parse_signal(name) else {
+            return false;
+        };
+        match self {
+            SessionIo::Pty(p) => p.signal(sig),
+            SessionIo::Pipes(p) => p.signal(sig),
         }
     }
 
