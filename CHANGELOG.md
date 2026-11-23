@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Rust `rust-v0.8.0`
 
 ### Rust: identity parity, part 1 (#145)
 
