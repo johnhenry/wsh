@@ -3,3 +3,5 @@ target/
 .DS_Store
 *.tgz
 coverage/
+test-results/
+playwright-report/

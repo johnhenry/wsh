@@ -8,6 +8,7 @@
  * reverse mode (client registers as a peer for incoming connections).
  */
 
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE } from './features.mjs';
 import { WebTransportTransport } from './transport.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
 import {
@@ -66,21 +67,8 @@ const DEFAULT_AUTH_TIMEOUT   = 10_000;  // ms
 const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
 const FS_RPC_OPS = new Set(['stat', 'list', 'read', 'write', 'mkdir', 'remove', 'rename']);
 
-/**
- * ServerHello feature advertising that McpResult echoes McpCall's call_id.
- *
- * Negotiated rather than assumed: McpCallPayload is `deny_unknown_fields` on
- * the Rust side, so sending call_id to a server predating it does not
- * degrade -- it makes the server reject the call.
- */
-export const MCP_CALL_ID_FEATURE = 'mcp-call-id';
-
-/**
- * ServerHello feature advertising that the host understands `McpCancel` (stop an in-flight `McpCall`).
- * Negotiated rather than assumed: McpCancelPayload is `deny_unknown_fields` on the Rust side, so an older
- * server would reject it. Implies `mcp-call-id` (the cancel names a call by its id).
- */
-export const MCP_CANCEL_FEATURE = 'mcp-cancel';
+// The feature strings live in features.mjs (a host names them without importing this file); re-exported here.
+export { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE };
 
 /** An `AbortError` for `signal`, with the signal's reason as `cause`. */
 function abortError(signal) {
@@ -89,13 +77,6 @@ function abortError(signal) {
   return e;
 }
 
-/**
- * ServerHello feature: the host discovers a client-opened exec data stream
- * on its own (the transport announces it), so the client must NOT write the
- * one-byte "primer" -- against such a host it would reach the process's stdin.
- */
-export const STREAM_ANNOUNCE_FEATURE = 'stream-announce';
-export const EXEC_PIPES_FEATURE = 'exec-pipes';
 
 /**
  * Reject a missing argument that maps to a `required: true` wire field.

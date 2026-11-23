@@ -87,6 +87,60 @@ lines of the `[gateway]` block above.
   login, the `sha256:` refusal. Unit tests cover the OpenOk race, the policy (every restricted range, IPv4-mapped and
   NAT64 spellings, rebinding shape), listener bind, password hashing and the config defaults.
 
+## 0.36.0
+
+- **A host that lives in a page, with the public API only (#131: #114, #115, #132, #133, #116, #128, #130).** An embedder
+  ran `createMemoryHost().accept(new WebSocket(...))` in Chromium with the released Rust `wsh` CLI as operator. It worked
+  only by wiring the connection factory by hand (deep imports the package did not export), with `dataStreams: false` and an
+  injected pty; pty stdin was silently dropped until `globalThis.Buffer` was shimmed; and the bundle dragged in the whole
+  client. All of that now works through exported, typed entry points, and CI proves it in a real browser.
+  - **`createMemoryHost({ pty, fs, hostKey, dataStreams })` (#114, #132).** `pty` is `node-pty`-shaped (`{ spawn }`); `fs`
+    is an object of file operations (`operate`, `readWhole`, `writeWhole`, `writeAt`; `fs: { root }` is refused, it needs
+    Node); `hostKey` is a `CryptoKeyPair` (non-extractable is fine), a signer `{ publicKey, sign }`, or `true`; clients
+    pin it as for any host. `dataStreams: false` (default `true`, so nothing changes) serves exec as `data_mode:
+    "virtual"` and offers neither `stream-announce` nor `rpc`; `accept(socket, { dataStreams })` sets it per connection
+    (also on `createWshServer().accept()`). **#132 is an option, not a negotiation:** the released Rust client states
+    nothing in `Hello` (only `mcp`, `file-transfer`) that says whether it can open streams, so a host cannot decide.
+  - **New entry points `@johnhenry/wsh/host` and `@johnhenry/wsh/reverse` (#115).** `/host` exports the connection
+    factory (`createConnectionFactory`, now documented and with defaults; `authorize` is required), `bindSocket`,
+    `hostFeatures`, `resolveBackends`, `resolveHostKey`, `buildAuthorizer`, `authMethods`, with types (`src/host.d.ts`).
+    `/reverse` is `createReverseHost` for a page or Worker (injected `exec` / `pty` / `fs` / `mcp` only). `./server` is
+    unchanged and Node-only, and still exports `createReverseHost` with `exec: true` and `fs: { root }`.
+  - **`accept(new WebSocket(url))` works on a socket that is still connecting (#115).** The host speaks first (its QMux
+    handshake); those bytes were dropped while the socket was `CONNECTING`. They are now held (at most 256 KiB) and sent
+    on `open`.
+  - **#133: pty stdin is no longer dropped in a browser.** The pty input path called `Buffer.from(data)`, a
+    `ReferenceError` swallowed by an empty `catch`. It now passes a `Uint8Array` (node-pty accepts one), and a failed write
+    is logged (`onLog`) instead of swallowed. A pty's `write` therefore receives a `Uint8Array` where it used to receive
+    a `Buffer` (a `Buffer` is a `Uint8Array`; `typeof d === 'string'` and `Buffer.isBuffer(d)` checks in a custom `spawn`
+    shim are the only things that could notice).
+  - **No Node built-in or `Buffer` is reachable from a browser entry point, and `"sideEffects": false` (#128).** The
+    connection handler no longer imports `gateway.mjs` (its Node sockets are loaded by `createWshServer`, which passes
+    `createGatewaySession` to the factory) or the client (the feature strings moved to `src/features.mjs`, re-exported from
+    `client.mjs`). `test/browser-bundle.test.mjs` bundles every entry for the browser with esbuild, fails on a Node
+    built-in, `require()` or `Buffer`, and on a bundle more than 10% over `scripts/bundle-budget.json`; `npm run size`
+    prints raw / gzip per entry point and single-import probes (CI runs it; `-- --update` rewrites the budget).
+    esbuild is a devDependency only (one binary, no dependency tree).
+  - **Moved functions (for anyone rebasing):** `createReverseHost` moved from `src/server/reverse-host.mjs` to
+    `src/reverse-host.mjs` (renamed, body unchanged apart from taking its backends as a second argument as
+    `createReverseHostWith(options, backends)`); `src/server/reverse-host.mjs` is now a 4-line wrapper that builds the
+    Node backends. `buildBackends` is now `resolveBackends` (`src/host-backends.mjs`, browser-safe) plus a Node wrapper
+    (`src/server/backends.mjs`, same signature and result). `MCP_CALL_ID_FEATURE`, `MCP_CANCEL_FEATURE`,
+    `STREAM_ANNOUNCE_FEATURE`, `EXEC_PIPES_FEATURE` moved to `src/features.mjs` (still exported from `client.mjs`).
+  - **`npm run test:browser` and a `browser` CI job (#116).** Playwright + Chromium: a browser client against a Node host
+    (auth with a non-extractable key, exec, a pty with resize, files, resume); a host in the page joined to its operator by
+    a byte pipe, driven by the JS client and by the **released Rust CLI** (downloaded from this repository's `rust-v*`
+    release, verified against `SHA256SUMS`, run with `HOME` on a temp directory); `WshKeyStore` with a non-extractable key
+    across a reload. `npm test` stays JS-only.
+  - **README (#130):** Quick Start uses a non-extractable key; the stale "stands at 0.17.0" preamble is gone; the stale
+    codegen path in `spec/wsh-v1.yaml`'s header is fixed; a Related projects section; capability-matrix row and Security
+    model entry for a host that lives in a page (what a non-extractable key does not protect, and that a file/pty/exec
+    backend confines nothing by itself).
+  - **Wire format:** no message, field or feature string was added; `dataStreams: false` selects the existing `virtual`
+    data mode. **Defaults changed:** none.
+- **Tests:** `test/memory-host-backends.test.mjs` (injected pty / fs / host key; `dataStreams`; no `Buffer` global;
+  the exported factory; a still-connecting socket), `test/browser-bundle.test.mjs`, and `test/browser/*.spec.mjs`.
+
 ## 0.35.0
 
 - **`createMemoryHost({ rpc, sessions })`: typed RPC channels and detach/resume without Node (viaframe#592).** Both used
