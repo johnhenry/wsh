@@ -317,6 +317,11 @@ pub fn cleanup() {
 
 // ── local unix sockets ───────────────────────────────────────────────
 
+/// Tests only: `bind_local_unix` swaps the process umask for an instant; a test that creates files or
+/// directories holds the read side so it never races that swap.
+#[cfg(all(test, unix))]
+pub(crate) static UMASK_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// Create the listening socket for `path`: private from the first instant (umask around the
 /// one synchronous bind, then chmod), an existing file refused unless `replace` and then only a
 /// stale socket.
@@ -342,6 +347,21 @@ pub fn bind_local_unix(path: &str, replace: bool) -> Result<tokio::net::UnixList
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot look at {path}")),
     }
+    // The window of the swapped mask is closed to the tests of this binary that make files and
+    // directories (they hold the read side of the gate: `crate::sharefs` tests): a directory made
+    // in that instant would be `0600`.
+    #[cfg(test)]
+    // (`try_write` in a loop, not `write`: a queued writer would block a test that takes the read side
+    // a second time while it holds it, and deadlock.)
+    let _gate = loop {
+        match UMASK_GATE.try_write() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(1))
+            }
+        }
+    };
     // SAFETY: umask swaps a process-wide mask; nothing awaits between the two calls.
     let old = unsafe { libc::umask(0o177) };
     let bound = std::os::unix::net::UnixListener::bind(p);

@@ -15,7 +15,7 @@ pub mod ls;
 pub mod relay;
 pub mod reverse_host;
 pub mod scp;
-pub mod share;
 pub mod sessions;
 pub mod sftp;
+pub mod share;
 pub mod tools;

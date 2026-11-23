@@ -174,3 +174,214 @@ impl ShareHub {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use wsh_core::codec::FrameDecoder;
+
+    /// A provider that answers when told to, and counts what it was asked.
+    struct Gate {
+        asked: AtomicUsize,
+        release: Notify,
+        shut: AtomicUsize,
+    }
+
+    impl ShareProvider for Gate {
+        fn serve<'a>(
+            &'a self,
+            request: ShareRequestPayload,
+        ) -> Pin<Box<dyn Future<Output = ShareReplyPayload> + Send + 'a>> {
+            Box::pin(async move {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                let mut r = error_reply(request.request_id, "EIO", "x");
+                r.ok = true;
+                r.errno = None;
+                r
+            })
+        }
+        fn shutdown(&self) {
+            self.shut.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn gate() -> Arc<Gate> {
+        Arc::new(Gate {
+            asked: AtomicUsize::new(0),
+            release: Notify::new(),
+            shut: AtomicUsize::new(0),
+        })
+    }
+
+    fn request(id: u32) -> Envelope {
+        Envelope {
+            msg_type: MsgType::ShareRequest,
+            payload: Payload::ShareRequest(ShareRequestPayload {
+                request_id: id,
+                share: "s".into(),
+                op: "stat".into(),
+                path: Some("/".into()),
+                to: None,
+                handle: None,
+                offset: None,
+                length: None,
+                mode: None,
+                flags: vec![],
+                cursor: None,
+                attr: serde_json::Value::Null,
+                data: None,
+            }),
+        }
+    }
+
+    fn offer(max_inflight: u32) -> ShareOfferPayload {
+        ShareOfferPayload {
+            shares: vec!["s".into()],
+            writable: vec![],
+            max_inflight,
+            max_bytes: 4096,
+        }
+    }
+
+    fn replies(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<ShareReplyPayload> {
+        let mut dec = FrameDecoder::new();
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            for e in dec.feed::<Envelope>(&frame).expect("decode") {
+                if let Payload::ShareReply(r) = e.payload {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    fn features() -> Vec<String> {
+        vec![SHARES_FEATURE.to_string()]
+    }
+
+    #[tokio::test]
+    async fn a_request_before_any_offer_is_refused_and_asks_nothing_of_a_provider() {
+        let (tx, mut rx) = mpsc::channel(256);
+        let hub = ShareHub::new(tx);
+        assert!(hub.on_message(&request(1)));
+        let r = replies(&mut rx);
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].ok);
+        assert_eq!(r[0].errno.as_deref(), Some("EACCES"));
+    }
+
+    #[tokio::test]
+    async fn an_offer_needs_the_hosts_feature_and_is_made_once() {
+        let (tx, _rx) = mpsc::channel(256);
+        let hub = ShareHub::new(tx);
+        let g = gate();
+        let no = hub.offer(&[], g.clone(), offer(2)).await;
+        assert!(no.is_err(), "a host that did not list `shares`");
+        assert!(hub.offer(&features(), g.clone(), offer(2)).await.is_ok());
+        assert!(hub.offer(&features(), g.clone(), offer(2)).await.is_err());
+        let (tx, _rx) = mpsc::channel(256);
+        let hub = ShareHub::new(tx);
+        let empty = ShareOfferPayload {
+            shares: vec![],
+            ..offer(2)
+        };
+        assert!(hub.offer(&features(), g, empty).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn requests_beyond_the_window_are_refused_at_once_never_queued() {
+        let (tx, mut rx) = mpsc::channel(256);
+        let hub = ShareHub::new(tx);
+        let g = gate();
+        hub.offer(&features(), g.clone(), offer(2)).await.unwrap();
+        let _offer_frame = rx.recv().await.unwrap();
+        for id in 1..=10 {
+            assert!(hub.on_message(&request(id)));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            g.asked.load(Ordering::SeqCst),
+            2,
+            "only the window reached the provider"
+        );
+        let refused = replies(&mut rx);
+        assert_eq!(refused.len(), 8);
+        assert!(refused
+            .iter()
+            .all(|r| !r.ok && r.errno.as_deref() == Some("EAGAIN")));
+        g.release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let done = replies(&mut rx);
+        assert_eq!(done.len(), 2);
+        assert!(done.iter().all(|r| r.ok));
+        // The slots are free again.
+        assert!(hub.on_message(&request(11)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(g.asked.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_stops_reading_gets_no_more_replies_queued_than_a_few() {
+        // A small outgoing queue (the real one is 256 deep): once it is more than 1/4 full no reply is
+        // queued, so the provider's replies wait instead of piling up in memory.
+        let (tx, mut rx) = mpsc::channel(256);
+        let hub = ShareHub::new(tx.clone());
+        let g = gate();
+        hub.offer(&features(), g.clone(), offer(16)).await.unwrap();
+        let _ = rx.recv().await;
+        // Fill the queue past the reserve with something else (the host is not reading).
+        for _ in 0..200 {
+            tx.send(vec![0u8; 8]).await.unwrap();
+        }
+        for id in 1..=4 {
+            hub.on_message(&request(id));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        g.release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            rx.len(),
+            200,
+            "no reply was queued while the queue was deep"
+        );
+        // The host reads again: the replies come.
+        let mut n = 0;
+        while rx.len() > 40 {
+            rx.recv().await.unwrap();
+            n += 1;
+        }
+        assert!(n >= 100, "drained {n}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut got = 0;
+        while let Ok(f) = rx.try_recv() {
+            // A fresh decoder per frame: the filler frames are not wsh frames.
+            if let Ok(es) = FrameDecoder::new().feed::<Envelope>(&f) {
+                got += es
+                    .iter()
+                    .filter(|e| matches!(e.payload, Payload::ShareReply(_)))
+                    .count();
+            }
+        }
+        assert_eq!(got, 4, "all four replies arrived once the queue drained");
+    }
+
+    #[tokio::test]
+    async fn shutdown_tells_the_provider_once() {
+        let (tx, _rx) = mpsc::channel(256);
+        let hub = ShareHub::new(tx);
+        let g = gate();
+        hub.offer(&features(), g.clone(), offer(2)).await.unwrap();
+        hub.shutdown();
+        hub.shutdown();
+        assert_eq!(g.shut.load(Ordering::SeqCst), 1);
+        // And after it, nothing is served.
+        let (tx, mut rx) = mpsc::channel(256);
+        let hub2 = ShareHub::new(tx);
+        hub2.on_message(&request(1));
+        assert!(!replies(&mut rx)[0].ok);
+    }
+}

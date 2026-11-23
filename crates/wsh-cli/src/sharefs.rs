@@ -176,7 +176,10 @@ fn from_errno(e: Errno) -> ShareError {
     } else if e == Errno::BADF {
         ("EBADF", "bad handle")
     } else if e == Errno::LOOP {
-        ("ELOOP", "too many levels of symbolic links (symlinks are never followed)")
+        (
+            "ELOOP",
+            "too many levels of symbolic links (symlinks are never followed)",
+        )
     } else if e == Errno::NAMETOOLONG {
         ("ENAMETOOLONG", "file name too long")
     } else if e == Errno::NOSPC || e == Errno::DQUOT {
@@ -515,7 +518,7 @@ impl Inner {
                     req.mode,
                     req.length,
                 )?;
-                reply.handle = Some(handle);
+                reply.handle = handle;
                 reply.attr = attr;
                 if let Some((d, eof)) = data {
                     reply.data = Some(d);
@@ -536,7 +539,7 @@ impl Inner {
                     req.mode,
                     None,
                 )?;
-                reply.handle = Some(handle);
+                reply.handle = handle;
                 reply.attr = attr;
             }
             "read" => {
@@ -576,12 +579,7 @@ impl Inner {
                 req.to.as_deref().unwrap_or(""),
             )?,
             "setattr" => {
-                reply.attr = self.setattr(
-                    &share,
-                    req.path.as_deref(),
-                    req.handle,
-                    &req.attr,
-                )?;
+                reply.attr = self.setattr(&share, req.path.as_deref(), req.handle, &req.attr)?;
             }
             _ => return err("ENOTSUP", "unknown operation"),
         }
@@ -743,7 +741,7 @@ impl Inner {
         flags: &Flags,
         mode: Option<u32>,
         inline: Option<u32>,
-    ) -> R<(u32, Value, Option<(Vec<u8>, bool)>)> {
+    ) -> R<(Option<u32>, Value, Option<(Vec<u8>, bool)>)> {
         let want_write = flags.write || flags.create || flags.trunc;
         if want_write {
             share.need_write()?;
@@ -759,6 +757,20 @@ impl Inner {
             return err("EISDIR", "is a directory");
         };
         let cname = cstr(name)?;
+        if !(flags.create && flags.excl) {
+            // Look before opening: opening a device node or a FIFO can have effects of its own. (What
+            // is opened is looked at again below, so a swap in between is still caught.)
+            match statat(&loc.dir, cname.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => match kind_of(&st) {
+                    Some(Kind::File) => {}
+                    Some(Kind::Dir) => return err("EISDIR", "is a directory"),
+                    Some(Kind::Symlink) => return Err(from_errno(Errno::LOOP)),
+                    None => return err("ENOENT", "no such file or directory"),
+                },
+                Err(e) if e == Errno::NOENT && flags.create => {}
+                Err(e) => return Err(from_errno(e)),
+            }
+        }
         let access = match (flags.read, want_write) {
             (true, true) => OFlags::RDWR,
             (true, false) => OFlags::RDONLY,
@@ -803,7 +815,10 @@ impl Inner {
             return err("ENOENT", "no such file or directory");
         }
         if want_write && st.st_nlink as u64 > 1 {
-            return err("EPERM", "this file has other hard links and is not writable");
+            return err(
+                "EPERM",
+                "this file has other hard links and is not writable",
+            );
         }
         if flags.trunc {
             ftruncate(&fd, 0).ctx()?;
@@ -822,6 +837,11 @@ impl Inner {
         }
         let st = fstat(&fd).ctx()?;
         let attr = attr_of(&st, &Kind::File);
+        // The whole file came with the open and nothing can be written through it: there is
+        // nothing left to read or close, so no handle is made (one message for a small file).
+        if matches!(data, Some((_, true))) && !want_write {
+            return Ok((None, attr, data));
+        }
         let mut table = self.handles.lock().expect("handles");
         if table.1.len() >= self.limits.max_handles {
             return err("EMFILE", "too many open handles");
@@ -837,7 +857,7 @@ impl Inner {
                 writable: want_write,
             }),
         );
-        Ok((id, attr, data))
+        Ok((Some(id), attr, data))
     }
 
     fn handle(&self, id: u32, share: &str) -> R<Arc<Handle>> {
@@ -961,7 +981,11 @@ impl Inner {
             }
             (None, Some(p)) => {
                 let loc = self.locate(share, p)?;
-                let access = if size.is_some() { OFlags::WRONLY } else { OFlags::RDONLY };
+                let access = if size.is_some() {
+                    OFlags::WRONLY
+                } else {
+                    OFlags::RDONLY
+                };
                 owned = match &loc.name {
                     None => {
                         if size.is_some() {
@@ -991,7 +1015,10 @@ impl Inner {
         }
         if let Kind::File = k {
             if st.st_nlink as u64 > 1 {
-                return err("EPERM", "this file has other hard links and is not writable");
+                return err(
+                    "EPERM",
+                    "this file has other hard links and is not writable",
+                );
             }
         }
         if let Some(sz) = size {
@@ -1116,7 +1143,11 @@ pub fn describe(s: &Share) -> String {
         "sharing {:?} = {} ({})",
         s.name,
         s.root_path.display(),
-        if s.writable { "read-write" } else { "read-only" }
+        if s.writable {
+            "read-write"
+        } else {
+            "read-only"
+        }
     )
 }
 

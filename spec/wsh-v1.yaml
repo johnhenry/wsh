@@ -2394,8 +2394,11 @@ messages:
         readlink (path) -> target;
         open (path, flags, length?) -> handle, attr, and, when the file is
         no bigger than `length` (clamped to max_bytes) and opened for
-        reading, its whole content in `data` with eof=true; flags are any of
-        "read" "write" "append" "create" "excl" "trunc"; "create" and "write"
+        reading ONLY, its whole content in `data` with eof=true and NO
+        handle (there is nothing left to read or close: a small file costs
+        one round trip); flags are any of
+        "read" "write" "create" "excl" "trunc" (a write is at an explicit
+        offset: there is no append mode); "create", "write" and "trunc"
         need a writable share; `mode` applies to a created file;
         create (path, mode?) -> handle, attr: a NEW file (EEXIST if the name
         is taken, even by a symlink), opened for writing; use open with

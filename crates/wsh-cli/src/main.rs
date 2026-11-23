@@ -6,10 +6,10 @@
 
 mod commands;
 mod config;
-#[cfg(unix)]
-mod sharefs;
 #[allow(dead_code)]
 mod known_hosts;
+#[cfg(unix)]
+mod sharefs;
 #[allow(dead_code)]
 mod terminal;
 
@@ -463,7 +463,9 @@ async fn main() {
     // is not on this list never offers a share.
     if !cli.shares.is_empty() {
         if !matches!(&cli.command, None | Some(Command::Connect { .. })) {
-            eprintln!("wsh: --share applies to `wsh [user@]host [command...]` and `wsh connect` only");
+            eprintln!(
+                "wsh: --share applies to `wsh [user@]host [command...]` and `wsh connect` only"
+            );
             std::process::exit(2);
         }
         if let Err(e) = commands::share::set(&cli.shares) {

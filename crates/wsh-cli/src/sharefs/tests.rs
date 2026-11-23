@@ -6,8 +6,24 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use wsh_client::share::ShareProvider;
 
+/// The read side of the umask gate (`forward::bind_local_unix` holds the write side while it swaps
+/// the process umask): a test that makes files or directories never runs inside that instant.
+fn gate() -> std::sync::RwLockReadGuard<'static, ()> {
+    crate::commands::forward::UMASK_GATE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// `create_dir`, then an explicit mode: another test in this binary (`forward`) swaps the process
+/// umask around a `bind`, and a directory made in that instant would be `0600` and not enterable.
+fn mkdir(p: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    std::fs::create_dir(p.as_ref())?;
+    std::fs::set_permissions(p.as_ref(), std::fs::Permissions::from_mode(0o755))
+}
+
 struct Fx {
     _tmp: tempfile::TempDir,
+    _gate: std::sync::RwLockReadGuard<'static, ()>,
     /// The shared directory.
     root: PathBuf,
     /// A directory next to it that must never be reached.
@@ -28,12 +44,13 @@ fn limits() -> Limits {
 }
 
 fn fx_with(writable: bool, limits: Limits) -> Fx {
+    let gate = gate();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = std::fs::canonicalize(tmp.path()).expect("canon");
     let root = base.join("share");
     let outside = base.join("outside");
-    std::fs::create_dir(&root).unwrap();
-    std::fs::create_dir(&outside).unwrap();
+    mkdir(&root).unwrap();
+    mkdir(&outside).unwrap();
     std::fs::write(outside.join("secret.txt"), b"TOP SECRET").unwrap();
     let share = Share::open(&ShareSpec {
         name: "s".into(),
@@ -44,6 +61,7 @@ fn fx_with(writable: bool, limits: Limits) -> Fx {
     Fx {
         srv: ShareServer::new(vec![share], limits),
         _tmp: tmp,
+        _gate: gate,
         root,
         outside,
     }
@@ -147,6 +165,7 @@ fn spec_parsing() {
 
 #[test]
 fn a_missing_or_non_directory_root_is_an_error_before_anything_is_offered() {
+    let _gate = gate();
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("f");
     std::fs::write(&file, b"x").unwrap();
@@ -168,7 +187,7 @@ fn readdir_carries_attributes_sorted_and_pages_without_gaps() {
     for i in 0..12 {
         std::fs::write(f.root.join(format!("f{i:02}")), vec![b'x'; i]).unwrap();
     }
-    std::fs::create_dir(f.root.join("dir")).unwrap();
+    mkdir(f.root.join("dir")).unwrap();
     let first = f.run(at("readdir", "")).unwrap();
     let e = first.entries.as_array().unwrap();
     assert_eq!(e.len(), 5, "one page is page_entries");
@@ -226,7 +245,10 @@ fn a_symlink_is_listed_as_a_symlink_with_its_target_and_never_followed() {
     assert_eq!(by["abs-out"]["type"], "symlink");
     assert_eq!(by["rel-out"]["target"], "../outside/secret.txt");
     // stat of a symlink is the symlink's own; reading through one is refused.
-    assert_eq!(f.run(at("stat", "rel-out")).unwrap().attr["type"], "symlink");
+    assert_eq!(
+        f.run(at("stat", "rel-out")).unwrap().attr["type"],
+        "symlink"
+    );
     assert_eq!(f.errno(open_req("rel-out", &["read"])), "ELOOP");
     assert_eq!(f.errno(open_req("abs-out/secret.txt", &["read"])), "ELOOP");
     assert_eq!(f.errno(at("readdir", "abs-out")), "ELOOP");
@@ -250,6 +272,8 @@ fn small_files_come_with_the_open_and_large_ones_do_not() {
         .unwrap();
     assert_eq!(o.data.as_deref(), Some(&b"hello"[..]));
     assert_eq!(o.eof, Some(true));
+    assert!(o.handle.is_none(), "whole file inline: nothing to close");
+    assert_eq!(f.srv.open_handles(), 0);
     let o = f
         .run(ShareRequestPayload {
             length: Some(1024),
@@ -257,6 +281,8 @@ fn small_files_come_with_the_open_and_large_ones_do_not() {
         })
         .unwrap();
     assert!(o.data.is_none(), "bigger than asked: read it with `read`");
+    assert!(o.handle.is_some());
+    assert_eq!(f.srv.open_handles(), 1);
     assert_eq!(f.cat("big").unwrap(), vec![7u8; 3000]);
 }
 
@@ -265,7 +291,7 @@ fn small_files_come_with_the_open_and_large_ones_do_not() {
 #[test]
 fn dot_dot_is_refused_in_every_position() {
     let f = fx(false);
-    std::fs::create_dir(f.root.join("d")).unwrap();
+    mkdir(f.root.join("d")).unwrap();
     for p in [
         "..",
         "../outside/secret.txt",
@@ -304,17 +330,14 @@ fn a_nul_byte_in_a_path_is_refused() {
 #[test]
 fn a_symlink_in_the_middle_of_a_path_is_never_followed() {
     let f = fx(true);
-    std::fs::create_dir(f.root.join("real")).unwrap();
+    mkdir(f.root.join("real")).unwrap();
     std::fs::write(f.root.join("real/ok.txt"), b"inside").unwrap();
     symlink("real", f.root.join("inlink")).unwrap(); // even a link that stays inside
     symlink(&f.outside, f.root.join("out")).unwrap();
     assert_eq!(f.cat("real/ok.txt").unwrap(), b"inside");
     assert_eq!(f.errno(at("stat", "inlink/ok.txt")), "ELOOP");
     assert_eq!(f.errno(open_req("out/secret.txt", &["read"])), "ELOOP");
-    assert_eq!(
-        f.errno(open_req("out/new", &["write", "create"])),
-        "ELOOP"
-    );
+    assert_eq!(f.errno(open_req("out/new", &["write", "create"])), "ELOOP");
     assert_eq!(f.errno(at("mkdir", "out/d")), "ELOOP");
     assert_eq!(f.errno(at("unlink", "out/secret.txt")), "ELOOP");
     assert!(f.outside.join("secret.txt").exists());
@@ -329,7 +352,7 @@ fn a_symlink_swapped_in_between_the_check_and_the_use_is_not_followed() {
     let f = fx(false);
     std::fs::write(f.outside.join("inside.txt"), b"OUTSIDE").unwrap();
     let real = f.root.join("d-real");
-    std::fs::create_dir(&real).unwrap();
+    mkdir(&real).unwrap();
     std::fs::write(real.join("inside.txt"), b"inside").unwrap();
     let link = f.root.join("d");
     std::fs::rename(&real, &link).unwrap();
@@ -457,7 +480,7 @@ fn a_directory_on_another_file_system_is_not_entered() {
     // /dev is a different device than a temp directory on every unix we build for.
     let f = fx(false);
     let mount = f.root.join("mnt");
-    std::fs::create_dir(&mount).unwrap();
+    mkdir(&mount).unwrap();
     // Cannot mount in a test: emulate by pointing the share at /dev's parent check instead.
     let dev_meta = std::fs::metadata("/dev").unwrap();
     let share_meta = std::fs::metadata(&f.root).unwrap();
@@ -562,10 +585,11 @@ fn a_hard_linked_file_is_not_writable_but_still_readable() {
 
 #[test]
 fn a_root_that_is_a_symlink_is_resolved_once_at_startup() {
+    let _gate = gate();
     let tmp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
     let real = base.join("real");
-    std::fs::create_dir(&real).unwrap();
+    mkdir(&real).unwrap();
     std::fs::write(real.join("f"), b"in").unwrap();
     let link = base.join("link");
     symlink(&real, &link).unwrap();
@@ -575,7 +599,10 @@ fn a_root_that_is_a_symlink_is_resolved_once_at_startup() {
         writable: false,
     })
     .unwrap();
-    assert_eq!(share.root_path, real, "the start-up line shows the real place");
+    assert_eq!(
+        share.root_path, real,
+        "the start-up line shows the real place"
+    );
     let srv = ShareServer::new(vec![share], limits());
     assert!(srv.exec(&at("stat", "f")).is_ok());
 }
@@ -591,7 +618,7 @@ fn a_root_replaced_while_running_is_noticed() {
         std::fs::rename(&f.root, &moved).unwrap();
         match how {
             "new-directory" => {
-                std::fs::create_dir(&f.root).unwrap();
+                mkdir(&f.root).unwrap();
                 std::fs::write(f.root.join("f"), b"NEW").unwrap();
             }
             "symlink" => symlink(&f.outside, &f.root).unwrap(),
@@ -620,7 +647,7 @@ fn a_root_replaced_while_running_is_noticed() {
 fn a_read_only_share_refuses_every_change() {
     let f = fx(false);
     std::fs::write(f.root.join("f"), b"keep").unwrap();
-    std::fs::create_dir(f.root.join("d")).unwrap();
+    mkdir(f.root.join("d")).unwrap();
     let to = |p: &str| ShareRequestPayload {
         to: Some("zz".into()),
         ..at("rename", p)
@@ -687,7 +714,10 @@ fn a_writable_share_creates_writes_renames_and_removes() {
         ..rq("close")
     })
     .unwrap();
-    assert_eq!(std::fs::read(f.root.join("new.txt")).unwrap(), b"hello world");
+    assert_eq!(
+        std::fs::read(f.root.join("new.txt")).unwrap(),
+        b"hello world"
+    );
     let mode = std::fs::metadata(f.root.join("new.txt"))
         .unwrap()
         .permissions()
@@ -699,7 +729,10 @@ fn a_writable_share_creates_writes_renames_and_removes() {
     );
     assert_eq!(f.errno(at("create", "new.txt")), "EEXIST");
     f.run(at("mkdir", "sub")).unwrap();
-    let dmode = std::fs::metadata(f.root.join("sub")).unwrap().permissions().mode();
+    let dmode = std::fs::metadata(f.root.join("sub"))
+        .unwrap()
+        .permissions()
+        .mode();
     assert_eq!(dmode & 0o7022, 0);
     f.run(ShareRequestPayload {
         to: Some("sub/moved.txt".into()),
@@ -741,7 +774,10 @@ fn a_writable_share_creates_writes_renames_and_removes() {
     })
     .unwrap();
     assert_eq!(std::fs::read(f.root.join("oc")).unwrap(), b"");
-    assert_eq!(f.errno(open_req("oc", &["write", "create", "excl"])), "EEXIST");
+    assert_eq!(
+        f.errno(open_req("oc", &["write", "create", "excl"])),
+        "EEXIST"
+    );
 }
 
 #[test]
@@ -760,7 +796,7 @@ fn setattr_changes_permission_bits_times_and_size_only() {
     assert_eq!(m.mtime(), 1_000_000_000);
     assert_eq!(std::fs::read(f.root.join("f")).unwrap(), b"0123");
     // On a directory: mode and times work, size does not.
-    std::fs::create_dir(f.root.join("d")).unwrap();
+    mkdir(f.root.join("d")).unwrap();
     assert!(f
         .run(ShareRequestPayload {
             attr: json!({"mode": 0o700}),
@@ -794,7 +830,13 @@ fn open_handles_are_bounded_and_closing_frees_one() {
     })
     .unwrap();
     assert!(f.run(open_req("f", &["read"])).is_ok());
-    assert_eq!(f.errno(ShareRequestPayload { handle: Some(hs[0]), ..rq("close") }), "EBADF");
+    assert_eq!(
+        f.errno(ShareRequestPayload {
+            handle: Some(hs[0]),
+            ..rq("close")
+        }),
+        "EBADF"
+    );
     f.srv.shutdown();
     assert_eq!(f.srv.open_handles(), 0, "connection end drops every handle");
 }
@@ -803,7 +845,11 @@ fn open_handles_are_bounded_and_closing_frees_one() {
 fn bytes_per_operation_are_bounded() {
     let f = fx(true);
     std::fs::write(f.root.join("big"), vec![1u8; 100_000]).unwrap();
-    let h = f.run(open_req("big", &["read", "write"])).unwrap().handle.unwrap();
+    let h = f
+        .run(open_req("big", &["read", "write"]))
+        .unwrap()
+        .handle
+        .unwrap();
     let r = f
         .run(ShareRequestPayload {
             handle: Some(h),
@@ -812,7 +858,11 @@ fn bytes_per_operation_are_bounded() {
             ..rq("read")
         })
         .unwrap();
-    assert_eq!(r.data.unwrap().len(), 4096, "a read is clamped to max_bytes");
+    assert_eq!(
+        r.data.unwrap().len(),
+        4096,
+        "a read is clamped to max_bytes"
+    );
     assert_eq!(
         f.errno(ShareRequestPayload {
             handle: Some(h),
@@ -850,7 +900,11 @@ fn directory_size_and_page_size_are_bounded() {
             ..at("readdir", "")
         })
         .unwrap();
-    assert_eq!(r.entries.as_array().unwrap().len(), 5, "page_entries caps what was asked");
+    assert_eq!(
+        r.entries.as_array().unwrap().len(),
+        5,
+        "page_entries caps what was asked"
+    );
 }
 
 #[test]
@@ -859,15 +913,33 @@ fn paths_are_bounded() {
     assert_eq!(f.errno(at("stat", &"a/".repeat(2500))), "ENAMETOOLONG");
     assert_eq!(f.errno(at("stat", &"x".repeat(256))), "ENAMETOOLONG");
     assert_eq!(f.errno(at("stat", &"a/".repeat(129))), "ENAMETOOLONG");
-    assert_eq!(f.errno(at("stat", &"a/".repeat(100))), "ENOENT", "within bounds: just absent");
+    assert_eq!(
+        f.errno(at("stat", &"a/".repeat(100))),
+        "ENOENT",
+        "within bounds: just absent"
+    );
 }
 
 #[test]
 fn an_unknown_share_op_or_handle_is_refused() {
     let f = fx(true);
-    assert_eq!(f.errno(ShareRequestPayload { share: "other".into(), ..at("stat", "") }), "EACCES");
+    assert_eq!(
+        f.errno(ShareRequestPayload {
+            share: "other".into(),
+            ..at("stat", "")
+        }),
+        "EACCES"
+    );
     assert_eq!(f.errno(rq("frobnicate")), "ENOTSUP");
-    assert_eq!(f.errno(ShareRequestPayload { handle: Some(99), offset: Some(0), length: Some(1), ..rq("read") }), "EBADF");
+    assert_eq!(
+        f.errno(ShareRequestPayload {
+            handle: Some(99),
+            offset: Some(0),
+            length: Some(1),
+            ..rq("read")
+        }),
+        "EBADF"
+    );
     assert_eq!(f.errno(open_req("", &["read"])), "EISDIR");
     assert_eq!(f.errno(open_req("x", &["bogus"])), "EINVAL");
     assert_eq!(f.errno(open_req("x", &[])), "EINVAL");
@@ -920,4 +992,15 @@ async fn serve_turns_errors_into_error_replies_with_the_request_id() {
     assert_eq!(rep.request_id, 77);
     assert!(!rep.ok);
     assert_eq!(rep.errno.as_deref(), Some("EINVAL"));
+}
+
+#[test]
+fn creation_modes_are_limited_whatever_the_umask_does() {
+    // The umask (022 on most machines) would hide a missing mask in a file-system test, so the rule
+    // is checked where it is made: never setuid/setgid/sticky, never group- or other-writable.
+    assert_eq!(create_mode(Some(0o7777), 0o644), 0o755);
+    assert_eq!(create_mode(Some(0o666), 0o644), 0o644);
+    assert_eq!(create_mode(Some(0o777), 0o755), 0o755);
+    assert_eq!(create_mode(None, 0o644), 0o644);
+    assert_eq!(create_mode(None, 0o755), 0o755);
 }
