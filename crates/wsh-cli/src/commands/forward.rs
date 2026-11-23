@@ -926,7 +926,9 @@ mod tests {
             let p = d.path().join("c.sock");
             let l = bind_local_unix(p.to_str().unwrap(), false).unwrap();
             drop(l);
-            std::fs::remove_file(&p).unwrap();
+            // Moved aside, not deleted: a freed inode number can be handed out again (Linux does), which
+            // would make "someone else's socket" look like ours.
+            std::fs::rename(&p, d.path().join("ours-moved.sock")).unwrap();
             let _other = std::os::unix::net::UnixListener::bind(&p).unwrap();
             cleanup();
             assert!(
