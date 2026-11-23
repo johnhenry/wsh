@@ -102,6 +102,13 @@ impl Config {
     }
 }
 
+/// The local username, or "root" when the environment does not say.
+pub fn default_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "root".into())
+}
+
 /// Parse a `[user@]host` string into `(user, host)`.
 ///
 /// If no user is specified, defaults to the current system username (or "root").
@@ -117,9 +124,7 @@ pub fn parse_target(target: &str) -> Result<(String, String)> {
         }
         Ok((user.to_string(), host.to_string()))
     } else {
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "root".into());
+        let user = default_user();
         if target.is_empty() {
             anyhow::bail!("empty host");
         }

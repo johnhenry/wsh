@@ -45,6 +45,8 @@ struct ListenerEntry {
     /// The port the OS actually bound (may differ from the requested port
     /// when the request specified port 0).
     actual_port: u16,
+    /// The address the listener is bound to.
+    bound_addr: std::net::SocketAddr,
 }
 
 impl ReverseListenerManager {
@@ -87,10 +89,25 @@ impl ReverseListenerManager {
             return build_listen_fail(listener_id, &reason);
         }
 
-        let addr = format!("{}:{}", bind_addr, port);
+        // The listener binds where the server's configuration says (loopback unless
+        // `[gateway] reverse_bind_addr` is set), never where the client asks: its
+        // `bind_addr` defaults to "0.0.0.0", which would publish the port on every
+        // interface of this machine.
+        let bound_to = self.policy.reverse_bind_addr();
+        if bind_addr.parse::<std::net::IpAddr>().ok() != Some(bound_to) {
+            debug!(
+                listener_id,
+                requested = %bind_addr,
+                bound = %bound_to,
+                "ignoring the client's bind_addr: reverse listeners bind to the configured address"
+            );
+        }
+        let addr = std::net::SocketAddr::new(bound_to, port).to_string();
         match TcpListener::bind(&addr).await {
             Ok(tcp_listener) => {
-                let actual_port = tcp_listener.local_addr().map(|a| a.port()).unwrap_or(port);
+                let local = tcp_listener.local_addr().ok();
+                let actual_port = local.map(|a| a.port()).unwrap_or(port);
+                let bound_addr = local.unwrap_or_else(|| std::net::SocketAddr::new(bound_to, port));
 
                 let guard = self.policy.acquire();
 
@@ -100,6 +117,7 @@ impl ReverseListenerManager {
                     ListenerEntry {
                         cancel_tx,
                         actual_port,
+                        bound_addr,
                     },
                 );
 
@@ -149,7 +167,7 @@ impl ReverseListenerManager {
     pub async fn close_listener(&self, listener_id: u32) -> Option<Envelope> {
         if let Some(entry) = self.listeners.lock().await.remove(&listener_id) {
             let _ = entry.cancel_tx.send(()).await;
-            info!(listener_id, "reverse tunnel listener closed");
+            info!(listener_id, bound = %entry.bound_addr, "reverse tunnel listener closed");
             Some(build_listen_close(listener_id))
         } else {
             None
@@ -331,5 +349,82 @@ fn build_listen_close(listener_id: u32) -> Envelope {
     Envelope {
         msg_type: MsgType::ListenClose,
         payload: Payload::ListenClose(ListenClosePayload { listener_id }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::policy::GatewayPolicy;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn manager(enable: bool, bind: IpAddr) -> ReverseListenerManager {
+        ReverseListenerManager::new(Arc::new(GatewayPolicyEnforcer::new(GatewayPolicy {
+            allowed_destinations: vec!["*".into()],
+            enable_reverse_tunnels: enable,
+            reverse_bind_addr: bind,
+            ..GatewayPolicy::default()
+        })))
+    }
+
+    async fn listen(m: &ReverseListenerManager, requested_bind: &str) -> Envelope {
+        let (tx, _rx) = mpsc::channel(4);
+        m.handle_listen_request(1, 0, requested_bind, tx).await
+    }
+
+    #[tokio::test]
+    async fn a_listener_is_refused_unless_reverse_tunnels_are_enabled() {
+        let m = manager(false, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let reply = listen(&m, "127.0.0.1").await;
+        assert!(matches!(reply.payload, Payload::ListenFail(_)), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn the_default_bind_address_of_the_request_does_not_open_every_interface() {
+        // `bind_addr` defaults to "0.0.0.0" on the wire, so this is what an ordinary
+        // client sends.
+        let m = manager(true, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let reply = listen(&m, "0.0.0.0").await;
+        assert!(matches!(reply.payload, Payload::ListenOk(_)), "{reply:?}");
+        let bound = m.listeners.lock().await.get(&1).unwrap().bound_addr;
+        assert!(bound.ip().is_loopback(), "bound to {bound}");
+    }
+
+    #[tokio::test]
+    async fn only_the_configured_address_is_ever_bound() {
+        let m = manager(true, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        for requested in ["0.0.0.0", "::", "192.168.1.5", "not an address", ""] {
+            let _ = m.close_listener(1).await;
+            let reply = listen(&m, requested).await;
+            assert!(
+                matches!(reply.payload, Payload::ListenOk(_)),
+                "{requested}: {reply:?}"
+            );
+            assert!(m
+                .listeners
+                .lock()
+                .await
+                .get(&1)
+                .unwrap()
+                .bound_addr
+                .ip()
+                .is_loopback());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_configured_non_loopback_address_is_honoured() {
+        let m = manager(true, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let reply = listen(&m, "127.0.0.1").await;
+        assert!(matches!(reply.payload, Payload::ListenOk(_)), "{reply:?}");
+        assert!(m
+            .listeners
+            .lock()
+            .await
+            .get(&1)
+            .unwrap()
+            .bound_addr
+            .ip()
+            .is_unspecified());
     }
 }

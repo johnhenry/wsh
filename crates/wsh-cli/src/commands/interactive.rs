@@ -1,7 +1,9 @@
 //! Shared interactive PTY loop for direct and reverse connections.
 
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -11,45 +13,81 @@ use wsh_client::WshSession;
 
 use crate::terminal as term;
 
+/// How long the input thread waits for a key before it looks at the stop flag again.
+const INPUT_POLL: Duration = Duration::from_millis(50);
+
+/// Stops the input thread however the session loop is left, including by an error.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Run the interactive terminal loop for an already-open session.
 pub async fn run_session(session: Arc<WshSession>, label: &str) -> Result<()> {
+    run_session_with(session, Some(label)).await
+}
+
+/// [`run_session`], with the "Connected to" / "Connection closed" notices only when
+/// `label` is given (`wsh --tty host cmd` prints nothing of its own).
+pub async fn run_session_with(session: Arc<WshSession>, label: Option<&str>) -> Result<()> {
     let _guard = term::RawModeGuard::enter().context("failed to enter raw terminal mode")?;
 
     let (tx_input, mut rx_input) = mpsc::channel::<Vec<u8>>(64);
     let (tx_resize, mut rx_resize) = mpsc::channel::<(u16, u16)>(8);
     let (tx_quit, mut rx_quit) = mpsc::channel::<()>(1);
 
-    let input_handle = tokio::task::spawn_blocking(move || loop {
-        match event::read() {
-            Ok(Event::Key(key_event)) => {
-                if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                    && key_event.code == KeyCode::Char(']')
-                {
-                    let _ = tx_quit.blocking_send(());
+    // The thread polls instead of blocking in `event::read()`: a blocking read cannot
+    // be cancelled, so when the remote session ended the thread sat waiting for a key
+    // and the runtime waited for the thread -- `wsh connect` never exited (#136).
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_exit = StopOnDrop(stop.clone());
+    let stop_input = stop.clone();
+    let input_handle = tokio::task::spawn_blocking(move || {
+        while !stop_input.load(Ordering::Relaxed) {
+            match event::poll(INPUT_POLL) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) => {
+                    warn!("crossterm poll error: {e}");
                     break;
                 }
-
-                if let Some(bytes) = key_event_to_bytes(&key_event) {
-                    if tx_input.blocking_send(bytes).is_err() {
+            }
+            match event::read() {
+                Ok(Event::Key(key_event)) => {
+                    if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                        && key_event.code == KeyCode::Char(']')
+                    {
+                        let _ = tx_quit.blocking_send(());
                         break;
                     }
+
+                    if let Some(bytes) = key_event_to_bytes(&key_event) {
+                        if tx_input.blocking_send(bytes).is_err() {
+                            break;
+                        }
+                    }
                 }
-            }
-            Ok(Event::Resize(new_cols, new_rows)) => {
-                let _ = tx_resize.blocking_send((new_cols, new_rows));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("crossterm event error: {e}");
-                break;
+                Ok(Event::Resize(new_cols, new_rows)) => {
+                    let _ = tx_resize.blocking_send((new_cols, new_rows));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("crossterm event error: {e}");
+                    break;
+                }
             }
         }
     });
 
-    eprintln!("Connected to {label}. Press Ctrl+] to exit.\r");
+    if let Some(label) = label {
+        eprintln!("Connected to {label}. Press Ctrl+] to exit.\r");
+    }
 
     let mut stdout = std::io::stdout();
-    let mut read_buf = vec![0_u8; 8192];
+    let mut read_buf = vec![0_u8; 64 * 1024];
 
     loop {
         tokio::select! {
@@ -85,9 +123,12 @@ pub async fn run_session(session: Arc<WshSession>, label: &str) -> Result<()> {
         }
     }
 
-    input_handle.abort();
+    stop.store(true, Ordering::Relaxed);
+    let _ = input_handle.await;
     let _ = session.close().await;
-    eprintln!("\r\nConnection to {label} closed.");
+    if let Some(label) = label {
+        eprintln!("\r\nConnection to {label} closed.");
+    }
 
     Ok(())
 }

@@ -112,8 +112,27 @@ pub fn detect_transport(url: &str) -> WshResult<TransportKind> {
     }
 }
 
+/// Install the process-wide rustls `CryptoProvider` (ring) if none is set.
+///
+/// The dependency tree enables both rustls providers (`ring` here, `aws-lc-rs`
+/// through another crate), and rustls then refuses to pick one on its own: the
+/// first `wss://` handshake that built a `ClientConfig` panicked with "Could not
+/// automatically determine the process-level CryptoProvider" (#134). Called
+/// before every connection and by `wsh` at start-up; harmless to call again, and
+/// it leaves a provider the embedding application installed first alone.
+pub fn install_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            // `Err` means another thread installed one between the check and here.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+    });
+}
+
 /// Connect to a wsh server, auto-selecting the transport from the URL scheme.
 pub async fn auto_connect(url: &str) -> WshResult<AnyTransport> {
+    install_crypto_provider();
     let kind = detect_transport(url)?;
 
     match kind {
@@ -132,6 +151,15 @@ pub async fn auto_connect(url: &str) -> WshResult<AnyTransport> {
 mod tests {
     use super::*;
     use crate::transport::webtransport::normalize_webtransport_url;
+
+    #[test]
+    fn install_crypto_provider_sets_a_process_default() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        // Idempotent: a second call neither panics nor replaces it.
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[test]
     fn detect_websocket() {

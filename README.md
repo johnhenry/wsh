@@ -1155,6 +1155,22 @@ Four crates, workspace-versioned (currently `0.5.0`):
 | `wsh-cli` | binary (`wsh`) | SSH-like CLI: connect, exec, scp-style copy, reverse tunnels, key management |
 | `wsh-server` | binary (`wsh-server`) | Server: WebTransport/WebSocket listener, real PTY sessions (`portable-pty`), relay/reverse-connect, WISP bridging |
 
+### Running a command with `wsh`
+
+```sh
+wsh alice@host ls -l                          # dials https://host:4422, then wss://host:4422
+wsh -t ws -p 8443 alice@host ls -l            # wss:// only, on port 8443
+wsh wss://host:8443/rendezvous/ab12 ls -l     # a full URL, dialled exactly as written (path and query kept)
+printf 'a\nb\n' | wsh alice@host sort         # stdin is forwarded; its end reaches the command as EOF
+wsh --tty alice@host top                      # a terminal for the command: raw keys, resizes forwarded
+```
+
+stdout and stderr stay separate where the host offers `exec-pipes`; the exit status is the command's.
+SIGINT, SIGTERM and SIGHUP sent to `wsh` are forwarded to the command, and the same signal twice
+disconnects. `wsh connect` ends when the remote session does. Diagnostics go to stderr (`-v` for more),
+never into the command's stdout. TLS uses the platform trust store, and `SSL_CERT_FILE` points it at another certificate (how a self-signed host is trusted); a plain
+`ws://` URL is accepted only for a loopback host.
+
 ### Capability matrix: JS SDK vs Rust CLI/client
 
 Two implementations of one protocol will always have *some* asymmetry --
@@ -1170,7 +1186,9 @@ than left to be found.
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
 | Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
 | Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | Rust `wsh-server` (`rust-v0.4.0`+): `wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set; no client yet in `wsh-client` | **No wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere; the Rust server serves it on WebSocket/QMux only |
-| Exec stdin + EOF, separate stderr | `exec({ stdin })`, `session.closeStdin()`, `session.onStderr` | none yet in `wsh-client` | **Wire-unified, negotiated** (#105): `Open.stdio = "pipes"` + `OpenOk.stderr_channel_id` + zero-length `SessionData` as EOF, offered by the `exec-pipes` `ServerHello` feature. `@johnhenry/wsh/server` needs none of it (stream-mode EOF); the Rust `wsh-server` (`rust-v0.5.0`+) runs such an exec on pipes, everything else on the PTY |
+| Exec stdin + EOF, separate stderr | `exec({ stdin })`, `session.closeStdin()`, `session.onStderr` | `SessionOpts { stdio: Some("pipes") }`, `WshSession::read_stderr()` / `close_stdin()`; `wsh host command` uses them whenever its stdin is a pipe or a file and the host offers `exec-pipes` | **Wire-unified, negotiated** (#105): `Open.stdio = "pipes"` + `OpenOk.stderr_channel_id` + zero-length `SessionData` as EOF, offered by the `exec-pipes` `ServerHello` feature. `@johnhenry/wsh/server` needs none of it (stream-mode EOF); the Rust `wsh-server` (`rust-v0.5.0`+) runs such an exec on pipes, everything else on the PTY. Against a host without `exec-pipes` the CLI still forwards stdin, but cannot tell the command it ended |
+| Signals and resize for a one-off command | `session.signal()`, `session.resize()` | `wsh host command` forwards SIGINT/SIGTERM/SIGHUP (the same signal twice disconnects); `wsh --tty host command` also forwards terminal resizes | **Wire-unified** (`Signal`, `Resize`). **Not everywhere honoured**: the Rust `wsh-server` currently only logs `Signal`, so a forwarded signal does not stop the command there |
+| Dial target | a URL | `wsh [user@]host` (dials `https://` then `wss://` on `--port`), or a full URL: `wsh wss://host:8443/rendezvous/ab12 command`, `ws://127.0.0.1:PORT/` | **CLI-only convenience**: a URL is dialled exactly as given (no transport fallback; `--port` and `--transport` do not apply). Plain `ws://` is accepted only to a loopback host |
 | Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. Its `scp` download also reads a raw stream, not the `FileChunk` messages this host sends, so `wsh scp` from such a host does not work (`wsh ls` and exec do) |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
@@ -1305,7 +1323,57 @@ out explicitly below rather than left to be discovered.
   above), but nothing in this protocol or client stops a non-browser
   caller (Node, the Rust CLI) from dialing `ws://` directly. Prefer pubkey
   auth, or make sure the transport is actually encrypted, before sending a
-  password.
+  password. (The Rust `wsh` CLI refuses a plain `ws://` URL unless the host is
+  loopback.)
+
+### Rust `wsh-server`: what is off until you turn it on
+
+An authorized key is a login, not a licence to use the machine as a network
+position. From the Rust release after `rust-v0.6.0` the server's defaults are:
+
+- **The gateway is off** (`[gateway] enabled = false`), and `gateway` is not
+  advertised. Turning it on allows **no destination** until `allowed_destinations`
+  lists some. `"*"` means any *public* destination: an address that is loopback,
+  link-local (including `169.254.169.254`), private (RFC 1918), unique-local
+  (`fc00::/7`), carrier-grade NAT (`100.64.0.0/10`), unspecified or multicast is
+  refused **after the name is resolved**, whichever rule matched the name, unless
+  a rule names that host (`"db.internal:5432"`) or address/range
+  (`"10.1.0.0/16:5432"`, `"127.0.0.1:8080"`). The server connects to the address it
+  checked, so a name cannot pass the check as one address and connect as another.
+  `ResolveDns` follows the same rule and does not return internal answers.
+- **Reverse listeners are off** (`enable_reverse_tunnels = false`) and, when on,
+  bind to `reverse_bind_addr` (default `127.0.0.1`). The client's own `bind_addr`
+  in `ListenRequest` (its wire default is `0.0.0.0`) is ignored.
+- **Password login is off** (`[auth] allow_password = false`). Stored hashes are
+  Argon2id PHC strings with a per-user salt (`printf '%s' "$PW" | wsh-server
+  --hash-password`), compared in constant time; an unknown user and a wrong password
+  cost the same and fail with the same message. Old unsalted `sha256:` entries are
+  **refused** (logged at start-up, naming the user) unless `allow_legacy_sha256 = true`,
+  which accepts them with a warning at every start-up. Refusing, not warning, is the
+  default because a warning nobody reads leaves the weak hash live on every
+  deployment that is not watched; the edit that turns password login back on is the
+  natural moment to rehash.
+
+What this does **not** protect against:
+
+- **A rule you write is trusted.** A hostname rule (`"db.internal"`) allows that name
+  to resolve to anything, including a restricted address; only the wildcard is
+  held to public addresses. An address range or literal address rule allows
+  exactly what it says.
+- **It is not per-key.** Every authorized key gets the same gateway. A key that
+  should not have it should not be in `authorized_keys`.
+- **There is no bandwidth or request-rate limit** beyond `max_connections`
+  (default 100 concurrent connections and listeners together), and a listener's
+  port is chosen by the client within what the server's user may bind.
+- **Hashing protects the stored file, not the wire.** The password still travels
+  inside the auth message (see above); only use password login over `wss://` or
+  WebTransport. The per-address auth rate limit bounds how fast one address can
+  make the server run Argon2id (19 MiB each); it is not a defence against many
+  addresses.
+- **The dev certificate from `--generate-cert` is not a certificate a TLS client
+  can verify** (it is flagged as a CA); clients dial it with
+  `WSH_INSECURE_LOOPBACK_TLS=1`, which disables verification and is for loopback
+  testing only.
 
 - **A host that lives in a page (`createMemoryHost`, `@johnhenry/wsh/reverse`) is only as trustworthy as the page.** A
   non-extractable host key or client key keeps the private key from being *read*, not from being *used*: any script that

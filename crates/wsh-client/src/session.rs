@@ -54,6 +54,11 @@ pub struct SessionOpts {
     pub rows: Option<u16>,
     /// Environment variables to set.
     pub env: Option<std::collections::HashMap<String, String>>,
+    /// `Some("pipes")` asks an `exec-pipes` host to run an exec channel on plain
+    /// pipes (no terminal, stderr kept apart, stdin EOF -- see
+    /// [`WshSession::read_stderr`] and [`WshSession::close_stdin`]). Send it only to a
+    /// host that advertised `exec-pipes`; an older host rejects the unknown field.
+    pub stdio: Option<String>,
 }
 
 impl Default for SessionOpts {
@@ -64,6 +69,7 @@ impl Default for SessionOpts {
             cols: Some(80),
             rows: Some(24),
             env: None,
+            stdio: None,
         }
     }
 }
@@ -133,6 +139,9 @@ pub struct WshSession {
     /// (`CoalesceOverride::Disabled`) -- either way `write()` seals+frames
     /// each call immediately in that case.
     stream_coalescer: Mutex<Option<Arc<WriteCoalescer<StreamFlushFn>>>>,
+    /// The stderr half of a `stdio: "pipes"` exec channel, which the host delivers
+    /// on a channel id of its own (`OpenOk.stderr_channel_id`).
+    stderr: Option<Arc<WshSession>>,
 }
 
 /// Per-session E2E state set by `WshSession::enable_e2e`. Connection-scoped,
@@ -251,6 +260,7 @@ impl WshSession {
             stream_accumulator: Mutex::new(None),
             stream_read_pending: Mutex::new(VecDeque::new()),
             stream_coalescer: Mutex::new(None),
+            stderr: None,
         }
     }
 
@@ -276,6 +286,7 @@ impl WshSession {
             stream_accumulator: Mutex::new(None),
             stream_read_pending: Mutex::new(VecDeque::new()),
             stream_coalescer: Mutex::new(None),
+            stderr: None,
         }
     }
 
@@ -293,6 +304,60 @@ impl WshSession {
         self.session_id = session_id;
         self.resume_token = resume_token;
         self
+    }
+
+    /// Attach the stderr companion of a `stdio: "pipes"` exec channel. Builder-style,
+    /// before the session is wrapped in `Arc`.
+    #[must_use]
+    pub(crate) fn with_stderr(mut self, stderr: Arc<WshSession>) -> Self {
+        self.stderr = Some(stderr);
+        self
+    }
+
+    /// The stderr half, for the client to route its channel id to.
+    pub(crate) fn stderr_session(&self) -> Option<Arc<WshSession>> {
+        self.stderr.clone()
+    }
+
+    /// Whether this channel delivers stderr separately (`stdio: "pipes"` was granted).
+    pub fn has_stderr(&self) -> bool {
+        self.stderr.is_some()
+    }
+
+    /// Read the command's stderr, for a session opened with `stdio: "pipes"`.
+    ///
+    /// Returns 0 at end of stderr -- which is also what a session without a separate
+    /// stderr returns immediately (check [`has_stderr`](Self::has_stderr)). Drain it
+    /// alongside [`read`](Self::read): a host that writes more stderr than the
+    /// buffer holds stalls the connection until it is read.
+    pub async fn read_stderr(&self, buf: &mut [u8]) -> WshResult<usize> {
+        match &self.stderr {
+            Some(stderr) => stderr.read(buf).await,
+            None => Ok(0),
+        }
+    }
+
+    /// Whether the host will treat an empty write as end-of-input (`stdin-eof`,
+    /// granted with `stdio: "pipes"`).
+    pub fn supports_stdin_eof(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "stdin-eof")
+    }
+
+    /// Tell the command its stdin has ended, when the host supports it
+    /// ([`supports_stdin_eof`](Self::supports_stdin_eof)): a zero-length `SessionData`.
+    /// Returns `false` (and sends nothing) on a host that cannot take it.
+    pub async fn close_stdin(&self) -> WshResult<bool> {
+        if !self.supports_stdin_eof() {
+            return Ok(false);
+        }
+        self.control_tx
+            .send(ControlAction::Data {
+                channel_id: self.channel_id,
+                data: Vec::new(),
+            })
+            .await
+            .map_err(|_| WshError::Channel("control channel closed".into()))?;
+        Ok(true)
     }
 
     /// The channel ID assigned by the server.
@@ -484,6 +549,11 @@ impl WshSession {
 
     /// Write data to the session's data stream.
     pub async fn write(&self, data: &[u8]) -> WshResult<()> {
+        // On a `stdin-eof` host a zero-length write IS the end-of-input signal; an
+        // empty write must never be mistaken for it (use `close_stdin`).
+        if data.is_empty() && self.supports_stdin_eof() {
+            return Ok(());
+        }
         let state = self.state.lock().await;
         if *state != SessionState::Open {
             return Err(WshError::Channel(format!(
@@ -735,6 +805,13 @@ impl WshSession {
         if let SessionBackend::Virtual(backend) = &self.backend {
             backend.close().await;
         }
+        if let Some(stderr) = &self.stderr {
+            // stderr always arrives before the channel's Exit, so everything of it
+            // is already queued: closing lets a reader drain it and then see EOF.
+            if let SessionBackend::Virtual(backend) = &stderr.backend {
+                backend.close().await;
+            }
+        }
         let mut state = self.state.lock().await;
         *state = SessionState::Closed;
     }
@@ -757,10 +834,6 @@ impl WshSession {
 
     /// Handle a session-specific control message from the server.
     pub(crate) async fn handle_control(&self, envelope: &Envelope) -> WshResult<()> {
-        eprintln!(
-            "DEBUGTRACE session.handle_control payload={:?}",
-            envelope.payload
-        );
         match &envelope.payload {
             Payload::SessionData(data) => match &self.backend {
                 SessionBackend::Virtual(backend) => backend.push_data(data.data.clone()).await,

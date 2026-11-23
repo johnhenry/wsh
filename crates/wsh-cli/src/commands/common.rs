@@ -76,6 +76,9 @@ pub struct ResolvedTarget {
     pub url: String,
     pub fallback_urls: Vec<String>,
     pub transport: Option<String>,
+    /// The URL exactly as the user gave it, when the target was a full URL
+    /// (`wss://host/path`) rather than `[user@]host`.
+    pub explicit_url: Option<String>,
 }
 
 /// Persisted "last session" metadata used by session-oriented commands.
@@ -86,6 +89,20 @@ pub struct LastSession {
     pub port: u16,
     pub identity: String,
     pub transport: Option<String>,
+    /// Set when the session was dialled with a full URL, so `sessions`, `attach` and
+    /// `detach` reach the same path again. Absent in files written before URL targets.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl LastSession {
+    /// The target string that reaches this session again.
+    pub fn target(&self) -> String {
+        match &self.url {
+            Some(url) => format!("{}@{}", self.user, url),
+            None => format!("{}@{}", self.user, self.host),
+        }
+    }
 }
 
 /// Persisted "last reverse peer" metadata used by relay-oriented commands.
@@ -98,8 +115,118 @@ pub struct LastReversePeer {
     pub username: String,
 }
 
-/// Resolve `[user@]host` + transport into a concrete connection URL.
+/// Parse a target given as a full URL: `ws://`, `wss://`, `https://` or `wt://`, with an
+/// optional path and query (`wss://host:4422/rendezvous/ab12`), and an optional user in
+/// front of it or in its userinfo (`alice@wss://host/x`, `wss://alice@host/x`).
+///
+/// Returns `Ok(None)` for anything that is not a URL (a plain `[user@]host`). The URL
+/// is dialled as given -- no fallback to another transport, and `--port` / `--transport`
+/// do not apply, because the URL already says both.
+fn parse_url_target(target: &str) -> Result<Option<ResolvedTarget>> {
+    let Some((before, after)) = target.split_once("://") else {
+        return Ok(None);
+    };
+    let (prefix_user, scheme) = match before.rsplit_once('@') {
+        Some((user, scheme)) => (Some(user), scheme),
+        None => (None, before),
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let (transport, default_port) = match scheme.as_str() {
+        "ws" => ("ws", 80),
+        "wss" => ("ws", 443),
+        "https" | "wt" => ("wt", 443),
+        other => anyhow::bail!(
+            "unsupported URL scheme '{other}' in '{target}' (expected ws, wss, https or wt)"
+        ),
+    };
+
+    // Everything up to the first `/`, `?` or `#` is the authority; a fragment is never sent.
+    let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let (authority, tail) = after.split_at(authority_end);
+    let tail = tail.split('#').next().unwrap_or("");
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((userinfo, hostport)) => (Some(userinfo), hostport),
+        None => (None, authority),
+    };
+    if userinfo.is_some_and(|u| u.contains(':')) {
+        anyhow::bail!(
+            "a password in the URL is not supported ('{target}'): use a key (`wsh keygen`)"
+        );
+    }
+    let (host, explicit_port) =
+        split_host_port(hostport).with_context(|| format!("invalid host in '{target}'"))?;
+    if host.is_empty() {
+        anyhow::bail!("empty host in '{target}'");
+    }
+    if scheme == "ws" && !is_loopback_host(host) {
+        anyhow::bail!(
+            "refusing plain-text ws:// to '{host}': nothing in the session would be encrypted. \
+             Use wss://, or a loopback host for testing"
+        );
+    }
+    let user = match prefix_user.or(userinfo) {
+        Some("") => anyhow::bail!("empty username in '{target}'"),
+        Some(user) => user.to_string(),
+        None => crate::config::default_user(),
+    };
+
+    let url = format!("{scheme}://{hostport}{tail}");
+    Ok(Some(ResolvedTarget {
+        user,
+        host: host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string(),
+        port: explicit_port.unwrap_or(default_port),
+        url: url.clone(),
+        fallback_urls: Vec::new(),
+        transport: Some(transport.to_string()),
+        explicit_url: Some(url),
+    }))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Split `host`, `host:port`, `[v6]` or `[v6]:port` (the brackets stay on `host`).
+fn split_host_port(hostport: &str) -> Result<(&str, Option<u16>)> {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let (addr, after) = rest
+            .split_once(']')
+            .context("unterminated '[' in the host")?;
+        let host = &hostport[..addr.len() + 2];
+        return match after {
+            "" => Ok((host, None)),
+            _ => Ok((
+                host,
+                Some(parse_port(
+                    after.strip_prefix(':').context("expected ':' after ']'")?,
+                )?),
+            )),
+        };
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port)) => Ok((host, Some(parse_port(port)?))),
+        None => Ok((hostport, None)),
+    }
+}
+
+fn parse_port(port: &str) -> Result<u16> {
+    port.parse::<u16>()
+        .with_context(|| format!("invalid port '{port}'"))
+}
+
+/// Resolve `[user@]host` + transport into a concrete connection URL, or take a full
+/// URL (`wss://host:port/path`) as it is.
 pub fn resolve_target(target: &str, port: u16, transport: Option<&str>) -> Result<ResolvedTarget> {
+    if let Some(resolved) = parse_url_target(target)? {
+        return Ok(resolved);
+    }
     let (user, host) = parse_target(target)?;
     let transport = transport.map(ToString::to_string);
     let mut urls = connection_urls(&host, port, transport.as_deref())?;
@@ -111,6 +238,7 @@ pub fn resolve_target(target: &str, port: u16, transport: Option<&str>) -> Resul
         url,
         fallback_urls: urls,
         transport,
+        explicit_url: None,
     })
 }
 
@@ -160,6 +288,7 @@ pub fn save_last_session(resolved: &ResolvedTarget, port: u16, identity: &str) -
         port,
         identity: identity.to_string(),
         transport: resolved.transport.clone(),
+        url: resolved.explicit_url.clone(),
     };
 
     let path = last_session_path()?;
@@ -294,6 +423,94 @@ mod tests {
         assert_eq!(resolved.port, 4422);
         assert_eq!(resolved.url, "https://example.com:4422");
         assert_eq!(resolved.fallback_urls, vec!["wss://example.com:4422"]);
+    }
+
+    // ── full-URL targets (#136) ──────────────────────────────────────
+
+    #[test]
+    fn a_wss_url_with_a_path_is_dialled_exactly_and_without_fallback() {
+        let r = resolve_target(
+            "alice@wss://relay.example.com:8443/rendezvous/ab12?x=1",
+            4422,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.user, "alice");
+        assert_eq!(r.host, "relay.example.com");
+        assert_eq!(r.port, 8443);
+        assert_eq!(r.url, "wss://relay.example.com:8443/rendezvous/ab12?x=1");
+        assert!(r.fallback_urls.is_empty());
+        assert_eq!(r.transport.as_deref(), Some("ws"));
+        assert_eq!(r.explicit_url.as_deref(), Some(r.url.as_str()));
+    }
+
+    #[test]
+    fn a_url_ignores_the_port_and_transport_flags() {
+        let r = resolve_target("wss://example.com/x", 9999, Some("wt")).unwrap();
+        assert_eq!(r.url, "wss://example.com/x");
+        assert_eq!(r.port, 443);
+        assert_eq!(r.transport.as_deref(), Some("ws"));
+    }
+
+    #[test]
+    fn the_user_may_be_in_the_url_userinfo_and_a_fragment_is_never_sent() {
+        let r = resolve_target("wss://bob@example.com:1234/p#frag", 4422, None).unwrap();
+        assert_eq!(r.user, "bob");
+        assert_eq!(r.url, "wss://example.com:1234/p");
+    }
+
+    #[test]
+    fn webtransport_urls_keep_their_scheme() {
+        let r = resolve_target("carol@https://example.com/wt", 4422, None).unwrap();
+        assert_eq!(r.url, "https://example.com/wt");
+        assert_eq!(r.transport.as_deref(), Some("wt"));
+    }
+
+    #[test]
+    fn ipv6_hosts_keep_their_brackets_in_the_url() {
+        let r = resolve_target("wss://[2001:db8::1]:9000/x", 4422, None).unwrap();
+        assert_eq!(r.host, "2001:db8::1");
+        assert_eq!(r.port, 9000);
+        assert_eq!(r.url, "wss://[2001:db8::1]:9000/x");
+    }
+
+    #[test]
+    fn plain_text_ws_is_refused_except_to_loopback() {
+        assert!(resolve_target("ws://127.0.0.1:4422/x", 4422, None).is_ok());
+        assert!(resolve_target("ws://localhost/x", 4422, None).is_ok());
+        assert!(resolve_target("ws://[::1]:4422/x", 4422, None).is_ok());
+        let err = resolve_target("ws://example.com/x", 4422, None).unwrap_err();
+        assert!(err.to_string().contains("plain-text"), "{err}");
+    }
+
+    #[test]
+    fn bad_urls_are_errors() {
+        assert!(resolve_target("ftp://example.com", 4422, None).is_err());
+        assert!(resolve_target("wss://", 4422, None).is_err());
+        assert!(resolve_target("wss://host:notaport/", 4422, None).is_err());
+        assert!(resolve_target("wss://user:secret@host/", 4422, None).is_err());
+        assert!(resolve_target("@wss://host/", 4422, None).is_err());
+    }
+
+    #[test]
+    fn a_session_dialled_by_url_is_reached_by_url_again() {
+        let last = LastSession {
+            user: "alice".into(),
+            host: "example.com".into(),
+            port: 443,
+            identity: "default".into(),
+            transport: Some("ws".into()),
+            url: Some("wss://example.com/rv/1".into()),
+        };
+        let r = resolve_target(&last.target(), 4422, None).unwrap();
+        assert_eq!(r.url, "wss://example.com/rv/1");
+        assert_eq!(r.user, "alice");
+        // A last_session.json written before URL targets has no `url`.
+        let old: LastSession = serde_json::from_str(
+            r#"{"user":"a","host":"h","port":1,"identity":"i","transport":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.target(), "a@h");
     }
 
     #[test]

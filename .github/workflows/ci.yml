@@ -98,8 +98,8 @@ jobs:
       - name: npm run codegen:check
         run: npm run codegen:check
 
-      - name: Build wsh-server (release, for test:rust)
-        run: cargo build --release -p wsh-server
+      - name: Build wsh-server and wsh (release, for test:rust)
+        run: cargo build --release -p wsh-server -p wsh-cli
 
       - name: npm run test:rust
         run: npm run test:rust
