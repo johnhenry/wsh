@@ -3,12 +3,15 @@
 //! Provides CBOR message types, codec, identity/fingerprint management,
 //! authorized_keys parsing, HMAC session tokens, and abstract transport traits.
 
+pub mod channel_binding;
 pub mod codec;
 pub mod error;
 pub mod gateway_credit;
+pub mod host_key;
 pub mod identity;
 pub mod keys;
 pub mod messages;
+pub mod operator_proof;
 pub mod peer_record;
 pub mod qmux;
 pub mod qmux_connection;

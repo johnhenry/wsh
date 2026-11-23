@@ -8,6 +8,7 @@ mod client_env;
 mod config;
 mod gateway;
 mod handshake;
+mod host_key;
 mod mcp;
 mod relay;
 mod rpc;

@@ -32,12 +32,24 @@ fn length_prefixed(bytes: &[u8]) -> Vec<u8> {
 /// can't collide when concatenated; `username` binds the transcript to a
 /// specific identity. Matches the JS implementation exactly.
 fn build_transcript(username: &str, session_id: &str, nonce: &[u8]) -> Vec<u8> {
+    build_transcript_bound(username, session_id, nonce, &[])
+}
+
+/// The transcript with a channel binding (wsh #119; see `channel_binding`): the binding is the
+/// last component, and EMPTY unless both ends agreed to bind -- then identical to the unbound one.
+pub fn build_transcript_bound(
+    username: &str,
+    session_id: &str,
+    nonce: &[u8],
+    channel_binding: &[u8],
+) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(PROTOCOL_VERSION.as_bytes());
     hasher.update(b"\0");
     hasher.update(length_prefixed(username.as_bytes()));
     hasher.update(length_prefixed(session_id.as_bytes()));
     hasher.update(nonce);
+    hasher.update(channel_binding);
     hasher.finalize().to_vec()
 }
 
@@ -53,6 +65,34 @@ pub fn sign_challenge(
     let transcript = build_transcript(username, session_id, nonce);
     let signature = signing_key.sign(&transcript);
     signature.to_bytes().to_vec()
+}
+
+/// [`sign_challenge`] over a transcript that carries `channel_binding` (empty = unbound).
+pub fn sign_challenge_bound(
+    signing_key: &SigningKey,
+    username: &str,
+    session_id: &str,
+    nonce: &[u8],
+    channel_binding: &[u8],
+) -> Vec<u8> {
+    let transcript = build_transcript_bound(username, session_id, nonce, channel_binding);
+    signing_key.sign(&transcript).to_bytes().to_vec()
+}
+
+/// [`verify_challenge`] over a transcript that carries `channel_binding` (empty = unbound).
+pub fn verify_challenge_bound(
+    verifying_key: &VerifyingKey,
+    signature: &[u8],
+    username: &str,
+    session_id: &str,
+    nonce: &[u8],
+    channel_binding: &[u8],
+) -> bool {
+    let transcript = build_transcript_bound(username, session_id, nonce, channel_binding);
+    match ed25519_dalek::Signature::from_slice(signature) {
+        Ok(sig) => verifying_key.verify(&transcript, &sig).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Verify a challenge signature against a public key.
@@ -163,6 +203,30 @@ mod tests {
         let bytes = public_key_bytes(&vk);
         let vk2 = verifying_key_from_bytes(&bytes).unwrap();
         assert_eq!(vk, vk2);
+    }
+
+    #[test]
+    fn empty_binding_is_the_unbound_transcript_and_a_binding_changes_it() {
+        let a = build_transcript("alice", "sess", b"nonce");
+        assert_eq!(a, build_transcript_bound("alice", "sess", b"nonce", &[]));
+        assert_ne!(
+            a,
+            build_transcript_bound("alice", "sess", b"nonce", &[1u8; 32])
+        );
+        let (sk, vk) = generate_keypair();
+        let sig = sign_challenge_bound(&sk, "alice", "sess", b"nonce", &[1u8; 32]);
+        assert!(verify_challenge_bound(
+            &vk, &sig, "alice", "sess", b"nonce", &[1u8; 32]
+        ));
+        assert!(!verify_challenge_bound(
+            &vk,
+            &sig,
+            "alice",
+            "sess",
+            b"nonce",
+            &[]
+        ));
+        assert!(!verify_challenge(&vk, &sig, "alice", "sess", b"nonce"));
     }
 
     #[test]

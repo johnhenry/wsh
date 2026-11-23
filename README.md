@@ -1289,7 +1289,7 @@ fs_max_file_bytes = 67108864
 Key options apply as they do to other channels: a key restricted to a forced
 command opens no rpc channel, and `wsh-fs` needs the `file-transfer` scope
 (`permit-file-transfer` under `restrict`). `host.info` reports the crate version
-and `hostFingerprint: null` (the Rust server has no host key). The JS client
+and `hostFingerprint: null` unless `[server] host_key` is configured. The JS client
 needs nothing new: it reads `rpc` from `ServerHello`, and its file helpers prefer
 `wsh-fs` automatically once the server offers it.
 
@@ -1449,7 +1449,7 @@ instead of dragging its own toolchain and CI job into an unrelated
 browser-app repo. It was previously deleted from clawser by accident
 (2026-03-14) and restored (2026-07-05) before this move.
 
-Four crates, workspace-versioned (currently `0.8.0`):
+Four crates, workspace-versioned (currently `0.9.0`):
 
 | Crate | Kind | Description |
 |-------|------|--------------|
@@ -1517,7 +1517,7 @@ than left to be found.
 | Upload/download | `WshClient.upload()`/`.download()` | `file_transfer::upload()`/`download()`, `wsh scp` | **Wire-unified**: `FileChunk` over a `'file'`-kind channel (wsh #13) |
 | Remove a remote file | `WshClient.fileRemove()` | `file_transfer::remove()`, `wsh sftp`'s `rm` | **Wire-unified**: `FileOp`/`FileResult` (`op: "remove"`) -- refused today by every `wsh-server` release ("not yet implemented"), the same refusal on both sides |
 | Install an authorized key | `WshClient.addAuthorizedKey()` | `wsh_client::WshClient::add_authorized_key()`, `wsh copy-id` | **Wire-unified** (wsh #59): `AuthorizedKeyAdd`/`AuthorizedKeyResult`, replacing a Rust-CLI-only shell command with a message every implementation can send |
-| Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed) | **Record unified, policy is not** (wsh #59): both pin `ServerHello.host_fingerprint`, which `@johnhenry/wsh/server` populates (with a proof of possession, [Host key](#host-key-fingerprint--tofu)) but no Rust `wsh-server` release does yet (see [Security](#security-model)). *When* to trust, prompt, or persist is deliberately left per-implementation -- a browser and a CLI have different UX for "first time seeing this host" |
+| Host identity / TOFU | `WshKnownHosts` (localStorage-backed) | `KnownHosts`/`HostStatus` (`~/.wsh/known_hosts`-backed); the client sends `host-key-nonce`, verifies `host-key`/`host-key-sig`, pins only a proven key, and a first use needs `--accept-new-host-key` or a yes at a terminal (`--require-host-key` refuses a host with no proof); `wsh-server` has an opt-in host key (`[server] host_key`) | **Unified** (wsh #59, #145): both pin a PROVEN `ServerHello.host_fingerprint`. A Rust server with no `host_key` configured (the default, so released clients keep working) proves nothing |
 | Typed RPC channels (`openRpc`, `rpc` sessions; `wsh-host`, `wsh-fs`, `mcp`) | `WshClient.openRpc()`, `RpcChannel` | Rust `wsh-server` (`rust-v0.4.0`+): `wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set; no client yet in `wsh-client` | **No wire change**: `Open { kind: 'rpc', command: <protocol> }` plus `rpc*` `ServerHello` features, negotiated so it fails fast elsewhere; the Rust server serves it on WebSocket/QMux only |
 | Exec stdin + EOF, separate stderr | `exec({ stdin })`, `session.closeStdin()`, `session.onStderr` | `SessionOpts { stdio: Some("pipes") }`, `WshSession::read_stderr()` / `close_stdin()`; `wsh host command` uses them whenever its stdin is a pipe or a file and the host offers `exec-pipes` | **Wire-unified, negotiated** (#105): `Open.stdio = "pipes"` + `OpenOk.stderr_channel_id` + zero-length `SessionData` as EOF, offered by the `exec-pipes` `ServerHello` feature. `@johnhenry/wsh/server` needs none of it (stream-mode EOF); the Rust `wsh-server` (`rust-v0.5.0`+) runs such an exec on pipes, everything else on the PTY. Against a host without `exec-pipes` the CLI still forwards stdin, but cannot tell the command it ended |
 | Signals and resize for a one-off command | `session.signal()`, `session.resize()` | `wsh host command` forwards SIGINT/SIGTERM/SIGHUP (the same signal twice disconnects); `wsh --tty host command` also forwards terminal resizes | **Wire-unified** (`Signal`, `Resize`). The Rust `wsh-server` delivers `Signal` (#145) to a pty session's foreground process group (what ^C reaches) and to an exec-on-pipes command's own process group, for `HUP INT QUIT TERM KILL USR1 USR2 WINCH CONT STOP TSTP ALRM` (with or without `SIG`); another name is ignored, and only the control attachment of the connection that owns the channel can send one. Not delivered on Windows |
@@ -1532,8 +1532,8 @@ than left to be found.
 | TCP reverse tunnels (`ListenRequest`, #98) | `@johnhenry/wsh/server` `gateway.reverse` (off by default; loopback unless the operator lists addresses; port allow-list, nothing below 1024 unless named; bounded listeners/connections/backlog/idle); client `listenTcp(port, { onConnection })` | `wsh-server` `[gateway] enable_reverse_tunnels` + `reverse_bind_addr` (off by default, loopback, client `bind_addr` ignored); no port allow-list; no per-listener connection, backlog or idle bounds beyond `max_connections` | **Wire-unified** (`ListenRequest`/`ListenOk`/`ListenFail`/`InboundOpen`/`InboundAccept`; the JS host sends the real `peer_addr`/`peer_port`). **Rust still needs**: a port allow-list and per-client listener / per-listener connection / idle bounds to match the JS host. Accepted connections are metered by `gateway-credit` now |
 | UDP (`OpenUdp`) as WebTransport datagrams (#124) | `client.openUdp()` over WebTransport when both ends list `gateway-datagram`: payloads are datagrams (4-byte flow id + payload), read from `maxDatagramSize`; oversize goes on the control stream (or drops); bounds: flows, packet and byte rates, idle; policy as TCP. Host: `gateway.udp`; Playwright test from Chromium | `wsh-server` serves `OpenUdp` over the reliable control stream only (one `GatewayData` per datagram); no datagrams, no rate bounds | **JS only for now** (negotiated by `gateway-datagram`, so a Rust peer keeps the reliable path). **Rust must implement**: list `gateway-datagram` in `ServerHello.features` on a WebTransport connection, accept/send datagrams `[gateway_id u32 BE][payload]` for `OpenUdp` flows when the client listed it (ignore the id of an unknown flow), read `maxDatagramSize` and send a bigger payload as `GatewayData` (or drop, by config), `connect()` the UDP socket to the checked address, and the same rate/flow bounds |
 | Gateway destination policy by resolved address | `@johnhenry/wsh/server` `gateway`: resolved address checked, `allowPrivate` | fixed in the Rust release after `rust-v0.6.0`: a loopback/private/link-local/ULA/CGNAT/unspecified/multicast address is refused after resolution unless a rule names it, and the server connects to the address it checked | **Same rule on both sides** (a Rust server released before that still has the name-only check) |
-| Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | none: the Rust relay neither carries `ReverseChallenge`/`ReverseProof` nor lists the feature, and the Rust agent/client send and answer neither | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); the Rust types are regenerated (and `ReverseConnect.features` is `None` there) but no Rust peer implements it yet |
-| Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | none: no Rust host offers one and the Rust client signs with an empty binding | **Wire-unified, negotiated** (`channel-binding:<kind>` features); a Rust client logging in to a JS host that requires it is refused |
+| Operator proof to the peer, sealed bridge, signed initiator half (#117) | `reverseConnect(.., { sealed, requirePeerProof })`; host `createReverseHost({ requireOperatorProof })`; relay lists `operator-proof` | **Operator proof: yes.** The Rust relay lists `operator-proof` and carries `ReverseChallenge`/`ReverseProof`/`ReverseConnect.features`; `wsh reverse-connect` answers a challenge (`--operator-proof` / `--no-operator-proof`; by default only for a peer that registered the `operator-proof` capability, because a released Rust host cannot decode the field); `wsh reverse` / `wsh agent run` challenge, verify BEFORE accepting, and take `--require-operator-proof` and `--allow-operator`. **Sealed bridge and signed `KeyExchange` halves: not yet** (no Rust E2E responder), so `--require-operator-proof` proves who connected but does not stop a relay stamping an identity on later plain messages | **Wire-unified, negotiated** (`ReverseConnect.features`, `operator-proof`, `e2e-sealed`); sealing is JS-only |
+| Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | Kind `host`: the client binds to the proven host key (`--require-channel-binding`, and it honours `channel-binding-required`), and `wsh-server` offers it and can require it (`[server] require_channel_binding`, needs `host_key`). `cert-hash` and `tls-exporter`: not in Rust (the Rust WebTransport client has no certificate-hash pinning; `ConnectConfig.cert_hash` binds it if a caller supplies one) | **Wire-unified, negotiated** (`channel-binding:<kind>` features); verified against the spec's test vectors |
 | Pipe relay (#118) | `@johnhenry/wsh/pipe-relay` | operator side only (#145): `wsh --via wss://relay/r/<id> user@host command...` (also `connect`, `scp`, `ls`, `sftp`, `copy-id`), or the URL as the target. The host side of a pipe is not implemented in Rust, and the Rust client does not yet verify the host-key proof or bind the login to the host (see Security model) | **Deliberately a relay without wsh parsing** -- nothing to unify on the wire. `--via` keeps `user@host` as the identity: its key is recorded in `known_hosts` under `host:port` (what a direct connection uses), never under the relay's address; a URL target is recorded under the URL's own authority, i.e. the relay's. The URL is not saved to `last_session.json` (the id is a capability) |
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
@@ -1696,6 +1696,11 @@ out explicitly below rather than left to be discovered.
   treat `initiateE2E` as key agreement, not confidentiality, unless you've
   separately confirmed the session has sealing enabled.
 - **Host identity (TOFU) has a known, named gap (wsh #59).**
+  **Update (#145): the Rust `wsh-server` now has an opt-in host key
+  (`[server] host_key = "<path>"`, created 0600 on first start; see the
+  capability matrix) and the Rust client verifies the proof; the paragraph
+  below describes the state before that and still applies to a Rust server
+  with no `host_key` configured, which proves nothing.**
   `ServerHello.host_fingerprint` is the spec's formal host-identity slot:
   the SHA-256 fingerprint of a server's persistent Ed25519 host key, meant
   to be pinned across connections the way SSH pins a host key. **As of 0.19
@@ -1805,19 +1810,18 @@ What this does **not** protect against:
   JS host's, above): nothing is promised or enforced at connection level; do not
   treat the token as a credential.
 - **`wsh --via` (pipe relay from the Rust CLI) is the operator side only, and
-  weaker than the JS client's pinning.** The Rust client records
-  `ServerHello.host_fingerprint` in `known_hosts` (trust on first use) but does
-  not verify the proof of possession (`host-key-sig`) the JS client checks
-  before sending credentials, does not bind the login signature to the host key
-  (no channel binding), and cannot seal the bridge end to end. Over a pipe relay
-  that means: a relay or impostor that replays a genuine host's `ServerHello`
-  is not detected by the Rust CLI the way it is by a JS client with
-  `expectHostKey`; the host still authenticates the operator's own signature,
-  and a host whose key differs from the recorded one is refused. The relay
-  sees the handshake and session traffic in the clear unless the legs are TLS
-  and it is trusted not to read them (it terminates each leg's TLS). Use a JS
-  client with `expectHostKey` where that matters. Proof, binding and sealing
-  are the next part of #145.
+  still not sealed.** The Rust client now verifies the host-key proof
+  (`host-key` / `host-key-sig` over its own `host-key-nonce`) before sending
+  any credential, records only a PROVEN key in `known_hosts`, binds the login
+  signature to that key (channel binding `host`), and refuses a changed key
+  always. A replayed `ServerHello` or an impostor's key is refused as the JS
+  client refuses it. What is still unprotected: the bridge is not sealed
+  end to end (the Rust side has no sealed bridge yet), so the relay sees
+  session traffic in the clear unless the legs are TLS and it is trusted not
+  to read them (it terminates each leg's TLS), and it can stamp an identity on
+  a plain message after the handshake. A host with no host key proves nothing:
+  the CLI connects to it (as every release did) unless `--require-host-key`
+  says otherwise.
 
 - **A host that lives in a page (`createMemoryHost`, `@johnhenry/wsh/reverse`) is only as trustworthy as the page.** A
   non-extractable host key or client key keeps the private key from being *read*, not from being *used*: any script that

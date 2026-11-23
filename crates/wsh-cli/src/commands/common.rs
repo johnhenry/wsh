@@ -338,6 +338,138 @@ pub fn apply_via(mut resolved: ResolvedTarget, via: &str) -> Result<ResolvedTarg
     Ok(resolved)
 }
 
+/// What the operator asked of host identity on the command line (`--accept-new-host-key`,
+/// `--require-host-key`, `--require-channel-binding`).
+#[derive(Debug, Clone, Default)]
+pub struct IdentityPolicy {
+    pub accept_new_host_key: bool,
+    pub require_host_key: bool,
+    pub require_channel_binding: bool,
+    /// Reverse host: ask operators to prove who they are, and refuse one that cannot.
+    pub require_operator_proof: bool,
+    /// Reverse host: the operators it serves (fingerprints or prefixes of at least 8 digits).
+    pub allow_operators: Vec<String>,
+    /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
+    pub operator_proof: OperatorProofMode,
+}
+
+/// Whether `wsh reverse-connect` offers to prove its identity to the peer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OperatorProofMode {
+    /// Offer it when the relay carries it AND the peer registered the `operator-proof`
+    /// capability: a released reverse host cannot decode the extra field.
+    #[default]
+    Auto,
+    /// Offer it whenever the relay carries it (a JS host, which has no such capability to see).
+    Always,
+    Never,
+}
+
+static IDENTITY: std::sync::OnceLock<IdentityPolicy> = std::sync::OnceLock::new();
+
+/// Remember the identity flags for the rest of this process.
+pub fn set_identity_policy(p: IdentityPolicy) {
+    let _ = IDENTITY.set(p);
+}
+
+/// The identity flags of this process.
+pub fn identity_policy() -> IdentityPolicy {
+    IDENTITY.get().cloned().unwrap_or_default()
+}
+
+/// Put the reverse-host identity policy and key into the options of a reverse host.
+pub fn apply_host_policy(
+    options: &mut crate::commands::reverse_host::ReverseHostOptions,
+    key: &ed25519_dalek::SigningKey,
+) -> Result<()> {
+    let p = identity_policy();
+    options.require_operator_proof = p.require_operator_proof;
+    for a in &p.allow_operators {
+        if a.len() < 8 || !a.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!("--allow-operator takes at least 8 hex digits of an operator fingerprint, got `{a}`");
+        }
+    }
+    options.allowed_operators = p
+        .allow_operators
+        .iter()
+        .map(|a| a.to_ascii_lowercase())
+        .collect();
+    options.identity = Some(crate::commands::reverse_host::IdentityKey(
+        std::sync::Arc::new(key.clone()),
+    ));
+    Ok(())
+}
+
+/// Put the process-wide identity policy into a connection config.
+pub fn apply_identity_policy(config: &mut ConnectConfig) {
+    let p = identity_policy();
+    config.require_host_key = p.require_host_key;
+    config.require_channel_binding = p.require_channel_binding;
+    config.first_use = if p.accept_new_host_key {
+        wsh_client::FirstUse::Accept
+    } else {
+        wsh_client::FirstUse::Refuse
+    };
+}
+
+/// Dial with the first-use rule of `StrictHostKeyChecking=ask`: a host key never seen before is
+/// shown and needs a yes -- typed at a terminal, or `--accept-new-host-key` for scripts. Without
+/// either the connection is refused before any credential is sent. A changed key never gets a
+/// prompt. `host` is the `known_hosts` label shown to the person.
+pub async fn connect_checked(
+    url: &str,
+    config: &ConnectConfig,
+    host: &str,
+) -> Result<WshClient, wsh_client::WshError> {
+    use std::io::IsTerminal;
+    let mut config = config.clone();
+    apply_identity_policy(&mut config);
+    let mut result = WshClient::connect(url, config.clone()).await;
+    if let Err(wsh_client::WshError::HostKeyUnknown { fingerprint, .. }) = &result {
+        let fingerprint = fingerprint.clone();
+        if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+            eprintln!("The authenticity of host '{host}' cannot be established.");
+            eprintln!("Host key fingerprint (SHA-256, proven by the host) is {fingerprint}.");
+            let yes = dialoguer::Confirm::new()
+                .with_prompt("Are you sure you want to continue connecting?")
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if yes {
+                config.first_use = wsh_client::FirstUse::AcceptFingerprint(fingerprint);
+                result = WshClient::connect(url, config).await;
+            }
+        } else {
+            return Err(wsh_client::WshError::Other(format!(
+                "the authenticity of host '{host}' cannot be established: its host key has \
+                 fingerprint {fingerprint} and is not in known_hosts. Check the fingerprint, then \
+                 connect with --accept-new-host-key to trust it (or run wsh at a terminal to be asked)"
+            )));
+        }
+    }
+    if let Ok(client) = &result {
+        match client.host_key() {
+            Some(k) if client.host_key_newly_pinned() => eprintln!(
+                "Warning: Permanently added '{host}' (host key {}) to the list of known hosts.",
+                k.fingerprint
+            ),
+            Some(_) => {}
+            None => {
+                // A terminal gets told; a script keeps a quiet stderr (it has --require-host-key).
+                if std::io::stderr().is_terminal() {
+                    eprintln!(
+                        "Warning: {host} presented no host-key proof: its identity is not verified \
+                         (--require-host-key refuses such a host)"
+                    );
+                } else {
+                    tracing::debug!("{host} presented no host-key proof");
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Connect and authenticate a client for a resolved target.
 pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result<WshClient> {
     let config = ConnectConfig {
@@ -359,7 +491,13 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
 
     let mut errors = Vec::new();
     for (label, url) in attempts {
-        match WshClient::connect(&url, config.clone()).await {
+        match connect_checked(
+            &url,
+            &config,
+            config.known_host.as_deref().unwrap_or(&resolved.host),
+        )
+        .await
+        {
             Ok(client) => {
                 // `-L` / `-R`: the forwards live as long as this connection does.
                 crate::commands::forward::start_configured(&client).await?;

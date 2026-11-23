@@ -42,8 +42,10 @@ pub mod stream_frame;
 pub mod transport;
 pub mod virtual_session;
 
+pub use wsh_core::{channel_binding, host_key};
+
 // Re-export primary public types.
-pub use client::{ConnectConfig, GatewayHandle, RemoteSessionInfo, WshClient};
+pub use client::{ConnectConfig, FirstUse, GatewayHandle, RemoteSessionInfo, WshClient};
 pub use e2e::{E2eKeyExchange, ALGORITHM_HYBRID, ALGORITHM_X25519};
 pub use e2e_frame::RoleTag;
 pub use gateway::{GatewayListener, GatewayStream, PendingInbound};

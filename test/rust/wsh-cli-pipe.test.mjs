@@ -50,7 +50,7 @@ function makeHome() {
 
 function wsh(args, { home, timeoutMs = 20_000 } = {}) {
   return new Promise((resolve) => {
-    const proc = spawn(WSH_BIN, args, { env: cleanEnv(home), stdio: ['pipe', 'pipe', 'pipe'] });
+    const proc = spawn(WSH_BIN, ['--accept-new-host-key', ...args], { env: cleanEnv(home), stdio: ['pipe', 'pipe', 'pipe'] });
     const out = [];
     const err = [];
     proc.stdout.on('data', (d) => out.push(d));

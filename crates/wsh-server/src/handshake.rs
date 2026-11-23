@@ -38,6 +38,12 @@ pub struct HelloResult {
     pub nonce: Vec<u8>,
     /// Server fingerprints to advertise.
     pub fingerprints: Vec<String>,
+    /// Every channel binding the client's signature may legitimately carry on this connection
+    /// (wsh #119); includes the empty one unless the host requires a binding. A host with no
+    /// key offers nothing to bind, so this is just the empty binding.
+    pub acceptable_bindings: Vec<Vec<u8>>,
+    /// The host requires a bound login: an unbound signature is refused (with a reason that says so).
+    pub binding_required: bool,
 }
 
 /// Supported protocol versions (in priority order, newest first).
@@ -74,6 +80,7 @@ pub fn handle_hello(
     hello: &HelloPayload,
     server_fingerprints: &[String],
     enabled_features: Option<&[String]>,
+    identity: Option<&crate::host_key::HostIdentity>,
 ) -> WshResult<HelloResult> {
     // Validate protocol version with negotiation support
     let _negotiated = negotiate_version(&hello.version)?;
@@ -88,21 +95,44 @@ pub fn handle_hello(
     let mut rng = rand::thread_rng();
     rng.fill(&mut nonce[..]);
 
+    let mut features = enabled_features
+        .map(|f| f.to_vec())
+        .unwrap_or_else(|| vec!["mcp".to_string(), "file-transfer".to_string()]);
+    let mut host_fingerprint = None;
+    let mut acceptable_bindings = vec![Vec::new()];
+    let mut binding_required = false;
+    if let Some(id) = identity {
+        // A bare fingerprint for clients that know nothing of the proof (what the Node host
+        // sends too); the proof itself only when the client sent a nonce.
+        host_fingerprint = Some(id.fingerprint.clone());
+        if let Some(nonce) = wsh_core::host_key::find_client_nonce(&hello.features) {
+            features.extend(wsh_core::host_key::advert_features(
+                id.signing_key(),
+                &session_id,
+                &nonce,
+                &hello.username,
+            ));
+        }
+        // Channel binding (#119): the one kind this server can bind is its own host key.
+        if hello.auth_method != Some(AuthMethod::Password) {
+            features.extend(wsh_core::channel_binding::binding_features(
+                &["host"],
+                id.require_channel_binding,
+            ));
+            let held = [("host", vec![id.public_key().to_vec()])];
+            let required = id.require_channel_binding.then_some(&[][..]);
+            acceptable_bindings = wsh_core::channel_binding::acceptable_bindings(&held, required);
+            binding_required = id.require_channel_binding;
+        }
+    }
+
     let server_hello = Envelope {
         msg_type: MsgType::ServerHello,
         payload: Payload::ServerHello(ServerHelloPayload {
             session_id: session_id.clone(),
-            features: enabled_features
-                .map(|f| f.to_vec())
-                .unwrap_or_else(|| vec!["mcp".to_string(), "file-transfer".to_string()]),
+            features,
             fingerprints: server_fingerprints.to_vec(),
-            // wsh #59: this server does not yet mint/persist a host
-            // identity keypair -- that's a separate, security-sensitive
-            // feature. Left absent rather than falling back to
-            // `fingerprints.first()`, which is an authorized *client* key,
-            // not this server's own identity (see ServerHello.fingerprints'
-            // doc comment in spec/wsh-v1.yaml for the full accounting).
-            host_fingerprint: None,
+            host_fingerprint,
         }),
     };
 
@@ -120,6 +150,8 @@ pub fn handle_hello(
         session_id,
         nonce,
         fingerprints: server_fingerprints.to_vec(),
+        acceptable_bindings,
+        binding_required,
     })
 }
 
@@ -139,6 +171,8 @@ pub fn verify_auth(
     session_ttl: u64,
     allow_pubkey: bool,
     allow_password: bool,
+    acceptable_bindings: &[Vec<u8>],
+    binding_required: bool,
 ) -> WshResult<AuthResult> {
     match auth.method {
         AuthMethod::Pubkey => {
@@ -153,6 +187,8 @@ pub fn verify_auth(
                 authorized_keys,
                 server_secret,
                 session_ttl,
+                acceptable_bindings,
+                binding_required,
             )
         }
         AuthMethod::Password => {
@@ -179,13 +215,24 @@ fn length_prefixed(bytes: &[u8]) -> Vec<u8> {
 /// they can't collide when concatenated. `username` binds the transcript to
 /// a specific identity, so a signature produced for one username can't be
 /// replayed/relabeled as another.
+#[cfg(test)]
 fn build_transcript(username: &str, session_id: &str, nonce: &[u8]) -> Vec<u8> {
+    build_transcript_bound(username, session_id, nonce, &[])
+}
+
+fn build_transcript_bound(
+    username: &str,
+    session_id: &str,
+    nonce: &[u8],
+    channel_binding: &[u8],
+) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(PROTOCOL_VERSION.as_bytes());
     hasher.update(b"\0");
     hasher.update(length_prefixed(username.as_bytes()));
     hasher.update(length_prefixed(session_id.as_bytes()));
     hasher.update(nonce);
+    hasher.update(channel_binding);
     hasher.finalize().to_vec()
 }
 
@@ -198,6 +245,8 @@ fn verify_pubkey_auth(
     authorized_keys: &[AuthorizedKey],
     server_secret: &[u8],
     session_ttl: u64,
+    acceptable_bindings: &[Vec<u8>],
+    binding_required: bool,
 ) -> WshResult<AuthResult> {
     let public_key = auth
         .public_key
@@ -215,9 +264,9 @@ fn verify_pubkey_auth(
         return Err(WshError::AuthFailed("key not authorized".into()));
     }
 
-    // Verify the signature over the transcript.
-    // Transcript: SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce)
-    let transcript = build_transcript(username, session_id, nonce);
+    // Verify the signature over the transcript. Transcript:
+    // SHA-256("wsh-v1\0" || lp(username) || lp(session_id) || nonce || channel_binding)
+    // where the binding is any of `acceptable_bindings` (see `HelloResult`).
 
     // Import the public key and verify Ed25519 signature.
     let vk_bytes: [u8; 32] = public_key
@@ -230,9 +279,22 @@ fn verify_pubkey_auth(
         .map_err(|e| WshError::AuthFailed(format!("invalid signature: {e}")))?;
 
     use ed25519_dalek::Verifier;
-    verifying_key
-        .verify(&transcript, &sig)
-        .map_err(|_| WshError::AuthFailed("signature verification failed".into()))?;
+    let verifies = |binding: &[u8]| {
+        verifying_key
+            .verify(
+                &build_transcript_bound(username, session_id, nonce, binding),
+                &sig,
+            )
+            .is_ok()
+    };
+    if !acceptable_bindings.iter().any(|b| verifies(b)) {
+        if binding_required && verifies(&[]) {
+            return Err(WshError::AuthFailed(
+                "channel binding required: the signature is not bound to this connection".into(),
+            ));
+        }
+        return Err(WshError::AuthFailed("signature verification failed".into()));
+    }
 
     let fp = wsh_core::fingerprint(public_key);
     let token = wsh_core::create_token(server_secret, session_id, session_ttl);
@@ -317,4 +379,156 @@ fn generate_session_id() -> String {
     let mut rng = rand::thread_rng();
     let bytes: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
     hex::encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_key::HostIdentity;
+    use ed25519_dalek::{Signer, SigningKey};
+    use wsh_core::channel_binding;
+    use wsh_core::host_key;
+
+    fn hello(nonce: Option<&str>, method: AuthMethod) -> HelloPayload {
+        HelloPayload {
+            version: PROTOCOL_VERSION.to_string(),
+            username: "alice".into(),
+            features: nonce
+                .map(|n| vec![format!("{}{n}", host_key::HOST_KEY_NONCE_PREFIX)])
+                .unwrap_or_default(),
+            auth_method: Some(method),
+        }
+    }
+
+    fn server_hello(r: &HelloResult) -> ServerHelloPayload {
+        match &r.server_hello.payload {
+            Payload::ServerHello(sh) => sh.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn no_identity_means_no_host_key_features_and_the_empty_binding_only() {
+        let r = handle_hello(
+            &hello(Some(&host_key::new_nonce()), AuthMethod::Pubkey),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let sh = server_hello(&r);
+        assert_eq!(sh.host_fingerprint, None);
+        assert!(!sh
+            .features
+            .iter()
+            .any(|f| f.starts_with("host-key") || f.starts_with("channel-binding")));
+        assert_eq!(r.acceptable_bindings, vec![Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn an_identity_proves_the_key_over_the_clients_nonce() {
+        let id = HostIdentity::ephemeral(false);
+        let nonce = host_key::new_nonce();
+        let r = handle_hello(
+            &hello(Some(&nonce), AuthMethod::Pubkey),
+            &[],
+            None,
+            Some(&id),
+        )
+        .unwrap();
+        let sh = server_hello(&r);
+        assert_eq!(
+            sh.host_fingerprint.as_deref(),
+            Some(id.fingerprint.as_str())
+        );
+        let proven = host_key::verify_advert(
+            &sh.features,
+            sh.host_fingerprint.as_deref(),
+            &sh.session_id,
+            &nonce,
+            "alice",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(proven.fingerprint, id.fingerprint);
+        assert!(sh.features.contains(&"channel-binding:host".to_string()));
+        assert!(!sh
+            .features
+            .contains(&"channel-binding-required".to_string()));
+    }
+
+    #[test]
+    fn a_client_that_sent_no_nonce_gets_the_bare_fingerprint_and_no_proof() {
+        let id = HostIdentity::ephemeral(false);
+        let r = handle_hello(&hello(None, AuthMethod::Pubkey), &[], None, Some(&id)).unwrap();
+        let sh = server_hello(&r);
+        assert_eq!(
+            sh.host_fingerprint.as_deref(),
+            Some(id.fingerprint.as_str())
+        );
+        assert!(!sh
+            .features
+            .iter()
+            .any(|f| f.starts_with("host-key:") || f.starts_with("host-key-sig:")));
+    }
+
+    fn login(id: &HostIdentity, binding: Option<Vec<u8>>) -> WshResult<AuthResult> {
+        let r = handle_hello(&hello(None, AuthMethod::Pubkey), &[], None, Some(id)).unwrap();
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let sid = server_hello(&r).session_id;
+        let transcript =
+            build_transcript_bound("alice", &sid, &r.nonce, binding.as_deref().unwrap_or(&[]));
+        let auth = AuthPayload {
+            method: AuthMethod::Pubkey,
+            signature: Some(sk.sign(&transcript).to_bytes().to_vec()),
+            public_key: Some(pk.to_vec()),
+            password: None,
+        };
+        let key = AuthorizedKey {
+            key_type: "ssh-ed25519".into(),
+            key_data: String::new(),
+            raw: Vec::new(),
+            comment: String::new(),
+            fingerprint: wsh_core::fingerprint(&pk),
+            options: None,
+        };
+        verify_auth(
+            &auth,
+            &r.nonce,
+            &sid,
+            "alice",
+            &[key],
+            b"secret",
+            3600,
+            true,
+            false,
+            &r.acceptable_bindings,
+            r.binding_required,
+        )
+    }
+
+    #[test]
+    fn a_login_bound_to_the_host_key_verifies_and_so_does_an_unbound_one_unless_required() {
+        let id = HostIdentity::ephemeral(false);
+        let bound = channel_binding::compute(&[("host", &id.public_key())]);
+        assert!(login(&id, Some(bound.clone())).is_ok());
+        assert!(
+            login(&id, None).is_ok(),
+            "a released client that cannot bind still logs in"
+        );
+        let strict = HostIdentity::ephemeral(true);
+        let bound = channel_binding::compute(&[("host", &strict.public_key())]);
+        assert!(login(&strict, Some(bound)).is_ok());
+        let err = login(&strict, None).err().unwrap().to_string();
+        assert!(err.contains("channel binding required"), "{err}");
+    }
+
+    #[test]
+    fn a_login_bound_to_another_hosts_key_is_refused() {
+        let id = HostIdentity::ephemeral(false);
+        let other = HostIdentity::ephemeral(false);
+        let wrong = channel_binding::compute(&[("host", &other.public_key())]);
+        assert!(login(&id, Some(wrong)).is_err());
+    }
 }

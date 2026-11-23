@@ -264,7 +264,8 @@ pub async fn run_reverse(
     let public_bytes = wsh_client::auth::public_key_bytes(&verifying_key);
     let fingerprint = wsh_core::fingerprint(&public_bytes);
     let short_fp = &fingerprint[..fingerprint.len().min(12)];
-    let reverse_options = reverse_options(capabilities)?;
+    let mut reverse_options = reverse_options(capabilities)?;
+    crate::commands::common::apply_host_policy(&mut reverse_options, &signing_key)?;
 
     let resolved = resolve_target(relay_host, port, transport)?;
     debug!(url = %resolved.url, fallback_urls = ?resolved.fallback_urls, "relay URL");
@@ -480,16 +481,42 @@ pub async fn run_connect(
     };
     let target_fingerprint = &target_peer.fingerprint;
 
-    let connect_msg = Envelope {
-        msg_type: MsgType::ReverseConnect,
-        payload: Payload::ReverseConnect(ReverseConnectPayload {
-            target_fingerprint: target_fingerprint.to_string(),
-            username: username.clone(),
-            // Ignored by the server -- it overwrites this with the
-            // authenticated fingerprint of this connection before forwarding.
-            from_fingerprint: String::new(),
-            features: None,
-        }),
+    // Operator proof (#117): offered when the relay carries it and the peer can take it.
+    let mode = crate::commands::common::identity_policy().operator_proof;
+    let peer_can = target_peer
+        .capabilities
+        .iter()
+        .any(|c| c == wsh_core::operator_proof::OPERATOR_PROOF_FEATURE);
+    let offer_proof = client
+        .has_feature(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE)
+        .await
+        && match mode {
+            crate::commands::common::OperatorProofMode::Always => true,
+            crate::commands::common::OperatorProofMode::Auto => peer_can,
+            crate::commands::common::OperatorProofMode::Never => false,
+        };
+    let operator_key = if offer_proof {
+        let keystore = wsh_client::KeyStore::default_location()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("failed to initialize keystore")?;
+        Some(
+            keystore
+                .load(identity)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .with_context(|| format!("failed to load key '{identity}'"))?
+                .0,
+        )
+    } else {
+        None
+    };
+    let connect_request = ReverseConnectPayload {
+        target_fingerprint: target_fingerprint.to_string(),
+        username: username.clone(),
+        // Ignored by the server -- it overwrites this with the
+        // authenticated fingerprint of this connection before forwarding.
+        from_fingerprint: String::new(),
+        features: offer_proof
+            .then(|| vec![wsh_core::operator_proof::OPERATOR_PROOF_FEATURE.to_string()]),
     };
 
     println!(
@@ -498,7 +525,10 @@ pub async fn run_connect(
     );
 
     let response = client
-        .send_and_wait_public(connect_msg, MsgType::ReverseAccept)
+        .reverse_connect(
+            connect_request,
+            operator_key.as_ref().map(|k| (k, username.as_str())),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to reverse-connect to peer")?;
