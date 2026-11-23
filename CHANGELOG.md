@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Rust CLI: `wsh scp` speaks `FileChunk`, like every host (#140) (Rust CLI and `wsh-client`)
+
+Rust workspace and tests only (no `src/` change, no wire change); lands in the next `rust-v` release. Hosts are unchanged.
+
+- **Fix.** The Rust client's `file_transfer::download` sent a header and read a raw stream (an 8-byte size, then the data), and
+  `upload` wrote a header and the data as session bytes and waited for an acknowledgement that way. No host speaks that: the JS
+  hosts (Node, in-page) and `wsh-server` carry a file as `FileChunk` control messages (offset-addressed, the last `is_final`) and
+  end an upload with `Exit` and `Close`, as the JS client does. So `wsh scp` hung (JS hosts) or failed (`wsh-server`). The client
+  now speaks `FileChunk` both ways: `WshSession::write_file_chunk`, `read_file_chunk` and `wait_closed` are new, `FileChunk` is
+  routed to its session, and the download checks what the host sends (announced size, chunks in order, the last one reaches the
+  size; a refusal is an `Exit` with a non-zero code and no chunk; memory reserved up front is capped at 64 MiB whatever the host
+  claims). The raw-stream header builders are gone. An older `wsh` (`rust-v0.11.0` and before) still cannot `scp` from any host.
+- README: the capability matrix's upload/download row and the in-page host row say so.
+- Tests: `test/rust/wsh-cli-scp.test.mjs` (the real `wsh scp` up and down, 0 B / 17 B / 64 KiB / 300 KiB, a missing file, against a
+  Node host through a pipe relay and against `wsh-server`: all 18 hung or failed before). The JS client's own upload and
+  download against `wsh-server` was already in `test/rust/wsh-rust-server.test.mjs`.
+
 ## 0.40.0 / Rust `rust-v0.11.0`
 
 ### Operator-side shared folders: `wsh --share`, and `onShare` on the JS host (#159) (npm change)

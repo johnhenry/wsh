@@ -1,6 +1,8 @@
-//! File transfer for wsh: upload/download over a dedicated data stream
-//! (64KB `FileChunk` chunks with progress reporting), plus `list()` over
-//! the structured file channel (`FileOp`/`FileResult`, wsh #59).
+//! File transfer for wsh: upload/download over a file channel as `FileChunk`
+//! control messages (64KB chunks, offset-addressed, the last `is_final`; the
+//! host ends an upload with `Exit` and `Close` -- the framing the JS client,
+//! the Node and in-page hosts and `wsh-server` all speak, #140), plus `list()`
+//! over the structured file channel (`FileOp`/`FileResult`, wsh #59).
 
 use wsh_core::error::{WshError, WshResult};
 use wsh_core::messages::{ChannelKind, Envelope, FileEntry, FileOpPayload, MsgType, Payload};
@@ -10,11 +12,16 @@ use crate::session::SessionOpts;
 
 /// Default chunk size for file transfers: 64 KB.
 const CHUNK_SIZE: usize = 64 * 1024;
+/// How long a host has to confirm an upload (`Exit`, then `Close`) after the last chunk.
+const UPLOAD_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// A download reserves at most this much memory up front, whatever size the host announces.
+const MAX_PREALLOCATE: u64 = 64 * 1024 * 1024;
 
-/// Upload file data to a remote path via a dedicated file stream.
+/// Upload file data to a remote path over a file channel.
 ///
-/// Opens a file channel, sends a header with the remote path, then streams
-/// the data in 64KB chunks. Calls `on_progress` with bytes sent so far.
+/// Opens a file channel (`upload:<path>`), sends the data as `FileChunk`
+/// messages in 64KB chunks, and waits for the host's confirmation. Calls
+/// `on_progress` with bytes sent so far.
 ///
 /// Returns the total number of bytes uploaded.
 pub async fn upload<F>(
@@ -40,23 +47,41 @@ where
         })
         .await?;
 
-    // Send the file header: [4-byte path_len][path][8-byte total_size]
-    let header = build_upload_header(remote_path, total);
-    session.write(&header).await?;
-
-    // Stream the data in chunks
+    // The data as `FileChunk` control messages (offset-addressed, the last one `is_final`): the one
+    // framing every host and client speaks (#140). An empty file is one empty final chunk.
     let mut sent: u64 = 0;
-    for chunk in data.chunks(CHUNK_SIZE) {
-        session.write(chunk).await?;
+    let mut chunks = data.chunks(CHUNK_SIZE).peekable();
+    if chunks.peek().is_none() {
+        session.write_file_chunk(0, &[], true, 0).await?;
+    }
+    while let Some(chunk) = chunks.next() {
+        let is_final = chunks.peek().is_none();
+        session
+            .write_file_chunk(sent, chunk, is_final, total)
+            .await?;
         sent += chunk.len() as u64;
         on_progress(sent, total);
     }
 
-    // Wait for server acknowledgment (reads a small response)
-    let mut ack_buf = [0u8; 64];
-    let n = session.read(&mut ack_buf).await?;
-    if n == 0 {
-        tracing::warn!("no ack received from server after upload");
+    // The host confirms with Exit (its code) and then Close.
+    if !session.wait_closed(UPLOAD_CONFIRM_TIMEOUT).await {
+        let _ = session.close().await;
+        return Err(WshError::Channel(
+            "upload: the host did not confirm the transfer".into(),
+        ));
+    }
+    match session.exit_code().await {
+        Some(0) => {}
+        Some(code) => {
+            return Err(WshError::Channel(format!(
+                "upload failed with exit code {code}"
+            )));
+        }
+        None => {
+            return Err(WshError::Channel(
+                "upload failed: the channel closed without a result".into(),
+            ));
+        }
     }
 
     // Close the file channel
@@ -86,38 +111,46 @@ pub async fn download(client: &WshClient, remote_path: &str) -> WshResult<Vec<u8
         })
         .await?;
 
-    // Send the download request header: [4-byte path_len][path]
-    let header = build_download_header(remote_path);
-    session.write(&header).await?;
-
-    // Read the response: first 8 bytes are the total file size
-    let mut size_buf = [0u8; 8];
-    let mut size_read = 0;
-    while size_read < 8 {
-        let n = session.read(&mut size_buf[size_read..]).await?;
-        if n == 0 {
-            return Err(WshError::Transport(
-                "unexpected EOF reading file size".into(),
+    // The host answers with `FileChunk` control messages until one is `is_final` (the one framing
+    // every host and client speaks, #140). A refusal (no such file) is an `Exit` with a non-zero
+    // code and a `Close`, with no chunk. Everything from the host is untrusted: chunks must be
+    // in order, stay inside the size the first one announced, and the last must reach it.
+    let mut data: Vec<u8> = Vec::new();
+    let mut total_size: Option<u64> = None;
+    loop {
+        let Some(chunk) = session.read_file_chunk().await else {
+            let _ = session.close().await;
+            return Err(WshError::Channel(match session.exit_code().await {
+                Some(code) if code != 0 => {
+                    format!("download failed: the host refused or could not read {remote_path:?} (exit code {code})")
+                }
+                _ => "download failed: connection closed before the transfer completed (truncated)"
+                    .into(),
+            }));
+        };
+        let total = *total_size.get_or_insert(chunk.total_size);
+        if chunk.total_size != total
+            || chunk.offset != data.len() as u64
+            || chunk.offset + chunk.data.len() as u64 > total
+        {
+            let _ = session.close().await;
+            return Err(WshError::Channel(
+                "download failed: the host sent chunks out of order or past the announced size"
+                    .into(),
             ));
         }
-        size_read += n;
-    }
-    let total_size = u64::from_be_bytes(size_buf) as usize;
-
-    // Read the file data
-    let mut data = Vec::with_capacity(total_size);
-    let mut buf = vec![0u8; CHUNK_SIZE];
-
-    loop {
-        let n = session.read(&mut buf).await?;
-        if n == 0 {
-            break;
+        if data.is_empty() {
+            data.reserve(total.min(MAX_PREALLOCATE) as usize);
         }
-        data.extend_from_slice(&buf[..n]);
-
-        // Safety check: don't read more than expected
-        if data.len() >= total_size {
-            data.truncate(total_size);
+        data.extend_from_slice(&chunk.data);
+        if chunk.is_final {
+            if data.len() as u64 != total {
+                let _ = session.close().await;
+                return Err(WshError::Channel(format!(
+                    "download failed: truncated transfer (received {} of {total} bytes)",
+                    data.len()
+                )));
+            }
             break;
         }
     }
@@ -217,53 +250,9 @@ fn next_file_op_channel_id() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-// ── Header builders ──────────────────────────────────────────────────
-
-/// Build the upload header: `[4-byte path_len][path_bytes][8-byte total_size]`
-fn build_upload_header(path: &str, total_size: u64) -> Vec<u8> {
-    let path_bytes = path.as_bytes();
-    let mut header = Vec::with_capacity(4 + path_bytes.len() + 8);
-    header.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
-    header.extend_from_slice(path_bytes);
-    header.extend_from_slice(&total_size.to_be_bytes());
-    header
-}
-
-/// Build the download header: `[4-byte path_len][path_bytes]`
-fn build_download_header(path: &str) -> Vec<u8> {
-    let path_bytes = path.as_bytes();
-    let mut header = Vec::with_capacity(4 + path_bytes.len());
-    header.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
-    header.extend_from_slice(path_bytes);
-    header
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn upload_header_format() {
-        let header = build_upload_header("/tmp/test.txt", 1024);
-        let path_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        assert_eq!(path_len, 13); // "/tmp/test.txt".len()
-        let path = std::str::from_utf8(&header[4..4 + path_len]).unwrap();
-        assert_eq!(path, "/tmp/test.txt");
-        let size = u64::from_be_bytes([
-            header[17], header[18], header[19], header[20], header[21], header[22], header[23],
-            header[24],
-        ]);
-        assert_eq!(size, 1024);
-    }
-
-    #[test]
-    fn download_header_format() {
-        let header = build_download_header("/tmp/data.bin");
-        let path_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        assert_eq!(path_len, 13);
-        let path = std::str::from_utf8(&header[4..4 + path_len]).unwrap();
-        assert_eq!(path, "/tmp/data.bin");
-    }
 
     #[test]
     fn chunk_size_is_64kb() {
