@@ -1,5 +1,92 @@
 # Changelog
 
+## Unreleased
+
+Rust workspace only (`wsh`, `wsh-server`, `wsh-client`); the npm package and the wire protocol are unchanged, and no
+message or field was added. **The Rust `wsh-server` changes three defaults. Read "Breaking" before upgrading it.**
+
+### Breaking: Rust `wsh-server` defaults (private advisories GHSA-89hv-m54m-49wj, GHSA-hx95-3p5g-2vwg)
+
+- **The gateway is off, and allows no destination when on.** Before: `[gateway] enabled = true`,
+  `allowed_destinations = ["*"]`, so any authorized key could open TCP/UDP connections and DNS lookups from the host,
+  including to loopback, private and link-local addresses. Now: `enabled = false` (and `gateway` is not advertised),
+  `allowed_destinations = []`, and even with `"*"` an address that is loopback, link-local, private, unique-local,
+  carrier-grade NAT, unspecified or multicast is refused after resolution unless a rule names that host, address or
+  range (`"db.internal:5432"`, `"10.1.0.0/16:5432"`, `"127.0.0.1:8080"`). The server connects to the address it checked
+  instead of resolving the name again, and `ResolveDns` no longer returns internal answers. Rules are now also parsed
+  for address ranges (`10.0.0.0/8`, `10.0.0.0/8:443`, `fd00::/8`), which the old doc example showed but the code never
+  matched.
+- **Reverse listeners are off and bind to loopback.** Before: `enable_reverse_tunnels = true`, and a listener bound the
+  `bind_addr` the client sent (whose wire default is `0.0.0.0`). Now: `enable_reverse_tunnels = false`, and a listener
+  binds `[gateway] reverse_bind_addr` (default `127.0.0.1`); the client's `bind_addr` is ignored.
+- **Password login is off, and hashes are Argon2id.** Before: `allow_password = true`; hashes were `sha256:<hex>` of the
+  bare password, compared with `==`. Now: `allow_password = false`; `password_hashes` values are Argon2id PHC strings
+  with a per-user salt (`printf '%s' "$PASSWORD" | wsh-server --hash-password`), compared in constant time. An unknown
+  user and a wrong password now answer identically (`invalid password`) after the same work; `unknown user` is gone.
+  **Existing `sha256:` entries are refused**, not accepted with a warning: the server logs, at start-up and by user name,
+  that the entry is ignored and how to replace it. (A warning that nobody reads would leave the weak hash live; and
+  anyone relying on password login must already edit the config to set `allow_password = true`, which is the moment to
+  rehash.)
+
+To get the old behaviour back (not recommended; each line says what it re-opens), put this in `config.toml`:
+
+```toml
+[gateway]
+enabled = true
+allowed_destinations = ["*", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "::1", "fc00::/7", "fe80::/10"]
+enable_reverse_tunnels = true
+reverse_bind_addr = "0.0.0.0"
+
+[auth]
+allow_password = true
+allow_legacy_sha256 = true   # keeps `sha256:<hex>` entries working; logs a DEPRECATED warning at every start-up
+```
+
+Most deployments want less than that: `enabled = true` plus `allowed_destinations = ["*"]` is the public internet only;
+add `"host:port"` or a range for each internal service a client really needs. A downstream that downloads the release
+binaries and relied on the default gateway for egress (the netway `GatewayBackend` pairing) needs at least the first two
+lines of the `[gateway]` block above.
+
+### Rust `wsh` CLI (#134, #135, #136)
+
+- **Fix: `wss://` no longer panics (#134).** rustls needs a process-wide crypto provider and the build enables two;
+  the first TLS handshake panicked unless `WSH_INSECURE_LOOPBACK_TLS=1` happened to take another path (`-t wt`
+  masked it, because that transport installed one). `wsh` installs `ring` at start-up and the client library does
+  before every connection (a provider the embedding program installed first is left alone).
+- **Fix: output sent in the same burst as `OpenOk` was lost (#135).** The dispatch loop handed `OpenOk` to the opener
+  and went on to the next frame; a host that answers at once had already sent the first `SessionData` (even the `Exit`),
+  which arrived before the session was registered and was dropped. The loop now notes the channel when it hands over
+  `OpenOk`, keeps what follows for it (bounded: 16 channels, 1024 frames and 4 MiB each), and `open_session` replays it in
+  order as it registers the session. `echo hi` lost its output in 11 of 40 runs against such a host; it is 0 of 160 now.
+  The same path carries a `stdio: "pipes"` stderr channel.
+- **Fix: `wsh connect` exits when the session ends (#136).** The terminal input thread blocked in a read nothing could
+  cancel, so the runtime waited for a key press. It polls now and stops with the session. A dropped connection also
+  ends a session blocked in `read()` instead of leaving it waiting forever.
+- **Fix: the per-frame `DEBUGTRACE` lines are gone, and bulk output is fast (#136).** The release build wrote one line to
+  stderr per frame, including the whole `SessionData` payload formatted as a list of numbers. 64 MiB through `wsh` took
+  about 91 s before (0.7 MiB/s); it takes about 0.1 s now (600+ MiB/s) on the same host and machine; the session read
+  path also copies slices instead of popping one byte at a time. Diagnostics go to stderr now (they went to stdout, into
+  the command's output), and `channel N exited` is a debug event, not a line on every run. (That `eprintln!` stood in for a
+  `tracing` call that hung: the old exec held `stdout().lock()` across its read loop, and `tracing` wrote to stdout.)
+- **`wsh host command` forwards stdin, signals and resize (#136).** Stdin that is a pipe or file is sent to the command and
+  its end is EOF where the host offers `exec-pipes` (which also keeps stderr apart, on `stderr` instead of in the
+  output); elsewhere the bytes are sent but the end cannot be signalled. SIGINT, SIGTERM and SIGHUP are forwarded; the
+  same signal twice disconnects (`128 + n`). `--tty` gives the command a terminal and forwards resizes. A command whose
+  exit status never arrived (dropped connection) now exits 255 instead of 0. `wsh-client` gains
+  `SessionOpts.stdio`, `WshSession::{read_stderr, close_stdin, supports_stdin_eof, has_stderr}`.
+  The Rust `wsh-server` only logs `Signal`, so forwarding a signal to it does not stop the command yet.
+- **A full URL is a target (#136).** `wsh wss://host:8443/rendezvous/ab12 command` (also `https://`, `wt://`, `ws://`,
+  with `user@` in front or in the URL) dials exactly that, path and query included; `--port` and `--transport` do not
+  apply and there is no transport fallback. `ws://` is accepted only for a loopback host. `sessions`, `attach` and
+  `detach` reach the same URL again (`last_session.json` gains an optional `url`).
+- **Tests:** `test/rust/wsh-cli.test.mjs` runs the built `wsh` against a Node host (`test/rust/fixtures/cli-host.mjs`,
+  which answers in the same burst as `OpenOk`) and the real `wsh-server`: TLS without a panic, 160 instant-answer runs
+  eight at a time, URL targets, stdin, SIGINT, exit status, bulk output, `connect` under a pty, EOF and stderr against
+  `wsh-server`. `test/rust/wsh-rust-server-defaults.test.mjs` runs `wsh-server` with no configuration: gateway and
+  reverse listeners refused, the wildcard not reaching loopback, a named rule reaching exactly its address, Argon2id
+  login, the `sha256:` refusal. Unit tests cover the OpenOk race, the policy (every restricted range, IPv4-mapped and
+  NAT64 spellings, rebinding shape), listener bind, password hashing and the config defaults.
+
 ## 0.35.0
 
 - **`createMemoryHost({ rpc, sessions })`: typed RPC channels and detach/resume without Node (viaframe#592).** Both used
