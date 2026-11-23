@@ -3397,7 +3397,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wsh-cli"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "wsh-client"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "dirs",
  "ed25519-dalek",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "wsh-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
@@ -3466,7 +3466,7 @@ dependencies = [
 
 [[package]]
 name = "wsh-server"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "argon2",
  "ciborium",

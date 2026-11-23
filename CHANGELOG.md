@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.42.0 / Rust `rust-v0.13.0`
 
 ### Rust `wsh-server`: seal a whole session end to end, `[server] seal_session` (#155 stage c, part 2; Rust change)
 
