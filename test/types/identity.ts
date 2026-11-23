@@ -31,3 +31,18 @@ const relay = createPipeRelay({ maxWaiting: 8, authorize: ({ role }) => role ===
 const id: string = newRendezvousId();
 const url: string = pipeUrl('wss://relay.example', id, 'host');
 void relay.listen({ port: 0 }); void url; void operator; void SealedBridge; void computeChannelBinding; void OPERATOR_PROOF_FEATURE;
+
+// The browser-safe hosts: the same identity options, with `clientEnv` typed as the list / predicate it is.
+import { createMemoryHost } from '@johnhenry/wsh/memory';
+import { createReverseHost as createBrowserReverseHost } from '@johnhenry/wsh/reverse';
+
+createMemoryHost({
+  hostKey: true, connectionTtlMs: 60_000, requireChannelBinding: ['host'],
+  exec: { run: async () => 0, clientEnv: ['TERM', 'LC_*'] },
+});
+createMemoryHost({ exec: { run: async () => 0, clientEnv: (name: string, value: string) => name === 'TERM' && value.length < 32 } });
+createBrowserReverseHost({
+  url: 'wss://relay', username: 'host', keyPair: {} as CryptoKeyPair, requireOperatorProof: true,
+  exec: { run: async () => 0, clientEnv: true },
+  accept: ({ proven, publicKey }) => proven === true && publicKey instanceof Uint8Array,
+});

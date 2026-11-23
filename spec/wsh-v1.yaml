@@ -1,6 +1,6 @@
 # wsh Protocol Specification — v1
 # This file is the single source of truth for all message types.
-# Run: node web/packages/wsh/spec/codegen.mjs
+# Run: npm run codegen   (node spec/codegen.mjs, from the repository root)
 
 protocol:
   name: wsh

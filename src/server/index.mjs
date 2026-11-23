@@ -15,7 +15,7 @@ import { SessionRegistry } from './sessions.mjs';
 import { RelayHub } from './relay.mjs';
 import { startWebTransport } from './webtransport.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
-import { normalizeGateway } from './gateway.mjs';
+import { normalizeGateway, createGatewaySession } from './gateway.mjs';
 import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
 import { bindSocket } from './socket.mjs';
 import { TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH, CHANNEL_BINDING_KINDS } from '../channel-binding.mjs';
@@ -146,7 +146,7 @@ export function createWshServer({
       if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createWshServer: extensions must be an object of handlers');
       return createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, log: onLog,
-        methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, sessions: registry, relay: hub,
+        methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, createGatewaySession, sessions: registry, relay: hub,
       });
     })();
     ready.catch(() => { ready = null; });

@@ -8,3 +8,6 @@ export const FILE_CHUNK_BYTES = 64 * 1024;
 
 /** Most clients attached to one detached-session at once. */
 export const MAX_ATTACHMENTS = 16;
+
+/** Default cap on one file read or written through a file backend. */
+export const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;

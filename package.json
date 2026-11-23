@@ -1,6 +1,6 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.35.0",
+  "version": "0.36.0",
   "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
@@ -20,8 +20,17 @@
     "./memory": {
       "types": "./src/memory-host.d.ts",
       "import": "./src/memory-host.mjs"
+    },
+    "./host": {
+      "types": "./src/host.d.ts",
+      "import": "./src/host.mjs"
+    },
+    "./reverse": {
+      "types": "./src/reverse-host.d.ts",
+      "import": "./src/reverse-host.mjs"
     }
   },
+  "sideEffects": false,
   "types": "./src/index.d.ts",
   "files": [
     "src",
@@ -55,6 +64,8 @@
     "@fails-components/webtransport": "^1.6.4",
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
     "@johnhenry/browsermesh-primitives": "^0.2.0",
+    "@playwright/test": "^1.65.1",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.0",
     "ws": "^8.21.0",
     "@modelcontextprotocol/sdk": "^1.17.0"
@@ -62,6 +73,8 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "test:rust": "node --test test/rust/*.test.mjs",
+    "test:browser": "playwright test --config test/browser/playwright.config.mjs",
+    "size": "node scripts/bundle-size.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "codegen": "node spec/codegen.mjs",
     "codegen:check": "node scripts/codegen-check.mjs",

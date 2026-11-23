@@ -8,6 +8,7 @@
  * reverse mode (client registers as a peer for incoming connections).
  */
 
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE } from './features.mjs';
 import { WebTransportTransport, normalizeWebTransportOptions } from './transport.mjs';
 import { clientChannelBinding, offeredKinds, TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH } from './channel-binding.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
@@ -69,21 +70,8 @@ const DEFAULT_AUTH_TIMEOUT   = 10_000;  // ms
 const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
 const FS_RPC_OPS = new Set(['stat', 'list', 'read', 'write', 'mkdir', 'remove', 'rename']);
 
-/**
- * ServerHello feature advertising that McpResult echoes McpCall's call_id.
- *
- * Negotiated rather than assumed: McpCallPayload is `deny_unknown_fields` on
- * the Rust side, so sending call_id to a server predating it does not
- * degrade -- it makes the server reject the call.
- */
-export const MCP_CALL_ID_FEATURE = 'mcp-call-id';
-
-/**
- * ServerHello feature advertising that the host understands `McpCancel` (stop an in-flight `McpCall`).
- * Negotiated rather than assumed: McpCancelPayload is `deny_unknown_fields` on the Rust side, so an older
- * server would reject it. Implies `mcp-call-id` (the cancel names a call by its id).
- */
-export const MCP_CANCEL_FEATURE = 'mcp-cancel';
+// The feature strings live in features.mjs (a host names them without importing this file); re-exported here.
+export { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE };
 
 /** An `AbortError` for `signal`, with the signal's reason as `cause`. */
 function abortError(signal) {
@@ -92,13 +80,6 @@ function abortError(signal) {
   return e;
 }
 
-/**
- * ServerHello feature: the host discovers a client-opened exec data stream
- * on its own (the transport announces it), so the client must NOT write the
- * one-byte "primer" -- against such a host it would reach the process's stdin.
- */
-export const STREAM_ANNOUNCE_FEATURE = 'stream-announce';
-export const EXEC_PIPES_FEATURE = 'exec-pipes';
 
 /**
  * Reject a missing argument that maps to a `required: true` wire field.
@@ -2164,26 +2145,12 @@ export class WshClient {
 
     const peerMsg = await peerMsgPromise;
 
-    let peerAuthenticated = false;
-    if (verifyPeer !== undefined) {
-      const ok = await verifyKeyExchangeSignature(verifyPeer, peerMsg.signature, {
-        sessionId, algorithm, initiatorKey: localPub, responderKey: new Uint8Array(peerMsg.public_key ?? []),
-      });
-      if (!ok) {
-        throw Object.assign(
-          new Error(peerMsg.signature === undefined
-            ? 'initiateE2E: the peer did not sign its key exchange (verifyPeer was given)'
-            : 'initiateE2E: the peer\'s key exchange signature does not verify against verifyPeer'),
-          { code: 'E2E_PEER_UNAUTHENTICATED' },
-        );
-      }
-      peerAuthenticated = true;
-    }
-
     // Round 2 has the same shape as round 1, so it needs the same treatment.
     // Whether we encapsulate or decapsulate is decided entirely by data
     // already in hand, so decide it now and register the ciphertext waiter
-    // BEFORE the derive below. Registering it inside the `else` branch, after
+    // BEFORE the signature check and the derive below (the check is async too: the ciphertext of a responder that
+    // signs follows its reply at once, and was dropped while this side was still verifying -- a ~50% stall of a sealed
+    // reverse bridge with a host in Chromium). Registering it inside the `else` branch, after
     // importKey and deriveBits, let the peer's ciphertext arrive while this
     // side was still deriving -- dropped, then a full-timeout wait for a
     // message already sent. That surfaced as "Timed out waiting for peer
@@ -2201,6 +2168,22 @@ export class WshClient {
         'Timed out waiting for peer ML-KEM-768 ciphertext'
       );
       ctMsgPromise.catch(() => {});
+    }
+
+    let peerAuthenticated = false;
+    if (verifyPeer !== undefined) {
+      const ok = await verifyKeyExchangeSignature(verifyPeer, peerMsg.signature, {
+        sessionId, algorithm, initiatorKey: localPub, responderKey: new Uint8Array(peerMsg.public_key ?? []),
+      });
+      if (!ok) {
+        throw Object.assign(
+          new Error(peerMsg.signature === undefined
+            ? 'initiateE2E: the peer did not sign its key exchange (verifyPeer was given)'
+            : 'initiateE2E: the peer\'s key exchange signature does not verify against verifyPeer'),
+          { code: 'E2E_PEER_UNAUTHENTICATED' },
+        );
+      }
+      peerAuthenticated = true;
     }
 
     // Import peer's public key and derive the classical shared secret.

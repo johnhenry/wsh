@@ -8,8 +8,14 @@
  * sockets -- so what a client does here is what it does against a server. It serves what a browser can: `exec` as a
  * function you provide (there is no shell), `mcp` tools, `extensions`, typed `rpc` channels (handler functions you
  * provide) and `sessions` (detach / attach / resume of exec sessions, output replayed from an in-memory ring buffer).
- * Not available: `pty`, `fs`, `gateway`, `relay`, `hostKey`, WebTransport, the `wsh-host` / `wsh-fs` rpc built-ins
- * (they need Node; use `@johnhenry/wsh/server`).
+ * Backends are injected, shaped like the Node host's: `pty` (`{ spawn }`, node-pty shaped), `fs` (an object of file
+ * operations, not a root path), `hostKey` (a `CryptoKeyPair`, which may be non-extractable, or a signer
+ * `{ publicKey, sign }`).
+ * Not available: `gateway`, `relay`, WebTransport, `exec: true` and `fs: { root }` (they need Node), the `wsh-host` /
+ * `wsh-fs` rpc built-ins (use `@johnhenry/wsh/server`).
+ *
+ * To serve a socket someone else upgraded (a WebSocket the page opened to a relay, a byte pipe) use `host.accept(socket)`;
+ * a peer that cannot open QMux data streams (the released Rust client over WebSocket) needs `dataStreams: false`.
  *
  * ```js
  * import { createMemoryHost } from '@johnhenry/wsh/memory';
@@ -25,8 +31,9 @@ import { WshClient } from './client.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
 import { createConnectionFactory } from './server/connection.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
-import { createMcpHost } from './server/mcp.mjs';
+import { resolveBackends, resolveHostKey } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
+import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
 import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
 
@@ -122,8 +129,22 @@ function createRegistry(sessions, log) {
 /**
  * @param {object} [options]
  * @param {object | Function} [options.auth] - As for `createWshServer`. Omitted = refuse everyone.
- * @param {Function | { run: Function, timeoutMs?: number, clientEnv?: boolean }} [options.exec]
+ * @param {Function | { run: Function, timeoutMs?: number, clientEnv?: boolean | string[] | Function }} [options.exec]
  *   `run(command, io) => Promise<exitCode>` (see `ExecIo` in `server/exec.mjs`): the host has no shell, so there is no `true`.
+ * @param {{ spawn: Function, shell?: string, cwd?: string, env?: object, term?: string }} [options.pty]
+ *   `pty.spawn(file, args, { name, cols, rows, cwd, env })` as `node-pty`'s `spawn` (or anything shaped like it) returns
+ *   `{ onData(cb), onExit(cb), write(data), resize(cols, rows), kill(signal?) }`. Input arrives at `write` as a `Uint8Array`.
+ *   `shell` is the `file` it is called with (default `/bin/sh`: name the program your `spawn` understands).
+ * @param {{ operate: Function, readWhole: Function, writeWhole: Function, writeAt: Function, openRange?: Function, maxFileBytes?: number }} [options.fs]
+ *   File operations, as `createFileAccess` in `@johnhenry/wsh/server` returns them (see `normalizeFileBackend` in
+ *   `host-backends.mjs`). Not a root path: confining paths is the backend's job.
+ * @param {true | CryptoKeyPair | { publicKey: Uint8Array | CryptoKey, sign: Function }} [options.hostKey]
+ *   This host's own identity, so clients can pin it (TOFU): a `CryptoKeyPair` (non-extractable is fine), a signer
+ *   `{ publicKey, sign(data) }`, or `true` for a fresh non-extractable key.
+ * @param {boolean} [options.dataStreams=true] - Offer client-opened QMux data streams for exec output (`stream-announce`,
+ *   rpc). Set `false` for a peer that cannot open them -- the released Rust client over WebSocket -- so exec output rides
+ *   `SessionData` instead (and `rpc` is not offered). The released clients state nothing in their `Hello` that a host could
+ *   key an automatic choice on, so this is an option; `accept(socket, { dataStreams })` overrides it per connection.
  * @param {{ tools?: object[] | object, client?: object, authorize?: Function, maxConcurrent?: number, timeoutMs?: number }} [options.mcp]
  * @param {Record<string, Function>} [options.extensions] - Handlers for application-defined messages, as for `createWshServer`.
  * @param {Record<string, Function>} [options.rpc] - Typed RPC channels: `{ [protocol]: (channel, ctx) => void | Promise<void> }`,
@@ -136,18 +157,30 @@ function createRegistry(sessions, log) {
  *   per session). Off unless given: sessions then die with their connection. There is no `sessionSecret`: session
  *   tokens are random per session.
  * @param {number} [options.bindTimeoutMs=3000]
+ * @param {number} [options.connectionTtlMs=0] - End each authenticated connection this long after login; advertised as
+ *   `AuthOk.ttl` in whole seconds (#125). 0 = never.
+ * @param {boolean | string[]} [options.requireChannelBinding=false] - Accept a key login only when its signature is bound
+ *   to this host's key (#119). A memory host can bind only `host` (it has no TLS of its own), so this needs `hostKey`;
+ *   `true` or `['host']`.
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, onLog = () => {} } = {}) {
+  if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
+  if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
+    throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
+  }
+  if (Array.isArray(requireChannelBinding) && requireChannelBinding.some((k) => k !== 'host')) throw new TypeError('createMemoryHost: requireChannelBinding can name only "host" (a memory host has no TLS connection or certificate to bind)');
+  if (requireChannelBinding && !hostKey) throw new TypeError('createMemoryHost: requireChannelBinding needs a hostKey (the only thing a memory host can bind a login to)');
   if (exec === true) throw new TypeError('createMemoryHost: exec must be a function (run(command, io)); there is no shell to run `true` with');
   if (exec !== undefined && typeof exec !== 'function' && typeof exec?.run !== 'function') {
     throw new TypeError('createMemoryHost: exec must be a function or { run }');
   }
   if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createMemoryHost: extensions must be an object of handlers');
+  if (typeof dataStreams !== 'boolean') throw new TypeError('createMemoryHost: dataStreams must be true or false');
   const rpcHost = rpc === undefined || rpc === null ? null : createRpcTable(rpc, rpcMaxMessageBytes, rpcMaxInflight);
   const registry = sessions === undefined || sessions === null || sessions === false ? null : createRegistry(sessions, onLog);
-  const execOptions = typeof exec === 'function' || !exec ? {} : exec;
-  const execRunner = typeof exec === 'function' ? exec : exec?.run ?? null;
+  const { execRunner, execOptions, pty: ptyBackend, files, mcp: mcpHost } = resolveBackends({ exec, pty, fs, mcp });
+  const hostKeyReady = hostKey === undefined || hostKey === null || hostKey === false ? Promise.resolve(null) : resolveHostKey(hostKey, 'createMemoryHost: hostKey');
   const rl = auth?.rateLimit ?? {};
   const rateLimit = {
     limiter: new FailureLimiter(rl),
@@ -155,11 +188,10 @@ export function createMemoryHost({ auth, exec, mcp, extensions, rpc, rpcMaxMessa
     failureDelayMs: rl.failureDelayMs ?? 250,
   };
   const methods = authMethods(auth);
-  const mcpHost = mcp ? createMcpHost(mcp) : null;
 
-  const ready = buildAuthorizer(auth).then((authorize) => createConnectionFactory({
-    authorize, execRunner, execOptions, pty: null, files: null, bindTimeoutMs, log: onLog,
-    methods, hostKey: null, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: null, sessions: registry, relay: null,
+  const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
+    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, log: onLog,
+    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: null, sessions: registry, relay: null,
   }));
   ready.catch(() => {});
 
@@ -168,7 +200,7 @@ export function createMemoryHost({ auth, exec, mcp, extensions, rpc, rpcMaxMessa
 
   async function accept(socket, options) {
     if (closed) throw new Error('createMemoryHost: host is closed');
-    const handle = await bindSocket(socket, ready, options);
+    const handle = await bindSocket(socket, ready, { dataStreams, ...options });
     accepted.add(handle);
     return handle;
   }

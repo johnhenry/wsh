@@ -434,6 +434,12 @@ export interface WshAcceptableSocket {
 export interface WshAcceptOptions {
   /** What the embedder knows of the peer; `address` keys the password-failure throttle. */
   remote?: { address?: string; headers?: Record<string, unknown> };
+  /**
+   * Serve this connection without client-opened QMux data streams: exec output rides `SessionData`
+   * (`data_mode: 'virtual'`) and `stream-announce` / `rpc` are not offered. For a peer that cannot open streams
+   * (the released Rust client over WebSocket). Default `true`.
+   */
+  dataStreams?: boolean;
 }
 
 export interface WshServer {
