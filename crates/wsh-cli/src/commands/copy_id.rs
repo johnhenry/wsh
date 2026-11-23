@@ -58,7 +58,7 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
     let public_key_raw = verifying_key.to_bytes();
 
     let password = load_password(&resolved.user, &resolved.host)?;
-    debug!(url = %resolved.url, "transport URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), "transport URL");
 
     let client = crate::commands::common::connect_checked(
         &resolved.url,

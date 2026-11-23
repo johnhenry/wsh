@@ -64,7 +64,7 @@ async fn upload(
     let target = format!("{user}@{host}");
     let resolved = resolve_target(&target, port, transport)?;
     let client = connect_client(&resolved, identity).await?;
-    debug!(url = %resolved.url, file_size, "upload transport URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), file_size, "upload transport URL");
     save_last_session(&resolved, port, identity)?;
 
     file_transfer::upload(&client, &data, remote_path, |sent, total| {
@@ -96,7 +96,7 @@ async fn download(
     let target = format!("{user}@{host}");
     let resolved = resolve_target(&target, port, transport)?;
     let client = connect_client(&resolved, identity).await?;
-    debug!(url = %resolved.url, "download transport URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), "download transport URL");
     save_last_session(&resolved, port, identity)?;
 
     let data = file_transfer::download(&client, remote_path)

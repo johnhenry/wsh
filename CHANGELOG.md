@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.40.0 / Rust `rust-v0.11.0`
 
 ### Operator-side shared folders: `wsh --share`, and `onShare` on the JS host (#159) (npm change)
 
@@ -24,6 +24,19 @@ are unaffected either way.
 - Tests: `test/shares.test.mjs`; `crates/wsh-cli/src/sharefs/tests.rs` (a hostile-path table; each rule broken once and seen to fail),
   `crates/wsh-client/src/share.rs`; `test/rust/wsh-cli-share.test.mjs` (the real `wsh` against a Node host and a page host through a
   pipe relay); `test/browser/rust-cli-share.spec.mjs` (an in-page host reads a file the built CLI shares).
+
+### Rust CLI: the rendezvous id is not printed anywhere; tests for `-N -L` exiting (#156)
+
+Rust workspace, tests and README only (no `src/` change, no wire change). The `-N -L` exit and the redaction of error lines
+landed in #158; this finishes the rest of #156.
+
+- `--verbose` logs (`transport URL`), `wsh check`, `copy-id` and the transport's own `WebSocket connected to ...` line show the
+  relay's host and the id shortened (`wss://relay/r/AbCd...`), as the error lines do.
+- README: the capability matrix's pipe-relay row and the `--via` paragraph say what the Rust client does today (host-key proof,
+  channel binding `host`).
+- Tests: `test/rust/wsh-cli-156.test.mjs` (host killed or closed mid-session over a relay and a direct socket: the CLI exits
+  non-zero within seconds and removes its sockets; stdout and stderr of five commands over four failure paths, with and without
+  `--verbose`, grepped for the id).
 
 ## 0.39.0 / Rust `rust-v0.10.0`
 
