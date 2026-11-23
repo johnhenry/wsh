@@ -15,6 +15,7 @@ import { SessionRegistry } from './sessions.mjs';
 import { RelayHub } from './relay.mjs';
 import { startWebTransport } from './webtransport.mjs';
 import { createConnectionFactory, STREAM_ANNOUNCE } from './connection.mjs';
+import { validateOnShare } from '../shares.mjs';
 import { normalizeGateway, createGatewaySession } from './gateway.mjs';
 import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
 import { bindSocket } from './socket.mjs';
@@ -90,12 +91,17 @@ function tlsChannelBinding(socket) {
  *   this connection (#119): `true` needs any binding kind, an array names kinds that must all be bound (`host` needs
  *   `hostKey`; `tls-exporter` needs `wss://` served by this process, not a TLS-terminating proxy; `cert-hash` needs
  *   WebTransport with `selfSigned`). Clients older than 0.36 cannot satisfy it. Off by default.
+ * @param {(name: string, fs: object, who: { username: string | null, fingerprint: string | null }) => void | Promise<void>} [options.onShare]
+ *   Folders of the operator's machine (`wsh --share`, #159), once per share, as an object of async file operations to mount;
+ *   listing it makes the host state the `shares` feature. As for `createMemoryHost`.
  * @param {(line: string) => void} [options.onLog]
  * @returns {{ listen(): Promise<{address: string, port: number}>, accept(socket: object, options?: object): Promise<{ close(): void }>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
   host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, onLog = () => {},
+  onShare,
 } = {}) {
+  validateOnShare(onShare, 'createWshServer');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createWshServer: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
   }
@@ -147,6 +153,7 @@ export function createWshServer({
       return createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, createGatewaySession, sessions: registry, relay: hub,
+        onShare,
       });
     })();
     ready.catch(() => { ready = null; });

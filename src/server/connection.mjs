@@ -35,6 +35,7 @@ import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
 import { acceptableBindings, bindingFeatures } from '../channel-binding.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
+import { SHARES_FEATURE, createShareSession } from '../shares.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
 
@@ -49,6 +50,7 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   if (cfg.mcp) features.push(MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE);
   if (cfg.gateway) features.push(...gatewayFeatures(cfg.gateway));
   if (cfg.files) features.push('file-transfer', 'file-write', 'file-rename');
+  if (cfg.onShare) features.push(SHARES_FEATURE); // #159: this host can use folders the operator's client offers
   // End-to-end encryption (#90) is the virtual-mode EncryptedFrame layer, so it is offered where there are no
   // client-opened streams: over a relay bridge.
   // A relay carries a signed KeyExchange untouched, and (when configured) several operators per peer: peers read
@@ -163,6 +165,11 @@ export function createConnectionFactory(cfg) {
       ? cfg.createGatewaySession(cfg.gateway, (m) => send(m), log, { who: () => ({ username: state.username, fingerprint: state.fingerprint }), datagrams })
       : null;
 
+    // Operator-side shared folders (#159): created with the connection, used only after the client's ShareOffer.
+    const shares = cfg.onShare
+      ? createShareSession({ send: (m) => send(m), onShare: cfg.onShare, who: () => ({ username: state.username, fingerprint: state.fingerprint }), log, timeoutMs: cfg.shareTimeoutMs })
+      : null;
+
     const qmux = sendMessage ? null : new QMuxConnection({ isClient: false, send: (b) => { if (!state.closed) sendBytes(b); } });
 
     // ── End-to-end encryption (#90) ──────────────────────────────────
@@ -218,6 +225,7 @@ export function createConnectionFactory(cfg) {
       channels.clear();
       responder?.close();
       gateway?.close();
+      shares?.close();
       e2eSessions.clear();
       for (const c of mcpCalls) c.abort(new Error('connection closed'));
       mcpCalls.clear();
@@ -268,6 +276,7 @@ export function createConnectionFactory(cfg) {
       if (!state.authed) return handleAuth(m);
       if (await handleRelay(m)) return;
       if (gateway && await gateway.handle(m)) return;
+      if (shares && shares.handle(m)) return;
       switch (m.type) {
         case MSG.PING: return send(pong({ id: m.id }));
         case MSG.OPEN: return handleOpen(m);

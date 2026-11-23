@@ -28,3 +28,4 @@ export { createConnectionFactory, hostFeatures, STREAM_ANNOUNCE } from './server
 export { bindSocket } from './server/socket.mjs';
 export { resolveBackends, resolveHostKey, normalizeFileBackend } from './host-backends.mjs';
 export { buildAuthorizer, authMethods } from './server/auth.mjs';
+export { ShareError, SHARES_FEATURE } from './shares.mjs';

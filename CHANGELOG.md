@@ -19,6 +19,29 @@ Rust workspace and tests only (no `src/` change); negotiated by existing feature
   **A frame that does not open (tampered, replayed, reordered) closes the bridge** (the JS host drops the frame and ignores the rest).
 - Not done here: sealing a direct or pipe-relayed connection and gateway data outside a reverse bridge (#155).
 
+### Operator-side shared folders: `wsh --share`, and `onShare` on the JS host (#159) (npm change)
+
+A host with no disk of its own (a browser tab) can use directories of the OPERATOR's machine for a session
+(`docker run -v $PWD:/app` through `wsh -L sock:endpoint=docker`). New JS API and new wire messages, negotiated, so released peers
+are unaffected either way.
+
+- **Wire** (`spec/wsh-v1.yaml`): feature `shares` (a host lists it when it can use shares); `ShareOffer` `0xa8` (the client names its
+  shares once, after login), `ShareRequest` `0xa9` (HOST to client: stat, lstat, readdir with attributes in pages, readlink, open,
+  create, read, write, close, mkdir, unlink, rmdir, rename, setattr), `ShareReply` `0xaa` (errno-like codes). A host without the
+  feature never receives an offer; a client with no `--share` never sends one. Flow control: the offer promises `max_inflight`
+  (16) requests and `max_bytes` (256 KiB) per request or reply. A small file arrives with the `open` (no handle, nothing to close).
+- **CLI** (`rust-v` release): `wsh --share NAME=/abs/dir[:ro|:rw]`, repeatable, read-only by default, with `-N`, `-L`, `--via` and a
+  command; unix only. Served by descriptor (`openat`, `O_NOFOLLOW` on every component), never following a link out of the root, no
+  `..`, no special files, hard-linked files not writable, a replaced root answers `ESTALE`, bounded handles, bytes, directory size
+  and rate. New dependency `rustix` (MIT OR Apache-2.0 WITH LLVM-exception; already in the lockfile through `tempfile`).
+- **JS host** (npm): `onShare(name, fs, who)` on `createMemoryHost`, `createWshServer` and `createReverseHost`; `fs` is an object of
+  async file operations (also shaped like an `fs` backend); browser-safe (`src/shares.mjs`). The bundle grows: `./host` +3.9 kB gzip
+  (28.5 to 32.4), `./memory` +4.2 kB, `./reverse` +4.2 kB, `.` +0.25 kB (the three message builders); `scripts/bundle-budget.json` updated.
+- Not done: change notification, a Rust host that uses shares, sharing over `wsh reverse-connect`, Windows.
+- Tests: `test/shares.test.mjs`; `crates/wsh-cli/src/sharefs/tests.rs` (a hostile-path table; each rule broken once and seen to fail),
+  `crates/wsh-client/src/share.rs`; `test/rust/wsh-cli-share.test.mjs` (the real `wsh` against a Node host and a page host through a
+  pipe relay); `test/browser/rust-cli-share.spec.mjs` (an in-page host reads a file the built CLI shares).
+
 ## 0.38.1
 
 ### JS: `operator-proof` is offered only to a peer that advertises it (npm change)

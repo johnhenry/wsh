@@ -111,9 +111,9 @@ function pageEndpoints(record) {
   };
 }
 
-window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding } = {}) => {
+window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding, shares = false } = {}) => {
   const log = [];
-  const record = { opened: [] };
+  const record = { opened: [], shares: new Map() };
   const ptyCalls = [];
   const fs = memoryFs(initialFiles);
   let hostKeyOption;
@@ -154,6 +154,7 @@ window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = f
     requireChannelBinding,
     sessions: sessions || undefined,
     endpoints: endpoints ? pageEndpoints(record) : undefined,
+    onShare: shares ? (name, shareFs) => { record.shares.set(name, shareFs); } : undefined,
     dataStreams,
     onLog: (l) => log.push(l),
   });
@@ -176,6 +177,24 @@ window.h.hostInfo = async (id) => {
   };
 };
 window.h.stopHost = (id) => hosts.get(id).host.close();
+/** The names of the shares the operator's CLI offered this in-page host (#159). */
+window.h.shareNames = (id) => [...hosts.get(id).record.shares.keys()];
+/** Run one operation of a share's `fs` and return something `page.evaluate` can carry back (bytes as text + length + a digest). */
+window.h.share = async (id, name, op, ...args) => {
+  const shareFs = hosts.get(id).record.shares.get(name);
+  if (!shareFs) throw new Error(`no share ${name}`);
+  const toBytes = (v) => (typeof v === 'string' ? enc.encode(v) : v);
+  try {
+    const out = await shareFs[op](...args.map((a, i) => (op === 'writeFile' && i === 1 ? toBytes(a) : a)));
+    if (out instanceof Uint8Array) {
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', out));
+      return { bytes: out.byteLength, text: out.byteLength < 4096 ? dec.decode(out) : undefined, sha256: [...digest].map((b) => b.toString(16).padStart(2, '0')).join('') };
+    }
+    return { value: JSON.parse(JSON.stringify(out ?? null)), requests: shareFs.stats.requests };
+  } catch (e) {
+    return { error: e.code ?? 'ERR', message: e.message };
+  }
+};
 
 // ── A reverse host that lives in the page (`@johnhenry/wsh/reverse`) ────────────────────────────────────────────────────
 const reverseHosts = new Map();

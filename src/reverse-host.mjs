@@ -23,6 +23,7 @@ import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, ver
 import { SealedBridge } from './bridge-seal.mjs';
 import { resolveBackends } from './host-backends.mjs';
 import { createConnectionFactory, hostFeatures } from './server/connection.mjs';
+import { validateOnShare } from './shares.mjs';
 
 const BACKOFF_START_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
@@ -67,6 +68,9 @@ const BACKOFF_MAX_MS = 30_000;
  *   plain message (it could inject an `Open`). Needs `e2e` (on by default) and `reportFeatures`. Without this option the
  *   proof is requested when it can be and reported as `proven`, and the bridge is sealed only if the operator asks.
  * @param {number} [options.proofTimeoutMs=5000] - How long an operator has to answer the challenge.
+ * @param {(name: string, fs: object, who: { username: string | null, fingerprint: string | null }) => void | Promise<void>} [options.onShare]
+ *   Folders an operator offers (`ShareOffer`, #159), once per share, as an object of async file operations. The Rust CLI
+ *   offers shares on a direct or pipe-relayed session (`wsh --share`), not over `wsh reverse-connect` yet.
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost(options = {}) {
@@ -81,8 +85,9 @@ export function createReverseHost(options = {}) {
  */
 export function createReverseHostWith({
   url, username, keyPair, accept, reconnect = true, connect = {}, peerType = 'host', reportFeatures = true, maxOperators = 1, e2e = {},
-  requireOperatorProof = false, proofTimeoutMs = 5000, onLog = () => {},
+  requireOperatorProof = false, proofTimeoutMs = 5000, onLog = () => {}, onShare,
 } = {}, backends) {
+  validateOnShare(onShare, 'createReverseHost');
   if (typeof requireOperatorProof !== 'boolean') throw new TypeError('createReverseHost: requireOperatorProof must be a boolean');
   if (requireOperatorProof && e2e === false) throw new TypeError('createReverseHost: requireOperatorProof seals the bridge, which needs e2e (do not set e2e: false)');
   if (requireOperatorProof && !reportFeatures) throw new TypeError('createReverseHost: requireOperatorProof needs reportFeatures (the operator learns "e2e-sealed" from ReverseAccept.features)');
@@ -109,13 +114,13 @@ export function createReverseHostWith({
   });
   /** Features for `ReverseAccept` on this relay connection. */
   const bridgeFeatures = (c, e2eConfig, manyOperators) => [
-    ...hostFeatures({ mcp: backends.mcp, files: backends.files, e2e: e2eConfig }, { dataStreams: false }),
+    ...hostFeatures({ mcp: backends.mcp, files: backends.files, e2e: e2eConfig, onShare }, { dataStreams: false }),
     ...(manyOperators ? [MULTI_OPERATOR_FEATURE] : []),
   ];
   const factory = createConnectionFactory({
     authorize: async () => false, methods: { pubkey: false, password: null }, hostKey: null, rateLimit: null,
     execRunner: backends.execRunner, execOptions: backends.execOptions, pty: backends.pty, files: backends.files, mcp: backends.mcp,
-    sessions: null, relay: null, e2e: null, bindTimeoutMs: 3000, log: (l) => onLog(`[reverse] ${l}`),
+    sessions: null, relay: null, e2e: null, bindTimeoutMs: 3000, log: (l) => onLog(`[reverse] ${l}`), onShare,
   });
 
   let client = null;

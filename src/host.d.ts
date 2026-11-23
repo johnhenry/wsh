@@ -82,9 +82,14 @@ export interface WshConnectionConfig extends Partial<WshResolvedBackends> {
   e2e?: { signKey: CryptoKey | null; hybrid?: boolean } | null;
   /** How long exec output waits for the client-opened data stream (default 3000). */
   bindTimeoutMs?: number;
+  /** Folders the operator offers (`wsh --share`, #159): called once per share; listing it makes the host state `shares`. */
+  onShare?: WshOnShare;
   log?: (line: string) => void;
   [key: string]: unknown;
 }
+
+/** The `ServerHello` feature of a host that can use shares (#159). */
+export const SHARES_FEATURE: 'shares';
 
 /** One connection over a byte pipe. */
 export interface WshConnectionPipe {
@@ -144,3 +149,73 @@ export function bindSocket(
   ready: Promise<WshConnectionAttach>,
   options?: WshAcceptOptions,
 ): Promise<{ close(): void }>;
+
+/** A file's attributes on the operator's machine (`wsh --share`, #159). Times are milliseconds since the epoch. */
+export interface WshShareAttr {
+  type: 'file' | 'directory' | 'symlink';
+  size: number;
+  /** Permission bits only (`0o777` at most). */
+  mode: number;
+  mtimeMs: number;
+  atimeMs: number;
+  ctimeMs: number;
+  nlink: number;
+  ino: number;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+/** An entry of {@link WshShareFs.readdir}: attributes included, so listing a directory needs no `stat` per entry. */
+export interface WshShareEntry extends WshShareAttr { name: string; /** A symlink's target. A link is never followed. */ target?: string }
+
+/** An open file of a share. */
+export interface WshShareFile {
+  readonly attr: WshShareAttr;
+  read(offset: number, length: number): Promise<{ data: Uint8Array; eof: boolean }>;
+  write(offset: number, data: Uint8Array): Promise<number>;
+  setattr(changes: WshShareChanges): Promise<WshShareAttr>;
+  truncate(size: number): Promise<WshShareAttr>;
+  close(): Promise<void>;
+}
+
+export interface WshShareChanges { mode?: number; atimeMs?: number; mtimeMs?: number; size?: number }
+
+/** An errno-like failure answered by the operator's client (`code`: `ENOENT`, `EROFS`, `EEXIST`, `ELOOP`, `EPERM`, ...). */
+export class ShareError extends Error { readonly errno: string; readonly code: string }
+
+/**
+ * One folder the operator shares with this host (`wsh --share NAME=/abs/dir[:ro|:rw]`, #159): async file operations
+ * answered by the operator's client, which confines every path to the folder. Paths are relative to the folder root.
+ * It also has the shape of a {@link WshFileBackend} (`operate`, `readWhole`, `writeWhole`, `writeAt`), so it can be served on.
+ */
+export interface WshShareFs extends WshFileBackend {
+  readonly name: string;
+  /** Whether the operator offered writes (`:rw`). A change on a read-only share fails with `EROFS`. */
+  readonly writable: boolean;
+  /** Aborted when the connection to the operator ends; every later call fails with `EIO`. */
+  readonly signal: AbortSignal;
+  /** Requests, replies, errors, bytes each way and timeouts on this connection so far. */
+  readonly stats: { requests: number; replies: number; errors: number; bytesDown: number; bytesUp: number; timeouts: number };
+  stat(path: string): Promise<WshShareAttr>;
+  lstat(path: string): Promise<WshShareAttr>;
+  readlink(path: string): Promise<string>;
+  /** The whole directory with attributes, sorted by name, in as few messages as the operator's page size allows. */
+  readdir(path: string): Promise<WshShareEntry[]>;
+  open(path: string, flags?: Array<'read' | 'write' | 'create' | 'excl' | 'trunc'>, options?: { mode?: number; inlineBytes?: number }): Promise<WshShareFile>;
+  create(path: string, options?: { mode?: number }): Promise<WshShareFile>;
+  /** A small file arrives with the open (one round trip). */
+  readFile(path: string, options?: { maxBytes?: number }): Promise<Uint8Array>;
+  writeFile(path: string, data: Uint8Array, options?: { mode?: number; truncate?: boolean }): Promise<number>;
+  mkdir(path: string, options?: { mode?: number }): Promise<WshShareAttr>;
+  unlink(path: string): Promise<void>;
+  rmdir(path: string): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+  setattr(path: string, changes: WshShareChanges): Promise<WshShareAttr>;
+  truncate(path: string, size: number): Promise<WshShareAttr>;
+  chmod(path: string, mode: number): Promise<WshShareAttr>;
+  utimes(path: string, atimeMs: number, mtimeMs: number): Promise<WshShareAttr>;
+}
+
+/** Called once per share the operator offers (#159). Mount `fs` where you like; `who` is the authenticated operator. */
+export type WshOnShare = (name: string, fs: WshShareFs, who: { username: string | null; fingerprint: string | null }) => void | Promise<void>;
