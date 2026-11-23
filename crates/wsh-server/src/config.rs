@@ -1,9 +1,12 @@
 //! Server configuration: TOML file + CLI overrides.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{error, info, warn};
 use wsh_core::WshResult;
+
+use crate::auth::password::StoredHash;
 
 /// Top-level config file structure.
 #[derive(Debug, Clone, Deserialize)]
@@ -92,24 +95,33 @@ impl Default for ServerSection {
 ///
 /// # Password Authentication
 ///
-/// To enable password auth, set `allow_password = true` and add entries
-/// to `password_hashes`:
+/// Password login is **off** unless `allow_password = true`. Each user needs an
+/// Argon2id hash in PHC format with its own random salt; make one with
+/// `printf '%s' "$PASSWORD" | wsh-server --hash-password`:
 ///
 /// ```toml
 /// [auth]
 /// allow_password = true
 ///
 /// [auth.password_hashes]
-/// alice = "sha256:e3b0c44298fc..."  # SHA-256 hex digest of password
-/// bob = "sha256:5e884898da28..."
+/// alice = "$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>"
 /// ```
+///
+/// Entries written as `sha256:<hex>` (one unsalted SHA-256 of the password, the
+/// only format before this release) are **refused**: the server says so at start-up
+/// and the user cannot log in. `allow_legacy_sha256 = true` keeps them working, with
+/// a warning at every start-up, as a stop-gap while the hashes are replaced.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthSection {
     #[serde(default = "default_true")]
     pub allow_pubkey: bool,
-    #[serde(default = "default_true")]
+    /// Accept password login at all. Default: `false`.
+    #[serde(default)]
     pub allow_password: bool,
-    /// Username → "sha256:<hex>" password hash pairs.
+    /// Accept the old unsalted `sha256:<hex>` entries in `password_hashes`. Default: `false`.
+    #[serde(default)]
+    pub allow_legacy_sha256: bool,
+    /// Username → Argon2id PHC hash (see above).
     #[serde(default)]
     pub password_hashes: std::collections::HashMap<String, String>,
 }
@@ -118,7 +130,8 @@ impl Default for AuthSection {
     fn default() -> Self {
         Self {
             allow_pubkey: true,
-            allow_password: true,
+            allow_password: false,
+            allow_legacy_sha256: false,
             password_hashes: std::collections::HashMap::new(),
         }
     }
@@ -127,16 +140,31 @@ impl Default for AuthSection {
 /// `[gateway]` section of the config TOML.
 ///
 /// Controls the gateway subsystem that handles TCP/UDP forwarding, DNS
-/// resolution, and reverse tunnel listeners.
+/// resolution, and reverse tunnel listeners. **All of it is off by default**:
+/// the gateway lets an authenticated client open connections *from this
+/// machine*, so it is something to switch on deliberately.
 ///
 /// # TOML Example
 ///
 /// ```toml
 /// [gateway]
 /// enabled = true
-/// allowed_destinations = ["example.com", "10.0.0.0/8:443", "*"]
+/// # Public destinations only unless a rule names an internal one:
+/// allowed_destinations = ["example.com:443", "203.0.113.0/24", "*"]
 /// max_connections = 100
+/// # Off unless set; when on, listeners bind to loopback unless reverse_bind_addr says otherwise.
 /// enable_reverse_tunnels = true
+/// reverse_bind_addr = "127.0.0.1"
+/// ```
+///
+/// To get the pre-0.7 behaviour (anything reachable, listeners on every interface):
+///
+/// ```toml
+/// [gateway]
+/// enabled = true
+/// allowed_destinations = ["*", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "::1", "fc00::/7", "fe80::/10"]
+/// enable_reverse_tunnels = true
+/// reverse_bind_addr = "0.0.0.0"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewaySection {
@@ -144,19 +172,22 @@ pub struct GatewaySection {
     ///
     /// When `false`, all gateway message types (`OpenTcp`, `OpenUdp`,
     /// `ResolveDns`, `ListenRequest`) are rejected with error code 5
-    /// (`GATEWAY_DISABLED`).
+    /// (`GATEWAY_DISABLED`) and `gateway` is not advertised.
     ///
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Default: `false`.
+    #[serde(default)]
     pub enabled: bool,
-    /// Destination allowlist for outbound connections.
+    /// Destination rules for outbound connections and DNS lookups.
     ///
-    /// Supports exact hostnames (`"example.com"`), exact host:port pairs
-    /// (`"example.com:443"`), or a wildcard (`"*"`) to allow all.
-    /// An empty list blocks all outbound connections.
+    /// Forms: `"example.com"`, `"example.com:443"`, `"10.0.0.0/8"`,
+    /// `"10.0.0.0/8:5432"`, `"127.0.0.1:5432"`, and the wildcard `"*"`.
+    /// The wildcard means any *public* destination: an address that is
+    /// loopback, link-local, private, unique-local, carrier-grade NAT, unspecified
+    /// or multicast is refused after the name is resolved unless a rule names that
+    /// host or address. See `gateway::policy`.
     ///
-    /// Default: `["*"]` (allow all).
-    #[serde(default = "default_gateway_destinations")]
+    /// Default: `[]` (nothing is allowed).
+    #[serde(default)]
     pub allowed_destinations: Vec<String>,
     /// Maximum number of concurrent gateway connections (TCP + UDP +
     /// reverse tunnel listeners combined).
@@ -166,18 +197,25 @@ pub struct GatewaySection {
     pub max_connections: usize,
     /// Whether clients may open reverse tunnel listeners via `ListenRequest`.
     ///
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Default: `false`.
+    #[serde(default)]
     pub enable_reverse_tunnels: bool,
+    /// Address reverse tunnel listeners bind to. The client's own `bind_addr` in
+    /// `ListenRequest` is ignored. Must be an IP address.
+    ///
+    /// Default: `"127.0.0.1"`.
+    #[serde(default = "default_reverse_bind_addr")]
+    pub reverse_bind_addr: String,
 }
 
 impl Default for GatewaySection {
     fn default() -> Self {
         Self {
-            enabled: true,
-            allowed_destinations: default_gateway_destinations(),
+            enabled: false,
+            allowed_destinations: Vec::new(),
             max_connections: default_gateway_max_connections(),
-            enable_reverse_tunnels: true,
+            enable_reverse_tunnels: false,
+            reverse_bind_addr: default_reverse_bind_addr(),
         }
     }
 }
@@ -242,8 +280,8 @@ fn default_rpc_fs_max_file() -> u64 {
     crate::rpc::fs::DEFAULT_MAX_FILE_BYTES
 }
 
-fn default_gateway_destinations() -> Vec<String> {
-    vec!["*".to_string()]
+fn default_reverse_bind_addr() -> String {
+    "127.0.0.1".to_string()
 }
 fn default_gateway_max_connections() -> usize {
     100
@@ -304,8 +342,12 @@ pub struct ServerConfig {
     pub gateway_max_connections: usize,
     /// Whether reverse tunnel listeners are allowed. See [`GatewaySection::enable_reverse_tunnels`].
     pub gateway_enable_reverse_tunnels: bool,
-    /// Username → "sha256:<hex>" password hash pairs for password auth.
-    pub password_hashes: std::collections::HashMap<String, String>,
+    /// Where reverse tunnel listeners bind. See [`GatewaySection::reverse_bind_addr`].
+    pub gateway_reverse_bind_addr: std::net::IpAddr,
+    /// Username → usable password hash, for password auth. Entries that could not be
+    /// used (an unsalted `sha256:` without `allow_legacy_sha256`, anything unparsable)
+    /// are logged at start-up and left out, so those users cannot log in.
+    pub password_hashes: std::collections::HashMap<String, StoredHash>,
     /// Whether typed rpc channels are served. See [`RpcSection::enabled`].
     pub rpc_enabled: bool,
     /// Largest rpc message in bytes. See [`RpcSection::max_message_bytes`].
@@ -394,6 +436,16 @@ impl ServerConfig {
         let session_ttl = cli_session_ttl.unwrap_or(file_config.server.session_ttl);
         let idle_timeout = cli_idle_timeout.unwrap_or(file_config.server.idle_timeout);
 
+        let gateway_reverse_bind_addr: std::net::IpAddr =
+            file_config.gateway.reverse_bind_addr.parse().map_err(|_| {
+                wsh_core::WshError::Other(format!(
+                    "config: [gateway] reverse_bind_addr '{}' is not an IP address",
+                    file_config.gateway.reverse_bind_addr
+                ))
+            })?;
+        let password_hashes = parse_password_hashes(&file_config.auth);
+        warn_about_gateway(&file_config.gateway, gateway_reverse_bind_addr);
+
         Ok(Self {
             port,
             cert_path: expand_tilde_str(&cert_str),
@@ -408,7 +460,8 @@ impl ServerConfig {
             gateway_allowed_destinations: file_config.gateway.allowed_destinations,
             gateway_max_connections: file_config.gateway.max_connections,
             gateway_enable_reverse_tunnels: file_config.gateway.enable_reverse_tunnels,
-            password_hashes: file_config.auth.password_hashes,
+            gateway_reverse_bind_addr,
+            password_hashes,
             rpc_enabled: file_config.rpc.enabled,
             rpc_max_message_bytes: file_config.rpc.max_message_bytes,
             rpc_max_inflight: file_config.rpc.max_inflight,
@@ -417,6 +470,62 @@ impl ServerConfig {
             rpc_fs_max_file_bytes: file_config.rpc.fs_max_file_bytes,
             mcp_tools: file_config.mcp.tools,
         })
+    }
+}
+
+/// Parse `[auth.password_hashes]`, saying so -- loudly, once, at start-up -- about every
+/// entry that cannot be used and every legacy entry that is.
+fn parse_password_hashes(auth: &AuthSection) -> HashMap<String, StoredHash> {
+    let mut usable = HashMap::new();
+    for (user, value) in &auth.password_hashes {
+        match StoredHash::parse(value, auth.allow_legacy_sha256) {
+            Ok(hash) => {
+                if matches!(hash, StoredHash::LegacySha256(_)) {
+                    warn!(
+                        user = %user,
+                        "DEPRECATED: [auth.password_hashes] entry is an unsalted SHA-256 hash, accepted only \
+                         because allow_legacy_sha256 = true. Anyone who reads this file can guess passwords \
+                         at billions per second. Replace it: printf '%s' \"$PASSWORD\" | wsh-server --hash-password"
+                    );
+                }
+                usable.insert(user.clone(), hash);
+            }
+            Err(problem) => error!(
+                user = %user,
+                "[auth.password_hashes] entry ignored, so this user cannot log in with a password: {problem}"
+            ),
+        }
+    }
+    if auth.allow_password && usable.is_empty() {
+        warn!("[auth] allow_password = true but no usable password_hashes: nobody can log in with a password");
+    }
+    if !auth.allow_password && !auth.password_hashes.is_empty() {
+        warn!(
+            "[auth.password_hashes] has entries but password login is off: set `allow_password = true` under [auth] to use them"
+        );
+    }
+    usable
+}
+
+/// Say what an enabled gateway exposes, so it is not a surprise in the log.
+fn warn_about_gateway(gateway: &GatewaySection, reverse_bind_addr: std::net::IpAddr) {
+    if !gateway.enabled {
+        if gateway.enable_reverse_tunnels || !gateway.allowed_destinations.is_empty() {
+            warn!("[gateway] has settings but `enabled = false`: the gateway stays off");
+        }
+        return;
+    }
+    if gateway.allowed_destinations.is_empty() {
+        warn!("[gateway] enabled with no allowed_destinations: every outbound connection will be refused");
+    }
+    if gateway.allowed_destinations.iter().any(|d| d == "*") {
+        info!("[gateway] allowed_destinations contains \"*\": any authorized client can use this host to reach the public internet (not its own network, unless a rule names it)");
+    }
+    if gateway.enable_reverse_tunnels && !reverse_bind_addr.is_loopback() {
+        warn!(
+            bind = %reverse_bind_addr,
+            "[gateway] reverse listeners are reachable from the network: reverse_bind_addr is not a loopback address"
+        );
     }
 }
 
@@ -433,4 +542,137 @@ pub(crate) fn expand_tilde_str(s: &str) -> PathBuf {
         }
     }
     PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(toml_text: &str) -> ServerConfig {
+        let dir = std::env::temp_dir().join(format!(
+            "wsh-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml_text).unwrap();
+        let cfg = ServerConfig::load(Some(&path), None, None, None, None, None, None, false)
+            .expect("config loads");
+        std::fs::remove_dir_all(&dir).ok();
+        cfg
+    }
+
+    fn load_defaults() -> ServerConfig {
+        ServerConfig::load(None, None, None, None, None, None, None, false).unwrap()
+    }
+
+    // ── gateway: off, deny, loopback ─────────────────────────────────
+
+    #[test]
+    fn the_gateway_is_off_by_default_and_allows_nothing() {
+        for cfg in [load_defaults(), load("")] {
+            assert!(!cfg.gateway_enabled);
+            assert!(cfg.gateway_allowed_destinations.is_empty());
+            assert!(!cfg.gateway_enable_reverse_tunnels);
+            assert!(cfg.gateway_reverse_bind_addr.is_loopback());
+        }
+    }
+
+    #[test]
+    fn enabling_the_gateway_does_not_enable_destinations_or_reverse_tunnels() {
+        let cfg = load("[gateway]\nenabled = true\n");
+        assert!(cfg.gateway_enabled);
+        assert!(cfg.gateway_allowed_destinations.is_empty(), "default-deny");
+        assert!(!cfg.gateway_enable_reverse_tunnels);
+        assert_eq!(cfg.gateway_reverse_bind_addr.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn the_old_behaviour_is_restored_by_the_lines_in_the_changelog() {
+        let cfg = load(
+            r#"
+[gateway]
+enabled = true
+allowed_destinations = ["*", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "::1", "fc00::/7", "fe80::/10"]
+enable_reverse_tunnels = true
+reverse_bind_addr = "0.0.0.0"
+"#,
+        );
+        assert!(cfg.gateway_enabled && cfg.gateway_enable_reverse_tunnels);
+        assert_eq!(cfg.gateway_reverse_bind_addr.to_string(), "0.0.0.0");
+        let policy = crate::gateway::policy::GatewayPolicyEnforcer::new(
+            crate::gateway::policy::GatewayPolicy {
+                allowed_destinations: cfg.gateway_allowed_destinations.clone(),
+                max_connections: cfg.gateway_max_connections,
+                enable_reverse_tunnels: cfg.gateway_enable_reverse_tunnels,
+                reverse_bind_addr: cfg.gateway_reverse_bind_addr,
+            },
+        );
+        for (host, addr) in [
+            ("example.com", "93.184.216.34"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("db", "10.0.0.5"),
+            ("meta", "169.254.169.254"),
+            ("::1", "::1"),
+        ] {
+            assert!(policy.check_connect(host, 80).is_ok(), "{host}");
+            assert!(
+                !policy
+                    .authorize_addrs(host, Some(80), &[addr.parse().unwrap()])
+                    .is_empty(),
+                "{host} -> {addr} should be reachable again with those lines"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reverse_bind_address_that_is_not_an_address_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("wsh-config-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[gateway]\nreverse_bind_addr = \"all interfaces\"\n").unwrap();
+        let result = ServerConfig::load(Some(&path), None, None, None, None, None, None, false);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_err());
+    }
+
+    // ── passwords: off, salted, no legacy ────────────────────────────
+
+    #[test]
+    fn password_login_is_off_by_default_even_with_hashes_configured() {
+        assert!(!load_defaults().allow_password);
+        let hash = crate::auth::password::hash_password("pw").unwrap();
+        let cfg = load(&format!("[auth.password_hashes]\nalice = '{hash}'\n"));
+        assert!(!cfg.allow_password);
+        assert!(cfg.allow_pubkey);
+    }
+
+    #[test]
+    fn argon2id_hashes_load_and_verify() {
+        let hash = crate::auth::password::hash_password("pw").unwrap();
+        let cfg = load(&format!(
+            "[auth]\nallow_password = true\n[auth.password_hashes]\nalice = '{hash}'\n"
+        ));
+        assert!(cfg.allow_password);
+        assert!(cfg.password_hashes["alice"].verify("pw"));
+        assert!(!cfg.password_hashes["alice"].verify("nope"));
+    }
+
+    #[test]
+    fn legacy_sha256_entries_are_dropped_unless_allowed() {
+        let legacy = "sha256:5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8";
+        let off = load(&format!(
+            "[auth]\nallow_password = true\n[auth.password_hashes]\nbob = '{legacy}'\n"
+        ));
+        assert!(
+            off.password_hashes.is_empty(),
+            "refused, so bob cannot log in"
+        );
+        let on = load(&format!("[auth]\nallow_password = true\nallow_legacy_sha256 = true\n[auth.password_hashes]\nbob = '{legacy}'\n"));
+        assert!(on.password_hashes["bob"].verify("password"));
+    }
 }

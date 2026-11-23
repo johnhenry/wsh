@@ -517,6 +517,7 @@ pub async fn run_connect(
             cols: Some(cols),
             rows: Some(rows),
             env: None,
+            ..Default::default()
         })
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))

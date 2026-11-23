@@ -77,6 +77,81 @@ struct Waiter {
 /// SERVER_HELLO feature advertising that McpResult echoes McpCall's call_id.
 pub const MCP_CALL_ID_FEATURE: &str = "mcp-call-id";
 
+/// SERVER_HELLO feature: the host runs `Open { stdio: "pipes" }` exec channels on
+/// plain pipes (separate stderr, stdin EOF).
+pub const EXEC_PIPES_FEATURE: &str = "exec-pipes";
+
+/// How many channels may be waiting for their session at once.
+const EARLY_MAX_CHANNELS: usize = 16;
+/// Largest backlog kept per channel: messages, and payload bytes. A host that
+/// answers `OpenOk` and streams at once has a few messages in flight, not megabytes;
+/// the cap only bounds what an `OpenOk` nobody ever claims can hold.
+const EARLY_MAX_MESSAGES: usize = 1024;
+const EARLY_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Session messages that arrive between a channel's `OpenOk` and the moment
+/// `open_session` has registered the session for it (#135).
+///
+/// The dispatch loop hands `OpenOk` to the waiting task and goes straight on to the
+/// next frame. A host that answers at once sends that frame -- the first
+/// `SessionData`, even the `Exit` -- in the same burst, so the loop can reach it
+/// before the opener has run and inserted the session. Nothing was listening on that
+/// channel id then, and the data was dropped (or sent to the relay channel). The
+/// loop now notes the channel the moment it hands over its `OpenOk`
+/// ([`reserve`](Self::reserve)); frames for a reserved channel are kept in arrival order
+/// and replayed by `open_session` as it registers the session, under the same lock.
+#[derive(Default)]
+struct EarlyChannels {
+    channels: HashMap<u32, EarlyBacklog>,
+}
+
+#[derive(Default)]
+struct EarlyBacklog {
+    messages: Vec<Envelope>,
+    bytes: usize,
+}
+
+impl EarlyChannels {
+    fn reserve(&mut self, channel_id: u32) {
+        if self.channels.len() < EARLY_MAX_CHANNELS {
+            self.channels.entry(channel_id).or_default();
+        }
+    }
+
+    fn release(&mut self, channel_id: u32) -> Vec<Envelope> {
+        self.channels
+            .remove(&channel_id)
+            .map(|b| b.messages)
+            .unwrap_or_default()
+    }
+
+    /// Keep `envelope` if `channel_id` is reserved. Returns the envelope back when the
+    /// channel is not waiting (the caller routes it as before) and `None` when kept
+    /// or dropped for exceeding the cap.
+    fn hold(&mut self, channel_id: u32, envelope: Envelope) -> Option<Envelope> {
+        let Some(backlog) = self.channels.get_mut(&channel_id) else {
+            return Some(envelope);
+        };
+        let size = match &envelope.payload {
+            Payload::SessionData(p) => p.data.len(),
+            Payload::EncryptedFrame(p) => p.ciphertext.len(),
+            _ => 0,
+        };
+        if backlog.messages.len() >= EARLY_MAX_MESSAGES || backlog.bytes + size > EARLY_MAX_BYTES {
+            tracing::warn!(
+                channel_id,
+                "dropping session message that arrived before its session was registered: backlog full"
+            );
+            return None;
+        }
+        backlog.bytes += size;
+        backlog.messages.push(envelope);
+        None
+    }
+}
+
+type EarlyShared = Arc<Mutex<EarlyChannels>>;
+
 /// Remove and return the first waiter that claims `envelope`.
 ///
 /// FIFO, and matcher-aware. Dispatch used `Vec::pop()`, which is LIFO: with
@@ -124,6 +199,8 @@ pub struct WshClient {
     /// app code via `trust_relay_peer` once it decides to accept/establish
     /// a given peer (see `ReverseConnectPayload.from_fingerprint`).
     accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
+    /// Session frames that beat their session's registration (see [`EarlyChannels`]).
+    early: EarlyShared,
 }
 
 /// Server-provided session summary from `SessionList`.
@@ -169,6 +246,7 @@ impl WshClient {
         let relay_message_rx = Arc::new(Mutex::new(Some(relay_rx)));
         let accepted_relay_peers: Arc<Mutex<HashSet<String>>> =
             Arc::new(Mutex::new(HashSet::new()));
+        let early: EarlyShared = Arc::new(Mutex::new(EarlyChannels::default()));
 
         let mut client = Self {
             transport: transport.clone(),
@@ -185,6 +263,7 @@ impl WshClient {
             reverse_connect_rx,
             relay_message_rx,
             accepted_relay_peers: accepted_relay_peers.clone(),
+            early: early.clone(),
         };
 
         // Perform handshake with timeout
@@ -206,6 +285,7 @@ impl WshClient {
             let connected = connected.clone();
             let outgoing_tx_clone = outgoing_tx.clone();
             let accepted_relay_peers = accepted_relay_peers.clone();
+            let early = early.clone();
 
             tokio::spawn(async move {
                 Self::dispatch_loop(
@@ -219,6 +299,7 @@ impl WshClient {
                     Some(rc_tx),
                     Some(relay_tx),
                     accepted_relay_peers,
+                    early,
                 )
                 .await;
             })
@@ -369,6 +450,7 @@ impl WshClient {
             cols,
             rows,
             env,
+            stdio,
         } = opts;
 
         // Build and send OPEN message
@@ -380,7 +462,7 @@ impl WshClient {
                 cols,
                 rows,
                 env,
-                stdio: None,
+                stdio,
             }),
         };
 
@@ -389,39 +471,23 @@ impl WshClient {
         // Parse OPEN_OK response
         match response.payload {
             Payload::OpenOk(ok) => {
-                let session = match ok.data_mode {
-                    SessionDataMode::Stream => {
-                        let stream = {
-                            let mut t = self.transport.lock().await;
-                            t.open_stream().await?
-                        };
-
-                        Arc::new(
-                            WshSession::new_stream(
-                                ok.channel_id,
-                                kind,
-                                stream.stream,
-                                self.control_action_tx.clone(),
-                                ok.capabilities.clone(),
-                            )
-                            .with_session_credentials(ok.session_id.clone(), ok.token.clone()),
-                        )
+                // The dispatch loop reserved these channels when it handed us the
+                // `OpenOk`; whatever the host sent after it is waiting in `early`.
+                // Every way out of here must release them.
+                let built = self.build_session(&ok, kind).await;
+                let session = match built {
+                    Ok(session) => session,
+                    Err(err) => {
+                        let mut early = self.early.lock().await;
+                        early.release(ok.channel_id);
+                        if let Some(stderr_id) = ok.stderr_channel_id {
+                            early.release(stderr_id);
+                        }
+                        return Err(err);
                     }
-                    SessionDataMode::Virtual => Arc::new(
-                        WshSession::new_virtual(
-                            ok.channel_id,
-                            kind,
-                            self.control_action_tx.clone(),
-                            ok.capabilities.clone(),
-                        )
-                        .with_session_credentials(ok.session_id.clone(), ok.token.clone()),
-                    ),
                 };
 
-                {
-                    let mut sessions = self.sessions.lock().await;
-                    sessions.insert(ok.channel_id, session.clone());
-                }
+                self.register_session(&session, &ok).await;
 
                 tracing::info!(
                     "opened channel {} ({:?}) with data mode {:?}",
@@ -435,6 +501,99 @@ impl WshClient {
             _ => Err(WshError::InvalidMessage(
                 "unexpected response to OPEN".into(),
             )),
+        }
+    }
+
+    /// Build the `WshSession` (and its stderr companion) an `OpenOk` describes.
+    async fn build_session(
+        &self,
+        ok: &OpenOkPayload,
+        kind: ChannelKind,
+    ) -> WshResult<Arc<WshSession>> {
+        let session = match ok.data_mode {
+            SessionDataMode::Stream => {
+                let stream = {
+                    let mut t = self.transport.lock().await;
+                    t.open_stream().await?
+                };
+
+                WshSession::new_stream(
+                    ok.channel_id,
+                    kind,
+                    stream.stream,
+                    self.control_action_tx.clone(),
+                    ok.capabilities.clone(),
+                )
+                .with_session_credentials(ok.session_id.clone(), ok.token.clone())
+            }
+            SessionDataMode::Virtual => WshSession::new_virtual(
+                ok.channel_id,
+                kind,
+                self.control_action_tx.clone(),
+                ok.capabilities.clone(),
+            )
+            .with_session_credentials(ok.session_id.clone(), ok.token.clone()),
+        };
+        // `stdio: "pipes"`: stderr arrives as SessionData on its own channel id.
+        let session = match ok.stderr_channel_id {
+            Some(stderr_id) => session.with_stderr(Arc::new(WshSession::new_virtual(
+                stderr_id,
+                ChannelKind::Exec,
+                self.control_action_tx.clone(),
+                Vec::new(),
+            ))),
+            None => session,
+        };
+        Ok(Arc::new(session))
+    }
+
+    /// Make `session` routable and replay what arrived for it before it was.
+    ///
+    /// Holds `early` throughout (taken before `sessions`, as the dispatch loop does)
+    /// so a frame is either replayed here, in arrival order, or delivered by the
+    /// loop to the registered session -- never reordered, never lost.
+    async fn register_session(&self, session: &Arc<WshSession>, ok: &OpenOkPayload) {
+        let mut early = self.early.lock().await;
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(ok.channel_id, session.clone());
+            if let (Some(stderr_id), Some(stderr)) =
+                (ok.stderr_channel_id, session.stderr_session())
+            {
+                sessions.insert(stderr_id, stderr);
+            }
+        }
+
+        // stderr first: the main channel's Exit closes both, and the host sent stderr
+        // before it (spec: OpenOk.stderr_channel_id).
+        let mut closed = false;
+        for channel_id in ok.stderr_channel_id.into_iter().chain([ok.channel_id]) {
+            let target = if channel_id == ok.channel_id {
+                Some(session.clone())
+            } else {
+                session.stderr_session()
+            };
+            let backlog = early.release(channel_id);
+            if !backlog.is_empty() {
+                tracing::debug!(
+                    channel_id,
+                    frames = backlog.len(),
+                    "replaying frames that arrived before the session was registered"
+                );
+            }
+            for envelope in backlog {
+                if let Some(target) = &target {
+                    if let Err(err) = target.handle_control(&envelope).await {
+                        tracing::debug!(channel_id, "failed to route early session message: {err}");
+                    }
+                }
+                if matches!(envelope.msg_type, MsgType::Close) {
+                    closed = true;
+                }
+            }
+        }
+        if closed {
+            self.sessions.lock().await.remove(&ok.channel_id);
         }
     }
 
@@ -1201,6 +1360,7 @@ impl WshClient {
         reverse_connect_tx: Option<mpsc::Sender<Envelope>>,
         relay_message_tx: Option<mpsc::Sender<Envelope>>,
         accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
+        early: EarlyShared,
     ) {
         loop {
             let is_connected = { *connected.lock().await };
@@ -1272,7 +1432,7 @@ impl WshClient {
                         Ok(data) => {
                             match decode_envelope(&data) {
                                 Ok(envelope) => {
-                                    eprintln!("DEBUGTRACE dispatch_loop got envelope msg_type={:?}", envelope.msg_type);
+                                    tracing::trace!(msg_type = ?envelope.msg_type, "control message");
                                     Self::handle_incoming(
                                         envelope,
                                         &response_tx,
@@ -1281,8 +1441,8 @@ impl WshClient {
                                         &reverse_connect_tx,
                                         &relay_message_tx,
                                         &accepted_relay_peers,
+                                        &early,
                                     ).await;
-                                    eprintln!("DEBUGTRACE dispatch_loop handle_incoming returned");
                                 }
                                 Err(e) => {
                                     tracing::warn!("failed to decode control message: {}", e);
@@ -1300,18 +1460,28 @@ impl WshClient {
             }
         }
 
+        // The connection is gone, so nothing more will ever arrive for these
+        // sessions. Close them: a reader blocked in `read()` otherwise waits forever
+        // for data from a peer that has disconnected (`wsh connect` never exited).
+        let open: Vec<Arc<WshSession>> = sessions.lock().await.values().cloned().collect();
+        for session in open {
+            session.mark_closed().await;
+        }
+
         tracing::debug!("dispatch loop ended");
     }
 
     /// Handle an incoming control message.
+    #[allow(clippy::too_many_arguments)]
     fn handle_incoming<'a>(
-        envelope: Envelope,
+        mut envelope: Envelope,
         response_tx: &'a Arc<Mutex<HashMap<u8, Vec<Waiter>>>>,
         sessions: &'a Arc<Mutex<HashMap<u32, Arc<WshSession>>>>,
         outgoing_tx: &'a mpsc::Sender<Vec<u8>>,
         reverse_connect_tx: &'a Option<mpsc::Sender<Envelope>>,
         relay_message_tx: &'a Option<mpsc::Sender<Envelope>>,
         accepted_relay_peers: &'a Arc<Mutex<HashSet<String>>>,
+        early: &'a EarlyShared,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             // Unwrap RelayForward: only deliver the inner message if it came
@@ -1342,6 +1512,7 @@ impl WshClient {
                                 reverse_connect_tx,
                                 relay_message_tx,
                                 accepted_relay_peers,
+                                early,
                             )
                             .await;
                         }
@@ -1396,35 +1567,38 @@ impl WshClient {
                         return;
                     };
 
+                    // `early` is taken before `sessions` (as `open_session` does) so a
+                    // frame is either routed to the registered session or kept for the
+                    // one being registered, never lost in between.
                     let session = {
-                        let sessions = sessions.lock().await;
-                        sessions.get(&channel_id).cloned()
+                        let mut early_guard = early.lock().await;
+                        let found = sessions.lock().await.get(&channel_id).cloned();
+                        if found.is_none() {
+                            match early_guard.hold(channel_id, envelope) {
+                                None => return,
+                                Some(not_waiting) => envelope = not_waiting,
+                            }
+                        }
+                        found
                     };
 
                     if let Some(session) = session {
                         if matches!(envelope.msg_type, MsgType::Exit) {
                             if let Payload::Exit(exit) = &envelope.payload {
-                                // `eprintln!`, not `tracing::info!`, is
-                                // deliberate here: a `tracing::info!` call at
-                                // exactly this point -- the dispatch loop
-                                // processing an `Exit` envelope for a Virtual
-                                // session, right after that same loop already
-                                // logged at least one other event on this
-                                // connection -- was found to hang forever
-                                // (confirmed by bisecting with manual
-                                // `eprintln!` markers immediately before/after
-                                // the call; execution stops inside the macro
-                                // and never returns). Root cause not
-                                // identified (suspected interaction between
-                                // this i686-unknown-linux-musl cross-compiled
-                                // binary and `tracing-subscriber`'s global
-                                // writer lock, but unconfirmed) -- tracked as
-                                // a known issue on #38. `eprintln!` sidesteps
-                                // the tracing subscriber entirely and is not
-                                // known to hang.
-                                eprintln!(
-                                    "channel {} exited with code {}",
-                                    exit.channel_id, exit.code
+                                // This was an `eprintln!` because a
+                                // `tracing::info!` here hung forever (#38): the
+                                // old `wsh exec` held `stdout().lock()` across its
+                                // `session.read().await` loop, and the default
+                                // tracing writer is stdout, so the first log line
+                                // this loop emitted while exec was reading blocked
+                                // on a lock exec would release only after this loop
+                                // delivered its data. exec no longer holds the lock
+                                // and the CLI logs to stderr, so this is an
+                                // ordinary event (and no longer a line on every run).
+                                tracing::debug!(
+                                    channel = exit.channel_id,
+                                    code = exit.code,
+                                    "channel exited"
                                 );
                             }
                         }
@@ -1487,7 +1661,30 @@ impl WshClient {
                     let mut responses = response_tx.lock().await;
                     if let Some(waiters) = responses.get_mut(&msg_type_u8) {
                         if let Some(waiter) = take_matching_waiter(waiters, &envelope) {
-                            let _ = waiter.tx.send(envelope);
+                            // An `OpenOk` hands a channel to whoever is opening it. Note
+                            // the channel BEFORE they are woken, so a frame that follows
+                            // in the same burst is held for them instead of being lost.
+                            let opened = match &envelope.payload {
+                                Payload::OpenOk(ok) => {
+                                    let mut channels = vec![ok.channel_id];
+                                    channels.extend(ok.stderr_channel_id);
+                                    channels
+                                }
+                                _ => Vec::new(),
+                            };
+                            if !opened.is_empty() {
+                                let mut early = early.lock().await;
+                                for channel_id in &opened {
+                                    early.reserve(*channel_id);
+                                }
+                            }
+                            if waiter.tx.send(envelope).is_err() && !opened.is_empty() {
+                                // Nobody is waiting any more (the open timed out).
+                                let mut early = early.lock().await;
+                                for channel_id in &opened {
+                                    early.release(*channel_id);
+                                }
+                            }
                             if waiters.is_empty() {
                                 responses.remove(&msg_type_u8);
                             }
@@ -1797,6 +1994,7 @@ mod tests {
             &None,
             &None,
             &Arc::new(Mutex::new(HashSet::new())),
+            &Default::default(),
         )
         .await;
 
@@ -1832,6 +2030,7 @@ mod tests {
             &None,
             &None,
             &Arc::new(Mutex::new(HashSet::new())),
+            &Default::default(),
         )
         .await;
 
@@ -1860,6 +2059,7 @@ mod tests {
             &None,
             &Some(relay_tx),
             &Arc::new(Mutex::new(HashSet::new())),
+            &Default::default(),
         )
         .await;
 
@@ -1874,6 +2074,187 @@ mod tests {
             }
             other => panic!("unexpected payload: {:?}", other),
         }
+    }
+
+    // ── frames that arrive in the same burst as OpenOk (#135) ────────────
+    //
+    // `dispatch_loop` hands OpenOk to the task inside `open_session` and goes on
+    // to the next frame. When a host answers at once, that frame (the first
+    // output, even the Exit) is already queued, and the loop reached it before the
+    // opener had registered the session: nothing was listening on the channel and
+    // the data was dropped -- `wsh host -- echo hi` printed nothing, some runs.
+
+    fn open_ok_for(channel_id: u32, stderr_channel_id: Option<u32>) -> Envelope {
+        Envelope {
+            msg_type: MsgType::OpenOk,
+            payload: Payload::OpenOk(OpenOkPayload {
+                channel_id,
+                stream_ids: vec![],
+                data_mode: SessionDataMode::Virtual,
+                capabilities: vec![],
+                session_id: Some("sess".into()),
+                token: Some(vec![1u8; 16]),
+                stderr_channel_id,
+            }),
+        }
+    }
+
+    fn data_for(channel_id: u32, data: &[u8]) -> Envelope {
+        Envelope {
+            msg_type: MsgType::SessionData,
+            payload: Payload::SessionData(SessionDataPayload {
+                channel_id,
+                data: data.to_vec(),
+            }),
+        }
+    }
+
+    fn exit_for(channel_id: u32, code: i32) -> Envelope {
+        Envelope {
+            msg_type: MsgType::Exit,
+            payload: Payload::Exit(wsh_core::messages::ExitPayload { channel_id, code }),
+        }
+    }
+
+    /// Feed `frames` to the client the way its dispatch loop does, with the
+    /// opener task not yet run in between (a current-thread runtime only polls it
+    /// when the test awaits something that suspends).
+    async fn dispatch_burst(client: &WshClient, frames: Vec<Envelope>) {
+        let (reverse_connect_tx, relay_message_tx) = (None, None);
+        for frame in frames {
+            WshClient::handle_incoming(
+                frame,
+                &client.response_tx,
+                &client.sessions,
+                &client.outgoing_tx,
+                &reverse_connect_tx,
+                &relay_message_tx,
+                &client.accepted_relay_peers,
+                &client.early,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn output_and_exit_that_arrive_with_open_ok_reach_the_session() {
+        let mut rig = build_test_client("s");
+        let client = Arc::new(rig.client);
+        let opener = {
+            let client = client.clone();
+            tokio::spawn(async move { client.open_session(SessionOpts::default()).await })
+        };
+        // The OPEN has gone out, so the opener is registered as the waiter.
+        rig.outgoing_rx.recv().await.expect("OPEN frame");
+
+        dispatch_burst(
+            &client,
+            vec![
+                open_ok_for(31, None),
+                data_for(31, b"hi\n"),
+                data_for(31, b"there\n"),
+                exit_for(31, 5),
+            ],
+        )
+        .await;
+
+        let session = opener.await.unwrap().expect("open_session");
+        let mut got = Vec::new();
+        let mut buf = [0_u8; 64];
+        // Bounded: with the frames lost, `read` never sees data or EOF and waits forever.
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let n = session.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await;
+        assert_eq!(
+            got, b"hi\nthere\n",
+            "output sent with OpenOk was lost or reordered"
+        );
+        assert_eq!(session.exit_code().await, Some(5), "the Exit was lost");
+    }
+
+    #[tokio::test]
+    async fn frames_for_a_channel_nobody_opened_still_go_to_the_relay_channel() {
+        // The hold applies only to a channel an OpenOk was just handed out for.
+        let rig = build_test_client("s");
+        let (relay_tx, mut relay_rx) = mpsc::channel(4);
+        WshClient::handle_incoming(
+            data_for(77, b"x"),
+            &rig.response_tx,
+            &rig.sessions,
+            &rig.outgoing_tx,
+            &None,
+            &Some(relay_tx),
+            &rig.accepted_relay_peers,
+            &rig.client.early,
+        )
+        .await;
+        assert!(relay_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stderr_channel_granted_with_open_ok_collects_its_early_output() {
+        let mut rig = build_test_client("s");
+        let client = Arc::new(rig.client);
+        let opener = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .open_session(SessionOpts {
+                        kind: ChannelKind::Exec,
+                        command: Some("x".into()),
+                        stdio: Some("pipes".into()),
+                        ..Default::default()
+                    })
+                    .await
+            })
+        };
+        rig.outgoing_rx.recv().await.expect("OPEN frame");
+        dispatch_burst(
+            &client,
+            vec![
+                open_ok_for(8, Some(9)),
+                data_for(9, b"oops\n"),
+                data_for(8, b"out\n"),
+                exit_for(8, 1),
+            ],
+        )
+        .await;
+        let session = opener.await.unwrap().expect("open_session");
+        assert!(session.has_stderr());
+        let mut buf = [0_u8; 16];
+        let n = session.read_stderr(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"oops\n");
+        assert_eq!(session.read_stderr(&mut buf).await.unwrap(), 0);
+        let n = session.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"out\n");
+        assert_eq!(session.exit_code().await, Some(1));
+    }
+
+    #[test]
+    fn the_backlog_for_one_unclaimed_channel_is_bounded() {
+        let mut early = super::EarlyChannels::default();
+        early.reserve(1);
+        let chunk = vec![0_u8; 1024 * 1024];
+        for _ in 0..16 {
+            assert!(early.hold(1, data_for(1, &chunk)).is_none());
+        }
+        let kept = early.release(1).len();
+        assert!(
+            kept <= 4,
+            "an OpenOk nobody claims must not hold more than a few MiB, held {kept} MiB"
+        );
+        // Too many channels reserved at once: the extras are simply not held.
+        for id in 0..64 {
+            early.reserve(id);
+        }
+        assert!(early.channels.len() <= 16);
     }
 
     #[tokio::test]
@@ -1900,6 +2281,7 @@ mod tests {
             reverse_connect_rx: Arc::new(Mutex::new(None)),
             relay_message_rx: Arc::new(Mutex::new(None)),
             accepted_relay_peers: Arc::new(Mutex::new(HashSet::new())),
+            early: Default::default(),
         };
 
         let response_task = tokio::spawn(async move {
@@ -1998,6 +2380,7 @@ mod tests {
             reverse_connect_rx: Arc::new(Mutex::new(None)),
             relay_message_rx: Arc::new(Mutex::new(None)),
             accepted_relay_peers: accepted_relay_peers.clone(),
+            early: Default::default(),
         };
 
         TestClientRig {
@@ -2042,6 +2425,7 @@ mod tests {
                     &None,
                     &None,
                     &accepted_relay_peers,
+                    &Default::default(),
                 )
                 .await;
             }
@@ -2140,6 +2524,7 @@ mod tests {
                 &None,
                 &None,
                 &accepted_relay_peers,
+                &Default::default(),
             )
             .await;
         }

@@ -65,6 +65,40 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Read a password from standard input (first line) and print its Argon2id hash for
+    /// `[auth.password_hashes]`, then exit. Pipe it in so it stays out of the process list
+    /// and shell history: printf '%s' "$PASSWORD" | wsh-server --hash-password
+    #[arg(long)]
+    hash_password: bool,
+}
+
+/// `--hash-password`: stdin in, a PHC string on stdout, a status code out.
+fn hash_password_from_stdin() -> i32 {
+    use std::io::{BufRead as _, IsTerminal as _};
+    if std::io::stdin().is_terminal() {
+        eprintln!("Password (typed text is shown; prefer piping it in):");
+    }
+    let mut line = String::new();
+    if let Err(e) = std::io::stdin().lock().read_line(&mut line) {
+        eprintln!("wsh-server: cannot read the password: {e}");
+        return 1;
+    }
+    let password = line.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        eprintln!("wsh-server: refusing to hash an empty password");
+        return 1;
+    }
+    match auth::password::hash_password(password) {
+        Ok(hash) => {
+            println!("{hash}");
+            0
+        }
+        Err(e) => {
+            eprintln!("wsh-server: hashing failed: {e}");
+            1
+        }
+    }
 }
 
 #[tokio::main]
@@ -72,6 +106,10 @@ async fn main() {
     install_rustls_crypto_provider();
 
     let cli = Cli::parse();
+
+    if cli.hash_password {
+        std::process::exit(hash_password_from_stdin());
+    }
 
     // Initialize tracing
     use tracing_subscriber::EnvFilter;

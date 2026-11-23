@@ -151,6 +151,7 @@ pub struct WebSocketSession {
 impl WebSocketSession {
     /// Connect to a wsh server over WebSocket.
     pub async fn connect(url: &str) -> WshResult<Self> {
+        super::install_crypto_provider();
         let (ws_stream, _response) = if insecure_loopback_tls_requested() {
             // See INSECURE_LOOPBACK_TLS_ENV's doc comment: only reachable
             // when the loopback test harness explicitly opts in.

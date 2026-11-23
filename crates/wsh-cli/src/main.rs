@@ -47,6 +47,11 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Give a one-off command (`wsh host command...`) a terminal: raw keyboard input,
+    /// and terminal resizes passed on. Needs standard input to be a terminal.
+    #[arg(long = "tty")]
+    tty: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -249,14 +254,20 @@ enum CheckCommand {
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize tracing.
+    // rustls needs a process-wide crypto provider before the first TLS handshake;
+    // without one every `wss://` connection panicked (#134).
+    wsh_client::transport::install_crypto_provider();
+
+    // Initialize tracing. Diagnostics go to stderr: stdout is the remote command's.
     if cli.verbose {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter("wsh=debug,wsh_cli=debug,wsh_client=debug,wsh_core=debug")
             .with_target(true)
             .init();
     } else {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter("wsh=warn,wsh_cli=warn")
             .with_target(false)
             .init();
@@ -416,7 +427,15 @@ async fn main() {
             if cli.args.len() > 1 {
                 // One-off exec: wsh user@host command arg1 arg2 ...
                 let command = cli.args[1..].join(" ");
-                commands::exec::run(target, &command, port, &identity, transport.as_deref()).await
+                commands::exec::run(
+                    target,
+                    &command,
+                    port,
+                    &identity,
+                    transport.as_deref(),
+                    cli.tty,
+                )
+                .await
             } else {
                 // Interactive connect: wsh user@host
                 commands::connect::run(target, port, &identity, transport.as_deref()).await
@@ -429,4 +448,9 @@ async fn main() {
         eprintln!("wsh: {e:#}");
         std::process::exit(1);
     }
+
+    // The command is done. Leave now instead of waiting for the runtime to drain: a
+    // reader thread blocked on the terminal or stdin cannot be cancelled, and
+    // `connect` stayed running behind one after the session had ended (#136).
+    std::process::exit(0);
 }

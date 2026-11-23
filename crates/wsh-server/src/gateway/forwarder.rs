@@ -10,6 +10,7 @@ use super::policy::GatewayPolicyEnforcer;
 use super::resolver::DnsResolver;
 use super::GatewayEvent;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -21,6 +22,23 @@ use wsh_core::messages::*;
 /// Idle timeout for UDP relay channels. If no data is sent or received for
 /// this duration, the relay shuts down automatically to prevent resource leaks.
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a destination name may take to resolve, and each address to connect.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Connect to the first address that accepts, trying them in order.
+async fn connect_first(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let mut last = std::io::Error::other("no address to connect to");
+    for addr in addrs {
+        match time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"),
+        }
+    }
+    Err(last)
+}
 
 /// Manages active gateway forwarding connections (TCP, UDP) and DNS lookups.
 ///
@@ -71,14 +89,15 @@ impl GatewayForwarder {
         port: u16,
         data_tx: mpsc::Sender<GatewayEvent>,
     ) -> Envelope {
-        // Policy check
-        if let Err(reason) = self.policy.check_connect(host, port) {
-            return build_gateway_fail(gateway_id, 4, &reason); // POLICY_DENIED
-        }
+        // Policy check, then resolve once and connect to an address that passed.
+        let addrs = match self.authorized_destination(host, port).await {
+            Ok(addrs) => addrs,
+            Err((code, reason)) => return build_gateway_fail(gateway_id, code, &reason),
+        };
 
         // Connect
         let addr = format!("{}:{}", host, port);
-        match TcpStream::connect(&addr).await {
+        match connect_first(&addrs).await {
             Ok(stream) => {
                 let resolved_addr = stream
                     .peer_addr()
@@ -139,15 +158,22 @@ impl GatewayForwarder {
         port: u16,
         data_tx: mpsc::Sender<GatewayEvent>,
     ) -> Envelope {
-        if let Err(reason) = self.policy.check_connect(host, port) {
-            return build_gateway_fail(gateway_id, 4, &reason);
-        }
+        let addrs = match self.authorized_destination(host, port).await {
+            Ok(addrs) => addrs,
+            Err((code, reason)) => return build_gateway_fail(gateway_id, code, &reason),
+        };
+        // The first address that passed: the socket must be of its family.
+        let target = addrs[0];
+        let addr = target.to_string();
+        let local = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
 
-        let addr = format!("{}:{}", host, port);
-
-        match UdpSocket::bind("0.0.0.0:0").await {
+        match UdpSocket::bind(local).await {
             Ok(socket) => {
-                if let Err(e) = socket.connect(&addr).await {
+                if let Err(e) = socket.connect(target).await {
                     return build_gateway_fail(gateway_id, 1, &e.to_string());
                 }
 
@@ -201,10 +227,61 @@ impl GatewayForwarder {
         name: &str,
         record_type: &str,
     ) -> Envelope {
+        if let Err(reason) = self.policy.check_resolve(name) {
+            return build_gateway_fail(gateway_id, 4, &reason); // POLICY_DENIED
+        }
         match DnsResolver::resolve(name, record_type).await {
-            Ok((addresses, ttl)) => build_dns_result(gateway_id, addresses, ttl),
+            Ok((addresses, ttl)) => {
+                // Answers inside the host's own network are not for the client to see
+                // either, unless a rule names them.
+                let parsed: Vec<IpAddr> = addresses.iter().filter_map(|a| a.parse().ok()).collect();
+                let allowed = self.policy.authorize_addrs(name, None, &parsed);
+                let addresses: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+                if addresses.is_empty() {
+                    return build_gateway_fail(
+                        gateway_id,
+                        4,
+                        &format!("destination not allowed: {name}"),
+                    );
+                }
+                build_dns_result(gateway_id, addresses, ttl)
+            }
             Err(reason) => build_gateway_fail(gateway_id, 3, &reason), // DNS_FAILED
         }
+    }
+
+    /// The addresses a client may reach for `host:port`: the policy's name-level check,
+    /// then one resolution (none for a literal address), filtered address by address.
+    ///
+    /// Callers connect to what comes back instead of resolving the name a second time,
+    /// so a name cannot answer "public" to this check and "internal" to the connect.
+    async fn authorized_destination(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Vec<SocketAddr>, (u32, String)> {
+        self.policy
+            .check_connect(host, port)
+            .map_err(|reason| (4, reason))?; // POLICY_DENIED
+        let bare = host.trim_matches(['[', ']']);
+        let resolved: Vec<IpAddr> = match bare.parse::<IpAddr>() {
+            Ok(ip) => vec![ip],
+            Err(_) => match time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((bare, port)))
+                .await
+            {
+                Ok(Ok(found)) => found.map(|a| a.ip()).collect(),
+                Ok(Err(e)) => return Err((3, format!("DNS resolution failed for {host}: {e}"))),
+                Err(_) => return Err((3, format!("DNS resolution timed out for {host}"))),
+            },
+        };
+        let allowed = self.policy.authorize_addrs(host, Some(port), &resolved);
+        if allowed.is_empty() {
+            return Err((4, format!("destination not allowed: {host}:{port}")));
+        }
+        Ok(allowed
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect())
     }
 
     /// Close a gateway connection (TCP or UDP) by `gateway_id`.
@@ -417,5 +494,128 @@ fn build_dns_result(gateway_id: u32, addresses: Vec<String>, ttl: Option<u32>) -
             addresses,
             ttl,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::policy::GatewayPolicy;
+    use tokio::net::TcpListener;
+
+    fn forwarder(rules: &[&str]) -> GatewayForwarder {
+        GatewayForwarder::new(Arc::new(GatewayPolicyEnforcer::new(GatewayPolicy {
+            allowed_destinations: rules.iter().map(|r| r.to_string()).collect(),
+            ..GatewayPolicy::default()
+        })))
+    }
+
+    /// A TCP listener on loopback that accepts and holds connections, and its port.
+    async fn local_service() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        (port, task)
+    }
+
+    async fn open_tcp(f: &GatewayForwarder, host: &str, port: u16) -> Envelope {
+        let (tx, _rx) = mpsc::channel(4);
+        f.handle_open_tcp(1, host, port, tx).await
+    }
+
+    fn fail_code(reply: &Envelope) -> Option<u32> {
+        match &reply.payload {
+            Payload::GatewayFail(f) => Some(f.code),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_policy_refuses_every_destination() {
+        let (port, _service) = local_service().await;
+        let reply = open_tcp(&forwarder(&[]), "127.0.0.1", port).await;
+        assert_eq!(fail_code(&reply), Some(4), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn the_wildcard_does_not_reach_this_machines_own_services() {
+        let (port, _service) = local_service().await;
+        let f = forwarder(&["*"]);
+        for host in ["127.0.0.1", "localhost", "[::1]", "0.0.0.0"] {
+            let reply = open_tcp(&f, host, port).await;
+            assert_eq!(fail_code(&reply), Some(4), "{host}: {reply:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_names_the_address_lets_it_through() {
+        let (port, _service) = local_service().await;
+        let reply = open_tcp(
+            &forwarder(&[&format!("127.0.0.1:{port}")]),
+            "127.0.0.1",
+            port,
+        )
+        .await;
+        assert!(matches!(reply.payload, Payload::GatewayOk(_)), "{reply:?}");
+
+        let reply = open_tcp(&forwarder(&["127.0.0.0/8"]), "127.0.0.1", port).await;
+        assert!(matches!(reply.payload, Payload::GatewayOk(_)), "{reply:?}");
+
+        // A name rule: `localhost` resolves to loopback and the admin named it.
+        let reply = open_tcp(&forwarder(&["localhost"]), "localhost", port).await;
+        assert!(matches!(reply.payload, Payload::GatewayOk(_)), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn naming_one_port_does_not_open_the_others() {
+        let (port, _service) = local_service().await;
+        let other = if port == 65535 { port - 1 } else { port + 1 };
+        let reply = open_tcp(
+            &forwarder(&[&format!("127.0.0.1:{port}")]),
+            "127.0.0.1",
+            other,
+        )
+        .await;
+        assert_eq!(fail_code(&reply), Some(4), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn udp_to_a_restricted_address_is_refused_too() {
+        let (tx, _rx) = mpsc::channel(4);
+        let reply = forwarder(&["*"])
+            .handle_open_udp(1, "127.0.0.1", 9, tx)
+            .await;
+        assert_eq!(fail_code(&reply), Some(4), "{reply:?}");
+        let (tx, _rx) = mpsc::channel(4);
+        let reply = forwarder(&["127.0.0.1"])
+            .handle_open_udp(1, "127.0.0.1", 9, tx)
+            .await;
+        assert!(matches!(reply.payload, Payload::GatewayOk(_)), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn dns_lookups_need_a_rule_and_do_not_reveal_internal_answers() {
+        let none = forwarder(&[]).handle_resolve_dns(1, "localhost", "A").await;
+        assert_eq!(fail_code(&none), Some(4), "{none:?}");
+
+        // `*` allows the lookup, but its only answer is 127.0.0.1: nothing left to return.
+        let wild = forwarder(&["*"])
+            .handle_resolve_dns(1, "localhost", "A")
+            .await;
+        assert_eq!(fail_code(&wild), Some(4), "{wild:?}");
+
+        // Named, it answers.
+        let named = forwarder(&["localhost"])
+            .handle_resolve_dns(1, "localhost", "A")
+            .await;
+        match named.payload {
+            Payload::DnsResult(r) => assert!(r.addresses.iter().any(|a| a == "127.0.0.1"), "{r:?}"),
+            other => panic!("expected an answer, got {other:?}"),
+        }
     }
 }
