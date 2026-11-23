@@ -111,7 +111,7 @@ function pageEndpoints(record) {
   };
 }
 
-window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false } = {}) => {
+window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding, firstOutputDelayMs = 0 } = {}) => {
   const log = [];
   const record = { opened: [] };
   const ptyCalls = [];
@@ -127,11 +127,14 @@ window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = f
     // Each entry is an authorized_keys line or the raw key bytes a spec sends as an array of numbers.
     auth: { authorizedKeys: authorizedKeys.map((a) => (typeof a === 'string' ? a : new Uint8Array(a))) },
     exec: async (command, io) => {
+      if (command === 'env') { await io.write(JSON.stringify(io.env)); return 0; }
       if (command === 'cat') {
         io.onInput((bytes) => { void io.write(bytes); });
         await new Promise((resolve) => io.onInputEnd(resolve));
         return 0;
       }
+      // (a spec driving a RELEASED Rust CLI asks for a pause here: releases up to rust-v0.6.0 drop output that arrives in the same burst as OpenOk, #135)
+      if (firstOutputDelayMs) await new Promise((resolve) => setTimeout(resolve, firstOutputDelayMs));
       await io.write(`ran:${command}\n`);
       return 3;
     },
@@ -150,6 +153,7 @@ window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = f
     },
     fs,
     hostKey: hostKeyOption,
+    requireChannelBinding,
     sessions: sessions || undefined,
     endpoints: endpoints ? pageEndpoints(record) : undefined,
     dataStreams,
@@ -174,5 +178,30 @@ window.h.hostInfo = async (id) => {
   };
 };
 window.h.stopHost = (id) => hosts.get(id).host.close();
+
+// ── A reverse host that lives in the page (`@johnhenry/wsh/reverse`) ────────────────────────────────────────────────────
+const reverseHosts = new Map();
+/**
+ * Dial `url` (a relay) with the page's own WebSocket as a reverse host. `acceptFingerprints` are the operators `accept`
+ * says yes to; every `accept` call and every command the host ran is recorded.
+ */
+window.h.startReverseHost = async ({ url, acceptFingerprints, requireOperatorProof = true, name = 'host', key = 'host' }) => {
+  const keyPair = keys.get(key); // made by `newKey` (non-extractable)
+  const accepted = [];
+  const ran = [];
+  const log = [];
+  const host = wsh.createReverseHost({
+    url, username: name, keyPair, reconnect: false, proofTimeoutMs: 1500, requireOperatorProof,
+    exec: async (command, io) => { ran.push(command); await io.write(`ran:${command}\n`); return 0; },
+    accept: (who) => { accepted.push({ ...who, publicKey: who.publicKey ? Array.from(who.publicKey) : null }); return acceptFingerprints.includes(who.fingerprint); },
+    onLog: (l) => log.push(l),
+  });
+  const { fingerprint } = await host.start();
+  const id = `r${++counter}`;
+  reverseHosts.set(id, { host, accepted, ran, log });
+  return { id, fingerprint, bufferType: typeof Buffer };
+};
+window.h.reverseInfo = (id) => { const { host, accepted, ran, log } = reverseHosts.get(id); return { accepted, ran, log, operators: host.operators }; };
+window.h.stopReverseHost = (id) => reverseHosts.get(id).host.close();
 
 window.wshReady = true;

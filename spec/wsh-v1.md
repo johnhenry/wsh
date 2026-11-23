@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 103
+- **Total message types**: 105
 
 ## Enums
 
@@ -119,6 +119,8 @@ Type: `string`
 | `0x55` | ReverseReject | reverse |
 | `0x56` | RelayForward | reverse |
 | `0x57` | ReverseClose | reverse |
+| `0x58` | ReverseChallenge | reverse |
+| `0x59` | ReverseProof | reverse |
 | `0x5f` | SessionList | session |
 | `0x60` | Detach | session |
 | `0x61` | DetachOk | session |
@@ -663,6 +665,7 @@ Category: **reverse**
 | `target_fingerprint` | `string` | yes | — |
 | `username` | `string` | yes | — |
 | `from_fingerprint` | `string` | yes | — |
+| `features` | `string[]` | no | — |
 
 ### ReverseAccept (`0x54`)
 
@@ -717,6 +720,37 @@ Category: **reverse**
 |-------|------|----------|---------|
 | `target_fingerprint` | `string` | yes | — |
 | `reason` | `string` | no | — |
+
+### ReverseChallenge (`0x58`)
+
+Category: **reverse**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `target_fingerprint` | `string` | yes | — |
+| `public_key` | `bytes` | yes | — |
+| `operator_fingerprint` | `string` | yes | — |
+| `nonce` | `bytes` | yes | — |
+| `session_id` | `string` | yes | — |
+| `signature` | `bytes` | yes | — |
+
+### ReverseProof (`0x59`)
+
+Category: **reverse**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `target_fingerprint` | `string` | yes | — |
+| `public_key` | `bytes` | yes | — |
+| `username` | `string` | yes | — |
+| `nonce` | `bytes` | yes | — |
+| `session_id` | `string` | yes | — |
+| `signature` | `bytes` | yes | — |
+| `from_fingerprint` | `string` | no | — |
 
 ### SessionList (`0x5f`)
 

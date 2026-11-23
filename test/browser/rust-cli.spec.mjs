@@ -49,7 +49,7 @@ test.describe('released Rust CLI -> host in the page', () => {
 
   /** A host in the page that trusts the CLI's key, served on one pipe socket. */
   async function startHost(page, options = {}) {
-    const id = await page.evaluate((o) => window.h.startHost(o), { authorizedKeys: [operatorKey], dataStreams: false, ...options });
+    const id = await page.evaluate((o) => window.h.startHost(o), { authorizedKeys: [operatorKey], dataStreams: false, firstOutputDelayMs: 50 /* #135: the released CLI loses output that arrives with OpenOk; remove once a release carries the fix */, ...options });
     await page.evaluate(([i, url]) => window.h.serve(i, url), [id, pipe.hostUrl]);
     return id;
   }

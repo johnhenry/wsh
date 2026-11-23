@@ -488,6 +488,7 @@ pub async fn run_connect(
             // Ignored by the server -- it overwrites this with the
             // authenticated fingerprint of this connection before forwarding.
             from_fingerprint: String::new(),
+            features: None,
         }),
     };
 
@@ -516,6 +517,7 @@ pub async fn run_connect(
             cols: Some(cols),
             rows: Some(rows),
             env: None,
+            ..Default::default()
         })
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))

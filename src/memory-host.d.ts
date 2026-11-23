@@ -2,7 +2,7 @@ import type { WshClient, RpcChannel } from './index.js';
 import type { WshSigner } from './index.js';
 import type { WshFileBackend, WshHostKeyOption } from './host.js';
 import type {
-  WshServerAuthOptions, WshServerPrincipal, WshServerMcpOptions, WshExecRunner, WshServerOptions, WshServerPtyOptions,
+  WshServerAuthOptions, WshServerPrincipal, WshServerMcpOptions, WshExecRunner, WshServerOptions, WshServerPtyOptions, WshClientEnv,
   WshAcceptableSocket, WshAcceptOptions, WshGatewayEndpointHandler as WshMemoryEndpointHandler,
 } from './server/index.js';
 
@@ -30,7 +30,7 @@ export interface WshMemoryHostOptions {
   /** As for `createWshServer`. Omitted = refuse everyone. */
   auth?: WshServerAuthOptions | ((who: WshServerPrincipal) => boolean | Promise<boolean>);
   /** `run(command, io)`; there is no shell in memory, so there is no `true`. */
-  exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: boolean };
+  exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: WshClientEnv };
   /** `node-pty`-shaped `{ spawn }`, injected (a browser has no pty of its own). Input arrives at `write` as a `Uint8Array`. Off unless given. */
   pty?: WshServerPtyOptions;
   /** An object of file operations, not a root path (confining paths is the backend's job). Off unless given. */
@@ -68,6 +68,13 @@ export interface WshMemoryHostOptions {
    */
   endpoints?: Record<string, WshMemoryEndpointHandler | { open: WshMemoryEndpointHandler; authorize?: (who: { username: string | null; fingerprint: string | null }) => boolean | Promise<boolean> }>;
   bindTimeoutMs?: number;
+  /** End each authenticated connection this long after login; advertised as `AuthOk.ttl` in whole seconds. 0 / omitted = never. */
+  connectionTtlMs?: number;
+  /**
+   * Accept a key login only when its signature is bound to this host's key (`host`, the one binding a memory host has).
+   * Needs `hostKey`; a client older than 0.36 cannot satisfy it.
+   */
+  requireChannelBinding?: boolean | Array<'host'>;
   onLog?: (line: string) => void;
 }
 

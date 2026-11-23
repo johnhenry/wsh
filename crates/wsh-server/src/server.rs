@@ -232,6 +232,22 @@ struct FileUploadState {
 }
 
 impl WshServer {
+    /// Does `password` match the configured hash for `username`?
+    ///
+    /// Argon2id is deliberately slow, so it runs on the blocking pool, not on the
+    /// connection's task. A user with no usable entry costs the same and answers the
+    /// same as a wrong password. Callers have already checked `allow_password`, and
+    /// the per-address auth rate limit bounds how many of these one peer can start.
+    async fn check_password(&self, username: &str, password: &str) -> bool {
+        let stored = self.config.password_hashes.get(username).cloned();
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::auth::password::verify_login(&password, stored.as_ref())
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// Create a new server instance.
     pub fn new(config: ServerConfig) -> WshResult<Self> {
         // Generate server secret
@@ -295,6 +311,7 @@ impl WshServer {
             allowed_destinations: config.gateway_allowed_destinations.clone(),
             max_connections: config.gateway_max_connections,
             enable_reverse_tunnels: config.gateway_enable_reverse_tunnels,
+            reverse_bind_addr: config.gateway_reverse_bind_addr,
         };
         let policy_enforcer = Arc::new(GatewayPolicyEnforcer::new(gateway_policy));
         let gateway_forwarder = Arc::new(GatewayForwarder::new(policy_enforcer.clone()));
@@ -701,23 +718,16 @@ impl WshServer {
         }
 
         // Pre-check password auth against config hashes
-        if auth.method == AuthMethod::Password {
+        if auth.method == AuthMethod::Password && self.config.allow_password {
             match auth.password {
                 Some(ref password) => {
-                    if let Some(expected_hash) = self.config.password_hashes.get(&hello.username) {
-                        if !handshake::verify_password_hash(password, expected_hash) {
-                            let fail = handshake::build_auth_fail("invalid password");
-                            let fail_frame = frame_encode(&fail)?;
-                            let _ = send.write_all(&fail_frame).await;
-                            return Err(WshError::AuthFailed("invalid password".into()));
-                        }
-                    } else {
-                        let fail = handshake::build_auth_fail("unknown user");
+                    // An unknown user and a wrong password are one answer, after the
+                    // same work (see `auth::password::verify_login`).
+                    if !self.check_password(&hello.username, password).await {
+                        let fail = handshake::build_auth_fail("invalid password");
                         let fail_frame = frame_encode(&fail)?;
                         let _ = send.write_all(&fail_frame).await;
-                        return Err(WshError::AuthFailed(
-                            "unknown user for password auth".into(),
-                        ));
+                        return Err(WshError::AuthFailed("invalid password".into()));
                     }
                 }
                 None => {
@@ -1711,25 +1721,18 @@ impl WshServer {
                                         }
 
                                         // Pre-check password auth against config hashes
-                                        if auth.method == AuthMethod::Password {
+                                        if auth.method == AuthMethod::Password && self.config.allow_password {
                                             match auth.password {
                                                 Some(ref password) => {
-                                                    if let Some(expected_hash) = self.config.password_hashes.get(&hello.username) {
-                                                        if !handshake::verify_password_hash(password, expected_hash) {
-                                                            let fail = handshake::build_auth_fail("invalid password");
-                                                            if let Ok(fail_frame) = frame_encode(&fail) {
-                                                                let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
-                                                            }
-                                                            break 'session Err(WshError::AuthFailed("invalid password".into()));
-                                                        }
-                                                    } else {
-                                                        let fail = handshake::build_auth_fail("unknown user");
+                                                    // An unknown user and a wrong password are one
+                                                    // answer, after the same work (see
+                                                    // `auth::password::verify_login`).
+                                                    if !self.check_password(&hello.username, password).await {
+                                                        let fail = handshake::build_auth_fail("invalid password");
                                                         if let Ok(fail_frame) = frame_encode(&fail) {
                                                             let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
                                                         }
-                                                        break 'session Err(WshError::AuthFailed(
-                                                            "unknown user for password auth".into(),
-                                                        ));
+                                                        break 'session Err(WshError::AuthFailed("invalid password".into()));
                                                     }
                                                 }
                                                 None => {
@@ -2535,6 +2538,7 @@ impl WshServer {
                                     target_fingerprint: p.target_fingerprint.clone(),
                                     username: p.username.clone(),
                                     from_fingerprint: ctx.fingerprint.clone(),
+                                    features: None,
                                 }),
                             };
                             if target_tx.try_send(fwd).is_err() {
@@ -4848,6 +4852,7 @@ mod wisp_reverse_connect_e2e_tests {
             gateway_allowed_destinations: Vec::new(),
             gateway_max_connections: 10,
             gateway_enable_reverse_tunnels: false,
+            gateway_reverse_bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             password_hashes: std::collections::HashMap::new(),
             rpc_enabled: true,
             rpc_max_message_bytes: crate::rpc::RPC_DEFAULT_MAX_MESSAGE,

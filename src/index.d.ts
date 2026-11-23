@@ -1824,7 +1824,16 @@ export interface WshHostKeyOptions {
   hostLabel?: string;
   /** Sees the verified key before any credential is sent; return `false` (or throw) to refuse. */
   onHostKey?: (hostKey: WshHostKey) => boolean | void | Promise<boolean | void>;
+  /**
+   * Refuse to sign the login unless the signature can be bound to this connection (#119): `true` needs at least one
+   * binding kind the host offers and this client can supply (`host`, `cert-hash`, `tls-exporter`), an array names
+   * kinds that must all be bound. Nothing is signed otherwise. Key logins only.
+   */
+  requireChannelBinding?: boolean | WshChannelBindingKind[];
 }
+
+/** What a login signature can be bound to (wsh #119). */
+export type WshChannelBindingKind = 'cert-hash' | 'host' | 'tls-exporter';
 
 /** Options for WshClient.connect(). */
 export interface WshConnectOptions extends WshHostKeyOptions {
@@ -1921,6 +1930,7 @@ export interface WshConnectReverseOptions {
   trustOnFirstUse?: boolean;
   hostLabel?: string;
   onHostKey?: WshHostKeyOptions['onHostKey'];
+  requireChannelBinding?: WshHostKeyOptions['requireChannelBinding'];
   expose?: {
     shell?: boolean;
     exec?: boolean;
@@ -2009,6 +2019,31 @@ export interface WshPeerInfo {
 export const E2E_FEATURE: 'e2e';
 /** Host feature: it signs its `KeyExchange` reply, so `initiateE2E(..., { verifyPeer })` can authenticate it. */
 export const E2E_SIGN_FEATURE: 'e2e-sign';
+
+/** Relay feature / operator feature: a `ReverseChallenge` / `ReverseProof` crosses the relay (#117). */
+export const OPERATOR_PROOF_FEATURE: 'operator-proof';
+/** Host feature (`ReverseAccept.features`): it takes a signed initiator half and a sealed bridge (#117). */
+export const E2E_SEALED_FEATURE: 'e2e-sealed';
+export function challengeTranscript(t: { peerPublicKey: Uint8Array; operatorFingerprint: string; nonce: Uint8Array; sessionId: string }): Uint8Array;
+export function proofTranscript(t: { peerPublicKey: Uint8Array; operatorPublicKey: Uint8Array; username: string; nonce: Uint8Array; sessionId: string }): Uint8Array;
+/** `EncryptedFrame.channel_id` of a bridge-level frame (real channels start at 1). */
+export const BRIDGE_CHANNEL_ID: 0;
+/** A sealed reverse bridge (#117): seals every message that would cross it into an `EncryptedFrame` and opens them. */
+export class SealedBridge {
+  constructor(p: { key: CryptoKey; sessionId: string; role: 'initiator' | 'responder' });
+  readonly sessionId: string;
+  isFrame(msg: WshMessage): boolean;
+  seal(msg: WshMessage): Promise<WshMessage>;
+  open(frame: WshMessage): Promise<WshMessage>;
+}
+/** Operator proof (#117): the peer's signed `ReverseChallenge` fields, and the checks on each side. */
+export function createReverseChallenge(identity: { keyPair?: CryptoKeyPair; signer?: WshSigner }, operatorFingerprint: string): Promise<{ fields: object; nonce: Uint8Array; sessionId: string; peerPublicKey: Uint8Array }>;
+export function verifyReverseChallenge(msg: WshMessage, expect: { target: string; ownFingerprint: string }): Promise<{ peerPublicKey: Uint8Array; peerFingerprint: string; nonce: Uint8Array; sessionId: string }>;
+export function createOperatorProof(signer: { publicKeyRaw: Uint8Array; sign(data: Uint8Array): Promise<Uint8Array> }, challenge: { peerPublicKey: Uint8Array; nonce: Uint8Array; sessionId: string }, username: string): Promise<object>;
+export function verifyOperatorProof(msg: WshMessage, issued: { nonce: Uint8Array; sessionId: string; peerPublicKey: Uint8Array }): Promise<{ publicKey: Uint8Array; fingerprint: string; username: string } | null>;
+/** The binding a login signature carries (#119): SHA-256 over the kinds present, or empty when there are none. */
+export function computeChannelBinding(values: Partial<Record<WshChannelBindingKind, Uint8Array>>): Promise<Uint8Array>;
+export const CHANNEL_BINDING_KINDS: readonly WshChannelBindingKind[];
 
 /** The bytes a responder signs in `KeyExchange.signature`. */
 export function keyExchangeTranscript(t: {
@@ -2112,6 +2147,9 @@ export class WshClient {
    * `resumeSession`.
    */
   readonly authToken: Uint8Array | null;
+
+  /** Seconds the host said it will keep this connection (`AuthOk.ttl`); 0 = no limit promised. Hosts older than 0.36 sent an unenforced 3600. */
+  readonly authTtl: number;
 
   /** Read-only view of active sessions. */
   readonly sessions: Map<number, WshSession>;
@@ -2342,6 +2380,34 @@ export class WshClient {
   reverseConnectTo(targetFingerprint: string, timeout?: number): Promise<void>;
 
   /**
+   * Connect to a registered peer and wait for its accept or reject. Against a relay that lists `operator-proof` and a
+   * peer that asks, this operator PROVES its identity to the peer (a signature over the peer's key, a nonce the peer
+   * chose and the bridge's session) instead of leaving the peer to trust the relay's `from_fingerprint` (#117).
+   */
+  reverseConnect(
+    targetFingerprint: string,
+    timeout?: number,
+    opts?: {
+      /** `'auto'` (default): prove when the relay carries it and the peer asks; `false`: never; `true`: refuse if the relay cannot carry it. */
+      proof?: 'auto' | boolean;
+      /** Refuse the bridge unless the peer signed its challenge (so it proved its key to this operator). */
+      requirePeerProof?: boolean;
+      /**
+       * Seal the bridge: a key exchange both sides sign comes first, and everything after crosses the relay as
+       * `EncryptedFrame`s. Nothing that names a command, a path or a session is sent before the key exists.
+       * The peer must state `e2e-sealed`. `{ hybrid: false }` skips ML-KEM.
+       */
+      sealed?: boolean | { hybrid?: boolean };
+    },
+  ): Promise<WshMessage>;
+
+  /** The binding kinds the last login's signature covered (`[]` = unbound). */
+  readonly channelBinding: WshChannelBindingKind[];
+
+  /** Called with the operator's `ReverseProof` when this peer sent a `ReverseChallenge` (reverse mode). */
+  onReverseProof: ((msg: WshMessage) => void) | null;
+
+  /**
    * Send a control message over the authenticated relay connection.
    */
   sendRelayControl(msg: WshMessage, opts?: { to?: string }): Promise<void>;
@@ -2384,6 +2450,10 @@ export class WshClient {
     opts?: {
       /** The peer's long-term Ed25519 public key; the exchange is refused (`E2E_PEER_UNAUTHENTICATED`) unless it signed its half. */
       verifyPeer?: Uint8Array | CryptoKey;
+      /** Sign this (initiator) half with the operator's key; send only to a peer that stated `e2e-sealed`. */
+      signAs?: { sign(data: Uint8Array): Promise<Uint8Array> };
+      /** The responder's raw identity key, bound into the initiator signature (default: `verifyPeer` when raw). */
+      responderIdentity?: Uint8Array;
     },
   ): Promise<WshE2EResult>;
 

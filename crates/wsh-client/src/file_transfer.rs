@@ -36,6 +36,7 @@ where
             cols: None,
             rows: None,
             env: None,
+            ..Default::default()
         })
         .await?;
 
@@ -81,6 +82,7 @@ pub async fn download(client: &WshClient, remote_path: &str) -> WshResult<Vec<u8
             cols: None,
             rows: None,
             env: None,
+            ..Default::default()
         })
         .await?;
 

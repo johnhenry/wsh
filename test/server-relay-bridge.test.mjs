@@ -188,7 +188,7 @@ describe('relay bridge: E2E, one operator per peer, bridged features', () => {
       await bob.reverseConnect(keys.host.fp);
       assert.equal(bob.hasFeature('file-write'), false, 'the host has no fs, whatever the relay has');
       assert.equal(bob.hasFeature('file-rename'), false);
-      assert.deepEqual(bob.bridgedFeatures, ['e2e', 'e2e-sign'], 'the host stated its features (only the end-to-end layer: no fs, no mcp), which is a statement');
+      assert.deepEqual(bob.bridgedFeatures, ['e2e', 'e2e-sign', 'e2e-sealed'], 'the host stated its features (only the end-to-end layer: no fs, no mcp; e2e-sealed because the operator proved itself), which is a statement');
       await assert.rejects(() => bob.fileWrite('x.txt', 'x'), /does not support file write/);
     });
 

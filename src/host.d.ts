@@ -1,6 +1,6 @@
 import type { WshSigner } from './index.js';
 import type {
-  WshExecRunner, WshServerPtyOptions, WshServerMcpOptions, WshServerAuthOptions, WshServerPrincipal, WshAcceptableSocket, WshAcceptOptions,
+  WshExecRunner, WshServerPtyOptions, WshServerMcpOptions, WshServerAuthOptions, WshServerPrincipal, WshAcceptableSocket, WshAcceptOptions, WshClientEnv,
 } from './server/index.js';
 
 /**
@@ -41,7 +41,7 @@ export interface WshResolvedHostKey {
 
 export interface WshResolvedBackends {
   execRunner: WshExecRunner | null;
-  execOptions: { timeoutMs?: number; clientEnv?: boolean };
+  execOptions: { timeoutMs?: number; clientEnv?: WshClientEnv };
   pty: { spawn: WshServerPtyOptions['spawn']; shell: string; cwd?: string; env?: Record<string, string | undefined>; term: string } | null;
   files: Required<Pick<WshFileBackend, 'operate' | 'readWhole' | 'writeWhole' | 'writeAt' | 'maxFileBytes'>> & Pick<WshFileBackend, 'openRange'> | null;
   mcp: object | null;
@@ -49,7 +49,7 @@ export interface WshResolvedBackends {
 
 /** Validate injected backends (no shell, no directory: `exec` is a function or `{ run }`, `fs` an object of operations). */
 export function resolveBackends(options?: {
-  exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: boolean };
+  exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: WshClientEnv };
   pty?: WshServerPtyOptions;
   fs?: WshFileBackend;
   mcp?: WshServerMcpOptions;

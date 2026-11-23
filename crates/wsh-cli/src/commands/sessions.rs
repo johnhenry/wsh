@@ -19,7 +19,7 @@ use crate::commands::common::{
 pub async fn run_list() -> Result<()> {
     let last = load_last_session()?
         .context("no previous session found (connect once before using `wsh sessions`)")?;
-    let target = format!("{}@{}", last.user, last.host);
+    let target = last.target();
     let resolved = resolve_target(&target, last.port, last.transport.as_deref())?;
     let client = connect_client(&resolved, &last.identity).await?;
     let sessions = client
@@ -66,7 +66,7 @@ pub async fn run_attach(
     info!(session = %session, "attaching");
     let last = load_last_session()?
         .context("no previous session found (connect once before using `wsh attach`)")?;
-    let target = format!("{}@{}", last.user, last.host);
+    let target = last.target();
     let effective_transport = transport.or(last.transport.as_deref());
     let resolved = resolve_target(&target, port, effective_transport)?;
     let effective_identity = if identity.is_empty() {
@@ -102,7 +102,7 @@ pub async fn run_detach() -> Result<()> {
     let session_id = load_active_attachment()?
         .context("no active attachment found (use `wsh attach <session_id>` first)")?;
 
-    let target = format!("{}@{}", last.user, last.host);
+    let target = last.target();
     let resolved = resolve_target(&target, last.port, last.transport.as_deref())?;
     let client = connect_client(&resolved, &last.identity).await?;
     client

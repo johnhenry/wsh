@@ -61,6 +61,8 @@ pub enum MsgType {
     ReverseReject = 0x55,
     RelayForward = 0x56,
     ReverseClose = 0x57,
+    ReverseChallenge = 0x58,
+    ReverseProof = 0x59,
 
     SessionList = 0x5f,
     Detach = 0x60,
@@ -193,6 +195,8 @@ impl TryFrom<u8> for MsgType {
             0x55 => Ok(Self::ReverseReject),
             0x56 => Ok(Self::RelayForward),
             0x57 => Ok(Self::ReverseClose),
+            0x58 => Ok(Self::ReverseChallenge),
+            0x59 => Ok(Self::ReverseProof),
             0x5f => Ok(Self::SessionList),
             0x60 => Ok(Self::Detach),
             0x61 => Ok(Self::DetachOk),
@@ -372,6 +376,8 @@ pub enum Payload {
     ReverseReject(ReverseRejectPayload),
     RelayForward(RelayForwardPayload),
     ReverseClose(ReverseClosePayload),
+    ReverseChallenge(ReverseChallengePayload),
+    ReverseProof(ReverseProofPayload),
     SessionList(SessionListPayload),
     Detach(DetachPayload),
     DetachOk(DetachOkPayload),
@@ -484,6 +490,8 @@ impl Payload {
             MsgType::ReverseReject => Ok(Self::ReverseReject(ciborium::from_reader(cursor)?)),
             MsgType::RelayForward => Ok(Self::RelayForward(ciborium::from_reader(cursor)?)),
             MsgType::ReverseClose => Ok(Self::ReverseClose(ciborium::from_reader(cursor)?)),
+            MsgType::ReverseChallenge => Ok(Self::ReverseChallenge(ciborium::from_reader(cursor)?)),
+            MsgType::ReverseProof => Ok(Self::ReverseProof(ciborium::from_reader(cursor)?)),
             MsgType::SessionList => Ok(Self::SessionList(ciborium::from_reader(cursor)?)),
             MsgType::Detach => Ok(Self::Detach(ciborium::from_reader(cursor)?)),
             MsgType::DetachOk => Ok(Self::DetachOk(ciborium::from_reader(cursor)?)),
@@ -924,6 +932,8 @@ pub struct ReverseConnectPayload {
     pub target_fingerprint: String,
     pub username: String,
     pub from_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,6 +991,36 @@ pub struct ReverseClosePayload {
     pub target_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseChallengePayload {
+    pub target_fingerprint: String,
+    #[serde(with = "serde_bytes")]
+    pub public_key: Vec<u8>,
+    pub operator_fingerprint: String,
+    #[serde(with = "serde_bytes")]
+    pub nonce: Vec<u8>,
+    pub session_id: String,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseProofPayload {
+    pub target_fingerprint: String,
+    #[serde(with = "serde_bytes")]
+    pub public_key: Vec<u8>,
+    pub username: String,
+    #[serde(with = "serde_bytes")]
+    pub nonce: Vec<u8>,
+    pub session_id: String,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

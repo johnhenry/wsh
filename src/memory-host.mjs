@@ -35,6 +35,7 @@ import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs'
 import { resolveBackends, resolveHostKey } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
 import { normalizeEndpointGateway, createEndpointGatewaySession } from './server/gateway-core.mjs';
+import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
 import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
 
@@ -130,7 +131,7 @@ function createRegistry(sessions, log) {
 /**
  * @param {object} [options]
  * @param {object | Function} [options.auth] - As for `createWshServer`. Omitted = refuse everyone.
- * @param {Function | { run: Function, timeoutMs?: number, clientEnv?: boolean }} [options.exec]
+ * @param {Function | { run: Function, timeoutMs?: number, clientEnv?: boolean | string[] | Function }} [options.exec]
  *   `run(command, io) => Promise<exitCode>` (see `ExecIo` in `server/exec.mjs`): the host has no shell, so there is no `true`.
  * @param {{ spawn: Function, shell?: string, cwd?: string, env?: object, term?: string }} [options.pty]
  *   `pty.spawn(file, args, { name, cols, rows, cwd, env })` as `node-pty`'s `spawn` (or anything shaped like it) returns
@@ -164,9 +165,20 @@ function createRegistry(sessions, log) {
  *   throw synchronously to refuse, or give `{ open, authorize(who) }`. Only the names listed here exist (an allow-list by
  *   construction); nothing else of the gateway (TCP, DNS, unix sockets) is on in memory.
  * @param {number} [options.bindTimeoutMs=3000]
+ * @param {number} [options.connectionTtlMs=0] - End each authenticated connection this long after login; advertised as
+ *   `AuthOk.ttl` in whole seconds (#125). 0 = never.
+ * @param {boolean | string[]} [options.requireChannelBinding=false] - Accept a key login only when its signature is bound
+ *   to this host's key (#119). A memory host can bind only `host` (it has no TLS of its own), so this needs `hostKey`;
+ *   `true` or `['host']`.
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, onLog = () => {} } = {}) {
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, onLog = () => {} } = {}) {
+  if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
+  if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
+    throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
+  }
+  if (Array.isArray(requireChannelBinding) && requireChannelBinding.some((k) => k !== 'host')) throw new TypeError('createMemoryHost: requireChannelBinding can name only "host" (a memory host has no TLS connection or certificate to bind)');
+  if (requireChannelBinding && !hostKey) throw new TypeError('createMemoryHost: requireChannelBinding needs a hostKey (the only thing a memory host can bind a login to)');
   if (exec === true) throw new TypeError('createMemoryHost: exec must be a function (run(command, io)); there is no shell to run `true` with');
   if (exec !== undefined && typeof exec !== 'function' && typeof exec?.run !== 'function') {
     throw new TypeError('createMemoryHost: exec must be a function or { run }');
@@ -189,7 +201,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   const gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints });
 
   const ready = Promise.all([buildAuthorizer(auth), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
-    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, log: onLog,
+    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, log: onLog,
     methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));

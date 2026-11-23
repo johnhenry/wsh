@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+### npm package: gateway forwarding (#120, #123, #98, #124)
 - **Security fix and behaviour change: the Node gateway checks the resolved address.** The `gateway` option of
   `createWshServer` matched `allow` against the NAME a client sent and dialled that name; it now checks the address the
   name resolves to as well. The host resolves the name once, drops every address that
@@ -16,8 +17,8 @@
     so explicitly: `gateway.allowPrivate: ['10.0.0.0/8', '127.0.0.1', ...]` (CIDR blocks or addresses), or an `allow`
     entry that is itself an IP literal (`"192.168.1.5:1883"`, which permits exactly that address). Public destinations are
     unaffected. Through `socks` the name still goes to the proxy unresolved (nothing to check); IP literals are checked.
-  - The Rust `wsh-server` gateway has the same gap (`check_connect` matches the name, `connect` resolves it again) and is
-    NOT fixed by this change.
+  - The Rust `wsh-server` closed the same gap separately (see "Breaking: Rust `wsh-server` defaults" below): a server
+    built before that change still matches only the name.
   - **Tests:** `test/gateway-address-guard.test.mjs` (the guard over IPv4, IPv6, mapped, NAT64, 6to4, malformed input),
     `test/gateway-address-policy.test.mjs` (an allowed name resolving to loopback/private/link-local/mapped/NAT64 refused
     after exactly one lookup; connect uses the checked address; literals and the odd numeric spellings; `allowPrivate`
@@ -72,7 +73,7 @@
   No new messages or features. Because it rides the ordered, reliable control stream it has head-of-line blocking and
   retransmission: **WebTransport datagrams, per-flow datagram ids, MTU handling and per-client rate bounds (the rest of
   #124) are not implemented.** The Rust `wsh-server` already answers `OpenUdp`. Tests: `test/gateway-udp.test.mjs`.
-- The message count is 103 (`GatewayCredit`, `OpenUnix`, `OpenEndpoint`, `ListenUnix`); `spec/wsh-v1.yaml` and the three
+- The message count is 105 with the identity messages (`GatewayCredit`, `OpenUnix`, `OpenEndpoint`, `ListenUnix`); `spec/wsh-v1.yaml` and the three
   generated outputs are updated.
 - **Named endpoints work in a page, and the gateway is split in two.** `createMemoryHost({ endpoints })` is built from
   `src/server/gateway-core.mjs` (the connection table, credit accounting, per-client budget, `OpenEndpoint`, the feature
@@ -83,6 +84,179 @@
   `GatewayFail` / `ListenFail` instead of silence). The gateway-credit exchange therefore works over a byte pipe to an
   in-page host. Browser bundle budget (gzip) grew by the gateway core, the gateway channel and the client's gateway
   methods: see `scripts/bundle-budget.json`. Test: `test/browser/endpoint.spec.mjs` (Playwright).
+
+### npm package: identity (#117, #118, #119, #125, #126)
+
+Identity: who is on the other end, and what a relay can do about it. Everything wire-visible is optional and negotiated
+by feature strings, so released clients (npm 0.35.0, Rust `rust-v0.6.0`) and hosts keep working; the one default that
+changes is `clientEnv` below, and it is breaking.
+
+- **BREAKING default: `clientEnv` is an allow-list (#126).** A client's `openSession({ env })` used to be applied
+  whole to the command or shell the host ran, so a client could set `PATH`, `LD_PRELOAD` or `BASH_ENV` and defeat a host
+  that restricts what runs (`exec` as a function, a fixed command set). The default is now `TERM`, `COLORTERM`, `LANG`,
+  `LANGUAGE` and `LC_*` (sshd's `AcceptEnv` shape), for `exec` and, new, for `pty`. `exec: { clientEnv: true }` restores
+  the old behaviour; `false` accepts nothing; an array of names or `PREFIX_*` patterns (replacing the default list) or a
+  predicate `(name, value) => boolean` takes anything in between. Names must be plain identifiers; at most 64 variables
+  of at most 4096 bytes are considered. Hosts that passed `clientEnv: false` are unchanged. The Rust `wsh-server` still
+  applies whatever environment the client sends.
+- **Default change: `AuthOk.ttl` is now `0` ("no limit promised"), not `3600` (#125).** Nothing ever enforced the 3600, so
+  no connection behaves differently, but a client that read `ttl` as "this login expires in an hour" now sees `0`; set
+  `connectionTtlMs` to have the host really enforce and advertise a lifetime.
+- **`AuthOk.ttl` is true, `AuthOk.token` is honest (#125).** The fields stay on the wire (released peers require them, so
+  removing them would break the Rust client), but they no longer promise what nothing delivered. `ttl` is the lifetime the
+  host enforces: `createWshServer({ connectionTtlMs })` ends every authenticated connection that long after login and
+  advertises it in whole seconds (rounded up; `client.authTtl`); without it the host sends `ttl: 0` ("no limit
+  promised") instead of an unenforced 3600. `token` is documented as an opaque per-connection value with no authority
+  -- nothing accepts it back; `Resume` and `Attach` use the per-session token from `OpenOk`. The spec text no longer
+  says "a signed session token". The Rust `wsh-server` still sends an unenforced `session_ttl` and an HMAC no one checks.
+- **Channel binding (#119).** The auth transcript's `channel_binding` slot, empty since 0.1, is populated with what
+  each transport offers: the `host` key the client saw prove possession (a relay presenting its own key binds to its
+  own), the pinned WebTransport `cert-hash`, and a `tls-exporter` (Node on both ends, over `wss://` the process serves
+  itself; browsers and Node's global `WebSocket` cannot compute it). Negotiated with `channel-binding:<kind>` and
+  `channel-binding-required` features in `ServerHello` -- no new field, empty binding when nothing is offered, so the
+  transcript released peers sign is unchanged. `createWshServer({ requireChannelBinding: true | [kinds] })` refuses an
+  unbound login with a reason; `connect(url, { requireChannelBinding })` refuses to sign one (it also defeats an
+  intermediary that strips the host's offer). `client.channelBinding` says what a login covered. Spec text and two test
+  vectors under `Auth`. Does not protect a login nobody requires binding for, password logins, or anything through a
+  TLS-terminating proxy (for `tls-exporter`); the Rust server and client neither offer nor compute one.
+- **Operator proof to the peer, and sealed bridges (#117; see #93).** In reverse mode the host's `accept` trusted the
+  relay's `from_fingerprint`. New optional messages `ReverseChallenge` (0x58) and `ReverseProof` (0x59) and
+  `ReverseConnect.features`: the host sends a challenge signed with its own key (so the operator knows whom it is
+  proving itself to, and that the host saw the operator's own fingerprint -- a rewritten `from_fingerprint` shows up);
+  the operator signs the host's key, its own key, its username and the host's single-use nonce and session id; the host
+  verifies it **before `accept`**, and `accept` now receives `{ fingerprint, username, proven, publicKey }`. A relay lists
+  `operator-proof` in its `ServerHello` and carries the two messages (the JS relay does; the Rust relay does not, so the
+  operator does not offer there). `createReverseHost({ requireOperatorProof: true })` makes it mandatory *and* seals the
+  bridge: `KeyExchange.signature` is now also signed by the **initiator** (a different label, so it cannot pass for the
+  responder's), the host verifies it against the proven operator key, and the `KeyExchange` for the bridge (session id =
+  the challenge's) keys a channel on which every message that would cross the relay travels as an `EncryptedFrame` with
+  `channel_id` 0 and a strict counter; the host drops plaintext. `client.reverseConnect(fp, timeout, { proof, sealed,
+  requirePeerProof })`; nothing that names a command, a path or a session is sent before the key exists. Before this
+  `Open` (command, environment) and `OpenOk` (resume token) crossed the relay in the clear until a per-session
+  `initiateE2E`. By default a host still serves operators that do not prove themselves, and a new operator/host pair
+  now exchanges the challenge automatically and the host states `e2e-sealed` in `ReverseAccept.features` (a visible
+  extra string). README: [Operator proof and sealed bridges](README.md#operator-proof-and-sealed-bridges-117) has the
+  table of what a relay can and cannot do, with and without it. Not in the Rust `wsh-server` / `wsh` (regenerated
+  types only; `ReverseConnect.features` is `None` there).
+- **Pipe relay (#118).** `@johnhenry/wsh/pipe-relay`: `createPipeRelay()` pairs one host connection and one operator
+  connection by an unguessable rendezvous id (`newRendezvousId()`, `pipeUrl()`) and copies WebSocket messages both ways with
+  backpressure, bounded in waiting halves, rendezvous time, idle time, lifetime, bytes, message size and early bytes. It
+  parses nothing of wsh, so the host authenticates the operator itself, exactly as on a direct connection, and the
+  operator can pin the host key. The module has no imports (`ws`, `node:http` and `node:https` are loaded lazily by
+  `listen()`), and a test walks its module graph to keep it so. The Rust `wsh` CLI always dials `wss://<host>/` (#136), so it
+  cannot use it until it grows `--via` or keeps the URL path.
+- **In a page (the browser-safe entry points).** `@johnhenry/wsh/reverse`'s `createReverseHost` takes `requireOperatorProof`,
+  `proofTimeoutMs` and the proof-aware `accept({ fingerprint, username, proven, publicKey })`, with the sealed bridge:
+  all WebCrypto, no Node built-in and no `Buffer` (the bundle test checks it). `createMemoryHost` gained
+  `connectionTtlMs` and `requireChannelBinding` (`true` or `['host']`, needs `hostKey`: the host key is the one thing a
+  memory host can bind a login to, so `accept(socket)` hosts with a `hostKey` bind kind `host`); `clientEnv` is typed
+  as `boolean | string[] | predicate` in `memory-host.d.ts`, `host.d.ts` and `reverse-host.d.ts`. `@johnhenry/wsh/pipe-relay`
+  is a relay and stays Node-only (it listens through `ws` and `node:http`); a page is the host or operator behind it, and
+  the bundle test names it as the one deliberate exception. Browser bundle sizes grew by what this adds (see
+  `scripts/bundle-budget.json`).
+- **Fix: a sealed bridge stalled about half the time with a host in Chromium.** `initiateE2E` registered the waiter for
+  the responder's ML-KEM ciphertext after awaiting the responder's signature check; the ciphertext follows the reply at
+  once and was dropped in that window ("Timed out waiting for peer ML-KEM-768 ciphertext"). It is now registered
+  before the check.
+- **Not done:** #122 (per-key capabilities shared by both hosts) is left for a later change; the design is in the PR
+  description. The Rust side of #117, #119 and #125.
+- **Tests:** `test/client-env.test.mjs`, `test/auth-ok-ttl.test.mjs`, `test/channel-binding.test.mjs` (vectors; a
+  relaying and a TLS-terminating intermediary against hosts that do and do not require binding; WebTransport `cert-hash`),
+  `test/pipe-relay.test.mjs` (module graph, rendezvous, every bound, backpressure, then the same authentication
+  checks directly and through the pipe, including pinning and an impostor host), `test/operator-proof.test.mjs` (a hostile relay
+  that rewrites `from_fingerprint`, replays a proof, swaps the operator's key and injects an `Open` against a host that
+  requires proof; what the relay can and cannot read of a sealed bridge). The existing relay-bridge test now also sees
+  `e2e-sealed` among a proven host's bridged features. `test/memory-host-identity.test.mjs` (channel binding `host`,
+  `connectionTtlMs`, `clientEnv` on the memory host) and `test/browser/identity.spec.mjs` (Chromium: an in-page host
+  behind the pipe relay -- pinning, binding, an unknown key, the env allow-list; an in-page reverse host that requires
+  operator proof behind the hostile relay -- sealed bridge, no proof refused, a rewritten `from_fingerprint`, an injected `Open`).
+
+### Rust workspace changes in the same release
+
+Rust workspace only (`wsh`, `wsh-server`, `wsh-client`); the npm package and the wire protocol are unchanged, and no
+message or field was added. **The Rust `wsh-server` changes three defaults. Read "Breaking" before upgrading it.**
+
+### Breaking: Rust `wsh-server` defaults
+
+- **The gateway is off, and allows no destination when on.** Before: `[gateway] enabled = true`,
+  `allowed_destinations = ["*"]`, so any authorized key could open TCP/UDP connections and DNS lookups from the host,
+  including to loopback, private and link-local addresses. Now: `enabled = false` (and `gateway` is not advertised),
+  `allowed_destinations = []`, and even with `"*"` an address that is loopback, link-local, private, unique-local,
+  carrier-grade NAT, unspecified or multicast is refused after resolution unless a rule names that host, address or
+  range (`"db.internal:5432"`, `"10.1.0.0/16:5432"`, `"127.0.0.1:8080"`). The server connects to the address it checked
+  instead of resolving the name again, and `ResolveDns` no longer returns internal answers. Rules are now also parsed
+  for address ranges (`10.0.0.0/8`, `10.0.0.0/8:443`, `fd00::/8`), which the old doc example showed but the code never
+  matched.
+- **Reverse listeners are off and bind to loopback.** Before: `enable_reverse_tunnels = true`, and a listener bound the
+  `bind_addr` the client sent (whose wire default is `0.0.0.0`). Now: `enable_reverse_tunnels = false`, and a listener
+  binds `[gateway] reverse_bind_addr` (default `127.0.0.1`); the client's `bind_addr` is ignored.
+- **Password login is off, and hashes are Argon2id.** Before: `allow_password = true`; hashes were `sha256:<hex>` of the
+  bare password, compared with `==`. Now: `allow_password = false`; `password_hashes` values are Argon2id PHC strings
+  with a per-user salt (`printf '%s' "$PASSWORD" | wsh-server --hash-password`), compared in constant time. An unknown
+  user and a wrong password now answer identically (`invalid password`) after the same work; `unknown user` is gone.
+  **Existing `sha256:` entries are refused**, not accepted with a warning: the server logs, at start-up and by user name,
+  that the entry is ignored and how to replace it. (A warning that nobody reads would leave the weak hash live; and
+  anyone relying on password login must already edit the config to set `allow_password = true`, which is the moment to
+  rehash.)
+
+To get the old behaviour back (not recommended; each line says what it re-opens), put this in `config.toml`:
+
+```toml
+[gateway]
+enabled = true
+allowed_destinations = ["*", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "::1", "fc00::/7", "fe80::/10"]
+enable_reverse_tunnels = true
+reverse_bind_addr = "0.0.0.0"
+
+[auth]
+allow_password = true
+allow_legacy_sha256 = true   # keeps `sha256:<hex>` entries working; logs a DEPRECATED warning at every start-up
+```
+
+Most deployments want less than that: `enabled = true` plus `allowed_destinations = ["*"]` is the public internet only;
+add `"host:port"` or a range for each internal service a client really needs. A downstream that downloads the release
+binaries and relied on the default gateway for egress (the netway `GatewayBackend` pairing) needs at least the first two
+lines of the `[gateway]` block above.
+
+### Rust `wsh` CLI (#134, #135, #136)
+
+- **Fix: `wss://` no longer panics (#134).** rustls needs a process-wide crypto provider and the build enables two;
+  the first TLS handshake panicked unless `WSH_INSECURE_LOOPBACK_TLS=1` happened to take another path (`-t wt`
+  masked it, because that transport installed one). `wsh` installs `ring` at start-up and the client library does
+  before every connection (a provider the embedding program installed first is left alone).
+- **Fix: output sent in the same burst as `OpenOk` was lost (#135).** The dispatch loop handed `OpenOk` to the opener
+  and went on to the next frame; a host that answers at once had already sent the first `SessionData` (even the `Exit`),
+  which arrived before the session was registered and was dropped. The loop now notes the channel when it hands over
+  `OpenOk`, keeps what follows for it (bounded: 16 channels, 1024 frames and 4 MiB each), and `open_session` replays it in
+  order as it registers the session. `echo hi` lost its output in 11 of 40 runs against such a host; it is 0 of 160 now.
+  The same path carries a `stdio: "pipes"` stderr channel.
+- **Fix: `wsh connect` exits when the session ends (#136).** The terminal input thread blocked in a read nothing could
+  cancel, so the runtime waited for a key press. It polls now and stops with the session. A dropped connection also
+  ends a session blocked in `read()` instead of leaving it waiting forever.
+- **Fix: the per-frame `DEBUGTRACE` lines are gone, and bulk output is fast (#136).** The release build wrote one line to
+  stderr per frame, including the whole `SessionData` payload formatted as a list of numbers. 64 MiB through `wsh` took
+  about 91 s before (0.7 MiB/s); it takes about 0.1 s now (600+ MiB/s) on the same host and machine; the session read
+  path also copies slices instead of popping one byte at a time. Diagnostics go to stderr now (they went to stdout, into
+  the command's output), and `channel N exited` is a debug event, not a line on every run. (That `eprintln!` stood in for a
+  `tracing` call that hung: the old exec held `stdout().lock()` across its read loop, and `tracing` wrote to stdout.)
+- **`wsh host command` forwards stdin, signals and resize (#136).** Stdin that is a pipe or file is sent to the command and
+  its end is EOF where the host offers `exec-pipes` (which also keeps stderr apart, on `stderr` instead of in the
+  output); elsewhere the bytes are sent but the end cannot be signalled. SIGINT, SIGTERM and SIGHUP are forwarded; the
+  same signal twice disconnects (`128 + n`). `--tty` gives the command a terminal and forwards resizes. A command whose
+  exit status never arrived (dropped connection) now exits 255 instead of 0. `wsh-client` gains
+  `SessionOpts.stdio`, `WshSession::{read_stderr, close_stdin, supports_stdin_eof, has_stderr}`.
+  The Rust `wsh-server` only logs `Signal`, so forwarding a signal to it does not stop the command yet.
+- **A full URL is a target (#136).** `wsh wss://host:8443/rendezvous/ab12 command` (also `https://`, `wt://`, `ws://`,
+  with `user@` in front or in the URL) dials exactly that, path and query included; `--port` and `--transport` do not
+  apply and there is no transport fallback. `ws://` is accepted only for a loopback host. `sessions`, `attach` and
+  `detach` reach the same URL again (`last_session.json` gains an optional `url`).
+- **Tests:** `test/rust/wsh-cli.test.mjs` runs the built `wsh` against a Node host (`test/rust/fixtures/cli-host.mjs`,
+  which answers in the same burst as `OpenOk`) and the real `wsh-server`: TLS without a panic, 160 instant-answer runs
+  eight at a time, URL targets, stdin, SIGINT, exit status, bulk output, `connect` under a pty, EOF and stderr against
+  `wsh-server`. `test/rust/wsh-rust-server-defaults.test.mjs` runs `wsh-server` with no configuration: gateway and
+  reverse listeners refused, the wildcard not reaching loopback, a named rule reaching exactly its address, Argon2id
+  login, the `sha256:` refusal. Unit tests cover the OpenOk race, the policy (every restricted range, IPv4-mapped and
+  NAT64 spellings, rebinding shape), listener bind, password hashing and the config defaults.
 
 ## 0.36.0
 

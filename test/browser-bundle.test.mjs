@@ -9,10 +9,12 @@ import { ENTRY_POINTS, ROOT, bundle } from '../scripts/browser-bundles.mjs';
 import { measure, readBudget, overBudget } from '../scripts/bundle-size.mjs';
 
 describe('browser entry points (#115, #128)', () => {
-  it('every exports entry except ./server is bundled', async () => {
+  it('every exports entry except the Node-only ones is bundled', async () => {
     const pkg = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'));
     const bundled = new Set(ENTRY_POINTS.filter((p) => p.entry).map((p) => p.name));
-    const expected = Object.keys(pkg.exports).filter((k) => k !== './server').map((k) => (k === '.' ? '.' : k));
+    // ./server needs Node. ./pipe-relay is a RELAY (it listens on a socket through `ws` and node:http, imported
+    // dynamically in `listen()`): it runs in Node, a browser page is a host or an operator behind it, never the relay.
+    const expected = Object.keys(pkg.exports).filter((k) => k !== './server' && k !== './pipe-relay');
     assert.deepEqual([...bundled].sort(), expected.sort());
     assert.equal(pkg.sideEffects, false);
   });

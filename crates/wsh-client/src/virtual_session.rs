@@ -64,11 +64,13 @@ impl VirtualSessionBackend {
                 let mut pending = self.pending.lock().await;
                 if !pending.is_empty() {
                     let to_copy = pending.len().min(buf.len());
-                    for slot in buf.iter_mut().take(to_copy) {
-                        if let Some(byte) = pending.pop_front() {
-                            *slot = byte;
-                        }
-                    }
+                    // Two slice copies, not a pop per byte: this is the hot path of
+                    // every byte a session receives.
+                    let (front, back) = pending.as_slices();
+                    let from_front = front.len().min(to_copy);
+                    buf[..from_front].copy_from_slice(&front[..from_front]);
+                    buf[from_front..to_copy].copy_from_slice(&back[..to_copy - from_front]);
+                    pending.drain(..to_copy);
                     return Ok(to_copy);
                 }
             }
