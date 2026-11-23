@@ -75,6 +75,8 @@ export interface WshMemoryHostOptions {
    * Needs `hostKey`; a client older than 0.36 cannot satisfy it.
    */
   requireChannelBinding?: boolean | Array<'host'>;
+  /** #155: seal the whole session end to end (needs `hostKey`; offered where `dataStreams` is false). `'require'` serves nothing unsealed. */
+  sealSession?: false | 'offer' | 'require';
   onLog?: (line: string) => void;
 }
 

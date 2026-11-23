@@ -111,7 +111,7 @@ function pageEndpoints(record) {
   };
 }
 
-window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding } = {}) => {
+window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = false, initialFiles = {}, endpoints = false, requireChannelBinding, sealSession } = {}) => {
   const log = [];
   const record = { opened: [] };
   const ptyCalls = [];
@@ -152,6 +152,7 @@ window.h.startHost = async ({ authorizedKeys, dataStreams, hostKey, sessions = f
     fs,
     hostKey: hostKeyOption,
     requireChannelBinding,
+    sealSession,
     sessions: sessions || undefined,
     endpoints: endpoints ? pageEndpoints(record) : undefined,
     dataStreams,

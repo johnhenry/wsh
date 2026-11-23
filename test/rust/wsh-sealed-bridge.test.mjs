@@ -160,7 +160,7 @@ for (const relayKind of ['js', 'rust']) {
       assert.ok(res.features.includes('e2e-sealed'));
       const s = await op.openSession({ type: 'exec', command: `echo SECRET-ZEBRA > ${dir}/legit; sleep 0.4; echo ECHOED-BACK-QUOKKA` });
       const out = await collectExec(s);
-      assert.match(out, /ECHOED-BACK-QUOKKA/);
+      assert.match(out, /ECHOED-BACK-QUOKKA/, `host stderr: ${h.err()} | host stdout: ${h.out()}`);
       await until(() => existsSync(path.join(dir, 'legit')), 'the command to run');
       assert.match(h.err() + h.out(), /[Bb]ridge sealed/);
       if (world.hop) {

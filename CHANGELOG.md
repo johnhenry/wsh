@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.39.0 / Rust `rust-v0.10.0`
 
 ### Rust: the sealed bridge (#145, step 5)
 
@@ -17,7 +17,24 @@ Rust workspace and tests only (no `src/` change); negotiated by existing feature
   **Behaviour change:** `--require-operator-proof` now also REQUIRES the sealed bridge (the JS rule): an operator that proves but does
   not seal is no longer served plain; its plain messages are not heard, and a bridge that has not sealed within 10 s is dropped.
   **A frame that does not open (tampered, replayed, reordered) closes the bridge** (the JS host drops the frame and ignores the rest).
-- Not done here: sealing a direct or pipe-relayed connection and gateway data outside a reverse bridge (#155).
+- Not done here: the sealed bridge is for reverse bridges; see the next section for sealing a whole connection.
+
+### Sealed session: a direct or pipe-relayed connection, gateway and endpoint data included (#155, stage b; npm change)
+
+**This changes `src/` (the JS host): please bump the npm version.** Opt-in and negotiated; released peers keep working.
+
+- **JS host:** `createMemoryHost({ sealSession: 'offer' | 'require' })` and `createWshServer({ sealSession })` (needs `hostKey`; offered on a
+  connection with no client-opened data streams, i.e. `dataStreams: false`). Features `e2e-session` and `e2e-session-required` in
+  `ServerHello`. After login a `KeyExchange` for the connection's `session_id`, signed by the login key and answered with the host key's
+  signature, seals every message but the keepalive (`GatewayData` and `GatewayCredit` included) as `EncryptedFrame`s on channel 0; a plain
+  message is dropped, a frame that does not open closes the session; `'require'` refuses a plain client (and a password login).
+  `SealedBridge` takes `scope: 'session'`; `E2EResponder`'s `signKey` may be a signer (`{ sign }`).
+- **Rust CLI:** `--sealed` seals the session (any command that dials one host), automatic against `e2e-session-required`; against a host that
+  does not offer it the CLI fails with a sentence and sends nothing (no silent downgrade). `WshClient::seal_session`, `ConnectConfig.seal_session`.
+- **Bundle size** (gzip, `npm run size`): `./host` +0.9 kB, `./memory` +0.7 kB, `./reverse` +0.5 kB, `.` unchanged; `scripts/bundle-budget.json` left as is (within its 10% margin). Browser acceptance: `test/browser/rust-cli-sealed.spec.mjs` (the built `wsh --sealed -N -L` against an in-page host that requires sealing, through a recording pipe).
+- **Not done:** the JS client and the Rust server (#155 stage c); a sealed session is not offered with client-opened QMux data streams.
+- **#156:** `wsh -N -L ...` now exits (non-zero, "the connection to the host was lost", sockets removed) when the host drops the connection
+  (the WebSocket transport never told the dispatch loop the socket had closed); a pipe relay's rendezvous id is shortened in error lines.
 
 ## 0.38.1
 

@@ -49,7 +49,7 @@ pub use wsh_core::{channel_binding, host_key};
 // Re-export primary public types.
 pub use client::{
     ConnectConfig, FirstUse, GatewayHandle, RemoteSessionInfo, ReverseConnectOptions,
-    ReverseOutcome, SealOptions, WshClient,
+    ReverseOutcome, SealOptions, SessionSeal, WshClient,
 };
 pub use e2e::{
     E2eKeyExchange, E2eOptions, E2eResponder, InitiatorAuth, Responded, ALGORITHM_HYBRID,
