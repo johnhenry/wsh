@@ -208,7 +208,7 @@ for (const relayKind of ['js', 'rust']) {
         const p = spawnWsh([...c.args, '--operator-proof', '--sealed', 'reverse-connect', host.fp.slice(0, 12), c.target], c.env);
         await until(() => /bridge sealed/.test(p.out()) || p.err(), `the CLI to report a sealed bridge (${p.out()} ${p.err()})`);
         assert.match(p.out(), /bridge sealed/, p.err());
-        assert.ok(logs.some((l) => /sealed \(hybrid\)/.test(l)), `the host sealed with the hybrid exchange: ${logs.join(' | ')}`);
+        await until(() => logs.some((l) => /sealed \(hybrid\)/.test(l)), `the host to seal with the hybrid exchange: ${logs.join(' | ')}`);
         p.proc.kill('SIGKILL');
       });
     }
