@@ -58,6 +58,30 @@ struct Cli {
     #[arg(long = "via", global = true, value_name = "URL")]
     via: Option<String>,
 
+    /// Forward a local port or unix socket to somewhere the HOST can reach, as `ssh -L` does:
+    /// `[bind_addr:]port:host:hostport`, `/local.sock:/remote.sock`, `[bind_addr:]port:/remote.sock`,
+    /// `/local.sock:host:hostport`; end any of them with `endpoint=NAME` to reach a named endpoint
+    /// of a host that has no file system (an in-page host). Repeatable. Local TCP binds loopback
+    /// unless `bind_addr` says otherwise; local sockets are created 0600 and removed on exit.
+    #[arg(short = 'L', value_name = "SPEC", action = clap::ArgAction::Append)]
+    local_forwards: Vec<String>,
+
+    /// Have the HOST listen and send each connection here, as `ssh -R` does:
+    /// `[bind_addr:]port:host:hostport`, `/remote.sock:/local.sock`, `/remote.sock:host:hostport`,
+    /// `[bind_addr:]port:/local.sock`. Repeatable. The host decides where it binds and which
+    /// paths it allows.
+    #[arg(short = 'R', value_name = "SPEC", action = clap::ArgAction::Append)]
+    remote_forwards: Vec<String>,
+
+    /// Do not run a command or a shell: only forward (with -L / -R). Stops on Ctrl-C.
+    #[arg(short = 'N')]
+    no_command: bool,
+
+    /// Let -L /local.sock replace a stale socket file already there (never a live one, never a
+    /// file that is not a socket); with -R, ask the host to replace its stale socket.
+    #[arg(long = "replace-socket")]
+    replace_socket: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -323,6 +347,41 @@ async fn main() {
         commands::common::set_via(via);
     }
 
+    // Forwarding (-L / -R / -N): only for the commands that dial one `[user@]host` and keep the
+    // connection open (`wsh [user@]host [command...]` and `wsh connect`); it works with `--via`
+    // exactly as they do, because the forwards ride whatever connection those open.
+    let wants_forwarding = !cli.local_forwards.is_empty()
+        || !cli.remote_forwards.is_empty()
+        || cli.no_command
+        || cli.replace_socket;
+    if wants_forwarding {
+        let allowed = matches!(&cli.command, None | Some(Command::Connect { .. }));
+        if !allowed {
+            eprintln!("wsh: -L, -R, -N and --replace-socket apply to `wsh [user@]host [command...]` and `wsh connect` only");
+            std::process::exit(2);
+        }
+        let config = match commands::forward::ForwardConfig::parse(
+            &cli.local_forwards,
+            &cli.remote_forwards,
+            cli.replace_socket,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("wsh: {e}");
+                std::process::exit(2);
+            }
+        };
+        if cli.no_command && config.is_empty() {
+            eprintln!("wsh: -N has nothing to do without -L or -R");
+            std::process::exit(2);
+        }
+        if cli.no_command && (!matches!(&cli.command, None) || cli.args.len() != 1) {
+            eprintln!("wsh: -N takes just the host: wsh -N -L ... [user@]host");
+            std::process::exit(2);
+        }
+        commands::forward::set(config);
+    }
+
     let result = match cli.command {
         Some(Command::Connect { target }) => {
             commands::connect::run(&target, port, &identity, transport.as_deref()).await
@@ -452,7 +511,11 @@ async fn main() {
             }
 
             let target = &cli.args[0];
-            if cli.args.len() > 1 {
+            if cli.no_command {
+                // wsh -N -L ... user@host: forward only.
+                commands::forward::run_forward_only(target, port, &identity, transport.as_deref())
+                    .await
+            } else if cli.args.len() > 1 {
                 // One-off exec: wsh user@host command arg1 arg2 ...
                 let command = cli.args[1..].join(" ");
                 commands::exec::run(
@@ -472,6 +535,7 @@ async fn main() {
     };
 
     if let Err(e) = result {
+        commands::forward::cleanup();
         error!("{:#}", e);
         eprintln!("wsh: {e:#}");
         std::process::exit(1);
@@ -480,5 +544,6 @@ async fn main() {
     // The command is done. Leave now instead of waiting for the runtime to drain: a
     // reader thread blocked on the terminal or stdin cannot be cancelled, and
     // `connect` stayed running behind one after the session had ended (#136).
+    commands::forward::cleanup();
     std::process::exit(0);
 }

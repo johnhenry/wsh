@@ -213,6 +213,51 @@ pub struct GatewaySection {
     /// Default: `"127.0.0.1"`.
     #[serde(default = "default_reverse_bind_addr")]
     pub reverse_bind_addr: String,
+    /// Unix-domain sockets in THIS machine's file system a client may connect to
+    /// (`OpenUnix`, `wsh -L ...:/remote.sock`). Needs `enabled = true`. Each entry is an
+    /// absolute path, exact (`"/var/run/docker.sock"`) or a directory prefix with a trailing
+    /// slash (`"/run/user/1000/wsh/"`); on Linux `"@name"` / `"@prefix/"` list abstract-namespace
+    /// sockets. A request is judged after the PARENT directory is resolved with realpath, the
+    /// target must be a socket, and a symlink is never followed out of the allowed place.
+    /// Listing a daemon socket such as Docker's gives every authorized client the daemon's
+    /// full power (it is root-equivalent). `gateway-unix` is advertised only when this or
+    /// `unix_listen` is non-empty.
+    ///
+    /// Default: `[]` (no unix sockets are reachable).
+    #[serde(default)]
+    pub unix_connect: Vec<String>,
+    /// Sockets a client may ask this host to CREATE and listen on (`ListenUnix`,
+    /// `wsh -R /remote.sock:...`); same pattern forms. The host creates them with mode 0600
+    /// and removes them when the listener closes or the connection ends.
+    ///
+    /// Default: `[]`.
+    #[serde(default)]
+    pub unix_listen: Vec<String>,
+    /// Let a client replace an existing, stale socket file at a `unix_listen` path (OpenSSH
+    /// `StreamLocalBindUnlink`). Only when the client asks AND nothing is accepting
+    /// connections on the old socket AND the file is a socket.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub unix_replace_stale: bool,
+    /// Unix listeners one client connection may hold.
+    ///
+    /// Default: `4`.
+    #[serde(default = "default_unix_max_listeners")]
+    pub unix_max_listeners: usize,
+    /// Bytes a client may have sent for one gateway connection that its origin has not yet
+    /// taken. With `gateway-credit` negotiated a client cannot exceed its credit (256 KiB);
+    /// for an older client this is the only bound, and a connection that exceeds it is closed.
+    /// At least 262144.
+    ///
+    /// Default: `4194304` (4 MiB).
+    #[serde(default = "default_max_buffered_bytes")]
+    pub max_buffered_bytes: usize,
+    /// The same, summed over every connection of one client. At least `max_buffered_bytes`.
+    ///
+    /// Default: `33554432` (32 MiB).
+    #[serde(default = "default_max_client_buffered_bytes")]
+    pub max_client_buffered_bytes: usize,
 }
 
 impl Default for GatewaySection {
@@ -223,8 +268,24 @@ impl Default for GatewaySection {
             max_connections: default_gateway_max_connections(),
             enable_reverse_tunnels: false,
             reverse_bind_addr: default_reverse_bind_addr(),
+            unix_connect: Vec::new(),
+            unix_listen: Vec::new(),
+            unix_replace_stale: false,
+            unix_max_listeners: default_unix_max_listeners(),
+            max_buffered_bytes: default_max_buffered_bytes(),
+            max_client_buffered_bytes: default_max_client_buffered_bytes(),
         }
     }
+}
+
+fn default_unix_max_listeners() -> usize {
+    crate::gateway::unix_policy::DEFAULT_MAX_UNIX_LISTENERS
+}
+fn default_max_buffered_bytes() -> usize {
+    crate::gateway::policy::DEFAULT_MAX_BUFFERED_BYTES
+}
+fn default_max_client_buffered_bytes() -> usize {
+    crate::gateway::policy::DEFAULT_MAX_CLIENT_BUFFERED_BYTES
 }
 
 /// `[rpc]` section of the config TOML: typed RPC channels (`Open { kind: "rpc" }`, wsh #85 / #86).
@@ -351,6 +412,12 @@ pub struct ServerConfig {
     pub gateway_enable_reverse_tunnels: bool,
     /// Where reverse tunnel listeners bind. See [`GatewaySection::reverse_bind_addr`].
     pub gateway_reverse_bind_addr: std::net::IpAddr,
+    /// Unix-domain socket policy. See [`GatewaySection::unix_connect`].
+    pub gateway_unix: crate::gateway::unix_policy::UnixPolicy,
+    /// See [`GatewaySection::max_buffered_bytes`].
+    pub gateway_max_buffered_bytes: usize,
+    /// See [`GatewaySection::max_client_buffered_bytes`].
+    pub gateway_max_client_buffered_bytes: usize,
     /// Username → usable password hash, for password auth. Entries that could not be
     /// used (an unsalted `sha256:` without `allow_legacy_sha256`, anything unparsable)
     /// are logged at start-up and left out, so those users cannot log in.
@@ -460,6 +527,29 @@ impl ServerConfig {
         if client_env == crate::client_env::ClientEnvPolicy::Everything {
             warn!("[server] client_env = true: a client can set any environment variable (PATH, LD_PRELOAD...) for what it runs");
         }
+        let gateway_unix = crate::gateway::unix_policy::UnixPolicy::new(
+            file_config.gateway.unix_connect.clone(),
+            file_config.gateway.unix_listen.clone(),
+            file_config.gateway.unix_replace_stale,
+            file_config.gateway.unix_max_listeners,
+        )
+        .map_err(wsh_core::WshError::Other)?;
+        let (max_buffered, max_client_buffered) = (
+            file_config.gateway.max_buffered_bytes,
+            file_config.gateway.max_client_buffered_bytes,
+        );
+        if max_buffered < crate::gateway::session::GATEWAY_CREDIT_WINDOW {
+            return Err(wsh_core::WshError::Other(format!(
+                "config: [gateway] max_buffered_bytes must be at least {}",
+                crate::gateway::session::GATEWAY_CREDIT_WINDOW
+            )));
+        }
+        if max_client_buffered < max_buffered {
+            return Err(wsh_core::WshError::Other(
+                "config: [gateway] max_client_buffered_bytes must be at least max_buffered_bytes"
+                    .into(),
+            ));
+        }
         warn_about_gateway(&file_config.gateway, gateway_reverse_bind_addr);
 
         Ok(Self {
@@ -477,6 +567,9 @@ impl ServerConfig {
             gateway_max_connections: file_config.gateway.max_connections,
             gateway_enable_reverse_tunnels: file_config.gateway.enable_reverse_tunnels,
             gateway_reverse_bind_addr,
+            gateway_unix,
+            gateway_max_buffered_bytes: max_buffered,
+            gateway_max_client_buffered_bytes: max_client_buffered,
             password_hashes,
             rpc_enabled: file_config.rpc.enabled,
             rpc_max_message_bytes: file_config.rpc.max_message_bytes,
@@ -527,10 +620,21 @@ fn parse_password_hashes(auth: &AuthSection) -> HashMap<String, StoredHash> {
 /// Say what an enabled gateway exposes, so it is not a surprise in the log.
 fn warn_about_gateway(gateway: &GatewaySection, reverse_bind_addr: std::net::IpAddr) {
     if !gateway.enabled {
-        if gateway.enable_reverse_tunnels || !gateway.allowed_destinations.is_empty() {
+        if gateway.enable_reverse_tunnels
+            || !gateway.allowed_destinations.is_empty()
+            || !gateway.unix_connect.is_empty()
+            || !gateway.unix_listen.is_empty()
+        {
             warn!("[gateway] has settings but `enabled = false`: the gateway stays off");
         }
         return;
+    }
+    if !gateway.unix_connect.is_empty() || !gateway.unix_listen.is_empty() {
+        warn!(
+            connect = ?gateway.unix_connect,
+            listen = ?gateway.unix_listen,
+            "[gateway] unix sockets are reachable by every authorized client: a socket such as Docker's is as powerful as the daemon behind it"
+        );
     }
     if gateway.allowed_destinations.is_empty() {
         warn!("[gateway] enabled with no allowed_destinations: every outbound connection will be refused");
@@ -652,6 +756,7 @@ reverse_bind_addr = "0.0.0.0"
                 max_connections: cfg.gateway_max_connections,
                 enable_reverse_tunnels: cfg.gateway_enable_reverse_tunnels,
                 reverse_bind_addr: cfg.gateway_reverse_bind_addr,
+                ..Default::default()
             },
         );
         for (host, addr) in [

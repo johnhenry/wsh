@@ -3406,6 +3406,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "hex",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

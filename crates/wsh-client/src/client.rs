@@ -18,6 +18,7 @@ use wsh_core::messages::*;
 
 use crate::auth;
 use crate::e2e::{combine_hybrid_secret, E2eKeyExchange, ALGORITHM_HYBRID};
+use crate::gateway::GatewayHub;
 use crate::known_hosts::{HostStatus, KnownHosts};
 use crate::session::{ControlAction, SessionInfo, SessionOpts, WshSession};
 use crate::transport::{self, AnyTransport};
@@ -207,6 +208,115 @@ pub struct WshClient {
     accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
     /// Session frames that beat their session's registration (see [`EarlyChannels`]).
     early: EarlyShared,
+    /// Connections and listeners opened through the host (see [`crate::gateway`]).
+    gateway: Arc<GatewayHub>,
+}
+
+/// Opens connections through the host and listens on it; cheap to clone, usable from any task.
+/// Get one with [`WshClient::gateway`].
+#[derive(Clone)]
+pub struct GatewayHandle {
+    hub: Arc<GatewayHub>,
+    features: Arc<Mutex<Vec<String>>>,
+}
+
+impl GatewayHandle {
+    async fn features(&self) -> Vec<String> {
+        self.features.lock().await.clone()
+    }
+
+    /// Does the host offer `feature` (as listed in its `ServerHello`)?
+    pub async fn has_feature(&self, feature: &str) -> bool {
+        self.features.lock().await.iter().any(|f| f == feature)
+    }
+
+    /// Open a TCP connection FROM the host to `host:port` (needs the host's `gateway` feature
+    /// and a destination its policy allows). `wsh -L [bind:]port:host:hostport`.
+    pub async fn open_tcp(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> WshResult<crate::gateway::GatewayStream> {
+        crate::gateway::require_feature(
+            &self.features().await,
+            crate::gateway::GATEWAY_FEATURE,
+            "TCP forwarding",
+        )?;
+        let host = host.to_string();
+        self.hub
+            .open(move |id| crate::gateway::open_tcp_msg(id, &host, port))
+            .await
+    }
+
+    /// Connect to a unix-domain socket on the HOST's file system (OpenSSH streamlocal). Needs the
+    /// host's `gateway-unix` feature and a path its policy lists.
+    pub async fn open_unix(&self, path: &str) -> WshResult<crate::gateway::GatewayStream> {
+        crate::gateway::require_feature(
+            &self.features().await,
+            crate::gateway::GATEWAY_UNIX_FEATURE,
+            "unix-socket forwarding",
+        )?;
+        let path = path.to_string();
+        self.hub
+            .open(move |id| crate::gateway::open_unix_msg(id, &path))
+            .await
+    }
+
+    /// Open the host's NAMED endpoint: an in-process handler a host without a file system (an
+    /// in-page host) registers instead of unix sockets. Needs `gateway-endpoints`.
+    pub async fn open_endpoint(&self, name: &str) -> WshResult<crate::gateway::GatewayStream> {
+        if !crate::gateway::valid_endpoint_name(name) {
+            return Err(WshError::Other(format!(
+                "{name:?} is not a valid endpoint name (letters, digits, \".\", \"_\", \"-\"; at most 64)"
+            )));
+        }
+        crate::gateway::require_feature(
+            &self.features().await,
+            crate::gateway::GATEWAY_ENDPOINTS_FEATURE,
+            "named endpoints",
+        )?;
+        let name = name.to_string();
+        self.hub
+            .open(move |id| crate::gateway::open_endpoint_msg(id, &name))
+            .await
+    }
+
+    /// Ask the host to listen on a unix-domain socket at `path` on ITS file system and hand each
+    /// connection to us (OpenSSH `-R /remote.sock:...`). `replace` asks to replace a stale socket
+    /// file there; the host's policy decides whether that is allowed.
+    pub async fn listen_unix(
+        &self,
+        path: &str,
+        replace: bool,
+    ) -> WshResult<crate::gateway::GatewayListener> {
+        crate::gateway::require_feature(
+            &self.features().await,
+            crate::gateway::GATEWAY_UNIX_FEATURE,
+            "unix-socket listening",
+        )?;
+        let path = path.to_string();
+        self.hub
+            .listen(move |id| crate::gateway::listen_unix_msg(id, &path, replace))
+            .await
+    }
+
+    /// Ask the host to listen on a TCP port and hand each connection to us (`-R`). The host binds
+    /// where its own configuration says, whatever `bind_addr` is; `port` 0 lets it choose.
+    pub async fn listen_tcp(
+        &self,
+        port: u16,
+        bind_addr: &str,
+    ) -> WshResult<crate::gateway::GatewayListener> {
+        crate::gateway::require_feature(
+            &self.features().await,
+            crate::gateway::GATEWAY_FEATURE,
+            "TCP listening",
+        )?;
+        let bind_addr = bind_addr.to_string();
+        self.hub
+            .listen(move |id| crate::gateway::listen_tcp_msg(id, port, &bind_addr))
+            .await
+    }
 }
 
 /// Server-provided session summary from `SessionList`.
@@ -256,6 +366,7 @@ impl WshClient {
         let accepted_relay_peers: Arc<Mutex<HashSet<String>>> =
             Arc::new(Mutex::new(HashSet::new()));
         let early: EarlyShared = Arc::new(Mutex::new(EarlyChannels::default()));
+        let gateway = Arc::new(GatewayHub::new(outgoing_tx.clone()));
 
         let mut client = Self {
             transport: transport.clone(),
@@ -272,6 +383,7 @@ impl WshClient {
             reverse_connect_rx,
             relay_message_rx,
             accepted_relay_peers: accepted_relay_peers.clone(),
+            gateway: gateway.clone(),
             early: early.clone(),
         };
 
@@ -295,6 +407,7 @@ impl WshClient {
             let outgoing_tx_clone = outgoing_tx.clone();
             let accepted_relay_peers = accepted_relay_peers.clone();
             let early = early.clone();
+            let gateway = gateway.clone();
 
             tokio::spawn(async move {
                 Self::dispatch_loop(
@@ -309,6 +422,7 @@ impl WshClient {
                     Some(relay_tx),
                     accepted_relay_peers,
                     early,
+                    gateway,
                 )
                 .await;
             })
@@ -433,6 +547,55 @@ impl WshClient {
     /// Whether the server advertised `name` in SERVER_HELLO.
     pub async fn has_feature(&self, name: &str) -> bool {
         self.server_features.lock().await.iter().any(|f| f == name)
+    }
+
+    // ── Gateway: connections through the host ───────────────────────
+
+    /// A handle for opening connections through the host (and listening on it), usable from
+    /// other tasks while this client runs the session. It stops working when the client is
+    /// dropped or disconnects.
+    pub fn gateway(&self) -> GatewayHandle {
+        GatewayHandle {
+            hub: self.gateway.clone(),
+            features: self.server_features.clone(),
+        }
+    }
+
+    /// See [`GatewayHandle::open_tcp`].
+    pub async fn open_tcp(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> WshResult<crate::gateway::GatewayStream> {
+        self.gateway().open_tcp(host, port).await
+    }
+
+    /// See [`GatewayHandle::open_unix`].
+    pub async fn open_unix(&self, path: &str) -> WshResult<crate::gateway::GatewayStream> {
+        self.gateway().open_unix(path).await
+    }
+
+    /// See [`GatewayHandle::open_endpoint`].
+    pub async fn open_endpoint(&self, name: &str) -> WshResult<crate::gateway::GatewayStream> {
+        self.gateway().open_endpoint(name).await
+    }
+
+    /// See [`GatewayHandle::listen_unix`].
+    pub async fn listen_unix(
+        &self,
+        path: &str,
+        replace: bool,
+    ) -> WshResult<crate::gateway::GatewayListener> {
+        self.gateway().listen_unix(path, replace).await
+    }
+
+    /// See [`GatewayHandle::listen_tcp`].
+    pub async fn listen_tcp(
+        &self,
+        port: u16,
+        bind_addr: &str,
+    ) -> WshResult<crate::gateway::GatewayListener> {
+        self.gateway().listen_tcp(port, bind_addr).await
     }
 
     /// `send_and_wait_public`, but the reply must satisfy `matcher`.
@@ -1020,7 +1183,12 @@ impl WshClient {
             payload: Payload::Hello(HelloPayload {
                 version: PROTOCOL_VERSION.to_string(),
                 username: config.username.clone(),
-                features: vec!["mcp".to_string(), "file-transfer".to_string()],
+                features: vec![
+                    "mcp".to_string(),
+                    "file-transfer".to_string(),
+                    // GatewayCredit flow control for connections opened through the host.
+                    wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE.to_string(),
+                ],
                 auth_method: Some(auth_method.clone()),
             }),
         };
@@ -1040,6 +1208,7 @@ impl WshClient {
                 ),
                 _ => return Err(WshError::InvalidMessage("expected SERVER_HELLO".into())),
             };
+        gateway_credit_on(&self.gateway, &advertised_features);
         *self.server_features.lock().await = advertised_features;
 
         // Verify host key (TOFU).
@@ -1370,6 +1539,7 @@ impl WshClient {
         relay_message_tx: Option<mpsc::Sender<Envelope>>,
         accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
         early: EarlyShared,
+        gateway: Arc<GatewayHub>,
     ) {
         loop {
             let is_connected = { *connected.lock().await };
@@ -1451,6 +1621,7 @@ impl WshClient {
                                         &relay_message_tx,
                                         &accepted_relay_peers,
                                         &early,
+                                        &gateway,
                                     ).await;
                                 }
                                 Err(e) => {
@@ -1477,6 +1648,7 @@ impl WshClient {
             session.mark_closed().await;
         }
 
+        gateway.close_all();
         tracing::debug!("dispatch loop ended");
     }
 
@@ -1491,6 +1663,7 @@ impl WshClient {
         relay_message_tx: &'a Option<mpsc::Sender<Envelope>>,
         accepted_relay_peers: &'a Arc<Mutex<HashSet<String>>>,
         early: &'a EarlyShared,
+        gateway: &'a Arc<GatewayHub>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             // Unwrap RelayForward: only deliver the inner message if it came
@@ -1522,6 +1695,7 @@ impl WshClient {
                                 relay_message_tx,
                                 accepted_relay_peers,
                                 early,
+                                gateway,
                             )
                             .await;
                         }
@@ -1536,6 +1710,23 @@ impl WshClient {
                         }
                     }
                 }
+                return;
+            }
+
+            // Gateway traffic for a connection or listener this client opened goes to it. What
+            // matches nothing here (a reverse host's own gateway messages) goes on as before.
+            if matches!(
+                envelope.msg_type,
+                MsgType::GatewayOk
+                    | MsgType::GatewayFail
+                    | MsgType::GatewayData
+                    | MsgType::GatewayCredit
+                    | MsgType::GatewayClose
+                    | MsgType::ListenOk
+                    | MsgType::ListenFail
+                    | MsgType::InboundOpen
+            ) && gateway.on_message(&envelope).await
+            {
                 return;
             }
 
@@ -1720,6 +1911,15 @@ impl WshClient {
             }
         })
     }
+}
+
+/// Credit is on when the host advertised `gateway-credit` (the client always lists it in `Hello`).
+fn gateway_credit_on(gateway: &GatewayHub, host_features: &[String]) {
+    gateway.set_credit(
+        host_features
+            .iter()
+            .any(|f| f == wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE),
+    );
 }
 
 fn envelope_channel_id(envelope: &Envelope) -> Option<u32> {
@@ -2004,6 +2204,7 @@ mod tests {
             &None,
             &Arc::new(Mutex::new(HashSet::new())),
             &Default::default(),
+            &Default::default(),
         )
         .await;
 
@@ -2040,6 +2241,7 @@ mod tests {
             &None,
             &Arc::new(Mutex::new(HashSet::new())),
             &Default::default(),
+            &Default::default(),
         )
         .await;
 
@@ -2068,6 +2270,7 @@ mod tests {
             &None,
             &Some(relay_tx),
             &Arc::new(Mutex::new(HashSet::new())),
+            &Default::default(),
             &Default::default(),
         )
         .await;
@@ -2140,6 +2343,7 @@ mod tests {
                 &relay_message_tx,
                 &client.accepted_relay_peers,
                 &client.early,
+                &client.gateway,
             )
             .await;
         }
@@ -2202,6 +2406,7 @@ mod tests {
             &Some(relay_tx),
             &rig.accepted_relay_peers,
             &rig.client.early,
+            &rig.client.gateway,
         )
         .await;
         assert!(relay_rx.try_recv().is_ok());
@@ -2291,6 +2496,7 @@ mod tests {
             relay_message_rx: Arc::new(Mutex::new(None)),
             accepted_relay_peers: Arc::new(Mutex::new(HashSet::new())),
             early: Default::default(),
+            gateway: Default::default(),
         };
 
         let response_task = tokio::spawn(async move {
@@ -2390,6 +2596,7 @@ mod tests {
             relay_message_rx: Arc::new(Mutex::new(None)),
             accepted_relay_peers: accepted_relay_peers.clone(),
             early: Default::default(),
+            gateway: Default::default(),
         };
 
         TestClientRig {
@@ -2434,6 +2641,7 @@ mod tests {
                     &None,
                     &None,
                     &accepted_relay_peers,
+                    &Default::default(),
                     &Default::default(),
                 )
                 .await;
@@ -2533,6 +2741,7 @@ mod tests {
                 &None,
                 &None,
                 &accepted_relay_peers,
+                &Default::default(),
                 &Default::default(),
             )
             .await;

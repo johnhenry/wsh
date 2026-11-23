@@ -360,7 +360,11 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
     let mut errors = Vec::new();
     for (label, url) in attempts {
         match WshClient::connect(&url, config.clone()).await {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                // `-L` / `-R`: the forwards live as long as this connection does.
+                crate::commands::forward::start_configured(&client).await?;
+                return Ok(client);
+            }
             Err(err) => errors.push(format!("{label}: {err}")),
         }
     }
