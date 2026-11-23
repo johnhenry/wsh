@@ -6,16 +6,8 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use wsh_client::share::ShareProvider;
 
-/// The read side of the umask gate (`forward::bind_local_unix` holds the write side while it swaps
-/// the process umask): a test that makes files or directories never runs inside that instant.
-fn gate() -> std::sync::RwLockReadGuard<'static, ()> {
-    crate::commands::forward::UMASK_GATE
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
-/// `create_dir`, then an explicit mode: another test in this binary (`forward`) swaps the process
-/// umask around a `bind`, and a directory made in that instant would be `0600` and not enterable.
+/// `create_dir`, then an explicit mode (the tests need a directory they can enter whatever the
+/// umask of whoever runs them is).
 fn mkdir(p: impl AsRef<std::path::Path>) -> std::io::Result<()> {
     std::fs::create_dir(p.as_ref())?;
     std::fs::set_permissions(p.as_ref(), std::fs::Permissions::from_mode(0o755))
@@ -23,7 +15,6 @@ fn mkdir(p: impl AsRef<std::path::Path>) -> std::io::Result<()> {
 
 struct Fx {
     _tmp: tempfile::TempDir,
-    _gate: std::sync::RwLockReadGuard<'static, ()>,
     /// The shared directory.
     root: PathBuf,
     /// A directory next to it that must never be reached.
@@ -44,7 +35,6 @@ fn limits() -> Limits {
 }
 
 fn fx_with(writable: bool, limits: Limits) -> Fx {
-    let gate = gate();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = std::fs::canonicalize(tmp.path()).expect("canon");
     let root = base.join("share");
@@ -61,7 +51,6 @@ fn fx_with(writable: bool, limits: Limits) -> Fx {
     Fx {
         srv: ShareServer::new(vec![share], limits),
         _tmp: tmp,
-        _gate: gate,
         root,
         outside,
     }
@@ -165,7 +154,6 @@ fn spec_parsing() {
 
 #[test]
 fn a_missing_or_non_directory_root_is_an_error_before_anything_is_offered() {
-    let _gate = gate();
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("f");
     std::fs::write(&file, b"x").unwrap();
@@ -585,7 +573,6 @@ fn a_hard_linked_file_is_not_writable_but_still_readable() {
 
 #[test]
 fn a_root_that_is_a_symlink_is_resolved_once_at_startup() {
-    let _gate = gate();
     let tmp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
     let real = base.join("real");
