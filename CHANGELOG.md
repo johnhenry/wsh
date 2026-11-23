@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Rust CLI: the rendezvous id is not printed anywhere; tests for `-N -L` exiting (#156)
+
+Rust workspace, tests and README only (no `src/` change, no wire change). The `-N -L` exit and the redaction of error lines
+landed in #158; this finishes the rest of #156.
+
+- `--verbose` logs (`transport URL`), `wsh check`, `copy-id` and the transport's own `WebSocket connected to ...` line show the
+  relay's host and the id shortened (`wss://relay/r/AbCd...`), as the error lines do.
+- README: the capability matrix's pipe-relay row and the `--via` paragraph say what the Rust client does today (host-key proof,
+  channel binding `host`).
+- Tests: `test/rust/wsh-cli-156.test.mjs` (host killed or closed mid-session over a relay and a direct socket: the CLI exits
+  non-zero within seconds and removes its sockets; stdout and stderr of five commands over four failure paths, with and without
+  `--verbose`, grepped for the id).
+
 ## 0.39.0 / Rust `rust-v0.10.0`
 
 ### Rust: the sealed bridge (#145, step 5)
@@ -35,19 +50,6 @@ Rust workspace and tests only (no `src/` change); negotiated by existing feature
 - **Not done:** the JS client and the Rust server (#155 stage c); a sealed session is not offered with client-opened QMux data streams.
 - **#156:** `wsh -N -L ...` now exits (non-zero, "the connection to the host was lost", sockets removed) when the host drops the connection
   (the WebSocket transport never told the dispatch loop the socket had closed); a pipe relay's rendezvous id is shortened in error lines.
-
-### Rust CLI: `-N -L` exits when the host goes; the rendezvous id is not printed (#156)
-
-Rust workspace, tests and README only (no `src/` change, no wire change).
-
-- **`wsh -N -L ...` exits when the host drops the session** (non-zero, "the connection to the host was lost", local sockets
-  removed). The WebSocket transport never told the dispatch loop that the socket had closed, so the process waited forever.
-- **The rendezvous id of a `--via` URL (a capability) is never printed:** errors, `--verbose` logs and `wsh check` show the relay's
-  host and the id shortened (`wss://relay/r/AbCd...`). `last_session.json` still stores no URL.
-- README: the capability matrix's pipe-relay row and the `--via` paragraph now say what the Rust client does today (host-key proof,
-  channel binding `host`).
-- Tests: `test/rust/wsh-cli-156.test.mjs` (host killed or closed mid-session over a relay and a direct socket; stderr/stdout of
-  five commands over four failure paths, with and without `--verbose`, grepped for the id).
 
 ## 0.38.1
 
