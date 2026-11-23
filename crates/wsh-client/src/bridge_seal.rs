@@ -154,6 +154,7 @@ mod tests {
                 rows: None,
                 env: None,
                 stdio: None,
+                target: None,
             }),
         }
     }

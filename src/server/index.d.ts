@@ -60,6 +60,8 @@ export type WshClientEnv = boolean | string[] | ((name: string, value: string) =
 /** What a custom `exec` runner receives for one session. */
 export interface WshExecIo {
   user: string;
+  /** #121: the execution target this command runs on; undefined on the host's own. */
+  target?: string;
   /** Environment the client asked for (empty when `clientEnv: false`). */
   env: Record<string, string>;
   cols: number;
@@ -115,6 +117,8 @@ export interface WshGatewayEndpointDuplex {
   readable: ReadableStream<Uint8Array>;
   writable: WritableStream<Uint8Array>;
   who: WshGatewayWho;
+  /** #121: the execution target this endpoint belongs to; undefined for the host's own. */
+  target?: string;
   /** Half-close: nothing more will be sent. */
   close(reason?: string): void;
   /** Tear the connection down now. */
@@ -487,6 +491,15 @@ export interface WshServerOptions {
   onShare?: import('../host.js').WshOnShare;
   /** #163: told once per connection this host turned away (an operator, on a reverse host), with a stable reason code (`REFUSAL_REASONS`, from `@johnhenry/wsh/host`). */
   onRefused?: import('../host.js').WshOnRefused;
+  /**
+   * #121: execution targets (containers, VMs, workers, sandboxes), each with its own `exec` (`true` = a shell), `pty`, `fs`
+   * (`{ root }` or operations) and `endpoints`, and an `authorize(who, { target, kind })`. A client names one in `Open`,
+   * `FileOp` or `OpenEndpoint` and lists what it may use with `listTargets()`. Off unless given: the host then advertises no
+   * `targets` and refuses a request that names one. A refused target and one that does not exist look the same to the client.
+   */
+  targets?: Record<string, Omit<import('../host.js').WshTargetOptions, 'exec' | 'fs'> & { exec?: true | WshServerExecOptions | WshExecRunner; fs?: WshServerFsOptions | import('../host.js').WshFileBackend }>;
+  /** With `targets`: an `Open`, `FileOp` or `OpenEndpoint` that names no target is refused, so nothing runs on the host itself (`rpc` channels too). Does not cover the gateway, MCP or `Attach`. */
+  requireTarget?: boolean;
   onLog?: (line: string) => void;
 }
 

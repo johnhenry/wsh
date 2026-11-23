@@ -86,6 +86,14 @@ export interface WshMemoryHostOptions {
   sealSession?: false | 'offer' | 'require';
   /** #163: told once per connection this host turned away (a key it does not allow, a plain client on a host that requires a sealed session, ...), with a stable reason code. */
   onRefused?: WshOnRefused;
+  /**
+   * #121: execution targets, each with its own `exec`, `pty`, `fs` and `endpoints` and an `authorize(who, { target, kind })`.
+   * A client names one in `Open`, `FileOp` or `OpenEndpoint` and lists what it may use with `listTargets()`. Off unless given:
+   * the host then advertises no `targets` and refuses a request that names one.
+   */
+  targets?: Record<string, import('./host.js').WshTargetOptions>;
+  /** With `targets`: an `Open`, `FileOp` or `OpenEndpoint` that names no target is refused (nothing runs on the host itself). */
+  requireTarget?: boolean;
   onLog?: (line: string) => void;
 }
 

@@ -273,6 +273,19 @@ messages:
             Send it only to a host that advertises the `exec-pipes` feature
             in ServerHello.features; an older host rejects the unknown field.
             Omitted (or `"pty"`) is the historical PTY behaviour.
+        target:
+          type: string
+          required: false
+          description: >
+            Which of the host's execution targets (a container, a VM, a
+            worker, a sandbox) this channel runs on or reads from. Send it
+            only to a host that advertises the `targets` feature in
+            ServerHello.features; an older host rejects the unknown field.
+            Omitted: the host's own default, exactly as before. A host that
+            does not know the name, or does not allow the caller on it,
+            answers OpenFail with the same reason for both (the answer does
+            not reveal which targets exist); it never runs the channel
+            somewhere else. Discover the names with ListTargets.
 
     OpenOk:
       code: 0x11
@@ -1486,6 +1499,14 @@ messages:
         name:
           type: string
           required: true
+        target:
+          type: string
+          required: false
+          description: >
+            The execution target whose endpoint `name` is meant, as for
+            Open.target (only to a host that advertises `targets`). Omitted:
+            the host's own endpoints. A host with targets answers GatewayFail
+            (4) for a target it does not know or does not allow the caller on.
 
     ListenUnix:
       code: 0x65
@@ -2119,6 +2140,13 @@ messages:
           type: u64
           required: false
           description: "Byte count for read"
+        target:
+          type: string
+          required: false
+          description: >
+            The execution target whose files this operation is about, as for
+            Open.target (only to a host that advertises `targets`). Omitted:
+            the host's own default files.
 
     FileResult:
       code: 0x99
@@ -2508,7 +2536,50 @@ messages:
           type: string
           required: false
 
+  # ── Execution targets (wsh #121) ─────────────────────────────────────
+  # A host that fronts several execution targets (containers, VMs, workers,
+  # sandboxes) says so with the `targets` feature in ServerHello.features.
+  # Open, FileOp and OpenEndpoint then take an optional `target`, and a client
+  # may ask what it can reach. Nothing is on by default: a host without the
+  # feature knows no targets, and a client must not send `target` to it (an
+  # older host rejects the unknown field; one that knows the field and has no
+  # targets answers OpenFail, FileResult(success=false) or GatewayFail).
+  # What a key may see is the host's decision: TargetList lists the targets the
+  # caller is allowed on, not every target the host has.
+  targets:
+    ListTargets:
+      code: 0xab
+      description: >
+        Sent by the client to a host that listed "targets" to ask which
+        execution targets it may use. Answered with TargetList.
+      fields: {}
+
+    TargetList:
+      code: 0xac
+      description: >
+        The host's answer to ListTargets: the targets the caller is allowed
+        on (the host decides what to reveal per key), in the host's order.
+      fields:
+        targets:
+          type: "TargetInfo[]"
+          required: true
+
 nested_types:
+  TargetInfo:
+    fields:
+      name:
+        type: string
+        required: true
+        description: "The value to put in Open.target (and FileOp.target, OpenEndpoint.target)"
+      description:
+        type: string
+        required: false
+        description: "A human line about the target (what it is); not for parsing"
+      capabilities:
+        type: "string[]"
+        default: "[]"
+        description: 'What the caller can do on it: any of "exec", "pty", "file", "endpoint" (a hint; the host decides on each request)'
+
   FileEntry:
     # wsh #59: the shape of a directory entry, formalized from the JS SDK's
     # previously-private WshFileListEntry (name, size, modified, type) so

@@ -212,6 +212,9 @@ async fn file_op(
             path: remote_path.to_string(),
             offset: None,
             length: None,
+            // The Rust client's file commands run on the host's own files; naming a target for
+            // them is not built (`wsh --target` is refused for them), only for exec and shells.
+            target: None,
         }),
     };
 

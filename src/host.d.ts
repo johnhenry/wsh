@@ -14,15 +14,15 @@ export interface WshFileBackend {
    * `read` (`offset`, `length`) -> `{ metadata: { data, size } }`; `write` (`offset`, `data`) -> `{ metadata: { written } }`;
    * `rename` (`newPath`); `mkdir`; `remove`. Anything else should throw.
    */
-  operate(op: string, path: string, args?: { offset?: number; length?: number; newPath?: string; data?: Uint8Array }): Promise<{ metadata?: Record<string, unknown>; entries?: Array<Record<string, unknown>> }>;
+  operate(op: string, path: string, args?: { offset?: number; length?: number; newPath?: string; data?: Uint8Array; target?: string }): Promise<{ metadata?: Record<string, unknown>; entries?: Array<Record<string, unknown>> }>;
   /** The whole file, for a `download:` channel. Throw if it is larger than `maxFileBytes`. */
-  readWhole(path: string): Promise<Uint8Array>;
+  readWhole(path: string, options?: { target?: string }): Promise<Uint8Array>;
   /** Create or replace a file (creating its directories), for an `upload:` channel. */
-  writeWhole(path: string, data: Uint8Array): Promise<void>;
+  writeWhole(path: string, data: Uint8Array, options?: { target?: string }): Promise<void>;
   /** Write `data` at `offset` (omitted = replace the file), without truncating when an offset is given. */
-  writeAt(path: string, data: Uint8Array, offset?: number, options?: { mkdirs?: boolean }): Promise<void>;
+  writeAt(path: string, data: Uint8Array, offset?: number, options?: { mkdirs?: boolean; target?: string }): Promise<void>;
   /** A byte range as chunks; only the `wsh-fs` rpc built-in (Node) reads it. */
-  openRange?(path: string, options?: { offset?: number; length?: number; chunkBytes?: number }): Promise<{ size: number; offset: number; length: number; chunks: AsyncIterable<Uint8Array> }>;
+  openRange?(path: string, options?: { offset?: number; length?: number; chunkBytes?: number; target?: string }): Promise<{ size: number; offset: number; length: number; chunks: AsyncIterable<Uint8Array> }>;
   /** Largest file read or written whole, in bytes (default 64 MiB). */
   maxFileBytes?: number;
 }
@@ -39,12 +39,35 @@ export interface WshResolvedHostKey {
   sign(data: Uint8Array): Promise<Uint8Array>;
 }
 
+/** What a host that serves several execution targets takes for each (#121). The same forms as the host's own backends. */
+export interface WshTargetOptions {
+  /** A human line shown by `ListTargets`. */
+  description?: string;
+  /**
+   * Who may use this target. Called for every `Open`, `FileOp` and `OpenEndpoint` naming it (`kind`: `exec`, `pty`, `file`,
+   * `endpoint`) and for `ListTargets` (`kind: 'list'`); only `true` lets the caller on. Absent: any authenticated key.
+   * A refusal looks like an unknown target to the client.
+   */
+  authorize?: (who: { username: string | null; fingerprint: string | null }, request: { target: string; kind: 'exec' | 'pty' | 'file' | 'endpoint' | 'list' }) => boolean | Promise<boolean>;
+  /** `run(command, io)`; `io.target` is this target's name. (`true`, a shell, is for `createWshServer`.) */
+  exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: WshClientEnv };
+  /** `spawn` is also given `{ target }` in its options. */
+  pty?: WshServerPtyOptions;
+  /** Every call is also given `{ target }`. */
+  fs?: WshFileBackend;
+  /** Named virtual endpoints of this target; the handler's `duplex.target` is its name. */
+  endpoints?: Record<string, ((duplex: object, who: { username: string | null; fingerprint: string | null }) => void | Promise<void>) | { open: Function; authorize?: (who: object) => boolean | Promise<boolean> }>;
+}
+
 export interface WshResolvedBackends {
   execRunner: WshExecRunner | null;
   execOptions: { timeoutMs?: number; clientEnv?: WshClientEnv };
   pty: { spawn: WshServerPtyOptions['spawn']; shell: string; cwd?: string; env?: Record<string, string | undefined>; term: string } | null;
   files: Required<Pick<WshFileBackend, 'operate' | 'readWhole' | 'writeWhole' | 'writeAt' | 'maxFileBytes'>> & Pick<WshFileBackend, 'openRange'> | null;
   mcp: object | null;
+  /** The validated `targets` option (#121), by name; null when the host has none. */
+  targets: Map<string, object> | null;
+  requireTarget: boolean;
 }
 
 /** Validate injected backends (no shell, no directory: `exec` is a function or `{ run }`, `fs` an object of operations). */
@@ -53,6 +76,10 @@ export function resolveBackends(options?: {
   pty?: WshServerPtyOptions;
   fs?: WshFileBackend;
   mcp?: WshServerMcpOptions;
+  /** #121: execution targets, each with its own backends. Off unless given. */
+  targets?: Record<string, WshTargetOptions>;
+  /** With `targets`: a request that names none is refused. */
+  requireTarget?: boolean;
 }): WshResolvedBackends;
 
 /** Validate a file backend (see {@link WshFileBackend}). */

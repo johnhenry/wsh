@@ -19,7 +19,7 @@
 - **Version**: `wsh-v1`
 - **Wire format**: CBOR
 - **Framing**: length prefixed be32
-- **Total message types**: 108
+- **Total message types**: 110
 
 ## Enums
 
@@ -180,6 +180,8 @@ Type: `string`
 | `0xa8` | ShareOffer | shares |
 | `0xa9` | ShareRequest | shares |
 | `0xaa` | ShareReply | shares |
+| `0xab` | ListTargets | targets |
+| `0xac` | TargetList | targets |
 
 ## Message Details
 
@@ -279,6 +281,7 @@ Category: **channel**
 | `rows` | `u16` | no | — |
 | `env` | `map<string,string>` | no | — |
 | `stdio` | `string` | no | — |
+| `target` | `string` | no | — |
 
 ### OpenOk (`0x11`)
 
@@ -816,6 +819,7 @@ Category: **gateway**
 |-------|------|----------|---------|
 | `gateway_id` | `u32` | yes | — |
 | `name` | `string` | yes | — |
+| `target` | `string` | no | — |
 
 ### ListenUnix (`0x65`)
 
@@ -1315,6 +1319,7 @@ Category: **filechannel**
 | `path` | `string` | yes | — |
 | `offset` | `u64` | no | — |
 | `length` | `u64` | no | — |
+| `target` | `string` | no | — |
 
 ### FileResult (`0x99`)
 
@@ -1473,7 +1478,33 @@ Category: **shares**
 | `written` | `u32` | no | — |
 | `target` | `string` | no | — |
 
+### ListTargets (`0xab`)
+
+Category: **targets**
+
+> >
+
+*No fields.*
+
+### TargetList (`0xac`)
+
+Category: **targets**
+
+> >
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `targets` | `TargetInfo[]` | yes | — |
+
 ## Nested Types
+
+### TargetInfo
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `name` | `string` | yes | — |
+| `description` | `string` | no | — |
+| `capabilities` | `string[]` | no | `[]` |
 
 ### FileEntry
 

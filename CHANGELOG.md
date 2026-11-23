@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Execution targets: `Open.target`, target discovery, `wsh --target` (#121; JS and Rust change)
+
+A host that fronts several places to run things (containers, VMs, workers, sandboxes) can now say which one a request is for, instead of
+overloading `username` or prefixing the command. **Nothing changes unless a host sets `targets`:** no feature is advertised, no existing
+message or option changes meaning, and no default changes (not a breaking change).
+
+- **Wire (spec change, regenerated):** optional `target` on `Open`, `FileOp` and `OpenEndpoint`; new `ListTargets` (`0xab`) and
+  `TargetList` (`0xac`, with `TargetInfo { name, description?, capabilities }`); the feature string `targets` in `ServerHello.features`.
+  A client sends a `target` (or `ListTargets`) only to a host that advertised `targets`. **A released peer:** the Rust types deny unknown
+  fields, so a released Rust `wsh-server` would reject an `Open` carrying `target` -- which is why nothing is sent to a host that did not
+  advertise the feature, and the new Rust server refuses (never ignores) a `target` it receives anyway. A released JS host would ignore
+  `target` and run on its own default -- the same reason. A released client never sends any of it.
+- **JS host (`createWshServer`, `createMemoryHost`, `createConnectionFactory` via `resolveBackends`):**
+  `targets: { [name]: { description?, authorize?(who, { target, kind }), exec?, pty?, fs?, endpoints? } }` and `requireTarget`. Each target has
+  its own backends (the same forms as the host's own; `exec: true` and `fs: { root }` on Node); a request that names no target uses the host's
+  own, a target without a backend for the request refuses it, and `io.target` / `{ target }` in the pty and file-backend calls /
+  `duplex.target` tell a shared function which target it serves. `authorize` is asked for every request that names a target and for
+  `ListTargets`; a refused target and an unknown one get the same answer (`no such target`). `requireTarget: true` refuses an `Open`
+  (including `rpc`), `FileOp` or `OpenEndpoint` that names none. `createReverseHost` takes no `targets` (it throws).
+- **JS client:** `client.listTargets()`, `openSession({ target })`, `WshClient.exec(url, cmd, { target })`, `fileOperation(op, path, { target })`
+  (a request with a target never goes over the `wsh-fs` rpc), `openEndpoint(name, { target })`; each throws before sending against a host that
+  does not advertise `targets`. Types and `TARGETS_FEATURE` exported.
+- **Rust CLI and client:** `wsh --target NAME [user@]host [command...]` and `wsh --target NAME connect`, `wsh targets [user@]host [--json]`;
+  `SessionOpts.target`, `WshClient::list_targets()`, `TARGETS_FEATURE`. `--target` is refused (exit 2) by every other subcommand, by `-L`,
+  `-R`, `-N` and `--share` (not per target), so it is never silently ignored; file and endpoint calls of the Rust client send no target.
+- **Rust `wsh-server` has no targets:** it states no `targets`, answers an `Open`/`FileOp` that names one with a failure (`this host has no
+  targets`) and `ListTargets` with an error.
+- Not covered by a target (README, Security model): the gateway, MCP, rpc channels and `Attach` to an existing session; and a target is an
+  authorization boundary only as far as `authorize` and the backends make it one.
+- Tests: `test/targets.test.mjs` (two targets, a key refused on one, listing per key, `authorize` arguments, `requireTarget`, hosts without
+  targets, malformed names, options), `test/rust/wsh-targets.test.mjs` (the Rust CLI against a JS host with two targets and against `wsh-server`),
+  `wsh targets` rendering unit tests. Bundle budget unchanged (within the 10% tolerance).
+
 ### Rust relay and `wsh` peer: several operators per peer (#93; Rust change, no `src/` change)
 
 The Rust relay (`wsh-server --enable-relay`) and the Rust peer (`wsh reverse`, `wsh agent run`) now do what the JS relay and

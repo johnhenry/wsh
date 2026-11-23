@@ -8,7 +8,7 @@
  * reverse mode (client registers as a peer for incoming connections).
  */
 
-import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE } from './features.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE } from './features.mjs';
 import { WebTransportTransport, normalizeWebTransportOptions } from './transport.mjs';
 import { clientChannelBinding, offeredKinds, TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH } from './channel-binding.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
@@ -36,6 +36,7 @@ import {
   policyEval as policyEvalMsg, policyUpdate as policyUpdateMsg,
   detach as detachMsg,
   sessionListRequest as sessionListRequestMsg,
+  listTargets as listTargetsMsg,
   sessionGrant as sessionGrantMsg, sessionRevoke as sessionRevokeMsg,
   isRelayForwardable,
 } from './messages.mjs';
@@ -74,7 +75,16 @@ const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
 const FS_RPC_OPS = new Set(['stat', 'list', 'read', 'write', 'mkdir', 'remove', 'rename']);
 
 // The feature strings live in features.mjs (a host names them without importing this file); re-exported here.
-export { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE };
+export { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE };
+
+/** `target` must be a non-empty string, and only a host that advertises `targets` may be sent one (#121). */
+function assertTargetUsable(client, target, who) {
+  if (target === undefined) return;
+  if (typeof target !== 'string' || !target) throw new TypeError(`${who}: target must be a non-empty string`);
+  if (!client.hasFeature(TARGETS_FEATURE)) {
+    throw new Error(`${who}: this host does not advertise "${TARGETS_FEATURE}" (execution targets); it would run the request on its own default, or reject the unknown field -- it was not sent`);
+  }
+}
 
 /** An `AbortError` for `signal`, with the signal's reason as `cause`. */
 function abortError(signal) {
@@ -825,10 +835,13 @@ export class WshClient {
    *   Throws `RpcError` (`UNSUPPORTED_PROTOCOL`) before sending anything if the host does not advertise it.
    * @param {(session: WshSession) => void} [opts.attach] - Advanced: called synchronously the moment the data
    *   stream is bound, before any received byte can be delivered (`openRpc` uses it to set `onData`).
+   * @param {string} [opts.target] - Which of the host's execution targets to run on (#121; see `listTargets()`).
+   *   Throws before sending anything if the host does not advertise `targets`. Omitted: the host's own default.
    * @returns {Promise<WshSession>}
    */
-  async openSession({ type = 'pty', command, protocol, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT, primer = true, attach, stdio } = {}) {
+  async openSession({ type = 'pty', command, protocol, cols = 80, rows = 24, env, timeout = DEFAULT_OPEN_TIMEOUT, primer = true, attach, stdio, target } = {}) {
     this.#assertAuthenticated('openSession');
+    assertTargetUsable(this, target, 'openSession');
     if (stdio !== undefined && stdio !== 'pty' && stdio !== 'pipes') {
       throw new TypeError('openSession: stdio must be "pty" or "pipes"');
     }
@@ -845,7 +858,7 @@ export class WshClient {
     const requestedChannelId = this._nextChannelId();
 
     await this.#transport.sendControl(
-      openMsg({ kind: type, command, cols, rows, env, stdio: stdio === 'pipes' ? 'pipes' : undefined })
+      openMsg({ kind: type, command, cols, rows, env, stdio: stdio === 'pipes' ? 'pipes' : undefined, target })
     );
 
     // Registered as a dedicated pending-open (not the generic
@@ -1188,10 +1201,11 @@ export class WshClient {
    *   when the host advertises `exec-pipes` (no echo, stderr kept apart, EOF), else the host's native
    *   mode; without `stdin`, the host's native mode (a PTY on the Rust server), exactly as before.
    *   `'pipes'` throws if the host does not advertise `exec-pipes`; `'pty'` never asks for pipes.
+   * @param {string} [opts.target] - The host's execution target to run on (#121; needs `targets`, see `openSession`).
    * @returns {Promise<{stdout: Uint8Array, exitCode: number, stderr?: Uint8Array}>} `stderr` is present
    *   only when the command ran on pipes.
    */
-  static async exec(url, command, { username, keyPair, signer, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, stdin, stdio, ...hostKeyOpts } = {}) {
+  static async exec(url, command, { username, keyPair, signer, password, timeout = DEFAULT_EXEC_TIMEOUT, primer = true, stdin, stdio, target, ...hostKeyOpts } = {}) {
     if (stdin !== undefined) assertStdinSource(stdin);
     if (stdio !== undefined && stdio !== 'pipes' && stdio !== 'pty') throw new TypeError('exec: stdio must be "pipes" or "pty"');
     const client = new WshClient();
@@ -1206,7 +1220,7 @@ export class WshClient {
 
       // The first stdin byte (or the EOF itself) announces the data stream to a
       // legacy host, so the primer byte is only needed when there is no stdin.
-      const session = await client.openSession({ type: 'exec', command, primer: stdin === undefined ? primer : false, stdio: piped ? 'pipes' : undefined });
+      const session = await client.openSession({ type: 'exec', command, primer: stdin === undefined ? primer : false, stdio: piped ? 'pipes' : undefined, target });
 
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -1383,6 +1397,22 @@ export class WshClient {
 
     const peers = response.peers || [];
     return Promise.all(peers.map(async (peer) => ({ ...peer, verified: await verifyPeerInfoRecord(peer) })));
+  }
+
+  /**
+   * The execution targets this connection may use (#121): what the host decides to show THIS key, in the host's order.
+   * Each is `{ name, description?, capabilities }` (`capabilities` is a hint: any of `exec`, `pty`, `file`, `endpoint`);
+   * pass `name` as `target` to `openSession`, `fileOperation` or `openEndpoint`. Throws if the host does not advertise `targets`.
+   *
+   * @param {number} [timeout=10000] - Timeout in ms
+   * @returns {Promise<Array<{ name: string, description?: string, capabilities: string[] }>>}
+   */
+  async listTargets(timeout = DEFAULT_OPEN_TIMEOUT) {
+    this.#assertAuthenticated('listTargets');
+    if (!this.hasFeature(TARGETS_FEATURE)) throw new Error(`listTargets: this host does not advertise "${TARGETS_FEATURE}" (execution targets)`);
+    await this.#transport.sendControl(listTargetsMsg());
+    const response = await this.#waitForMessage([MSG.TARGET_LIST], timeout, 'Timed out waiting for the target list');
+    return response.targets ?? [];
   }
 
   /**
@@ -2418,14 +2448,18 @@ export class WshClient {
    *
    * @param {string} op - Operation: 'stat', 'list', 'read', 'write', 'mkdir', 'remove', 'rename'
    * @param {string} path - File path
-   * @param {object} [opts] - Optional: offset, length for read; `data` (+ `offset`) for write; `newPath` for rename
+   * @param {object} [opts] - Optional: offset, length for read; `data` (+ `offset`) for write; `newPath` for rename;
+   *   `target` (#121): the execution target whose files these are (needs a host that advertises `targets`; the
+   *   `wsh-fs` rpc is not per target, so a request with a target always goes over FileOp)
    * @param {number} [timeout=10000]
    * @returns {Promise<object>} FileResult response
    */
   async fileOperation(op, path, opts = {}, timeout = DEFAULT_OPEN_TIMEOUT) {
     this.#assertAuthenticated('fileOperation');
+    assertTargetUsable(this, opts.target, 'fileOperation');
+    const { target } = opts;
     // wsh #85: a host that serves the `wsh-fs` rpc protocol is preferred over the FileOp/FileResult control path.
-    if (this.preferRpcFiles && FS_RPC_OPS.has(op) && this.hasFeature(rpcProtocolFeature('wsh-fs'))) {
+    if (target === undefined && this.preferRpcFiles && FS_RPC_OPS.has(op) && this.hasFeature(rpcProtocolFeature('wsh-fs'))) {
       let rpc = null;
       try { rpc = await this.#fsChannel(); } catch { /* fall back to FileOp */ }
       if (rpc) return this.#fileOperationRpc(rpc, op, path, opts, timeout);
@@ -2451,7 +2485,7 @@ export class WshClient {
       const result = this.#waitForMessage([MSG.FILE_RESULT], timeout, `Timed out waiting for file ${op} result`, byChannel);
       result.catch(() => {});
       await this.#transport.sendControl(fileOpMsg({
-        channelId, op, path, offset: op === 'write' ? opts.offset : undefined, length: data.byteLength,
+        channelId, op, path, offset: op === 'write' ? opts.offset : undefined, length: data.byteLength, target,
       }));
       let off = 0;
       do {
@@ -2465,7 +2499,7 @@ export class WshClient {
     }
 
     await this.#transport.sendControl(
-      fileOpMsg({ channelId, op, path, offset: opts.offset, length: opts.length })
+      fileOpMsg({ channelId, op, path, offset: opts.offset, length: opts.length, target })
     );
     return this.#waitForMessage(
       [MSG.FILE_RESULT],

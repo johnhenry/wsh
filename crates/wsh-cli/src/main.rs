@@ -49,6 +49,18 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Run on this execution target of the host (wsh #121): `wsh --target NAME [user@]host [command...]`
+    /// or `wsh --target NAME connect [user@]host`. `wsh targets [user@]host` lists the names this key
+    /// may use. Only for a host that advertises `targets`; nothing is sent to any other, and a
+    /// command that does not run on a target (file transfer, forwarding, ...) refuses the flag.
+    #[arg(
+        id = "exec_target",
+        long = "target",
+        global = true,
+        value_name = "NAME"
+    )]
+    exec_target: Option<String>,
+
     /// Give a one-off command (`wsh host command...`) a terminal: raw keyboard input,
     /// and terminal resizes passed on. Needs standard input to be a terminal.
     #[arg(long = "tty")]
@@ -175,6 +187,16 @@ enum Command {
     Connect {
         /// Target in [user@]host format
         target: String,
+    },
+
+    /// List the execution targets a host lets this key use (then `wsh --target NAME ...`)
+    Targets {
+        /// Host in [user@]host format
+        host: String,
+
+        /// Emit JSON instead of a human table
+        #[arg(long)]
+        json: bool,
     },
 
     /// List active sessions
@@ -428,17 +450,43 @@ async fn main() {
                 | Command::CopyId { .. }
                 | Command::Scp { .. }
                 | Command::Ls { .. }
-                | Command::Sftp { .. },
+                | Command::Sftp { .. }
+                | Command::Targets { .. },
             ) => true,
             Some(_) => false,
         };
         if !dials_a_host {
             eprintln!(
-                "wsh: --via applies to `wsh [user@]host`, connect, scp, ls, sftp and copy-id only"
+                "wsh: --via applies to `wsh [user@]host`, connect, scp, ls, sftp, targets and copy-id only"
             );
             std::process::exit(2);
         }
         commands::common::set_via(via);
+    }
+
+    // An execution target (--target, wsh #121): only for the commands that open a shell or run a command
+    // (`wsh [user@]host [command...]` and `wsh connect`). Everything else would use the host's own files,
+    // sockets or peers, so it refuses the flag rather than quietly ignore it; so do the host-level
+    // features that ride a connection (-L, -R, -N, --share), which are not per target.
+    if let Some(name) = &cli.exec_target {
+        let runs_on_a_target = matches!(&cli.command, None | Some(Command::Connect { .. }));
+        let host_level = !cli.local_forwards.is_empty()
+            || !cli.remote_forwards.is_empty()
+            || cli.no_command
+            || cli.replace_socket
+            || !cli.shares.is_empty();
+        if !runs_on_a_target || host_level {
+            eprintln!(
+                "wsh: --target applies to `wsh [user@]host [command...]` and `wsh connect` only (not to file \
+                 transfer, forwarding, --share, -N or the other subcommands: they would use the host's own)"
+            );
+            std::process::exit(2);
+        }
+        if name.is_empty() {
+            eprintln!("wsh: --target needs a name (see `wsh targets [user@]host`)");
+            std::process::exit(2);
+        }
+        commands::common::set_target(name.clone());
     }
 
     // Forwarding (-L / -R / -N): only for the commands that dial one `[user@]host` and keep the
@@ -498,6 +546,9 @@ async fn main() {
     let result = match cli.command {
         Some(Command::Connect { target }) => {
             commands::connect::run(&target, port, &identity, transport.as_deref()).await
+        }
+        Some(Command::Targets { host, json }) => {
+            commands::targets::run(&host, port, &identity, transport.as_deref(), json).await
         }
         Some(Command::Sessions) => commands::sessions::run_list().await,
         Some(Command::Attach { session }) => {

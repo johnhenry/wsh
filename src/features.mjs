@@ -28,6 +28,13 @@ export const STREAM_ANNOUNCE_FEATURE = 'stream-announce';
 export const EXEC_PIPES_FEATURE = 'exec-pipes';
 
 /**
+ * ServerHello feature (#121): this host serves several execution targets. `Open`, `FileOp` and `OpenEndpoint` take an optional
+ * `target`, and `ListTargets` is answered with `TargetList`. Negotiated rather than assumed: the Rust types deny unknown
+ * fields, so an older host rejects an `Open` that carries `target`.
+ */
+export const TARGETS_FEATURE = 'targets';
+
+/**
  * Host feature (#155): this host seals the whole session end to end when asked (a signed `KeyExchange` for the
  * connection's session id, then every message but the keepalive as an `EncryptedFrame` on channel 0).
  */

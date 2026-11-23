@@ -338,6 +338,18 @@ pub fn apply_via(mut resolved: ResolvedTarget, via: &str) -> Result<ResolvedTarg
     Ok(resolved)
 }
 
+static TARGET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Remember `--target NAME` (wsh #121) for the rest of this process.
+pub fn set_target(name: String) {
+    let _ = TARGET.set(name);
+}
+
+/// The execution target the command line named, if any: the host's own default when it did not.
+pub fn target() -> Option<String> {
+    TARGET.get().cloned()
+}
+
 /// What the operator asked of host identity on the command line (`--accept-new-host-key`,
 /// `--require-host-key`, `--require-channel-binding`).
 #[derive(Debug, Clone, Default)]

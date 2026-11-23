@@ -85,6 +85,15 @@ function tlsChannelBinding(socket) {
  *   Answer the gateway opcodes (OpenTcp, ResolveDns, GatewayData/Close): the client opens TCP connections and resolves
  *   names from this host. Default deny: a destination must match `allow` (`"*"`, `"host"`, `"host:port"`). `socks` dials
  *   through a SOCKS5 proxy (Tor) with the name unresolved. UDP (`udp`: bounds, WebTransport datagrams) and TCP reverse tunnels (`reverse`, off unless given) are served. Off unless given. See `gateway.mjs`.
+ * @param {Record<string, { description?: string, authorize?: Function, exec?: true | object | Function, pty?: object, fs?: object, endpoints?: object }>} [options.targets]
+ *   Execution targets (#121): the host fronts several (containers, VMs, workers, sandboxes), each with its own `exec`, `pty`,
+ *   `fs` and `endpoints` (the same forms as the host's own) and an `authorize(who, { target, kind })` (`kind`: `exec`, `pty`,
+ *   `file`, `endpoint`, `list`) deciding who may use it; a client names one in `Open`, `FileOp` or `OpenEndpoint` and lists
+ *   what it may use with `ListTargets`. Off unless given (the host then advertises no `targets` and refuses a request that
+ *   names one). A refused target and one that does not exist look the same to the client.
+ * @param {boolean} [options.requireTarget=false] - With `targets`: an `Open`, `FileOp` or `OpenEndpoint` that names no target is
+ *   refused, so nothing runs on the host itself (`kind: 'rpc'` channels, which are not per target, are refused too). Does NOT
+ *   cover the gateway (`OpenTcp`, `OpenUnix`, ...), MCP, or `Attach` to a session already open.
  * @param {number} [options.bindTimeoutMs=3000]
  * @param {number} [options.connectionTtlMs=0] - End every authenticated connection this long after login (0 = never).
  *   Advertised as `AuthOk.ttl` in whole seconds, rounded up; the client reads it as `client.authTtl`.
@@ -106,7 +115,7 @@ function tlsChannelBinding(socket) {
  */
 export function createWshServer({
   host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
-  onShare, onRefused,
+  onShare, onRefused, targets, requireTarget,
 } = {}) {
   validateOnShare(onShare, 'createWshServer');
   validateOnRefused(onRefused, 'createWshServer');
@@ -120,7 +129,7 @@ export function createWshServer({
   let httpsServer = null;
   let bound = null;
 
-  const { execRunner, execOptions, pty: ptyConfig, files, mcp: mcpHost } = buildBackends({ exec, pty, fs, mcp });
+  const { execRunner, execOptions, pty: ptyConfig, files, mcp: mcpHost, targets: targetTable, requireTarget: mustHaveTarget } = buildBackends({ exec, pty, fs, mcp, targets, requireTarget });
   const methods = authMethods(auth);
   const rl = auth?.rateLimit ?? {};
   const rateLimit = {
@@ -136,7 +145,10 @@ export function createWshServer({
   let registry = null;
   let hub = null;
   let wt = null;
-  const gatewayCfg = gateway === undefined ? null : normalizeGateway(gateway);
+  let gatewayCfg = gateway === undefined ? null : normalizeGateway(gateway);
+  // A target's own named endpoints (#121) are served by the gateway session even when the host has no gateway of its own:
+  // an endpoints-only one (no TCP, DNS or unix sockets), which advertises `gateway-endpoints`.
+  if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeGateway({ tcp: false })), targetEndpoints: true };
   const sessionOptions = sessions ? (sessions === true ? {} : sessions) : null;
 
   /** Sockets handed to `accept()` that are still open. */
@@ -163,7 +175,7 @@ export function createWshServer({
       return createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, createGatewaySession, sessions: registry, relay: hub,
-        onShare, onRefused,
+        onShare, onRefused, targets: targetTable, requireTarget: mustHaveTarget,
       });
     })();
     ready.catch(() => { ready = null; });

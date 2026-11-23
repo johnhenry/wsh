@@ -6,6 +6,7 @@
 
 import { normalizePty } from './server/pty.mjs';
 import { createMcpHost } from './server/mcp.mjs';
+import { normalizeEndpoints } from './server/gateway-core.mjs';
 import { DEFAULT_MAX_FILE_BYTES } from './server/constants.mjs';
 import { generateKeyPair, resolveSigner, fingerprint, exportPublicKeySSH, importPublicKeyRaw } from './auth.mjs';
 
@@ -51,11 +52,75 @@ export function normalizeFileBackend(fs, who = 'fs') {
   return files;
 }
 
+/** A target's name: what a client puts in `Open.target`. */
+export const TARGET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const TARGET_KEYS = ['description', 'authorize', 'exec', 'pty', 'fs', 'endpoints'];
+
+/** A file backend that tells every call which target it serves (the last argument's `target`). */
+function fileBackendForTarget(files, name) {
+  return {
+    maxFileBytes: files.maxFileBytes,
+    operate: (op, path, opts = {}) => files.operate(op, path, { ...opts, target: name }),
+    readWhole: (path, opts = {}) => files.readWhole(path, { ...opts, target: name }),
+    writeWhole: (path, data, opts = {}) => files.writeWhole(path, data, { ...opts, target: name }),
+    writeAt: (path, data, offset, opts = {}) => files.writeAt(path, data, offset, { ...opts, target: name }),
+    ...(files.openRange ? { openRange: (path, opts = {}) => files.openRange(path, { ...opts, target: name }) } : {}),
+  };
+}
+
 /**
- * @param {{ exec?: Function | { run: Function }, pty?: { spawn: Function }, fs?: object, mcp?: object }} options
- * @returns {{ execRunner: Function | null, execOptions: object, pty: object | null, files: object | null, mcp: object | null }}
+ * Validate the `targets` option (#121) and build one entry per target: its own exec / pty / files / endpoints
+ * (`buildOne({ exec, pty, fs })` makes the first three: `resolveBackends` in a browser, `buildBackends` in Node), the
+ * `authorize(who, { target, kind })` that decides who may use it, and a description. Nothing here is on by default: no
+ * `targets` option, no targets.
+ *
+ * @param {object | undefined} targets - `{ [name]: { description?, authorize?, exec?, pty?, fs?, endpoints? } }`
+ * @param {boolean | undefined} requireTarget
+ * @param {(spec: object) => { execRunner: Function | null, execOptions: object, pty: object | null, files: object | null }} buildOne
+ * @param {string} [who] - the host's name in error messages
+ * @returns {{ targets: Map<string, object> | null, requireTarget: boolean }}
  */
-export function resolveBackends({ exec, pty, fs, mcp } = {}) {
+export function normalizeTargets(targets, requireTarget, buildOne, who = 'host') {
+  if (requireTarget !== undefined && typeof requireTarget !== 'boolean') throw new TypeError(`${who}: requireTarget must be a boolean`);
+  if (targets === undefined || targets === null) {
+    if (requireTarget) throw new TypeError(`${who}: requireTarget needs targets`);
+    return { targets: null, requireTarget: false };
+  }
+  if (typeof targets !== 'object' || Array.isArray(targets)) throw new TypeError(`${who}: targets must be an object of { name: { exec, pty, fs, endpoints, authorize, description } }`);
+  const map = new Map();
+  for (const [name, spec] of Object.entries(targets)) {
+    if (!TARGET_NAME_RE.test(name)) throw new TypeError(`${who}: targets: ${JSON.stringify(name)} is not a valid target name (letters, digits, ".", "_", "-"; at most 64)`);
+    if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) throw new TypeError(`${who}: targets.${name} must be an object`);
+    for (const key of Object.keys(spec)) {
+      if (!TARGET_KEYS.includes(key)) throw new TypeError(`${who}: targets.${name}.${key} is not an option of a target (${TARGET_KEYS.join(', ')})`);
+    }
+    if (spec.authorize !== undefined && typeof spec.authorize !== 'function') throw new TypeError(`${who}: targets.${name}.authorize must be a function (who, { target, kind }) => boolean`);
+    if (spec.description !== undefined && typeof spec.description !== 'string') throw new TypeError(`${who}: targets.${name}.description must be a string`);
+    const built = buildOne({ exec: spec.exec, pty: spec.pty, fs: spec.fs });
+    map.set(name, {
+      name,
+      description: spec.description,
+      authorize: spec.authorize ?? null,
+      execRunner: built.execRunner,
+      execOptions: built.execOptions,
+      pty: built.pty,
+      files: built.files ? fileBackendForTarget(built.files, name) : null,
+      endpoints: normalizeEndpoints(spec.endpoints),
+    });
+  }
+  return { targets: map.size ? map : null, requireTarget: map.size ? !!requireTarget : false };
+}
+
+/**
+ * @param {{ exec?: Function | { run: Function }, pty?: { spawn: Function }, fs?: object, mcp?: object, targets?: object, requireTarget?: boolean }} options
+ * @returns {{ execRunner: Function | null, execOptions: object, pty: object | null, files: object | null, mcp: object | null, targets: Map<string, object> | null, requireTarget: boolean }}
+ */
+export function resolveBackends({ exec, pty, fs, mcp, targets, requireTarget } = {}) {
+  const base = resolveOwnBackends({ exec, pty, fs, mcp });
+  return { ...base, ...normalizeTargets(targets, requireTarget, (spec) => resolveOwnBackends(spec), 'host') };
+}
+
+function resolveOwnBackends({ exec, pty, fs, mcp } = {}) {
   let execRunner = null;
   let execOptions = {};
   if (typeof exec === 'function') {

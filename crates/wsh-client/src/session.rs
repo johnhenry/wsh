@@ -59,6 +59,12 @@ pub struct SessionOpts {
     /// [`WshSession::read_stderr`] and [`WshSession::close_stdin`]). Send it only to a
     /// host that advertised `exec-pipes`; an older host rejects the unknown field.
     pub stdio: Option<String>,
+    /// Which of the host's execution targets this channel runs on (wsh #121; see
+    /// [`WshClient::list_targets`](crate::WshClient::list_targets)). `None`: the host's own
+    /// default, as before. [`open_session`](crate::WshClient::open_session) refuses to send one to
+    /// a host that did not advertise `targets`: an older host rejects the unknown field, and one
+    /// that ignored it would run the command somewhere else.
+    pub target: Option<String>,
 }
 
 impl Default for SessionOpts {
@@ -70,6 +76,7 @@ impl Default for SessionOpts {
             rows: Some(24),
             env: None,
             stdio: None,
+            target: None,
         }
     }
 }

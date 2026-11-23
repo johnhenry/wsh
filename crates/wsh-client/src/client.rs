@@ -126,6 +126,12 @@ pub const MCP_CALL_ID_FEATURE: &str = "mcp-call-id";
 /// plain pipes (separate stderr, stdin EOF).
 pub const EXEC_PIPES_FEATURE: &str = "exec-pipes";
 
+/// SERVER_HELLO feature (wsh #121): the host has execution targets. `Open`, `FileOp` and
+/// `OpenEndpoint` take an optional `target`, and `ListTargets` is answered with `TargetList`.
+/// Negotiated rather than assumed: the Rust types deny unknown fields, so a host that predates the
+/// field rejects an `Open` that carries it.
+pub const TARGETS_FEATURE: &str = "targets";
+
 /// How many channels may be waiting for their session at once.
 const EARLY_MAX_CHANNELS: usize = 16;
 /// Largest backlog kept per channel: messages, and payload bytes. A host that
@@ -1100,7 +1106,14 @@ impl WshClient {
             rows,
             env,
             stdio,
+            target,
         } = opts;
+        if target.is_some() && !self.has_feature(TARGETS_FEATURE).await {
+            return Err(WshError::Other(format!(
+                "this host does not advertise \"{TARGETS_FEATURE}\" (execution targets): it would run the \
+                 request on its own default or reject the unknown field, so it was not sent"
+            )));
+        }
 
         // Build and send OPEN message
         let envelope = Envelope {
@@ -1112,6 +1125,7 @@ impl WshClient {
                 rows,
                 env,
                 stdio,
+                target,
             }),
         };
 
@@ -1266,6 +1280,32 @@ impl WshClient {
         }
 
         result
+    }
+
+    /// The execution targets this connection may use (wsh #121): what the host decides to show
+    /// THIS key, in the host's order. Fails, without sending anything, against a host that did not
+    /// advertise `targets`.
+    pub async fn list_targets(&self) -> WshResult<Vec<TargetInfo>> {
+        if !self.has_feature(TARGETS_FEATURE).await {
+            return Err(WshError::Other(format!(
+                "this host does not advertise \"{TARGETS_FEATURE}\" (execution targets)"
+            )));
+        }
+        let response = self
+            .send_and_wait(
+                Envelope {
+                    msg_type: MsgType::ListTargets,
+                    payload: Payload::ListTargets(ListTargetsPayload {}),
+                },
+                MsgType::TargetList,
+            )
+            .await?;
+        match response.payload {
+            Payload::TargetList(list) => Ok(list.targets),
+            other => Err(WshError::Other(format!(
+                "unexpected reply to ListTargets: {other:?}"
+            ))),
+        }
     }
 
     /// List sessions from the server that are visible to this user.
