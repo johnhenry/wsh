@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.44.0 / Rust `rust-v0.15.0`
 
 ### `wsh-mcp`: a stdio bridge so MCP clients can reach an MCP server behind a wsh host (#127, partial; JS only)
 
