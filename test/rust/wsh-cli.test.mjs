@@ -227,7 +227,7 @@ describe('wsh connect', () => {
 
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
 
-/** A `wsh-server` with a scratch HOME that authorizes `h`'s key. Its generated dev certificate is flagged as a CA, which a TLS client refuses as a server certificate, so these tests use WSH_INSECURE_LOOPBACK_TLS. */
+/** A `wsh-server` with a scratch HOME that authorizes `h`'s key. Its generated dev certificate is a leaf (wsh #145), so the CLI trusts it through SSL_CERT_FILE and no WSH_INSECURE_LOOPBACK_TLS is needed. */
 async function startRustServer(h) {
   const port = await new Promise((resolve) => {
     const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
@@ -248,14 +248,14 @@ async function startRustServer(h) {
     proc.once('exit', (c) => reject(new Error(`wsh-server exited early (${c}): ${seen}`)));
     setTimeout(() => reject(new Error(`wsh-server not ready: ${seen}`)), 10_000);
   });
-  return { port };
+  return { port, certFile: path.join(serverHome, '.wsh', 'cert.pem') };
 }
 
 describe('wsh CLI exec against the Rust wsh-server', { skip: !existsSync(SERVER_BIN) && `no wsh-server at ${SERVER_BIN}` }, () => {
   it('stdin reaches the command and its end is EOF; stdout and stderr stay apart; the exit status comes back', async () => {
     const h = makeHome();
-    const { port } = await startRustServer(h);
-    const env = { WSH_INSECURE_LOOPBACK_TLS: '1' };
+    const { port, certFile } = await startRustServer(h);
+    const env = { SSL_CERT_FILE: certFile };
     const base = ['-t', 'ws', '-p', String(port), 'localhost'];
 
     const cat = await wsh([...base, 'cat'], { home: h.home, env, input: 'a\nb\n' });
@@ -270,8 +270,8 @@ describe('wsh CLI exec against the Rust wsh-server', { skip: !existsSync(SERVER_
 
   it('a command with no stdin still runs, as before', async () => {
     const h = makeHome();
-    const { port } = await startRustServer(h);
-    const r = await wsh(['-t', 'ws', '-p', String(port), 'localhost', 'echo hello'], { home: h.home, env: { WSH_INSECURE_LOOPBACK_TLS: '1' } });
+    const { port, certFile } = await startRustServer(h);
+    const r = await wsh(['-t', 'ws', '-p', String(port), 'localhost', 'echo hello'], { home: h.home, env: { SSL_CERT_FILE: certFile } });
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout.toString(), /hello/);
   });

@@ -56,8 +56,11 @@ impl PtyHandle {
             }
         }
 
-        // Set TERM if not already in env
-        cmd.env("TERM", "xterm-256color");
+        // Set TERM if the client did not (its own TERM is on the default
+        // `client_env` allow-list).
+        if env.map_or(true, |m| !m.contains_key("TERM")) {
+            cmd.env("TERM", "xterm-256color");
+        }
 
         let child = pair
             .slave
@@ -153,6 +156,26 @@ impl PtyHandle {
             .kill()
             .map_err(|e| WshError::Other(format!("kill failed: {e}")))?;
         Ok(())
+    }
+
+    /// Deliver `sig` to the terminal's foreground process group (what ^C
+    /// reaches), or to the child's own group when that is not known.
+    pub fn signal(&self, sig: i32) -> bool {
+        let pid = self
+            .child
+            .try_lock()
+            .ok()
+            .and_then(|c| c.process_id())
+            .map(|p| p as i32)
+            .unwrap_or(0);
+        let fg = self
+            .master
+            .lock()
+            .ok()
+            .and_then(|m| m.process_group_leader())
+            .unwrap_or(0);
+        let pgid = if fg > 1 { fg } else { pid };
+        super::signals::kill_group(pgid, pid, sig)
     }
 
     /// Get a clone of the reader Arc for use in spawned tasks.

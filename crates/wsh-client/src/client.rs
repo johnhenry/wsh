@@ -33,6 +33,11 @@ pub struct ConnectConfig {
     pub password: Option<String>,
     /// Whether to verify the host key (TOFU).
     pub verify_host: bool,
+    /// The `known_hosts` key (`host:port`) the host's fingerprint is recorded and checked
+    /// under. `None`: the authority of the URL dialled. Set it when the URL is NOT the
+    /// host's address -- a pipe relay (`wss://relay/r/<id>`) -- so the host is pinned by
+    /// who it is, not by which relay carried the connection (the JS client's `hostLabel`).
+    pub known_host: Option<String>,
     /// Ping interval in seconds (0 = disabled).
     pub ping_interval_secs: u64,
     /// Connection timeout in seconds.
@@ -46,6 +51,7 @@ impl Default for ConnectConfig {
             key_name: None,
             password: None,
             verify_host: true,
+            known_host: None,
             ping_interval_secs: 30,
             timeout_secs: 10,
         }
@@ -220,7 +226,10 @@ impl WshClient {
     ///
     /// Returns the server-assigned session ID on success.
     pub async fn connect(url: &str, config: ConnectConfig) -> WshResult<Self> {
-        let known_host = known_host_label(url)?;
+        let known_host = match config.known_host.as_deref().filter(|h| !h.is_empty()) {
+            Some(label) => label.to_string(),
+            None => known_host_label(url)?,
+        };
         let timeout = Duration::from_secs(config.timeout_secs);
 
         // Auto-select and connect transport within the configured connection timeout.

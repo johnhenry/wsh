@@ -278,6 +278,18 @@ fn verify_password_auth(
     })
 }
 
+/// `AuthOk.ttl`: seconds this server promises to keep the connection. This
+/// server enforces no connection lifetime (`session_ttl` is the lifetime of a
+/// DETACHED session, enforced by the session manager), so it promises none: 0
+/// means "no limit is promised" (spec, wsh #125). It used to send
+/// `session_ttl` here, which nothing enforced.
+///
+/// `AuthOk.token` stays an HMAC because released clients require a non-empty
+/// field, but it is OPAQUE: no message accepts it back (Attach and Resume
+/// verify the per-session token from `OpenOk`), and a client must not present
+/// it as a credential.
+pub const AUTH_OK_TTL: u64 = 0;
+
 /// Build an AUTH_OK envelope.
 pub fn build_auth_ok(session_id: &str, token: &[u8], ttl: u64) -> Envelope {
     Envelope {

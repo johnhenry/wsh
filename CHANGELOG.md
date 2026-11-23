@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+### Rust: identity parity, part 1 (#145)
+
+Rust workspace only (`wsh`, `wsh-server`, `wsh-client`); no message or field was added to the wire, and the npm package is
+unchanged. **The Rust `wsh-server` changes one default (`client_env`) and one value it sends (`AuthOk.ttl`). Read both.**
+
+- **Breaking: the Rust `wsh-server` applies only an allow-list of the environment a client sends (#126).** Before, every
+  variable in `Open.env` reached the command, so a client could set `PATH`, `LD_PRELOAD`, `BASH_ENV` or `LD_LIBRARY_PATH`
+  for what the server runs. Now: `TERM`, `COLORTERM`, `LANG`, `LANGUAGE` and `LC_*` (the JS host's default), at most 64
+  variables with bounded names and values. **To get the old behaviour back, put this in `config.toml`:**
+
+  ```toml
+  [server]
+  client_env = true    # every variable the client sends; the server logs a warning at start-up
+  ```
+
+  `client_env = false` accepts nothing; a list (`client_env = ["TERM", "LC_*", "EDITOR"]`, a trailing `*` makes a prefix)
+  accepts exactly those names and replaces the default list. A deployment that relied on a client passing its own
+  variables (a `JAVA_HOME`, a `GIT_*`, an `AWS_*`) to a command needs a list or `true`. Fix with it: the pty no longer
+  overwrites the client's `TERM` with `xterm-256color` (it is the default only when the client sent none).
+- **Behaviour change: `AuthOk.ttl` is 0 from the Rust `wsh-server` (#125).** It sent `session_ttl` (86400 by default), a
+  lifetime nothing enforced; `session_ttl` is the lifetime of a detached session. Now `ttl: 0`, which the spec reads as
+  "no limit promised". `AuthOk.token` is still an HMAC (released clients require a non-empty field) but is documented as
+  opaque: no message accepts it back, so do not use it as a credential. A client that read `ttl` as a connection lifetime
+  (the JS client's `authTtl`) now sees 0 from a Rust host.
+- **Fix: the Rust `wsh-server` honours `Signal` (#145).** It only logged it, so the `SIGINT` that `wsh host command` forwards
+  did not stop the command. It now delivers `HUP INT QUIT TERM KILL USR1 USR2 WINCH CONT STOP TSTP ALRM` (with or without
+  `SIG`, any case) to a pty session's foreground process group (what ^C reaches) and, for an exec on pipes (which now
+  runs in its own process group so a shell that did not exec its last command cannot swallow the signal), to that group.
+  Another name is ignored; only the control attachment of the connection that owns the channel can send one, not a viewer.
+- **Fix: `wsh-server --generate-cert` makes a leaf certificate (#145).** It was flagged as a CA, which TLS clients refuse
+  as a server certificate, so the only way to connect was `WSH_INSECURE_LOOPBACK_TLS=1` (verification off). It is now a
+  self-signed leaf: `SSL_CERT_FILE=~/.wsh/cert.pem wsh -t ws ...` verifies it. An existing `~/.wsh/cert.pem` is not
+  regenerated; delete it to get the new one.
+- **New: `wsh --via wss://relay/r/<id> user@host [command...]` dials the operator side of a pipe relay (#118, #145).**
+  `user@host` stays the identity and its key is recorded in `~/.wsh/known_hosts` under `host:port` (what a direct
+  connection uses), not under the relay's address; a different host behind that name is refused with `HOST KEY CHANGED`
+  before a command is sent, whichever relay carried it. A URL target (`wsh alice@wss://relay/r/<id> ...`) also dials but is
+  pinned under the relay's authority, so prefer `--via`. `--via` works with `wsh [user@]host`, `connect`, `scp`, `ls`,
+  `sftp` and `copy-id`; it refuses the `?role=host` URL, a URL without `/r/<id>`, `https://`, and a URL target; the
+  rendezvous id is not saved to `last_session.json`. `wsh-client`'s `ConnectConfig` gains `known_host: Option<String>`
+  (default `None`: the URL's authority, as before). **Not done here:** the Rust client still does not verify the host-key
+  proof, bind the login to the host key, answer an operator challenge or seal the bridge (next part of #145); see the
+  README's Security model for what that leaves open over a pipe relay.
+- **Tests:** `test/rust/wsh-cli-pipe.test.mjs` runs the built `wsh` through the real `createPipeRelay` to a Node host
+  (`createWshServer().accept`) and to a page-shaped host (`createMemoryHost().accept`, `dataStreams: false`): a command
+  runs, the key lands under `user@host`, an impostor key and a page host with another key are refused with nothing run,
+  the pin follows the name across relays, an unauthorized operator is refused by the host, malformed `--via` values.
+  `test/rust/wsh-rust-server-defaults.test.mjs` gains the `client_env` cases (default, `true`, a list, `false`; pty and
+  pipes), `ttl` 0, and `Signal` ending a running command on a pty and on pipes while an unknown name is ignored; unit tests
+  cover the allow-list, the config line above, signal names and `--via` parsing. `test/rust/wsh-cli.test.mjs` trusts the
+  generated certificate through `SSL_CERT_FILE` instead of `WSH_INSECURE_LOOPBACK_TLS`.
+
+## 0.38.0
+
 ### npm package: TCP reverse tunnels and UDP over WebTransport datagrams (#98, #124)
 - **TCP reverse tunnels on the Node host (#98).** `ListenRequest { listener_id, port, bind_addr }` was answered with a
   `ListenFail`; it is now served when `createWshServer({ gateway: { reverse: {...} } })` is set. **Off by default** (a
@@ -291,7 +345,7 @@ lines of the `[gateway]` block above.
   same signal twice disconnects (`128 + n`). `--tty` gives the command a terminal and forwards resizes. A command whose
   exit status never arrived (dropped connection) now exits 255 instead of 0. `wsh-client` gains
   `SessionOpts.stdio`, `WshSession::{read_stderr, close_stdin, supports_stdin_eof, has_stderr}`.
-  The Rust `wsh-server` only logs `Signal`, so forwarding a signal to it does not stop the command yet.
+  (The Rust `wsh-server` only logged `Signal` at this point; it delivers it now, see the first section.)
 - **A full URL is a target (#136).** `wsh wss://host:8443/rendezvous/ab12 command` (also `https://`, `wt://`, `ws://`,
   with `user@` in front or in the URL) dials exactly that, path and query included; `--port` and `--transport` do not
   apply and there is no transport fallback. `ws://` is accepted only for a loopback host. `sessions`, `attach` and

@@ -760,7 +760,7 @@ impl WshServer {
                 let ok = handshake::build_auth_ok(
                     &result.session_id,
                     &result.token,
-                    self.config.session_ttl,
+                    handshake::AUTH_OK_TTL,
                 );
                 let ok_frame = frame_encode(&ok)?;
                 send.write_all(&ok_frame)
@@ -1763,7 +1763,7 @@ impl WshServer {
                                                 let ok = handshake::build_auth_ok(
                                                     &result.session_id,
                                                     &result.token,
-                                                    self.config.session_ttl,
+                                                    handshake::AUTH_OK_TTL,
                                                 );
                                                 let ok_frame = match frame_encode(&ok) {
                                                     Ok(f) => f,
@@ -2869,6 +2869,9 @@ impl WshServer {
                             .forced_command
                             .clone()
                             .or_else(|| p.command.clone());
+                        // Only the variables this server's `client_env` policy
+                        // accepts (TERM, LANG, LC_* ... by default; wsh #126).
+                        let accepted_env = self.config.client_env.filter(p.env.as_ref());
                         match self
                             .sessions
                             .create(
@@ -2878,7 +2881,7 @@ impl WshServer {
                                 effective_command_owned.as_deref(),
                                 cols,
                                 rows,
-                                p.env.as_ref(),
+                                accepted_env.as_ref(),
                                 self.recording_dir.as_deref(),
                                 pipes,
                             )
@@ -3142,6 +3145,40 @@ impl WshServer {
             }
             (MsgType::Signal, Payload::Signal(p)) => {
                 debug!(channel_id = p.channel_id, signal = %p.signal, "signal request");
+                // Delivered to the channel's process group, like ^C or `kill -INT -pgid`:
+                // only by a control attachment of this connection (a viewer cannot),
+                // and only the job-control names `session::signals` knows.
+                let target_session = {
+                    let ch_map = self.channel_sessions.read().await;
+                    ch_map.get(&p.channel_id).cloned()
+                };
+                if let Some(sid) = target_session {
+                    if !self
+                        .sessions
+                        .may_write(&sid, ctx.conn_id, p.channel_id)
+                        .await
+                    {
+                        warn!(channel_id = p.channel_id, session_id = %sid, "Signal refused: not a control attachment of this connection");
+                        return Ok(None);
+                    }
+                    self.sessions.touch(&sid).await;
+                    let name = p.signal.clone();
+                    match self
+                        .sessions
+                        .with_session(&sid, |session| Ok(session.io.signal(&name)))
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(channel_id = p.channel_id, signal = %p.signal, "Signal not delivered (unknown name or the process is gone)")
+                        }
+                        Err(e) => {
+                            warn!(channel_id = p.channel_id, error = %e, "Signal: session lookup failed")
+                        }
+                    }
+                } else {
+                    warn!(channel_id = p.channel_id, "Signal for unknown channel");
+                }
                 Ok(None)
             }
             (MsgType::SessionData, Payload::SessionData(p)) => {
@@ -4861,6 +4898,7 @@ mod wisp_reverse_connect_e2e_tests {
             rpc_fs_read_only: false,
             rpc_fs_max_file_bytes: 1024,
             mcp_tools: Vec::new(),
+            client_env: crate::client_env::ClientEnvPolicy::default(),
         }
     }
 

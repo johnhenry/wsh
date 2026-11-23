@@ -216,3 +216,108 @@ describe('Rust wsh-server: password login', () => {
     await client.disconnect();
   });
 });
+
+// ── #145: AuthOk.ttl, the clientEnv allow-list and Signal ────────────────────────────────────────────────────
+
+/** Open an exec session on `client` and resolve with what it printed and how it ended. */
+async function runExec(client, opts, { signalAfterMs } = {}) {
+  const session = await client.openSession({ type: 'exec', ...opts });
+  const chunks = [];
+  let exitCode = null;
+  const done = new Promise((resolve) => {
+    session.onData = (d) => chunks.push(Buffer.from(d));
+    session.onStderr = (d) => chunks.push(Buffer.from(d));
+    session.onExit = (c) => { exitCode = c; };
+    session.onClose = resolve;
+  });
+  if (signalAfterMs !== undefined) setTimeout(() => session.signal('INT').catch(() => {}), signalAfterMs);
+  await done;
+  return { text: Buffer.concat(chunks).toString(), exitCode, session };
+}
+
+describe('Rust wsh-server: AuthOk.ttl (#125)', () => {
+  it('promises no connection lifetime it does not enforce: ttl is 0', async () => {
+    const server = await startServer({ config: '[server]\nsession_ttl = 5\n' });
+    const client = await connect(server);
+    try {
+      assert.equal(client.authTtl, 0);
+      assert.ok(client.authToken instanceof Uint8Array && client.authToken.length > 0, 'released clients require the field');
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(client.state, 'authenticated');
+    } finally { await client.disconnect().catch(() => {}); }
+  });
+});
+
+describe('Rust wsh-server: clientEnv allow-list (#126)', () => {
+  const env = { TERM: 'screen', LC_ALL: 'C', LANG: 'C', WSH_TEST_VAR: 'leaked', LD_PRELOAD: '/nonexistent.so' };
+  const probe = 'echo "T=$TERM L=$LC_ALL V=$WSH_TEST_VAR P=$LD_PRELOAD"';
+
+  for (const stdio of [undefined, 'pipes']) {
+    it(`by default only TERM, COLORTERM, LANG, LANGUAGE and LC_* are applied (${stdio ?? 'pty'})`, async () => {
+      const server = await startServer();
+      const client = await connect(server);
+      try {
+        const { text } = await runExec(client, { command: probe, env, ...(stdio ? { stdio } : {}) });
+        assert.match(text, /T=screen L=C V= P=\s/, text);
+      } finally { await client.disconnect().catch(() => {}); }
+    });
+  }
+
+  it('`client_env = true` under [server] accepts everything again (the line the CHANGELOG gives)', async () => {
+    const server = await startServer({ config: '[server]\nclient_env = true\n' });
+    const client = await connect(server);
+    try {
+      const { text } = await runExec(client, { command: 'echo "V=$WSH_TEST_VAR"', env });
+      assert.match(text, /V=leaked/, text);
+    } finally { await client.disconnect().catch(() => {}); }
+  });
+
+  it('a list names exactly what is accepted (and replaces the default list)', async () => {
+    const server = await startServer({ config: '[server]\nclient_env = ["WSH_TEST_*"]\n' });
+    const client = await connect(server);
+    try {
+      const { text } = await runExec(client, { command: 'echo "T=$TERM L=$LC_ALL V=$WSH_TEST_VAR"', env, stdio: 'pipes' });
+      assert.match(text, /L= V=leaked/, text);
+    } finally { await client.disconnect().catch(() => {}); }
+  });
+
+  it('`client_env = false` accepts nothing', async () => {
+    const server = await startServer({ config: '[server]\nclient_env = false\n' });
+    const client = await connect(server);
+    try {
+      const { text } = await runExec(client, { command: probe, env, stdio: 'pipes' });
+      assert.match(text, /L= V= P=/, text);
+    } finally { await client.disconnect().catch(() => {}); }
+  });
+});
+
+describe('Rust wsh-server: Signal stops a command', () => {
+  for (const [label, extra] of [['exec on a pty', {}], ['exec on pipes', { stdio: 'pipes' }]]) {
+    it(`SIGINT ends a running ${label} (the shell and what it started)`, async () => {
+      const server = await startServer();
+      const client = await connect(server);
+      try {
+        const t0 = Date.now();
+        // `sh -c 'sleep 30; echo unreachable'` does not exec its last command: the signal has to reach the group.
+        const { text, exitCode } = await runExec(client, { command: 'sleep 30; echo unreachable', ...extra }, { signalAfterMs: 400 });
+        assert.ok(Date.now() - t0 < 10_000, `still ran after ${Date.now() - t0}ms`);
+        assert.doesNotMatch(text, /unreachable/);
+        assert.notEqual(exitCode, 0);
+      } finally { await client.disconnect().catch(() => {}); }
+    });
+  }
+
+  it('a name the server does not deliver is ignored and the command carries on', async () => {
+    const server = await startServer();
+    const client = await connect(server);
+    try {
+      const session = await client.openSession({ type: 'exec', command: 'sleep 1; echo survived', stdio: 'pipes' });
+      const chunks = [];
+      const done = new Promise((resolve) => { session.onData = (d) => chunks.push(Buffer.from(d)); session.onExit = () => {}; session.onClose = resolve; });
+      await session.signal('SEGV');
+      await session.signal('9; kill -9 1');
+      await done;
+      assert.match(Buffer.concat(chunks).toString(), /survived/);
+    } finally { await client.disconnect().catch(() => {}); }
+  });
+});
