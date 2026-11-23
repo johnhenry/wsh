@@ -205,11 +205,11 @@ describe('a sealed session through a pipe relay that copies bytes', () => {
     assert.equal((await roundTrip(f.port, Buffer.from(MARKER))).toString(), MARKER);
     assert.ok(!relay.text().includes(MARKER));
     assert.ok(logs.some((l) => /session sealed/.test(l)));
-    // a plain client (the JS client has no sealed session yet, #155 stage c): refused, and nothing opens
+    // a plain client (the JS client seals on its own against `require` since #155 stage c, so this one opts out): refused, and nothing opens
     const kp = await generateKeyPair(true);
     const h2 = createMemoryHost({ auth: { authorizedKeys: `${await exportPublicKeySSH(kp.publicKey)} u` }, exec: async () => 0, hostKey: true, dataStreams: false, sealSession: 'require', endpoints: { probe: () => { counters.probe += 1; } } });
     closers.push(() => h2.close());
-    const c = await h2.connect({ username: 'u', keyPair: kp });
+    const c = await h2.connect({ username: 'u', keyPair: kp, sealSession: false });
     await assert.rejects(c.openEndpoint('probe', { timeout: 1500 }));
     assert.equal(counters.probe, 0, 'the endpoint was never opened');
     void host;

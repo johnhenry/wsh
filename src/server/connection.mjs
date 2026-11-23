@@ -24,7 +24,7 @@ import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES, MAX_ATTACHMENTS } from './constants.mjs';
-import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE } from '../features.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE } from '../features.mjs';
 import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
@@ -39,10 +39,7 @@ import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMess
 import { SHARES_FEATURE, createShareSession } from '../shares.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
-/** Host feature (#155): this host seals the whole session end to end when asked (a signed `KeyExchange` for the connection's session id). */
-export const SESSION_SEAL_FEATURE = 'e2e-session';
-/** Host feature: this host serves nothing on a session that is not sealed. */
-export const SESSION_SEAL_REQUIRED_FEATURE = 'e2e-session-required';
+export { SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE };
 
 /**
  * The features a host built from `cfg` advertises (`ServerHello.features`, minus the host-key proof).

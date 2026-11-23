@@ -27,6 +27,18 @@ async function operator(client: WshClient): Promise<void> {
   void kinds; void ttl;
 }
 
+// A sealed session (#155): the client option and its read-back.
+async function sealed(client: WshClient): Promise<void> {
+  await client.connect('wss://host', { username: 'alice', sealSession: true });
+  await client.connect('wss://host', { username: 'alice', sealSession: 'auto' });
+  await client.connect('wss://host', { username: 'alice', sealSession: false });
+  const is: boolean = client.sessionSealed;
+  // @ts-expect-error -- 'offer' is a host mode, not a client one
+  await client.connect('wss://host', { username: 'alice', sealSession: 'offer' });
+  void is;
+}
+void sealed;
+
 const relay = createPipeRelay({ maxWaiting: 8, authorize: ({ role }) => role === 'host' });
 const id: string = newRendezvousId();
 const url: string = pipeUrl('wss://relay.example', id, 'host');

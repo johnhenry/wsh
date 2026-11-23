@@ -1839,6 +1839,16 @@ export interface WshHostKeyOptions {
    * kinds that must all be bound. Nothing is signed otherwise. Key logins only.
    */
   requireChannelBinding?: boolean | WshChannelBindingKind[];
+  /**
+   * Seal the WHOLE session end to end (#155): after login a signed key exchange with the host (bound to its proven host
+   * key and this login key), then every message but the keepalive -- gateway and endpoint data included -- is an
+   * authenticated encrypted frame a relay that copies bytes can neither read nor alter; a frame that does not open
+   * closes the connection. Default `'auto'`: seal only against a host that says `e2e-session-required`. `true` seals or
+   * fails, BEFORE a credential is sent (a host that does not offer `e2e-session`, one that proved no host key, a password
+   * login). `false` never seals. Only `true` is a guarantee (a relay can strip the ServerHello feature `'auto'` rests
+   * on); pin the host (`expectHostKey` / `knownHosts`) as well, since the exchange authenticates the key the host proved.
+   */
+  sealSession?: false | 'auto' | true;
 }
 
 /** What a login signature can be bound to (wsh #119). */
@@ -2234,6 +2244,9 @@ export class WshClient {
    * connection; `null` if the server advertised none (e.g. the Rust server).
    */
   readonly hostKey: WshHostKey | null;
+
+  /** Is this whole session sealed end to end (`connect(url, { sealSession })`, #155)? */
+  readonly sessionSealed: boolean;
 
   /** Default `onHostKey` for `connect()` (a per-call option wins). */
   onHostKey: ((hostKey: WshHostKey) => boolean | void | Promise<boolean | void>) | null;

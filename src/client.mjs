@@ -8,7 +8,7 @@
  * reverse mode (client registers as a peer for incoming connections).
  */
 
-import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE } from './features.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE } from './features.mjs';
 import { WebTransportTransport, normalizeWebTransportOptions } from './transport.mjs';
 import { clientChannelBinding, offeredKinds, TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH } from './channel-binding.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
@@ -183,6 +183,10 @@ function assertStdinSource(stdin) {
   throw new TypeError('exec: stdin must be a string, Uint8Array, ReadableStream or (async) iterable of those');
 }
 
+function assertSealSession(v) {
+  if (v !== false && v !== 'auto' && v !== true) throw new TypeError("connect: sealSession must be false, 'auto' or true");
+}
+
 /** Write `stdin` to `session` in bounded chunks, then close the write side (EOF). */
 async function pumpStdin(session, stdin) {
   const send = async (chunk) => {
@@ -273,6 +277,13 @@ export class WshClient {
    * pending) or a frame of the bridge (after).
    */
   #sealState = null;
+
+  /**
+   * Set from the moment this client starts sealing its whole session (#155) until the connection ends: `{ sessionId,
+   * bridge }`, `bridge` null until the key exists. A message that arrives from the host itself is then heard only
+   * as the key exchange (while pending), a frame of the session, or the keepalive.
+   */
+  #sessionSeal = null;
 
   /** The binding kinds the last login's signature covered (#119); empty when it was unbound. */
   #channelBindingKinds = [];
@@ -558,6 +569,14 @@ export class WshClient {
     return this.#hostKey;
   }
 
+  /**
+   * Is this whole session sealed end to end (#155, `connect(url, { sealSession })`)? Every message but the keepalive,
+   * gateway and endpoint data included, then travels as an authenticated encrypted frame a relay cannot read or alter.
+   */
+  get sessionSealed() {
+    return !!this.#sessionSeal?.bridge;
+  }
+
   // ── Connection ──────────────────────────────────────────────────────
 
   /**
@@ -595,15 +614,25 @@ export class WshClient {
    *   to this connection (#119): `true` needs at least one binding kind (`host`, `cert-hash`, `tls-exporter`) that
    *   both the host offers and this client can supply; an array names kinds that must all be bound. Not for
    *   password auth (nothing is signed). Stops an intermediary from relaying a genuine challenge to the host.
+   * @param {false | 'auto' | true} [opts.sealSession='auto'] - Seal the WHOLE session end to end (#155): after login a
+   *   signed key exchange with the host (bound to its proven host key and this login key), then every message but the
+   *   keepalive -- gateway and endpoint data included -- is an authenticated encrypted frame, so a relay that copies
+   *   bytes can neither read nor alter it, and a frame that does not open closes the connection. `'auto'` seals only
+   *   against a host that says `e2e-session-required` (a host that merely offers it is spoken to as before); `true`
+   *   seals or fails -- a host that does not offer `e2e-session`, one that proved no host key, or a password login is
+   *   refused BEFORE a credential is sent; `false` never seals (a host that requires it then serves nothing). Only
+   *   `true` is a guarantee: `'auto'` rests on a ServerHello feature that a relay can strip before login. Pin the host
+   *   (`expectHostKey` / `knownHosts`) too: the exchange authenticates the key the host proved, not whose it is.
    * @returns {Promise<string>} The server-assigned session ID
    */
-  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, requireChannelBinding = false, ...hostKeyOpts } = {}) {
+  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, requireChannelBinding = false, sealSession = 'auto', ...hostKeyOpts } = {}) {
     if (this.#state !== STATE_DISCONNECTED && this.#state !== STATE_CLOSED) {
       throw new Error(`Client already ${this.#state}`);
     }
     if (!username) {
       throw new Error('username is required');
     }
+    assertSealSession(sealSession);
     const cred = await resolveSigner({ keyPair, signer });
     this.#signer = cred;
     this.#loginUsername = username;
@@ -616,6 +645,7 @@ export class WshClient {
     this.#channelBindingKinds = [];
     this.#certHash = null;
     this.#sealState = null;
+    this.#sessionSeal = null;
     this.#peerProof = null;
     this.#sessions.clear();
     this.#channelCounter = 0;
@@ -651,6 +681,9 @@ export class WshClient {
       }
 
       let tempSessionId = null;
+      // Whether this session is to be sealed (#155): decided from the ServerHello and the proven host key, BEFORE a
+      // credential is sent, so a host that cannot seal is refused while nothing has been signed.
+      let seal = false;
 
       if (firstResponse.type === MSG.SERVER_HELLO) {
         // Server may proceed directly to auth if it accepted the hello.
@@ -665,6 +698,7 @@ export class WshClient {
           : null;
         challengeWait?.catch(() => {});
         await this.#verifyHostKey(firstResponse, hostCtx);
+        seal = this.#planSealing(sealSession, this.#serverFeatures, !!cred);
 
         if (authMethod === AUTH_METHOD.PUBKEY) {
           const challengeMsg = await challengeWait;
@@ -675,6 +709,7 @@ export class WshClient {
             this.#authToken = challengeMsg.token || null;
             this.#authTtl = Number(challengeMsg.ttl) || 0;
             this.#state = STATE_AUTHENTICATED;
+            if (seal) await this.#sealSession(timeout);
             this.#startPing();
             return this.#sessionId;
           }
@@ -708,6 +743,7 @@ export class WshClient {
       } else if (firstResponse.type === MSG.CHALLENGE) {
         // Some servers skip SERVER_HELLO and go straight to CHALLENGE.
         await this.#verifyHostKey(null, hostCtx);
+        seal = this.#planSealing(sealSession, [], !!cred);
         if (authMethod !== AUTH_METHOD.PUBKEY || !cred) {
           throw new Error('Server sent CHALLENGE but no key pair was provided');
         }
@@ -751,6 +787,7 @@ export class WshClient {
       this.#authToken = authResult.token || null;
       this.#authTtl = Number(authResult.ttl) || 0;
       this.#state = STATE_AUTHENTICATED;
+      if (seal) await this.#sealSession(timeout);
       this.#startPing();
 
       return this.#sessionId;
@@ -1562,7 +1599,7 @@ export class WshClient {
       // Datagrams for UDP flows: only on a transport that has them AND a host that listed "gateway-datagram".
       datagrams: () => {
         const t = this.#transport;
-        return t?.supportsDatagrams && this.hasFeature(GATEWAY_DATAGRAM_FEATURE) ? { send: (b) => t.sendDatagram(b), maxSize: () => t.maxDatagramSize } : null;
+        return !this.#sessionSeal && t?.supportsDatagrams && this.hasFeature(GATEWAY_DATAGRAM_FEATURE) ? { send: (b) => t.sendDatagram(b), maxSize: () => t.maxDatagramSize } : null;
       },
     }));
   }
@@ -1650,6 +1687,7 @@ export class WshClient {
    */
   async openStream() {
     this.#assertAuthenticated('openStream');
+    if (this.#sessionSeal) throw new Error('openStream: a sealed session carries no client-opened data streams (their bytes are not frames)');
     return this.#transport.openStream();
   }
 
@@ -2689,10 +2727,11 @@ export class WshClient {
    * @private
    */
   #attachTransportHandlers(transport) {
-    transport.onControl = (msg) => this.#handleControl(msg);
+    transport.onControl = (msg) => this.#onTransportControl(msg);
     transport.onClose = () => this.#handleTransportClose();
     transport.onError = (err) => this.#handleTransportError(err);
-    transport.onDatagram = (bytes) => this.#gateway?.handleDatagram(bytes);
+    // A datagram is not a frame: on a sealed session a relay could inject one, so none is heard (UDP uses the reliable path).
+    transport.onDatagram = (bytes) => { if (!this.#sessionSeal) this.#gateway?.handleDatagram(bytes); };
   }
 
   /**
@@ -2853,6 +2892,90 @@ export class WshClient {
     }
   }
 
+  // ── Internal: a sealed session (#155) ───────────────────────────────
+
+  /**
+   * Whether this connection is to be sealed, decided from the ServerHello's features and the proven host key BEFORE
+   * a credential is sent. `true` and a host that requires sealing (`'auto'`) fail here, with a sentence, when sealing
+   * is not possible -- never by talking in the clear.
+   * @param {false | 'auto' | true} mode
+   * @param {string[]} features - the host's ServerHello features (`[]` when it sent none)
+   * @param {boolean} haveKey - this login signs (a key login)
+   * @returns {boolean}
+   */
+  #planSealing(mode, features, haveKey) {
+    if (mode === false) return false;
+    if (mode === 'auto' && !features.includes(SESSION_SEAL_REQUIRED_FEATURE)) return false;
+    const why = !features.includes(SESSION_SEAL_FEATURE)
+      ? `the host does not offer "${SESSION_SEAL_FEATURE}" (it needs a host key and a connection without client-opened data streams)`
+      : !this.#hostKey?.publicKey
+        ? 'the host proved no host key to authenticate the exchange against'
+        : !haveKey
+          ? 'a sealed session needs a key login (a password login has nothing to sign with)'
+          : null;
+    if (why) throw new Error(`sealed session: ${why} -- nothing was sent`);
+    return true;
+  }
+
+  /**
+   * Seal this whole connection: a signed `KeyExchange` for the connection's session id (the login key signs this half,
+   * the host's proven key the other), then every message but the keepalive leaves as an `EncryptedFrame` on channel 0,
+   * in order. Until the key exists nothing but the key exchange may be sent, and nothing plain is heard.
+   * @param {number} timeout
+   */
+  async #sealSession(timeout) {
+    const sessionId = this.#sessionId;
+    const hostKey = this.#hostKey?.publicKey;
+    if (!sessionId || !hostKey || !this.#signer) throw new Error('sealed session: no session id, host key or login key -- nothing was sent');
+    const transport = this.#transport;
+    const plainSend = transport.sendControl.bind(transport);
+    let bridge = null;
+    this.#sessionSeal = { sessionId, bridge: null };
+    transport.sendControl = async (msg) => {
+      if (msg.type === MSG.PING || msg.type === MSG.PONG) return plainSend(msg);
+      if (bridge) return plainSend(await bridge.seal(msg));
+      if (msg.type === MSG.KEY_EXCHANGE && msg.session_id === sessionId) return plainSend(msg);
+      throw new Error('sealed session: nothing is sent before the key exists');
+    };
+    const { sharedSecret } = await this.initiateE2E(sessionId, 'X25519+ML-KEM-768', timeout, {
+      verifyPeer: hostKey, signAs: this.#signer, responderIdentity: hostKey,
+    });
+    bridge = new SealedBridge({ key: sharedSecret, sessionId, role: 'initiator', scope: 'session' });
+    this.#sessionSeal = { sessionId, bridge };
+  }
+
+  /**
+   * Every message that arrives from the host itself passes here. On a sealed session only the key exchange (while the
+   * key does not exist yet), the keepalive and frames of the session are heard: a relay in the middle can write any
+   * plain message, so a plain one is dropped; a frame that does not open (flipped bit, replay, reorder, forged) is the
+   * relay at work, and ends the connection.
+   * @param {object} msg
+   */
+  #onTransportControl(msg) {
+    const seal = this.#sessionSeal;
+    if (!seal || msg.type === MSG.PING || msg.type === MSG.PONG) { this.#handleControl(msg); return; }
+    if (seal.bridge) {
+      if (!seal.bridge.isFrame(msg)) {
+        console.warn(`[wsh:client] dropping a plaintext message (type ${msg.type}) on a sealed session`);
+        return;
+      }
+      seal.bridge.open(msg).then(
+        (inner) => { if (this.#sessionSeal === seal) this.#handleControl(inner); },
+        (err) => this.#sealedFrameFailed(seal, err),
+      );
+      return;
+    }
+    if (msg.type === MSG.KEY_EXCHANGE && msg.session_id === seal.sessionId) { this.#handleControl(msg); return; }
+    console.warn(`[wsh:client] dropping a plaintext message (type ${msg.type}) before the session is sealed`);
+  }
+
+  #sealedFrameFailed(seal, err) {
+    if (this.#sessionSeal !== seal || this.#state === STATE_CLOSED) return;
+    this.#sessionSeal = { ...seal, failed: true };
+    this.#emitError(new Error(`wsh: a sealed frame did not open (${err.message}); the session is closed`));
+    this.#transport?.close().catch(() => {});
+  }
+
   // ── Internal: auth handshake ────────────────────────────────────────
 
   /**
@@ -2868,8 +2991,10 @@ export class WshClient {
    * @returns {Promise<string>} Session ID
    * @private
    */
-  async #performAuth({ username, keyPair, signer, password, timeout = DEFAULT_AUTH_TIMEOUT, url, requireChannelBinding = false, ...hostKeyOpts } = {}) {
+  async #performAuth({ username, keyPair, signer, password, timeout = DEFAULT_AUTH_TIMEOUT, url, requireChannelBinding = false, sealSession = 'auto', ...hostKeyOpts } = {}) {
     if (!username) throw new Error('username is required');
+    assertSealSession(sealSession);
+    this.#sessionSeal = null;
     const cred = await resolveSigner({ keyPair, signer });
     this.#signer = cred;
     this.#loginUsername = username;
@@ -2895,6 +3020,7 @@ export class WshClient {
       }
 
       let tempSessionId = null;
+      let seal = false; // see connect()
 
       if (firstResponse.type === MSG.SERVER_HELLO) {
         tempSessionId = firstResponse.session_id;
@@ -2905,6 +3031,7 @@ export class WshClient {
           : null;
         challengeWait?.catch(() => {});
         await this.#verifyHostKey(firstResponse, hostCtx);
+        seal = this.#planSealing(sealSession, this.#serverFeatures, !!cred);
 
         if (authMethod === AUTH_METHOD.PUBKEY) {
           const challengeMsg = await challengeWait;
@@ -2914,6 +3041,7 @@ export class WshClient {
             this.#authToken = challengeMsg.token || null;
             this.#authTtl = Number(challengeMsg.ttl) || 0;
             this.#state = STATE_AUTHENTICATED;
+            if (seal) await this.#sealSession(timeout);
             this.#startPing();
             return this.#sessionId;
           }
@@ -2934,6 +3062,7 @@ export class WshClient {
       } else if (firstResponse.type === MSG.CHALLENGE) {
         if (!cred) throw new Error('Server sent CHALLENGE but no key pair provided');
         await this.#verifyHostKey(null, hostCtx);
+        seal = this.#planSealing(sealSession, [], true);
 
         // Challenge carries session_id directly — see connect()'s
         // CHALLENGE branch for why. Keep tempSessionId as a fallback for
@@ -2964,6 +3093,7 @@ export class WshClient {
       this.#authToken = authResult.token || null;
       this.#authTtl = Number(authResult.ttl) || 0;
       this.#state = STATE_AUTHENTICATED;
+      if (seal) await this.#sealSession(timeout);
       this.#startPing();
 
       return this.#sessionId;
@@ -3053,6 +3183,10 @@ export class WshClient {
       const serverChannelId = msg.channel_id ?? pending.requestedChannelId;
       const streamIds = msg.stream_ids ?? {};
       const dataMode = msg.data_mode === 'virtual' ? 'virtual' : 'stream';
+      if (this.#sessionSeal && dataMode !== 'virtual') {
+        pending.reject(new Error('Failed to open session: the host answered with a data stream, and a sealed session carries none'));
+        return;
+      }
       const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
 
       const session = new WshSession(

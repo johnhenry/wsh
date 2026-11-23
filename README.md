@@ -843,7 +843,7 @@ sides; a host that does not require proof is exactly as exposed as before), the 
 messages and seals nothing itself), and a compromised *operator* key (it proves the key, not the
 person). A relay can still refuse service by dropping the challenge.
 
-#### A sealed session (#155, host: JS; client: the Rust CLI so far)
+#### A sealed session (#155, host: JS; client: the JS client and the Rust CLI)
 
 `createMemoryHost({ hostKey, dataStreams: false, sealSession: 'offer' | 'require' })` (and `createWshServer`, for a connection
 accepted with `dataStreams: false`) seals the WHOLE session end to end. After login the client sends a `KeyExchange` whose
@@ -858,8 +858,18 @@ downgrade. Only `--sealed` is a guarantee: sealing "on its own" rests on a `Serv
 login, so a client that must never talk in the clear passes `--sealed` (against a host that requires sealing, a stripped client is
 refused, but what it sent before the refusal -- its commands, if any -- was already readable). What it does NOT cover: the handshake before login (the user name, the login public key and the host key proof are
 readable by the relay; the signed key exchange is not secret), the sizes and timing of traffic, a host whose connection has client-opened
-QMux data streams (not offered there), and a denial of service (a relay can always drop or cut). The JS client has no sealed
-session yet, so against a JS client use a host that only `'offer'`s.
+QMux data streams (not offered there), and a denial of service (a relay can always drop or cut).
+
+The JS client is the initiator too: `client.connect(url, { sealSession: false | 'auto' | true })` (also `WshClient.exec`).
+`'auto'`, the default, seals only against a host that says `e2e-session-required` (so a client written before this option keeps
+talking plainly to a host that merely offers it, and a host that requires sealing no longer refuses it); `true` seals or fails --
+a host that does not offer `e2e-session`, one that proved no host key, or a password login is refused BEFORE a credential is
+sent, with a sentence; `false` never seals. `client.sessionSealed` says whether it is. The exchange is bound to the host key the
+host PROVED on this connection: it authenticates that key, not whose it is, so pin the host as well (`expectHostKey` /
+`knownHosts`), or a relay that presents its own host key and terminates the exchange is the host to this client. Once sealed, a
+plain message from the host is dropped, a frame that does not open ends the connection (`onError`, then `onClose`), `openStream()`
+is refused and datagrams are neither sent nor heard (UDP uses the reliable path). `'auto'` is not a guarantee, for the reason above;
+`true` is.
 
 #### A pipe relay (`@johnhenry/wsh/pipe-relay`, #118)
 
@@ -893,7 +903,7 @@ handshake and the session traffic -- is readable by it unless the two ends seal 
 (per-session `initiateE2E`, or the **sealed session** below); it cannot forge the operator's signature or the host's.
 **Until you seal the session, treat a pipe relay as trusted for secrecy AND integrity**: it can read every control message and
 all gateway and endpoint data (`GatewayData`: TCP, unix sockets, named endpoints) and alter forwarded bytes after the handshake
-(#155). Pin the host key, require channel binding, use `wss://` to a relay you trust, or seal the session. It can drop, delay or
+(#155; the JS client's `sealSession: true` and the CLI's `--sealed` seal it against a JS host that offers it). Pin the host key, require channel binding, use `wss://` to a relay you trust, or seal the session. It can drop, delay or
 cut a connection, and it sees who dials which id and how much they send.
 
 *CLI side (#145).* `wsh --via wss://relay/r/<id> user@host [command...]` dials the operator side
@@ -1634,7 +1644,7 @@ than left to be found.
 | Channel binding of the login signature (#119) | `requireChannelBinding` (client and server); kinds `host`, `cert-hash`, `tls-exporter` | Kind `host`: the client binds to the proven host key (`--require-channel-binding`, and it honours `channel-binding-required`), and `wsh-server` offers it and can require it (`[server] require_channel_binding`, needs `host_key`). `cert-hash` and `tls-exporter`: not in Rust (the Rust WebTransport client has no certificate-hash pinning; `ConnectConfig.cert_hash` binds it if a caller supplies one) | **Wire-unified, negotiated** (`channel-binding:<kind>` features); verified against the spec's test vectors |
 | Pipe relay (#118) | `@johnhenry/wsh/pipe-relay` | operator side only (#145): `wsh --via wss://relay/r/<id> user@host command...` (also `connect`, `scp`, `ls`, `sftp`, `copy-id`), or the URL as the target. The host side of a pipe is not implemented in Rust. As on a direct connection the Rust client verifies the host-key proof (`host-key` / `host-key-sig` over its own nonce) before sending a credential, pins only a proven key, and binds the login to it (channel binding `host`; `test/rust/wsh-cli-identity.test.mjs`); the pipe-relayed session itself is not sealed (see Security model). `wsh -N -L` exits non-zero when the host drops the session (#156), and the error lines show the relay and a shortened id, never the whole rendezvous id | **Deliberately a relay without wsh parsing** -- nothing to unify on the wire. `--via` keeps `user@host` as the identity: its key is recorded in `known_hosts` under `host:port` (what a direct connection uses), never under the relay's address; a URL target is recorded under the URL's own authority, i.e. the relay's. The URL is not saved to `last_session.json` (the id is a capability) |
 | Operator-side shared folders (`--share`, #159) | host side: `onShare(name, fs, who)` on `createMemoryHost` / `createWshServer` / `createReverseHost` (the host *uses* the operator's directories; `fs` is an object of async file operations, also shaped like an `fs` backend). The JS client does not offer shares | CLI side: `wsh --share NAME=/abs/dir[:ro\|:rw]` offers them (`wsh_client::share`, `wsh-cli`'s `sharefs`: descriptor-relative, never follows a link, see [Sharing a directory](#sharing-a-directory-with-the-host-wsh---share-159)); unix only. **A Rust host that uses shares: not built** (`wsh-server` does not state `shares`) | **Wire-unified, negotiated**: the host states the feature `shares`; the client sends one `ShareOffer` after login (opcodes `0xa8` `ShareOffer`, `0xa9` `ShareRequest`, host to client, `0xaa` `ShareReply`). No change notification, no sharing over `reverse-connect` |
-| Sealed session: any authenticated connection incl. gateway/endpoint data (#155) | host `sealSession: 'offer' \| 'require'` (stage b); the JS client does not seal yet | `wsh --sealed ...` (or automatic against `e2e-session-required`) seals a direct or pipe-relayed session; `wsh-server` does not offer it yet | **Wire-unified, negotiated** (`e2e-session`, `e2e-session-required`, `KeyExchange` for the connection's session id, `EncryptedFrame` channel 0) |
+| Sealed session: any authenticated connection incl. gateway/endpoint data (#155) | host `sealSession: 'offer' \| 'require'` (stage b); client `connect(url, { sealSession: false \| 'auto' \| true })` (stage c) | `wsh --sealed ...` (or automatic against `e2e-session-required`) seals a direct or pipe-relayed session; `wsh-server` does not offer it yet | **Wire-unified, negotiated** (`e2e-session`, `e2e-session-required`, `KeyExchange` for the connection's session id, `EncryptedFrame` channel 0) |
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |

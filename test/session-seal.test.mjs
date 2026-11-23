@@ -19,7 +19,8 @@ describe('sealSession (host option)', () => {
     for (const mode of ['offer', 'require']) {
       const host = createMemoryHost({ auth: { authorizedKeys }, hostKey: true, dataStreams: false, sealSession: mode, endpoints: { echo: (d) => { d.readable.pipeTo(d.writable).catch(() => {}); } } });
       try {
-        const client = await host.connect({ username: 'u', keyPair });
+        // A client that does not seal (the JS client seals on its own against 'require' since stage c).
+        const client = await host.connect({ username: 'u', keyPair, sealSession: false });
         assert.ok(client.hasFeature('e2e-session'), `${mode}: advertised`);
         assert.equal(client.hasFeature('e2e-session-required'), mode === 'require');
         if (mode === 'offer') {
