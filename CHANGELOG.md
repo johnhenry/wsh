@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.37.0 / Rust `rust-v0.7.0`
 
 ### npm package: gateway forwarding (#120, #123, #98, #124)
 - **Security fix and behaviour change: the Node gateway checks the resolved address.** The `gateway` option of
