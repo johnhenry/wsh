@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.36.0
 
 - **A host that lives in a page, with the public API only (#131: #114, #115, #132, #133, #116, #128, #130).** An embedder
   ran `createMemoryHost().accept(new WebSocket(...))` in Chromium with the released Rust `wsh` CLI as operator. It worked
