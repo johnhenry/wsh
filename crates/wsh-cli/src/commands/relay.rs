@@ -268,7 +268,7 @@ pub async fn run_reverse(
     crate::commands::common::apply_host_policy(&mut reverse_options, &signing_key)?;
 
     let resolved = resolve_target(relay_host, port, transport)?;
-    debug!(url = %resolved.url, fallback_urls = ?resolved.fallback_urls, "relay URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), fallback_urls = ?resolved.fallback_urls, "relay URL");
 
     // Connect and authenticate
     let username = resolved.user.clone();
@@ -358,7 +358,7 @@ pub async fn run_peers(
     info!(relay = %relay_host, "listing peers");
 
     let resolved = resolve_target(relay_host, port, transport)?;
-    debug!(url = %resolved.url, fallback_urls = ?resolved.fallback_urls, "relay URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), fallback_urls = ?resolved.fallback_urls, "relay URL");
 
     // Connect and authenticate
     let client = connect_client(&resolved, identity)
@@ -466,7 +466,7 @@ pub async fn run_connect(
     info!(relay = %effective_relay, target = %target_selector, "reverse connecting to peer");
 
     let resolved = resolve_target(effective_relay, port, transport)?;
-    debug!(url = %resolved.url, fallback_urls = ?resolved.fallback_urls, "relay URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), fallback_urls = ?resolved.fallback_urls, "relay URL");
 
     // Connect and authenticate
     let username = resolved.user.clone();

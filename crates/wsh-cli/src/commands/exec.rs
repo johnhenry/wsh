@@ -44,7 +44,7 @@ pub async fn run(
 ) -> Result<()> {
     let resolved = resolve_target(target, port, transport)?;
     info!(user = %resolved.user, host = %resolved.host, command = %command, "exec");
-    debug!(url = %resolved.url, "transport URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), "transport URL");
 
     let stdin_is_tty = std::io::stdin().is_terminal();
     let want_tty = tty && stdin_is_tty;

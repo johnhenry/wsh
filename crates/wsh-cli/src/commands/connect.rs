@@ -18,7 +18,7 @@ use crate::terminal as term;
 pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str>) -> Result<()> {
     let resolved = resolve_target(target, port, transport)?;
     info!(user = %resolved.user, host = %resolved.host, port, "connecting");
-    debug!(url = %resolved.url, "transport URL");
+    debug!(url = %crate::commands::common::redact_rendezvous(&resolved.url), "transport URL");
 
     // Get initial terminal size.
     let (cols, rows) = term::get_terminal_size();
