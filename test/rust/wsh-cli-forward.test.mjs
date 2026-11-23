@@ -73,7 +73,7 @@ function makeHome() {
 /** Run `wsh` to completion. */
 function wsh(args, { home, timeoutMs = 20_000 } = {}) {
   return new Promise((resolve) => {
-    const proc = spawn(WSH_BIN, args, { env: cleanEnv(home), stdio: ['pipe', 'pipe', 'pipe'] });
+    const proc = spawn(WSH_BIN, ['--accept-new-host-key', ...args], { env: cleanEnv(home), stdio: ['pipe', 'pipe', 'pipe'] });
     const out = []; const err = [];
     proc.stdout.on('data', (d) => out.push(d)); proc.stderr.on('data', (d) => err.push(d));
     proc.stdin.on('error', () => {}); proc.stdin.end();
@@ -84,7 +84,7 @@ function wsh(args, { home, timeoutMs = 20_000 } = {}) {
 
 /** Start a long-running `wsh` (forwarding) and wait until `ready` matched its stderr. */
 async function wshBackground(args, { home, env = {}, ready = /forwarding|listening/ }) {
-  const proc = spawn(WSH_BIN, args, { env: cleanEnv(home, env), stdio: ['pipe', 'pipe', 'pipe'] });
+  const proc = spawn(WSH_BIN, ['--accept-new-host-key', ...args], { env: cleanEnv(home, env), stdio: ['pipe', 'pipe', 'pipe'] });
   procs.push(proc);
   let stderr = ''; let stdout = '';
   proc.stderr.on('data', (d) => { stderr += d; }); proc.stdout.on('data', (d) => { stdout += d; });

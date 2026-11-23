@@ -37,7 +37,7 @@
 use anyhow::{Context, Result};
 use dialoguer::Password;
 use tracing::{debug, info};
-use wsh_client::{ConnectConfig, WshClient};
+use wsh_client::ConnectConfig;
 
 use crate::commands::common::resolve_target;
 
@@ -60,15 +60,16 @@ pub async fn run(target: &str, port: u16, identity: &str, transport: Option<&str
     let password = load_password(&resolved.user, &resolved.host)?;
     debug!(url = %resolved.url, "transport URL");
 
-    let client = WshClient::connect(
+    let client = crate::commands::common::connect_checked(
         &resolved.url,
-        ConnectConfig {
+        &ConnectConfig {
             username: resolved.user.clone(),
             key_name: None,
             password: Some(password),
             known_host: resolved.known_host.clone(),
             ..Default::default()
         },
+        resolved.known_host.as_deref().unwrap_or(&resolved.host),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))

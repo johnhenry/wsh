@@ -82,6 +82,22 @@ struct Cli {
     #[arg(long = "replace-socket")]
     replace_socket: bool,
 
+    /// Trust a host key seen for the first time (no known_hosts entry) without asking. Without
+    /// this, a first use is refused unless you answer yes at a terminal. A host key that CHANGED
+    /// is always refused, and only a key the host proved it holds is ever recorded.
+    #[arg(long = "accept-new-host-key", global = true)]
+    accept_new_host_key: bool,
+
+    /// Refuse a host that proves no host key (a bare fingerprint is not a proof), before any
+    /// credential is sent.
+    #[arg(long = "require-host-key", global = true)]
+    require_host_key: bool,
+
+    /// Refuse to log in unless the signature is bound to this connection (the host's proven key
+    /// and, for WebTransport, a pinned certificate): nothing is signed otherwise.
+    #[arg(long = "require-channel-binding", global = true)]
+    require_channel_binding: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -323,6 +339,12 @@ async fn main() {
         } else {
             Some(t)
         }
+    });
+
+    commands::common::set_identity_policy(commands::common::IdentityPolicy {
+        accept_new_host_key: cli.accept_new_host_key,
+        require_host_key: cli.require_host_key,
+        require_channel_binding: cli.require_channel_binding,
     });
 
     if let Some(via) = cli.via.clone() {

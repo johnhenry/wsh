@@ -30,6 +30,11 @@ pub enum WshError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
+    /// The host proved a host key that `known_hosts` has no entry for, and the caller did not
+    /// allow first use. Carries what a person needs to decide.
+    #[error("host key for {host} is not in known_hosts (fingerprint {fingerprint}); first use must be accepted explicitly")]
+    HostKeyUnknown { host: String, fingerprint: String },
+
     #[error("timeout")]
     Timeout,
 

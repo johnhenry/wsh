@@ -39,6 +39,21 @@ pub struct ConnectConfig {
     /// host's address -- a pipe relay (`wss://relay/r/<id>`) -- so the host is pinned by
     /// who it is, not by which relay carried the connection (the JS client's `hostLabel`).
     pub known_host: Option<String>,
+    /// Refuse a host that proves no host key (wsh #145): without this a host that presents none is
+    /// connected to with its identity unverified, as before. A host that advertises a key it
+    /// cannot prove is always refused.
+    pub require_host_key: bool,
+    /// What to do the first time a PROVEN host key is seen (no `known_hosts` entry): see [`FirstUse`].
+    /// A CHANGED key is always refused.
+    pub first_use: FirstUse,
+    /// `known_hosts` file; `None`: `~/.wsh/known_hosts`.
+    pub known_hosts_path: Option<std::path::PathBuf>,
+    /// Refuse to log in unless the signature is bound to this connection (wsh #119): the host
+    /// must offer a binding kind this client can supply, or nothing is signed.
+    pub require_channel_binding: bool,
+    /// The SHA-256 of the WebTransport certificate this connection is pinned to, when it is
+    /// pinned to exactly one: the `cert-hash` binding kind.
+    pub cert_hash: Option<[u8; 32]>,
     /// Ping interval in seconds (0 = disabled).
     pub ping_interval_secs: u64,
     /// Connection timeout in seconds.
@@ -53,10 +68,29 @@ impl Default for ConnectConfig {
             password: None,
             verify_host: true,
             known_host: None,
+            require_host_key: false,
+            first_use: FirstUse::Refuse,
+            known_hosts_path: None,
+            require_channel_binding: false,
+            cert_hash: None,
             ping_interval_secs: 30,
             timeout_secs: 10,
         }
     }
+}
+
+/// What a client does the first time it sees a proven host key it has no `known_hosts` entry for.
+/// The default refuses: a first use is a trust decision, and a person (or `--accept-new-host-key`)
+/// makes it, as with OpenSSH `StrictHostKeyChecking`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FirstUse {
+    /// Refuse with [`WshError::HostKeyUnknown`], which carries the fingerprint.
+    #[default]
+    Refuse,
+    /// Record whatever key the host proves.
+    Accept,
+    /// Record the key only if its fingerprint is this one (what a person just confirmed).
+    AcceptFingerprint(String),
 }
 
 /// Get the current system username as a default.
@@ -208,6 +242,12 @@ pub struct WshClient {
     accepted_relay_peers: Arc<Mutex<HashSet<String>>>,
     /// Session frames that beat their session's registration (see [`EarlyChannels`]).
     early: EarlyShared,
+    /// The host key this connection's host proved (wsh #145), if it proved one.
+    host_key: Option<crate::host_key::ProvenHostKey>,
+    /// Whether this connection recorded the host key in `known_hosts` just now (first use).
+    host_key_newly_pinned: bool,
+    /// The channel-binding kinds the login signature covered.
+    channel_binding_kinds: Vec<&'static str>,
     /// Connections and listeners opened through the host (see [`crate::gateway`]).
     gateway: Arc<GatewayHub>,
 }
@@ -385,6 +425,9 @@ impl WshClient {
             accepted_relay_peers: accepted_relay_peers.clone(),
             gateway: gateway.clone(),
             early: early.clone(),
+            host_key: None,
+            host_key_newly_pinned: false,
+            channel_binding_kinds: Vec::new(),
         };
 
         // Perform handshake with timeout
@@ -478,6 +521,22 @@ impl WshClient {
     }
 
     /// The server-assigned session ID (available after successful connect).
+    /// The host key the host proved over this connection, if it proved one. `None`: the host
+    /// presented no host-key proof, so its identity was NOT verified.
+    pub fn host_key(&self) -> Option<&crate::host_key::ProvenHostKey> {
+        self.host_key.as_ref()
+    }
+
+    /// Whether this connection recorded the proven host key in `known_hosts` (first use).
+    pub fn host_key_newly_pinned(&self) -> bool {
+        self.host_key_newly_pinned
+    }
+
+    /// The channel-binding kinds the login signature covered (`"host"`, `"cert-hash"`); empty when unbound.
+    pub fn channel_binding(&self) -> &[&'static str] {
+        &self.channel_binding_kinds
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
@@ -1177,13 +1236,16 @@ impl WshClient {
             AuthMethod::Password
         };
 
-        // Send HELLO
+        // Send HELLO. The fresh nonce asks the host to prove its key over THIS connection
+        // (`host_key`); a host that does not know the string ignores it.
+        let host_key_nonce = crate::host_key::new_nonce();
         let hello = Envelope {
             msg_type: MsgType::Hello,
             payload: Payload::Hello(HelloPayload {
                 version: PROTOCOL_VERSION.to_string(),
                 username: config.username.clone(),
                 features: vec![
+                    format!("{}{host_key_nonce}", crate::host_key::HOST_KEY_NONCE_PREFIX),
                     "mcp".to_string(),
                     "file-transfer".to_string(),
                     // GatewayCredit flow control for connections opened through the host.
@@ -1198,7 +1260,7 @@ impl WshClient {
         let server_hello_data = self.recv_raw().await?;
         let server_hello = decode_envelope(&server_hello_data)?;
 
-        let (_server_hello_session_id, server_fingerprints, host_fingerprint, advertised_features) =
+        let (hello_session_id, server_fingerprints, host_fingerprint, advertised_features) =
             match &server_hello.payload {
                 Payload::ServerHello(sh) => (
                     sh.session_id.clone(),
@@ -1209,40 +1271,40 @@ impl WshClient {
                 _ => return Err(WshError::InvalidMessage("expected SERVER_HELLO".into())),
             };
         gateway_credit_on(&self.gateway, &advertised_features);
-        *self.server_features.lock().await = advertised_features;
+        *self.server_features.lock().await = advertised_features.clone();
 
-        // Verify host key (TOFU).
-        //
-        // wsh #59: prefer `host_fingerprint` -- the server's own persistent
-        // host identity key, the correct thing to pin. Fall back to
-        // `fingerprints[0]` (an authorized *client* key, not a stable
-        // per-server identity -- see ServerHello.fingerprints' doc comment
-        // in spec/wsh-v1.yaml) only for servers that don't populate
-        // host_fingerprint yet, which today is every wsh-server release;
-        // this keeps existing deployments working unchanged while making
-        // the upgrade path (a server that starts sending host_fingerprint)
-        // strictly safer without a client-side flag day. The fallback logs
-        // a warning so operators can see TOFU protection is degraded.
+        // Host key (wsh #59, #145): trust only a key the host PROVED it holds, over this
+        // connection, before any credential leaves. A bare `host_fingerprint` is not a proof.
         if config.verify_host {
-            let pinned_fp = match host_fingerprint.as_deref().filter(|fp| !fp.is_empty()) {
-                Some(fp) => Some(fp.to_string()),
-                None => {
-                    if let Some(first_fp) = server_fingerprints.first() {
-                        tracing::warn!(
-                            host = %known_host,
-                            "server did not advertise ServerHello.host_fingerprint (wsh #59); \
-                             falling back to fingerprints[0] (an authorized client key, not a \
-                             stable host identity) -- TOFU protection is degraded for this host"
-                        );
-                        Some(first_fp.clone())
-                    } else {
-                        None
-                    }
+            let proven = crate::host_key::verify_advert(
+                &advertised_features,
+                host_fingerprint.as_deref(),
+                &hello_session_id,
+                &host_key_nonce,
+                &config.username,
+            )?;
+            match proven {
+                Some(key) => {
+                    self.host_key_newly_pinned = self.pin_host_key(config, known_host, &key)?;
+                    self.host_key = Some(key);
                 }
-            };
-            if let Some(fp) = pinned_fp {
-                self.verify_host_key(known_host, &fp)?;
+                None => self.accept_unproven_host(
+                    config,
+                    known_host,
+                    host_fingerprint.as_deref(),
+                    &server_fingerprints,
+                )?,
             }
+        } else {
+            self.host_key = crate::host_key::verify_advert(
+                &advertised_features,
+                host_fingerprint.as_deref(),
+                &hello_session_id,
+                &host_key_nonce,
+                &config.username,
+            )
+            .ok()
+            .flatten();
         }
 
         // Receive CHALLENGE
@@ -1265,11 +1327,33 @@ impl WshClient {
                 let keystore = crate::keystore::KeyStore::default_location()?;
                 let (signing_key, verifying_key) = keystore.load(key_name)?;
 
-                let signature = auth::sign_challenge(
+                // Channel binding (wsh #119): bind every kind the host offers that this client can
+                // supply -- the host key it just saw prove possession, a pinned certificate hash.
+                let mut available: Vec<(&'static str, Vec<u8>)> = Vec::new();
+                if let Some(k) = &self.host_key {
+                    available.push(("host", k.public_key.to_vec()));
+                }
+                if let Some(h) = &config.cert_hash {
+                    available.push(("cert-hash", h.to_vec()));
+                }
+                let (binding, kinds) =
+                    crate::channel_binding::client_binding(&advertised_features, &available);
+                let host_requires = crate::channel_binding::requires_binding(&advertised_features);
+                if kinds.is_empty() && (config.require_channel_binding || host_requires) {
+                    let offered = crate::channel_binding::offered_kinds(&advertised_features);
+                    return Err(WshError::AuthFailed(format!(
+                        "channel binding {} but not available (host offers: {}; bound: none) -- nothing was signed",
+                        if config.require_channel_binding { "required" } else { "is required by the host" },
+                        if offered.is_empty() { "none".to_string() } else { offered.join(", ") },
+                    )));
+                }
+                self.channel_binding_kinds = kinds;
+                let signature = auth::sign_challenge_bound(
                     &signing_key,
                     &config.username,
                     &server_session_id,
                     &nonce,
+                    &binding,
                 );
                 let public_key = auth::public_key_bytes(&verifying_key);
 
@@ -1284,6 +1368,12 @@ impl WshClient {
                 }
             }
             AuthMethod::Password => {
+                if config.require_channel_binding {
+                    return Err(WshError::AuthFailed(
+                        "channel binding required but a password login signs nothing to bind"
+                            .into(),
+                    ));
+                }
                 let password = config
                     .password
                     .clone()
@@ -1325,31 +1415,89 @@ impl WshClient {
         }
     }
 
-    /// Verify the server's host key via TOFU.
-    fn verify_host_key(&self, host: &str, fingerprint: &str) -> WshResult<()> {
-        let known_hosts = KnownHosts::default_location()?;
+    fn known_hosts_for(config: &ConnectConfig) -> WshResult<KnownHosts> {
+        match &config.known_hosts_path {
+            Some(p) => Ok(KnownHosts::new(p.clone())),
+            None => KnownHosts::default_location(),
+        }
+    }
 
-        match known_hosts.verify_host(host, fingerprint)? {
+    /// Check a PROVEN host key against `known_hosts` and record it on first use if allowed.
+    /// Returns whether it was recorded just now. A changed key is always refused.
+    fn pin_host_key(
+        &self,
+        config: &ConnectConfig,
+        host: &str,
+        key: &crate::host_key::ProvenHostKey,
+    ) -> WshResult<bool> {
+        let known_hosts = Self::known_hosts_for(config)?;
+        match known_hosts.verify_host(host, &key.fingerprint)? {
             HostStatus::Known => {
                 tracing::debug!("host {} verified (known)", host);
-                Ok(())
+                Ok(false)
             }
             HostStatus::Unknown => {
-                // TOFU: trust on first use
+                let allowed = match &config.first_use {
+                    FirstUse::Accept => true,
+                    FirstUse::AcceptFingerprint(fp) => fp == &key.fingerprint,
+                    FirstUse::Refuse => false,
+                };
+                if !allowed {
+                    return Err(WshError::HostKeyUnknown {
+                        host: host.to_string(),
+                        fingerprint: key.fingerprint.clone(),
+                    });
+                }
                 tracing::info!(
                     "new host {} with fingerprint {}, adding to known_hosts",
                     host,
-                    fingerprint
+                    key.fingerprint
                 );
-                known_hosts.add_host(host, fingerprint)?;
-                Ok(())
+                known_hosts.add_host(host, &key.fingerprint)?;
+                Ok(true)
             }
             HostStatus::Changed { expected } => Err(WshError::AuthFailed(format!(
                 "HOST KEY CHANGED for {}: expected {}, got {}. \
                  This could indicate a man-in-the-middle attack.",
-                host, expected, fingerprint
+                host, expected, key.fingerprint
             ))),
         }
+    }
+
+    /// The host proved no host key. Refuse when one is required, or when a key is already
+    /// pinned for this host (a host that had a key and now shows none is a downgrade); the one
+    /// exception is an entry the OLD client recorded from `fingerprints[0]` -- an unauthenticated
+    /// list, what a host with no key sent -- which keeps working for a host that still sends
+    /// no `host_fingerprint`. Nothing is written to `known_hosts`.
+    fn accept_unproven_host(
+        &self,
+        config: &ConnectConfig,
+        host: &str,
+        host_fingerprint: Option<&str>,
+        fingerprints: &[String],
+    ) -> WshResult<()> {
+        if config.require_host_key {
+            return Err(WshError::AuthFailed(format!(
+                "HOST KEY REQUIRED but {host} proved none (a bare host_fingerprint is not a proof); \
+                 refusing before sending credentials"
+            )));
+        }
+        if let Some(pinned) = Self::known_hosts_for(config)?.get(host)? {
+            let legacy = host_fingerprint.is_none_or(str::is_empty)
+                && fingerprints.first().is_some_and(|f| *f == pinned);
+            if !legacy {
+                return Err(WshError::AuthFailed(format!(
+                    "HOST KEY MISSING for {host}: a host key ({pinned}) is pinned for it but the host \
+                     proved none now. This could be a man-in-the-middle attack, or the host dropped \
+                     its key; remove its line from known_hosts if you trust that change."
+                )));
+            }
+        }
+        tracing::debug!(
+            host = %host,
+            "host presented no host-key proof; its identity is not verified"
+        );
+        Ok(())
     }
 
     /// Send a CBOR-encoded envelope over the transport control channel.
@@ -2496,6 +2644,9 @@ mod tests {
             relay_message_rx: Arc::new(Mutex::new(None)),
             accepted_relay_peers: Arc::new(Mutex::new(HashSet::new())),
             early: Default::default(),
+            host_key: None,
+            host_key_newly_pinned: false,
+            channel_binding_kinds: Vec::new(),
             gateway: Default::default(),
         };
 
@@ -2596,6 +2747,9 @@ mod tests {
             relay_message_rx: Arc::new(Mutex::new(None)),
             accepted_relay_peers: accepted_relay_peers.clone(),
             early: Default::default(),
+            host_key: None,
+            host_key_newly_pinned: false,
+            channel_binding_kinds: Vec::new(),
             gateway: Default::default(),
         };
 

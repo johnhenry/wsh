@@ -29,11 +29,13 @@
 //! ```
 
 pub mod auth;
+pub mod channel_binding;
 pub mod client;
 pub mod e2e;
 pub mod e2e_frame;
 pub mod file_transfer;
 pub mod gateway;
+pub mod host_key;
 pub mod keystore;
 pub mod known_hosts;
 pub mod mcp;
@@ -43,7 +45,7 @@ pub mod transport;
 pub mod virtual_session;
 
 // Re-export primary public types.
-pub use client::{ConnectConfig, GatewayHandle, RemoteSessionInfo, WshClient};
+pub use client::{ConnectConfig, FirstUse, GatewayHandle, RemoteSessionInfo, WshClient};
 pub use e2e::{E2eKeyExchange, ALGORITHM_HYBRID, ALGORITHM_X25519};
 pub use e2e_frame::RoleTag;
 pub use gateway::{GatewayListener, GatewayStream, PendingInbound};

@@ -58,6 +58,15 @@ impl KnownHosts {
         Ok(HostStatus::Unknown)
     }
 
+    /// The fingerprint recorded for `host`, if any.
+    pub fn get(&self, host: &str) -> WshResult<Option<String>> {
+        Ok(self
+            .load_entries()?
+            .into_iter()
+            .find(|(h, _)| h == host)
+            .map(|(_, fp)| fp))
+    }
+
     /// Add or update a host's fingerprint.
     pub fn add_host(&self, host: &str, fingerprint: &str) -> WshResult<()> {
         let mut entries = self.load_entries()?;
