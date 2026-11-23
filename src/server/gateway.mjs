@@ -9,8 +9,14 @@
  * Off unless `createWshServer({ gateway })` is given, and then default-deny:
  * a destination must match `allow`. Pattern forms (the same as the Rust policy):
  * `"*"` any host and port, `"host"` that name on any port, `"host:port"`.
- * Matching is on the NAME the client asked for, case-insensitively; with `socks`
- * set the name is handed to the proxy unresolved, so the host never looks it up.
+ * The pattern is matched against the NAME the client asked for, case-insensitively, and then the ADDRESS it resolves
+ * to is checked as well: the host resolves the name once, refuses every address that is not globally routable
+ * (loopback, private, link-local, CGNAT, ULA, multicast, reserved, and IPv4 wrapped in IPv6 as mapped, NAT64 or 6to4
+ * forms) unless a rule says otherwise, and connects to that same address. Rules that say otherwise: `allowPrivate`
+ * (CIDR blocks or addresses the host may dial although they are not public) and an allow entry that is itself an IP
+ * literal (`"127.0.0.1:1883"`), which permits exactly that address. `ResolveDns` answers are filtered the same way.
+ * With `socks` set the name is handed to the proxy unresolved, so the host never looks it up (and cannot check what it
+ * resolves to; IP literals are still checked).
  *
  * Not implemented, and answered with a clean GatewayFail / ListenFail rather than
  * silence: UDP (`OpenUdp`) and reverse tunnels (`ListenRequest`).
@@ -23,6 +29,7 @@
  */
 
 import { MSG, gatewayOk, gatewayFail, gatewayClose, gatewayData, dnsResult, listenFail } from '../messages.gen.mjs';
+import { isPublicAddress, parseCidr, addressInCidr, parseIp, sameAddress } from './address-guard.mjs';
 
 // Loaded on first use so that importing the connection handler (which serves the gateway opcodes)
 // does not pull `node:net` into a browser bundle (see `src/memory-host.mjs`).
@@ -60,6 +67,33 @@ export function destinationAllowed(allow, host, port) {
     if (p === '*' || p === h || p === `${h}:${port}`) return true;
   }
   return false;
+}
+
+/**
+ * The name rule: does any allow entry match, and does a matching entry name the requested host as an IP literal
+ * (`explicit`: that entry is then allowed to reach exactly that address even if it is not public)?
+ */
+function nameDecision(allow, host, port) {
+  const h = String(host).toLowerCase();
+  let allowed = false;
+  let explicit = false;
+  for (const raw of allow) {
+    const p = String(raw).toLowerCase();
+    if (p === '*') allowed = true;
+    else if (p === h || p === `${h}:${port}`) { allowed = true; if (parseIp(h)) explicit = true; }
+  }
+  return { allowed, explicit };
+}
+
+/**
+ * May the host dial this resolved address? Public addresses, addresses in `allowPrivate`, and the literal address of
+ * an explicit IP rule.
+ * @param {{ allowPrivate: Array<object> }} cfg
+ */
+export function addressPermitted(cfg, address, { explicitLiteral = null } = {}) {
+  if (explicitLiteral && sameAddress(address, explicitLiteral)) return true;
+  if (isPublicAddress(address)) return true;
+  return cfg.allowPrivate.some((c) => addressInCidr(address, c));
 }
 
 /**
@@ -114,9 +148,73 @@ export async function socksConnect(proxy, host, port, { timeoutMs = DEFAULT_CONN
   });
 }
 
+const connectError = (e) => {
+  const code = e.code === 'ECONNREFUSED' ? GATEWAY_FAIL.CONNECTION_REFUSED : e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN' ? GATEWAY_FAIL.DNS_FAILED : GATEWAY_FAIL.HOST_UNREACHABLE;
+  const err = new Error(e.code === 'ENOTFOUND' ? 'name not found' : e.message);
+  err.code = code;
+  return err;
+};
+
+/**
+ * Connect to ONE address (no name lookup happens: the caller already resolved and checked it).
+ * @returns {Promise<import('node:net').Socket>}
+ */
+async function connectAddress(address, port, timeoutMs) {
+  const net = await loadNet();
+  return new Promise((resolve, reject) => {
+    const s = net.connect({ host: address, port });
+    const t = setTimeout(() => { s.destroy(); const e = new Error('connect timed out'); e.code = GATEWAY_FAIL.TIMEOUT; reject(e); }, timeoutMs);
+    s.once('connect', () => { clearTimeout(t); s.removeAllListeners('error'); resolve(s); });
+    s.once('error', (e) => { clearTimeout(t); reject(connectError(e)); });
+  });
+}
+
+/**
+ * Resolve `host` ONCE and return only the addresses `cfg` permits (an empty answer after filtering is POLICY_DENIED).
+ * Everything that then connects does so to one of these addresses, never to the name.
+ * @returns {Promise<string[]>}
+ */
+export async function resolveChecked(cfg, host, explicitLiteral, timeoutMs = cfg.connectTimeoutMs) {
+  const dns = await loadDns();
+  let found;
+  try {
+    found = await Promise.race([
+      dns.lookup(host, { all: true, verbatim: true }),
+      new Promise((_, rej) => { const t = setTimeout(() => { const e = new Error('name lookup timed out'); e.code = GATEWAY_FAIL.TIMEOUT; rej(e); }, timeoutMs); t.unref?.(); }),
+    ]);
+  } catch (e) { throw typeof e.code === 'number' ? e : connectError(e); }
+  const addresses = found.map((a) => a.address);
+  const usable = addresses.filter((a) => addressPermitted(cfg, a, { explicitLiteral }));
+  if (usable.length === 0) {
+    const e = new Error('the address this name resolves to is not permitted by the gateway policy');
+    e.code = GATEWAY_FAIL.POLICY_DENIED;
+    e.refusedAddresses = addresses;
+    throw e;
+  }
+  return usable;
+}
+
+/**
+ * Resolve `host` once, keep only the addresses `cfg` permits, and connect to the first that answers. A refusal of
+ * every address is POLICY_DENIED; the connect uses the address that was checked, never the name.
+ * @returns {Promise<{ sock: import('node:net').Socket, address: string }>}
+ */
+export async function dialChecked(cfg, host, port, explicitLiteral, timeoutMs = cfg.connectTimeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const usable = await resolveChecked(cfg, host, explicitLiteral, timeoutMs);
+  let last;
+  for (const address of usable) {
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    try { return { sock: await connectAddress(address, port, left), address }; } catch (e) { last = e; }
+  }
+  throw last ?? Object.assign(new Error('connect timed out'), { code: GATEWAY_FAIL.TIMEOUT });
+}
+
 /**
  * @param {object} opts
  * @param {string[]} [opts.allow=[]]  destination patterns; empty = nothing is reachable
+ * @param {string[]} [opts.allowPrivate=[]]  CIDR blocks or addresses (`"10.0.0.0/8"`, `"127.0.0.1"`, `"fd00::/8"`) the host may dial even though they are not globally routable
  * @param {number} [opts.maxConnections=32]  concurrent gateway sockets per client connection
  * @param {number} [opts.connectTimeoutMs=15000]
  * @param {string|{host:string,port:number}} [opts.socks]  dial through this SOCKS5 proxy (Tor)
@@ -127,10 +225,18 @@ export function normalizeGateway(opts) {
   if (!opts || typeof opts !== 'object') return null;
   const allow = opts.allow ?? [];
   if (!Array.isArray(allow) || allow.some((a) => typeof a !== 'string' || !a)) throw new TypeError('gateway.allow must be an array of non-empty strings');
+  const privateRules = opts.allowPrivate ?? [];
+  if (!Array.isArray(privateRules)) throw new TypeError('gateway.allowPrivate must be an array of CIDR blocks or addresses');
+  const allowPrivate = privateRules.map((r) => {
+    const c = parseCidr(r);
+    if (!c) throw new TypeError(`gateway.allowPrivate: ${JSON.stringify(r)} is not an address or CIDR block`);
+    return c;
+  });
   const maxConnections = opts.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
   if (!Number.isInteger(maxConnections) || maxConnections < 1) throw new TypeError('gateway.maxConnections must be a positive integer');
   return {
     allow: [...allow],
+    allowPrivate,
     maxConnections,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     socks: parseSocks(opts.socks),
@@ -159,32 +265,30 @@ export function createGatewaySession(cfg, send, log = () => {}) {
       return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'malformed OpenTcp');
     }
     if (sockets.has(id) || pending.has(id)) return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'gateway_id already in use');
-    if (!destinationAllowed(cfg.allow, m.host, m.port)) {
+    const decision = nameDecision(cfg.allow, m.host, m.port);
+    if (!decision.allowed) {
       log(`gateway: refused ${m.host}:${m.port} (not on the allow list)`);
       return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'destination not allowed by the gateway policy');
     }
     if (active() >= cfg.maxConnections) return fail(id, GATEWAY_FAIL.QUEUE_FULL, 'too many gateway connections');
     pending.add(id);
     let sock;
+    let resolvedAddr;
     try {
-      const net = await loadNet();
-      if (cfg.socks) sock = await socksConnect(cfg.socks, m.host, m.port, { timeoutMs: cfg.connectTimeoutMs });
-      else {
-        sock = await new Promise((resolve, reject) => {
-          const s = net.connect({ host: m.host, port: m.port });
-          const t = setTimeout(() => { s.destroy(); const e = new Error('connect timed out'); e.code = GATEWAY_FAIL.TIMEOUT; reject(e); }, cfg.connectTimeoutMs);
-          s.once('connect', () => { clearTimeout(t); s.removeAllListeners('error'); resolve(s); });
-          s.once('error', (e) => {
-            clearTimeout(t);
-            const code = e.code === 'ECONNREFUSED' ? GATEWAY_FAIL.CONNECTION_REFUSED : e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN' ? GATEWAY_FAIL.DNS_FAILED : GATEWAY_FAIL.HOST_UNREACHABLE;
-            const err = new Error(e.code === 'ENOTFOUND' ? 'name not found' : e.message);
-            err.code = code;
-            reject(err);
-          });
-        });
+      if (cfg.socks) {
+        // The proxy resolves the name, so only an IP literal can be checked here.
+        if (parseIp(m.host) && !addressPermitted(cfg, m.host, { explicitLiteral: decision.explicit ? m.host : null })) {
+          const e = new Error('the address is not permitted by the gateway policy');
+          e.code = GATEWAY_FAIL.POLICY_DENIED;
+          throw e;
+        }
+        sock = await socksConnect(cfg.socks, m.host, m.port, { timeoutMs: cfg.connectTimeoutMs });
+      } else {
+        ({ sock, address: resolvedAddr } = await dialChecked(cfg, m.host, m.port, decision.explicit ? m.host : null));
       }
     } catch (e) {
       pending.delete(id);
+      if (e.code === GATEWAY_FAIL.POLICY_DENIED) log(`gateway: refused ${m.host}:${m.port} (${e.message})`);
       return fail(id, typeof e.code === 'number' ? e.code : GATEWAY_FAIL.HOST_UNREACHABLE, String(e.message).slice(0, 200));
     }
     pending.delete(id);
@@ -195,8 +299,8 @@ export function createGatewaySession(cfg, send, log = () => {}) {
     sock.on('close', () => {
       if (sockets.get(id) === sock) { sockets.delete(id); void reply(gatewayClose({ gatewayId: id })); }
     });
-    log(`gateway: ${id} -> ${m.host}:${m.port}${cfg.socks ? ' (via SOCKS5)' : ''}`);
-    return reply(gatewayOk({ gatewayId: id }));
+    log(`gateway: ${id} -> ${m.host}:${m.port}${resolvedAddr && resolvedAddr !== m.host ? ` (${resolvedAddr})` : ''}${cfg.socks ? ' (via SOCKS5)' : ''}`);
+    return reply(gatewayOk({ gatewayId: id, resolvedAddr }));
   }
 
   async function resolveDns(m) {
@@ -209,7 +313,12 @@ export function createGatewaySession(cfg, send, log = () => {}) {
     try {
       const family = m.record_type === 'AAAA' ? 6 : m.record_type === 'A' || m.record_type === undefined ? 4 : 0;
       if (!family) return fail(id, GATEWAY_FAIL.DNS_FAILED, `unsupported record type ${String(m.record_type).slice(0, 8)}`);
-      const addresses = (await (await loadDns()).lookup(m.name, { family, all: true })).map((a) => a.address);
+      const all = (await (await loadDns()).lookup(m.name, { family, all: true, verbatim: true })).map((a) => a.address);
+      // An answer a client could not connect to is not handed out either: it would only be a way to learn the
+      // host's internal addresses, and a later OpenTcp to it has to pass the same check.
+      const lit = parseIp(m.name) ? m.name : null;
+      const addresses = all.filter((a) => addressPermitted(cfg, a, { explicitLiteral: lit }));
+      if (all.length && !addresses.length) return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'the addresses this name resolves to are not permitted by the gateway policy');
       return reply(dnsResult({ gatewayId: id, addresses }));
     } catch (e) {
       return fail(id, GATEWAY_FAIL.DNS_FAILED, String(e.code === 'ENOTFOUND' ? 'name not found' : e.message).slice(0, 200));
