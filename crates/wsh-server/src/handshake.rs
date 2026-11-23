@@ -297,6 +297,18 @@ fn verify_pubkey_auth(
     }
 
     let fp = wsh_core::fingerprint(public_key);
+    // wsh #122: a key past its `expires` does not log in.
+    let options = authorized_keys
+        .iter()
+        .find(|k| k.fingerprint == fp)
+        .and_then(|k| k.options.as_deref());
+    if let Err(refusal) =
+        crate::auth::permissions::KeyPermissions::from_options(fp.clone(), options)
+            .check(crate::auth::permissions::KeyRequest::Login, 0)
+    {
+        warn!(fingerprint = %fp, code = refusal.code, "key refused at login");
+        return Err(WshError::AuthFailed(refusal.reason));
+    }
     let token = wsh_core::create_token(server_secret, session_id, session_ttl);
 
     info!(fingerprint = %wsh_core::short_fingerprint(&fp, &[], 8), "pubkey auth OK");

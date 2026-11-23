@@ -22,6 +22,7 @@
 //! | `max-sessions=N` | at most N live pty/exec sessions for the key (N >= 1) |
 //! | `no-agent-forwarding`, `no-port-forwarding`, `no-X11-forwarding`, `no-user-rc` | accepted, no effect |
 
+use super::capabilities::{parse_capability_list, parse_rfc3339, Capability, CapabilitySet};
 use serde::{Deserialize, Serialize};
 use wsh_core::keys::AuthorizedKey;
 
@@ -50,7 +51,7 @@ pub struct OptionError {
 }
 
 impl OptionError {
-    fn new(code: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, reason: impl Into<String>) -> Self {
         Self {
             code,
             reason: reason.into(),
@@ -58,34 +59,66 @@ impl OptionError {
     }
 }
 
-/// What a request is, for [`KeyPermissions::check`].
+/// What a request is, for [`KeyPermissions::check`]. Gateway requests carry what the capability list is matched against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRequest<'a> {
+    /// The login itself (refused only for a key past its `expires`).
+    Login,
     OpenPty,
     OpenExec,
-    OpenFile,
+    /// A file channel: `upload` is false for a download.
+    OpenFile {
+        upload: bool,
+    },
     /// An rpc channel and its protocol (`wsh-fs`, `wsh-host`, ...).
     OpenRpc(&'a str),
-    FileOp,
+    /// A `FileOp` and its `op` (`list`, `stat`, `read`, `write`, ...).
+    FileOp(&'a str),
+    /// MCP discovery.
     Mcp,
+    /// An MCP call of this tool.
+    McpCall(&'a str),
+    /// Whether this tool may be listed.
+    McpTool(&'a str),
     Relay,
     /// `AuthorizedKeyAdd`: installing another key. The new key has no options, so only a key that is not
     /// restricted at all may do it (a restricted key would otherwise mint an unrestricted one).
     KeyAdmin,
+    Tcp(&'a str, u16),
+    Udp(&'a str, u16),
+    Dns(&'a str),
+    ListenTcp(u16),
+    Unix(&'a str),
+    ListenUnix(&'a str),
+    /// A named endpoint (and the target it names); this server has none, so it always refuses them.
+    Endpoint(&'a str, Option<&'a str>),
+    /// Whether this target may be listed; this server has none.
+    Target(&'a str),
 }
 
-/// A request the key's options do not allow. `code` is stable and shared with the Node host.
+/// A request the key's options or capabilities do not allow. `code` is stable and shared with the Node host;
+/// for `capability-missing`, `capability` is what the request needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub code: &'static str,
     pub reason: String,
+    pub capability: Option<String>,
 }
 
 impl Refusal {
-    fn new(code: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, reason: impl Into<String>) -> Self {
         Self {
             code,
             reason: reason.into(),
+            capability: None,
+        }
+    }
+
+    fn missing(capability: String) -> Self {
+        Self {
+            code: "capability-missing",
+            reason: format!("missing capability {capability}"),
+            capability: Some(capability),
         }
     }
 }
@@ -103,6 +136,16 @@ pub struct KeyPermissions {
     pub forced_command: Option<String>,
     /// Maximum number of concurrent sessions for this key.
     pub max_sessions: Option<usize>,
+    /// `capabilities="..."` (wsh #122, step two): `None` when the line has none (the options above decide everything),
+    /// else the list, default-deny.
+    #[serde(skip)]
+    pub capabilities: Option<Vec<Capability>>,
+    /// The capability list as written (for the shared vectors and for logs).
+    #[serde(skip)]
+    pub capability_names: Option<Vec<String>>,
+    /// `expires=`: the epoch second from which the key is refused.
+    #[serde(skip)]
+    pub expires: Option<i64>,
 }
 
 /// The options this server accepts as flags, and as valued options.
@@ -121,7 +164,7 @@ const FLAG_OPTIONS: [&str; 7] = [
     "permit-file-transfer",
     "permit-relay",
 ];
-const VALUE_OPTIONS: [&str; 2] = ["command", "max-sessions"];
+const VALUE_OPTIONS: [&str; 4] = ["command", "max-sessions", "capabilities", "expires"];
 
 impl KeyPermissions {
     /// Create default (full-access) permissions for a given fingerprint.
@@ -138,6 +181,9 @@ impl KeyPermissions {
             allow_pty: true,
             forced_command: None,
             max_sessions: None,
+            capabilities: None,
+            capability_names: None,
+            expires: None,
         }
     }
 
@@ -149,6 +195,9 @@ impl KeyPermissions {
             allow_pty: false,
             forced_command: None,
             max_sessions: None,
+            capabilities: Some(Vec::new()),
+            capability_names: Some(Vec::new()),
+            expires: None,
         }
     }
 
@@ -189,6 +238,9 @@ impl KeyPermissions {
         let mut flags: Vec<String> = Vec::new();
         let mut command: Option<String> = None;
         let mut max_sessions: Option<usize> = None;
+        let mut capabilities: Option<Vec<Capability>> = None;
+        let mut capability_names: Option<Vec<String>> = None;
+        let mut expires: Option<i64> = None;
 
         for (name, value) in tokenize(options_str)? {
             let known = FLAG_OPTIONS.contains(&name.as_str())
@@ -222,6 +274,20 @@ impl KeyPermissions {
                         ));
                     }
                     command = Some(value);
+                } else if name == "capabilities" {
+                    capabilities = Some(parse_capability_list(&value)?);
+                    capability_names = Some(if value.is_empty() {
+                        Vec::new()
+                    } else {
+                        value.split(',').map(str::to_string).collect()
+                    });
+                } else if name == "expires" {
+                    expires = Some(parse_rfc3339(&value).ok_or_else(|| {
+                        OptionError::new(
+                            "bad-value",
+                            "expires must be an RFC 3339 timestamp such as 2030-01-01T00:00:00Z",
+                        )
+                    })?);
                 } else {
                     let ok = !value.is_empty()
                         && value.len() <= 9
@@ -280,12 +346,121 @@ impl KeyPermissions {
             allow_pty,
             forced_command: command,
             max_sessions,
+            capabilities,
+            capability_names,
+            expires,
         })
     }
 
     /// Whether this key may make `request`; `active_sessions` is how many pty/exec sessions it has open
-    /// (for `max-sessions`). Same table as the Node host's `checkKeyRequest`.
+    /// (for `max-sessions`). Same table as the Node host's `checkKeyRequest`: expiry, then the options, then
+    /// the capability list when the key has one.
     pub fn check(&self, request: KeyRequest<'_>, active_sessions: usize) -> Result<(), Refusal> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        self.check_at(request, active_sessions, now)
+    }
+
+    /// [`KeyPermissions::check`] at a given time (epoch seconds), for `expires`.
+    pub fn check_at(
+        &self,
+        request: KeyRequest<'_>,
+        active_sessions: usize,
+        now: i64,
+    ) -> Result<(), Refusal> {
+        if self.expires.is_some_and(|e| now >= e) {
+            return Err(Refusal::new("key-expired", "this key has expired"));
+        }
+        if request == KeyRequest::Login {
+            return Ok(());
+        }
+        self.check_options(request, active_sessions)?;
+        match &self.capabilities {
+            Some(caps) => self.check_capabilities(CapabilitySet(caps), request),
+            None => Ok(()),
+        }
+    }
+
+    /// The capability part of a check (the key has a capability list).
+    fn check_capabilities(
+        &self,
+        caps: CapabilitySet<'_>,
+        request: KeyRequest<'_>,
+    ) -> Result<(), Refusal> {
+        let need = |raw: &str, ok: bool| {
+            if ok {
+                Ok(())
+            } else {
+                Err(Refusal::missing(raw.to_string()))
+            }
+        };
+        match request {
+            KeyRequest::Login => Ok(()),
+            KeyRequest::OpenPty => need("pty", caps.has(|c| *c == Capability::Pty)),
+            KeyRequest::OpenExec => need("exec", caps.has(|c| *c == Capability::Exec)),
+            KeyRequest::OpenFile { upload } => {
+                if upload {
+                    need("fs:write", caps.has(|c| *c == Capability::FsWrite))
+                } else {
+                    need("fs:read", caps.has(|c| *c == Capability::FsRead))
+                }
+            }
+            KeyRequest::OpenRpc(protocol) => match protocol {
+                // The file rpc has read and write methods on one channel: a key without both is refused it (a client
+                // falls back to FileOp and the file channels, which are checked per operation).
+                "wsh-fs" => need("fs:read", caps.has(|c| *c == Capability::FsRead))
+                    .and(need("fs:write", caps.has(|c| *c == Capability::FsWrite))),
+                "mcp" => need("mcp:*", caps.mcp_all()),
+                other => need(&format!("rpc:{other}"), caps.rpc(other)),
+            },
+            KeyRequest::FileOp(op) => {
+                if matches!(op, "stat" | "list" | "read") {
+                    need("fs:read", caps.has(|c| *c == Capability::FsRead))
+                } else {
+                    need("fs:write", caps.has(|c| *c == Capability::FsWrite))
+                }
+            }
+            KeyRequest::Mcp => need("mcp:*", caps.mcp_any()),
+            KeyRequest::McpCall(tool) | KeyRequest::McpTool(tool) => {
+                need(&format!("mcp:{tool}"), caps.mcp_tool(tool))
+            }
+            KeyRequest::Relay => need("relay", caps.has(|c| *c == Capability::Relay)),
+            // Installing a key gives a key with no capability list, so a key with one never may.
+            KeyRequest::KeyAdmin => Err(Refusal::new(
+                "key-admin-not-permitted",
+                "installing a key is not permitted for a restricted key",
+            )),
+            KeyRequest::Tcp(host, port) => {
+                need(&format!("gateway:tcp:{host}:{port}"), caps.tcp(host, port))
+            }
+            KeyRequest::Udp(host, port) => {
+                need(&format!("gateway:udp:{host}:{port}"), caps.udp(host, port))
+            }
+            KeyRequest::Dns(name) => need(&format!("gateway:tcp:{name}:*"), caps.dns(name)),
+            KeyRequest::ListenTcp(port) => {
+                need(&format!("gateway:listen:tcp:{port}"), caps.listen_tcp(port))
+            }
+            KeyRequest::Unix(path) => need(&format!("unix:{path}"), caps.unix(path)),
+            KeyRequest::ListenUnix(path) => {
+                need(&format!("unix:listen:{path}"), caps.listen_unix(path))
+            }
+            KeyRequest::Endpoint(name, target) => {
+                need(&format!("endpoint:{name}"), caps.endpoint(name)).and(match target {
+                    Some(t) => need(&format!("target:{t}"), caps.target(t)),
+                    None => Ok(()),
+                })
+            }
+            KeyRequest::Target(name) => need(&format!("target:{name}"), caps.target(name)),
+        }
+    }
+
+    /// The options part of a check (`restrict`, `permit-*`, `command=`, `max-sessions=`).
+    fn check_options(
+        &self,
+        request: KeyRequest<'_>,
+        active_sessions: usize,
+    ) -> Result<(), Refusal> {
         let no = Refusal::new;
         let forced = || no("forced-command", "key is restricted to forced exec command");
         let file_off = || {
@@ -297,7 +472,7 @@ impl KeyPermissions {
         match request {
             KeyRequest::OpenPty
             | KeyRequest::OpenExec
-            | KeyRequest::OpenFile
+            | KeyRequest::OpenFile { .. }
             | KeyRequest::OpenRpc(_) => {
                 if self.forced_command.is_some() && request != KeyRequest::OpenExec {
                     return Err(forced());
@@ -312,7 +487,7 @@ impl KeyPermissions {
                             "exec access not permitted for this key",
                         ))
                     }
-                    KeyRequest::OpenFile if !self.has_scope(&SessionScope::FileTransfer) => {
+                    KeyRequest::OpenFile { .. } if !self.has_scope(&SessionScope::FileTransfer) => {
                         return Err(file_off())
                     }
                     KeyRequest::OpenRpc(protocol) => {
@@ -354,7 +529,7 @@ impl KeyPermissions {
                 }
                 Ok(())
             }
-            KeyRequest::FileOp => {
+            KeyRequest::FileOp(_) => {
                 if self.forced_command.is_some() {
                     Err(forced())
                 } else if self.has_scope(&SessionScope::FileTransfer) {
@@ -363,7 +538,17 @@ impl KeyPermissions {
                     Err(file_off())
                 }
             }
-            KeyRequest::Mcp => {
+            // The gateway, endpoints and targets are not scoped by the options (only by capabilities).
+            KeyRequest::Login
+            | KeyRequest::Tcp(..)
+            | KeyRequest::Udp(..)
+            | KeyRequest::Dns(_)
+            | KeyRequest::ListenTcp(_)
+            | KeyRequest::Unix(_)
+            | KeyRequest::ListenUnix(_)
+            | KeyRequest::Endpoint(..)
+            | KeyRequest::Target(_) => Ok(()),
+            KeyRequest::Mcp | KeyRequest::McpCall(_) | KeyRequest::McpTool(_) => {
                 if self.has_scope(&SessionScope::Mcp) {
                     Ok(())
                 } else {
@@ -603,6 +788,15 @@ mod tests {
                             case["maxSessions"].as_u64().map(|n| n as usize),
                             "{name}"
                         );
+                        let want_caps: Option<Vec<&str>> = case["capabilities"]
+                            .as_array()
+                            .map(|a| a.iter().map(|x| x.as_str().unwrap()).collect());
+                        let got_caps: Option<Vec<&str>> = p
+                            .capability_names
+                            .as_ref()
+                            .map(|a| a.iter().map(String::as_str).collect());
+                        assert_eq!(got_caps, want_caps, "{name}: capabilities");
+                        assert_eq!(p.expires, case["expires"].as_i64(), "{name}: expires");
                         assert_eq!(refuse_keys_with_bad_options(keys).len(), 1, "{name}");
                     }
                 }
@@ -618,29 +812,53 @@ mod tests {
             let options = case["options"].as_str().unwrap();
             let p = KeyPermissions::try_from_options("fp".into(), Some(options))
                 .unwrap_or_else(|e| panic!("{name}: options must parse: {e:?}"));
+            // Cases for things only the Node host has (named endpoints, execution targets): the Rust server refuses
+            // those whatever the key says, see `rust_server_has_no_targets_or_endpoints` in the wire tests.
+            let hosts = case["hosts"].as_array();
+            if hosts.is_some_and(|h| !h.iter().any(|x| x == "rust")) {
+                continue;
+            }
             let r = &case["request"];
-            let protocol = r["protocol"].as_str().unwrap_or("");
+            let s = |k: &str| r[k].as_str().unwrap_or("");
+            let port = r["port"].as_u64().unwrap_or(0) as u16;
             let request = match (r["kind"].as_str().unwrap(), r["channel"].as_str()) {
+                ("login", _) => KeyRequest::Login,
                 ("open", Some("pty")) => KeyRequest::OpenPty,
                 ("open", Some("exec")) => KeyRequest::OpenExec,
-                ("open", Some("file")) => KeyRequest::OpenFile,
-                ("open", Some("rpc")) => KeyRequest::OpenRpc(protocol),
-                ("file-op", _) => KeyRequest::FileOp,
+                ("open", Some("file")) => KeyRequest::OpenFile {
+                    upload: s("direction") != "download",
+                },
+                ("open", Some("rpc")) => KeyRequest::OpenRpc(s("protocol")),
+                ("file-op", _) => KeyRequest::FileOp(s("op")),
                 ("mcp", _) => KeyRequest::Mcp,
+                ("mcp-call", _) => KeyRequest::McpCall(s("tool")),
+                ("mcp-tool", _) => KeyRequest::McpTool(s("tool")),
                 ("relay", _) => KeyRequest::Relay,
                 ("key-admin", _) => KeyRequest::KeyAdmin,
+                ("tcp", _) => KeyRequest::Tcp(s("host"), port),
+                ("udp", _) => KeyRequest::Udp(s("host"), port),
+                ("dns", _) => KeyRequest::Dns(s("name")),
+                ("listen-tcp", _) => KeyRequest::ListenTcp(port),
+                ("unix", _) => KeyRequest::Unix(s("path")),
+                ("listen-unix", _) => KeyRequest::ListenUnix(s("path")),
                 other => panic!("{name}: unknown request {other:?}"),
             };
             let active = case["activeSessions"].as_u64().unwrap_or(0) as usize;
-            let got = p.check(request, active);
+            let now = case["now"].as_i64().unwrap_or(0);
+            let got = p.check_at(request, active, now);
             if case["allowed"].as_bool().unwrap() {
                 assert_eq!(got, Ok(()), "{name}");
             } else {
-                assert_eq!(
-                    got.err().map(|r| r.code),
-                    Some(case["code"].as_str().unwrap()),
-                    "{name}"
-                );
+                let refusal = got.expect_err(name);
+                assert_eq!(refusal.code, case["code"].as_str().unwrap(), "{name}");
+                if let Some(cap) = case["capability"].as_str() {
+                    assert_eq!(
+                        refusal.capability.as_deref(),
+                        Some(cap),
+                        "{name}: the refusal names the missing capability"
+                    );
+                    assert!(refusal.reason.contains(cap), "{name}: {}", refusal.reason);
+                }
             }
         }
     }

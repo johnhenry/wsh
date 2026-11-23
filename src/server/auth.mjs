@@ -4,7 +4,7 @@
  */
 
 import { fingerprint } from '../auth.mjs';
-import { parseAuthorizedKeyLine } from '../key-options.mjs';
+import { parseAuthorizedKeyLine, grantPermissions } from '../key-options.mjs';
 
 /**
  * Parse an `authorized_keys`-style blob (one `[options] ssh-ed25519 AAAA... [comment]` per line; blank lines and `#` comments
@@ -64,7 +64,17 @@ export async function buildAuthorizer(auth, { log = () => {} } = {}) {
   /** @type {Map<string, object>} */
   const perms = new Map();
   const withPerms = (fn) => Object.assign(fn, { permissionsFor: (fp) => (fp ? perms.get(fp) ?? null : null) });
-  if (typeof auth === 'function') return withPerms(async (who) => (await auth(who)) === true);
+  /** `true` stays `true`; `{ capabilities, expires? }` is a grant (`{ permissions }`, #122); anything else is no. */
+  const verdict = (r) => {
+    if (r === true) return true;
+    if (r && typeof r === 'object' && !Array.isArray(r) && (r.capabilities !== undefined || r.expires !== undefined)) {
+      const g = grantPermissions(r);
+      if (g.ok) return { permissions: g.permissions };
+      log(`authorize returned a grant that is not understood (${g.code}): ${g.reason}`);
+    }
+    return false;
+  };
+  if (typeof auth === 'function') return withPerms(async (who) => verdict(await auth(who)));
   if (!auth) return withPerms(async () => false);
 
   /** @type {Set<string> | null} */
@@ -97,7 +107,7 @@ export async function buildAuthorizer(auth, { log = () => {} } = {}) {
 
   return withPerms(async (who) => {
     if (allowed && !allowed.has(who.fingerprint)) return false;
-    if (custom) return (await custom(who)) === true;
+    if (custom) return verdict(await custom(who));
     return true;
   });
 }

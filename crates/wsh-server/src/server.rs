@@ -2317,6 +2317,53 @@ impl WshServer {
         crate::auth::permissions::KeyPermissions::from_options(fingerprint.to_string(), key_options)
     }
 
+    /// The reply that refuses a gateway message the key's capabilities do not cover (`GatewayFail` / `ListenFail`), or `None`
+    /// (wsh #122, step two). Asked before the gateway's own policy; a key without a capability list is not affected.
+    /// This server has no named endpoints or targets, so `OpenEndpoint` is refused here whatever the key holds, and
+    /// the gateway answers a target it does not have.
+    fn gateway_key_refusal(&self, fingerprint: &str, envelope: &Envelope) -> Option<Envelope> {
+        let permissions = self.key_permissions(fingerprint);
+        let (request, gateway_id, listener_id) = match &envelope.payload {
+            Payload::OpenTcp(p) => (KeyRequest::Tcp(&p.host, p.port), Some(p.gateway_id), None),
+            Payload::OpenUdp(p) => (KeyRequest::Udp(&p.host, p.port), Some(p.gateway_id), None),
+            Payload::ResolveDns(p) => (KeyRequest::Dns(&p.name), Some(p.gateway_id), None),
+            Payload::OpenUnix(p) => (KeyRequest::Unix(&p.path), Some(p.gateway_id), None),
+            Payload::OpenEndpoint(p) => (
+                KeyRequest::Endpoint(&p.name, p.target.as_deref()),
+                Some(p.gateway_id),
+                None,
+            ),
+            Payload::ListenRequest(p) => (KeyRequest::ListenTcp(p.port), None, Some(p.listener_id)),
+            Payload::ListenUnix(p) => (KeyRequest::ListenUnix(&p.path), None, Some(p.listener_id)),
+            _ => return None,
+        };
+        let refusal = permissions.check(request, 0).err()?;
+        warn!(
+            fingerprint = %&fingerprint[..8.min(fingerprint.len())],
+            code = refusal.code,
+            capability = refusal.capability.as_deref().unwrap_or(""),
+            "gateway request refused by the key's permissions"
+        );
+        Some(match (gateway_id, listener_id) {
+            (Some(gateway_id), _) => Envelope {
+                msg_type: MsgType::GatewayFail,
+                payload: Payload::GatewayFail(GatewayFailPayload {
+                    gateway_id,
+                    code: 4,
+                    message: refusal.reason,
+                }),
+            },
+            (_, Some(listener_id)) => Envelope {
+                msg_type: MsgType::ListenFail,
+                payload: Payload::ListenFail(ListenFailPayload {
+                    listener_id,
+                    reason: refusal.reason,
+                }),
+            },
+            _ => return None,
+        })
+    }
+
     /// Allocate a unique connection ID, skipping 0 (reserved as sentinel).
     fn alloc_conn_id(&self) -> u64 {
         loop {
@@ -3131,7 +3178,12 @@ impl WshServer {
                 let request = match p.kind {
                     ChannelKind::Pty => Some(KeyRequest::OpenPty),
                     ChannelKind::Exec => Some(KeyRequest::OpenExec),
-                    ChannelKind::File => Some(KeyRequest::OpenFile),
+                    ChannelKind::File => Some(KeyRequest::OpenFile {
+                        upload: !p
+                            .command
+                            .as_deref()
+                            .is_some_and(|c| c.starts_with("download:")),
+                    }),
                     // Any other kind is not this key's business: a key tied to one command gets nothing else.
                     _ if permissions.forced_command.is_some() => Some(KeyRequest::OpenRpc("")),
                     _ => None,
@@ -3641,10 +3693,8 @@ impl WshServer {
             // ── MCP messages ────────────────────────────────────────
             (MsgType::McpDiscover, Payload::McpDiscover(_)) => {
                 // wsh #122: a key without MCP sees no tools, as it would on a server that has none.
-                let permitted = self
-                    .key_permissions(&ctx.fingerprint)
-                    .check(KeyRequest::Mcp, 0)
-                    .is_ok();
+                let permissions = self.key_permissions(&ctx.fingerprint);
+                let permitted = permissions.check(KeyRequest::Mcp, 0).is_ok();
                 let bridge = self.mcp_bridge.read().await;
                 let mut tools = if permitted {
                     bridge.list_tools()
@@ -3654,6 +3704,8 @@ impl WshServer {
                 let proxy = self.mcp_proxy.read().await;
                 if permitted {
                     tools.extend(proxy.list_tools());
+                    // A key with `mcp:<tool>` capabilities is told only of those tools.
+                    tools.retain(|t| permissions.check(KeyRequest::McpTool(&t.name), 0).is_ok());
                 }
                 Ok(Some(Envelope {
                     msg_type: MsgType::McpTools,
@@ -3663,7 +3715,7 @@ impl WshServer {
             (MsgType::McpCall, Payload::McpCall(p)) => {
                 if let Err(refusal) = self
                     .key_permissions(&ctx.fingerprint)
-                    .check(KeyRequest::Mcp, 0)
+                    .check(KeyRequest::McpCall(&p.tool), 0)
                 {
                     warn!(
                         fingerprint = %&ctx.fingerprint[..8.min(ctx.fingerprint.len())],
@@ -3714,6 +3766,9 @@ impl WshServer {
             // and the answers go out through the connection's outbound queue, so nothing here
             // waits on a connect.
             (msg_type, _) if GatewaySession::serves(*msg_type) => {
+                if let Some(refusal) = self.gateway_key_refusal(&ctx.fingerprint, &envelope) {
+                    return Ok(Some(refusal));
+                }
                 ctx.gateway.handle(envelope.clone());
                 Ok(None)
             }
@@ -4669,7 +4724,7 @@ impl WshServer {
                         entries: vec![],
                         error_message: Some("this host has no targets".to_string()),
                     }
-                } else if let Err(refusal) = permissions.check(KeyRequest::FileOp, 0) {
+                } else if let Err(refusal) = permissions.check(KeyRequest::FileOp(&p.op), 0) {
                     // Named refusal identifying the missing "fs" capability
                     // (wsh #58: "an unauthorized fs capability must be
                     // reported as a named refusal, never rendered as an

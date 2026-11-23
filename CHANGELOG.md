@@ -43,6 +43,38 @@ Capabilities, expiry and per-target/gateway scoping are step two.
 - Not covered (README, Security model): the gateway, targets and `AuthorizedKeyAdd` on the Node host (it has none) are not scoped per
   key; `no-port-forwarding` is accepted and does nothing.
 
+### Per-key capabilities and expiry: `capabilities="..."`, `expires="..."` (#122, step two; JS and Rust change)
+
+A key can now be given a finer, default-deny licence than `restrict` / `permit-*`: a capability list and an expiry, in its
+`authorized_keys` line (the same file works on the Node host and the Rust `wsh-server`) or, on the Node host, as what `authorize()`
+returns. Builds on the options of the entry above. **Nothing changes for a key whose line has neither option**, and no default
+changes. **No wire change**: refusals use the answers each entry already has.
+
+- **Grammar** (one, shared): `exec` `pty` `relay` `fs:read` `fs:write` `gateway:tcp:<host>:<port>` `gateway:udp:<host>:<port>`
+  `gateway:listen:tcp:<port>` `unix:<path>` `unix:listen:<path>` `endpoint:<name>` `mcp:<tool>` `target:<name>` `rpc:<protocol>`;
+  hosts may be `*` or `*.suffix`, ports and names `*`, paths exact or `/dir/*`. Once `capabilities` is present the key may do only what
+  it names, ANDed with its other options. An unknown capability, a bad argument or a bad timestamp refuses the key with a logged code
+  (`unknown-capability`, `bad-capability`, `bad-value`), like an unknown option. `expires` (RFC 3339, whole seconds) refuses the key at
+  login and on every request after it.
+- **Enforced** on the Node host at: `Open` (`pty`, `exec`, file upload/download, `rpc`), `FileOp` (read ops vs write ops), the gateway
+  (`OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest`, `OpenUnix`, `ListenUnix`, `OpenEndpoint`), MCP (`McpDiscover` lists only the tools
+  the key holds, `McpCall`), targets (`Open`, `FileOp`, `OpenEndpoint` naming one; `ListTargets` lists only the ones held), the relay
+  entry points, and login. On the Rust server at every entry it has (all of those but endpoints and targets, which it does not have: it
+  refuses `OpenEndpoint` and any request naming a target, whatever the key holds). The `wsh-fs` rpc channel needs both `fs:read` and
+  `fs:write` (a client falls back to `FileOp`). A key with a capability list may not install a key (`AuthorizedKeyAdd`).
+- **Node host API:** `authorize()` (in `auth` or as the `auth` function) may return `{ capabilities, expires }` instead of `true`: the same
+  grammar, narrowing the key's own options. `onRefused` gains two stable reasons, `not-permitted` (every refused request; `detail` names the
+  missing capability) and `key-expired`; `REFUSAL_REASONS` and the types list them. `KeyPermissions` gains `capabilities` and `expires`.
+- **Shared vectors** (`spec/key-options.vectors.json`) now cover the grammar, every refusal and the matching rules (hosts, ports, paths,
+  targets, expiry boundaries), run by `test/key-options.test.mjs` and `cargo test`; `test/server-capabilities.test.mjs` serves and refuses
+  at every Node entry point; `test/rust/wsh-capabilities.test.mjs` does the same against the real `wsh-server`.
+- **A released peer:** nothing new crosses the wire. A released Node host (0.43.0) skips a line with options, so such a key cannot log in
+  there; a released Rust server (`rust-v0.14.0`) ignores `capabilities` and `expires` (unknown options), so it would serve that key
+  everything -- **do not put these options in a key file read by a released Rust server** (the new one refuses a key with an option it does
+  not understand, the old one does not). Clients are unaffected.
+- Not covered (README, Security model): what a granted capability can reach; connections, commands and streams already open when a key
+  expires; operations on a session the key already owns; password logins; a key file is read at start.
+
 ## 0.43.0 / Rust `rust-v0.14.0`
 
 ### Execution targets: `Open.target`, target discovery, `wsh --target` (#121; JS and Rust change)

@@ -13,12 +13,18 @@
  *  - `bad-request`      a malformed login (bad username, malformed key, the wrong message)
  *  - `seal-failed`      a sealed session's key exchange failed, or one of its frames did not open
  *  - `busy`             (reverse host) it already serves its operators
+ *  - `key-expired`      the key is past the `expires` of its `authorized_keys` line (or of what `authorize` returned), at login or on a
+ *                       later request (#122)
+ *  - `not-permitted`    a request the key's options or capabilities do not allow (`restrict`, `command=`, `capabilities="..."`): an
+ *                       `Open`, `FileOp`, MCP call, gateway request, relay request ...; `detail` is `<code>: <reason> (<request>)`, with
+ *                       the missing capability named for `capability-missing` (#122). Unlike the login reasons it can come
+ *                       any number of times on one connection
  *  - `proof-required`   (reverse host) it requires the operator to prove its identity and the operator offered none
  *  - `proof-failed`     (reverse host) the operator's proof did not arrive, did not verify or names someone else
  */
 export const REFUSAL_REASONS = Object.freeze([
   'not-sealed', 'unauthorized', 'binding-required', 'bad-signature', 'method-disabled', 'rate-limited', 'bad-request',
-  'seal-failed', 'busy', 'proof-required', 'proof-failed',
+  'seal-failed', 'busy', 'proof-required', 'proof-failed', 'key-expired', 'not-permitted',
 ]);
 
 /** @throws {TypeError} when `onRefused` is given and is not a function */
