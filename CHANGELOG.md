@@ -19,6 +19,8 @@ Rust workspace and tests only (no `src/` change); negotiated by existing feature
   **A frame that does not open (tampered, replayed, reordered) closes the bridge** (the JS host drops the frame and ignores the rest).
 - Not done here: sealing a direct or pipe-relayed connection and gateway data outside a reverse bridge (#155).
 
+## 0.38.1
+
 ### JS: `operator-proof` is offered only to a peer that advertises it (npm change)
 
 The JS relay and operator sent `ReverseConnect.features: ['operator-proof']` unconditionally. Released Rust hosts
