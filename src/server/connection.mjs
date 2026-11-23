@@ -34,9 +34,14 @@ import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
 import { acceptableBindings, bindingFeatures } from '../channel-binding.mjs';
+import { SealedBridge } from '../bridge-seal.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
+/** Host feature (#155): this host seals the whole session end to end when asked (a signed `KeyExchange` for the connection's session id). */
+export const SESSION_SEAL_FEATURE = 'e2e-session';
+/** Host feature: this host serves nothing on a session that is not sealed. */
+export const SESSION_SEAL_REQUIRED_FEATURE = 'e2e-session-required';
 
 /**
  * The features a host built from `cfg` advertises (`ServerHello.features`, minus the host-key proof).
@@ -58,6 +63,8 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
     if (cfg.relay.maxOperatorsPerPeer > 1) features.push(MULTI_OPERATOR_FEATURE);
   }
   if (cfg.e2e && !dataStreams) features.push(E2E_FEATURE, ...(cfg.e2e.signKey ? [E2E_SIGN_FEATURE] : []));
+  // A sealed session (#155) needs the host's identity to sign its half, and no client-opened streams (their bytes are not frames).
+  if (cfg.sealSession && cfg.hostKey && !dataStreams) features.push(SESSION_SEAL_FEATURE, ...(cfg.sealSession === 'require' ? [SESSION_SEAL_REQUIRED_FEATURE] : []));
   if (cfg.rpc && dataStreams && cfg.rpc.protocols.size) {
     features.push(RPC_FEATURE, ...[...cfg.rpc.protocols.keys()].map(rpcProtocolFeature), RPC_MAX_MESSAGE_PREFIX + cfg.rpc.maxMessageBytes);
   }
@@ -155,6 +162,13 @@ export function createConnectionFactory(cfg) {
     /** Ends the connection at `connectionTtlMs` after authentication (#125). */
     let ttlTimer = null;
 
+    // A sealed session (#155): after login, a signed KeyExchange for this connection's session id seals everything
+    // that follows (control messages, gateway and endpoint data included) as EncryptedFrames on channel 0.
+    const sealOn = !!cfg.sealSession && !!cfg.hostKey && !dataStreams;
+    const sealRequired = sealOn && cfg.sealSession === 'require';
+    /** @type {{ bridge: SealedBridge | null, responder: E2EResponder | null }} */
+    const sealed = { bridge: null, responder: null };
+
     // The gateway needs Node sockets, so `gateway.mjs` is not imported here (a browser host must not pull it in):
     // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`; a
     // host in a page passes the endpoints-only session of `gateway-core.mjs` (`createMemoryHost({ endpoints })`).
@@ -198,6 +212,14 @@ export function createConnectionFactory(cfg) {
     };
 
     const deliver = (msg) => {
+      // Sealed: everything but the keepalive leaves as a frame, in the order it was sent (the bridge seals in call order).
+      if (sealed.bridge && msg.type !== MSG.PING && msg.type !== MSG.PONG) {
+        return sealed.bridge.seal(msg).then((frame) => deliverRaw(frame), (e) => { log(`could not seal: ${e.message}`); });
+      }
+      return deliverRaw(msg);
+    };
+
+    const deliverRaw = (msg) => {
       if (state.closed) return Promise.resolve();
       if (sendMessage) {
         try { return Promise.resolve(sendMessage(msg)).catch(() => {}); } catch { return Promise.resolve(); }
@@ -266,6 +288,11 @@ export function createConnectionFactory(cfg) {
     async function handle(m) {
       if (state.closed) return;
       if (!state.authed) return handleAuth(m);
+      if (sealOn) {
+        const inner = await sealedInput(m);
+        if (inner === undefined) return;
+        m = inner;
+      }
       if (await handleRelay(m)) return;
       if (gateway && await gateway.handle(m)) return;
       switch (m.type) {
@@ -363,6 +390,7 @@ export function createConnectionFactory(cfg) {
         } else {
           return refuse(`unsupported auth method ${JSON.stringify(method)}`);
         }
+        if (cfg.sealSession === 'require' && cfg.hostKey && !dataStreams && method !== 'pubkey') return refuse('this host requires a sealed session, which needs a key login');
         state.username = user;
         state.method = method;
         gateway?.setPeerFeatures(m.features);
@@ -438,10 +466,51 @@ export function createConnectionFactory(cfg) {
         if (!allowed) return refuse('key not authorized');
         state.authed = true;
         state.fingerprint = fp;
+        state.publicKey = m.public_key;
         state.nonce = null;
         await grantAuth();
         log(`authenticated ${state.username} (${fp.slice(0, 12)}...)`);
       }
+    }
+
+    /**
+     * The sealed-session gate (#155) for a message from an authenticated peer: the message to handle, or undefined
+     * when it was consumed (the key exchange) or refused. A plain message is not heard once the session is sealed
+     * (a relay in the middle can inject any), and with `sealSession: 'require'` not before either.
+     */
+    async function sealedInput(m) {
+      if (sealed.bridge) {
+        if (m.type === MSG.PING) return m;
+        if (!sealed.bridge.isFrame(m)) { log(`dropped a plaintext message (type ${m.type}) on a sealed session`); return undefined; }
+        try { return await sealed.bridge.open(m); } catch (e) {
+          log(`a sealed frame did not open (${e.message}): closing the session`);
+          shutdown('sealed frame did not open');
+          return undefined;
+        }
+      }
+      if (m.type === MSG.KEY_EXCHANGE && m.session_id === state.sessionId) {
+        if (!state.publicKey) { log('sealed session refused: no login key to authenticate the initiator with'); shutdown('sealed session needs a key login'); return undefined; }
+        sealed.responder ??= new E2EResponder({
+          signKey: cfg.hostKey, hybrid: true, identity: cfg.hostKey.publicKey,
+          initiator: { publicKey: state.publicKey, require: true },
+        });
+        try {
+          const result = await sealed.responder.respond(m, (reply) => deliverRaw(reply));
+          if (result.key) {
+            sealed.bridge = new SealedBridge({ key: result.key, sessionId: state.sessionId, role: 'responder', scope: 'session' });
+            log(`session sealed${result.hybrid ? ' (hybrid)' : ''}`);
+          }
+        } catch (e) { log(`sealed session refused: ${e.message}`); shutdown('sealed session key exchange failed'); }
+        return undefined;
+      }
+      if (m.type === MSG.PING) return m;
+      if (sealRequired) {
+        log(`refused a plaintext message (type ${m.type}): this host requires a sealed session`);
+        await deliverRaw(errorMsg({ code: 1, message: 'this host requires a sealed session (e2e-session-required)' }));
+        setTimeout(() => shutdown('sealed session required'), 50);
+        return undefined;
+      }
+      return m;
     }
 
     async function handlePasswordAuth(m) {

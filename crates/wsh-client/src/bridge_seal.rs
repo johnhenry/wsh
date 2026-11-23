@@ -18,8 +18,18 @@ use wsh_core::{cbor_encode, decode_envelope, WshError, WshResult};
 /// `EncryptedFrame.channel_id` of a bridge-level frame.
 pub const BRIDGE_CHANNEL_ID: u32 = 0;
 
+/// What a sealed bridge may carry (wsh #155).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// A reverse bridge across a relay: only what a relay may forward.
+    Bridge,
+    /// A whole direct or pipe-relayed connection: any message after login.
+    Session,
+}
+
 /// One direction pair of a sealed bridge.
 pub struct SealedBridge {
+    scope: Scope,
     key: [u8; 32],
     session_id: String,
     send_tag: RoleTag,
@@ -42,7 +52,12 @@ impl std::fmt::Debug for SealedBridge {
 impl SealedBridge {
     /// `role` is this side's: [`RoleTag::Initiator`] is the operator, [`RoleTag::Responder`] the peer.
     pub fn new(key: [u8; 32], session_id: String, role: RoleTag) -> Self {
+        Self::with_scope(key, session_id, role, Scope::Bridge)
+    }
+
+    pub fn with_scope(key: [u8; 32], session_id: String, role: RoleTag, scope: Scope) -> Self {
         Self {
+            scope,
             key,
             session_id,
             send_tag: role,
@@ -50,6 +65,10 @@ impl SealedBridge {
             send_counter: 0,
             recv_counter: 0,
         }
+    }
+
+    pub fn scope(&self) -> Scope {
+        self.scope
     }
 
     pub fn session_id(&self) -> &str {
@@ -109,7 +128,8 @@ impl SealedBridge {
         self.recv_counter += 1;
         let inner = decode_envelope(&plain)?;
         if matches!(inner.msg_type, MsgType::RelayForward)
-            || !wsh_core::messages::is_relay_forwardable(inner.msg_type)
+            || (self.scope == Scope::Bridge
+                && !wsh_core::messages::is_relay_forwardable(inner.msg_type))
         {
             return Err(WshError::Other(
                 "sealed message of a type that may not cross a bridge".into(),

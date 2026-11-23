@@ -151,7 +151,7 @@ export class E2EResponder {
 
   /**
    * @param {object} [opts]
-   * @param {CryptoKey | null} [opts.signKey] - long-term Ed25519 private key; given, the reply is signed
+   * @param {CryptoKey | { sign: (data: Uint8Array) => Promise<Uint8Array> } | null} [opts.signKey] - long-term Ed25519 private key (or a signer); given, the reply is signed
    * @param {boolean} [opts.hybrid=true] - offer X25519+ML-KEM-768 when the initiator asks for it
    * @param {Uint8Array | null} [opts.identity] - this responder's raw 32-byte identity key (what an initiator signs as `responderIdentity`)
    * @param {{ publicKey: Uint8Array, require?: boolean } | null} [opts.initiator] - the operator's identity key, already
@@ -234,7 +234,9 @@ export class E2EResponder {
       kemPublicKey: localKem?.publicKey,
     };
     if (this.#sign) {
-      reply.signature = await signBytes(this.#sign, keyExchangeTranscript({ sessionId, algorithm, initiatorKey: peerPub, responderKey: localPub }));
+      const transcript = keyExchangeTranscript({ sessionId, algorithm, initiatorKey: peerPub, responderKey: localPub });
+      // a CryptoKey, or a signer ({ sign }) such as a host key that is not extractable or lives elsewhere
+      reply.signature = typeof this.#sign.sign === 'function' ? await this.#sign.sign(transcript) : await signBytes(this.#sign, transcript);
     }
     await out(keyExchange(reply));
 

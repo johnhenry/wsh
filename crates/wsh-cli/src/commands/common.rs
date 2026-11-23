@@ -351,8 +351,10 @@ pub struct IdentityPolicy {
     pub allow_operators: Vec<String>,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
     pub operator_proof: OperatorProofMode,
-    /// Reverse operator: seal the bridge (`--sealed`).
+    /// Reverse operator: seal the bridge (`--sealed` on `wsh reverse-connect`).
     pub sealed: bool,
+    /// Every other command that dials one host: seal the whole session or fail (`--sealed`, #155).
+    pub sealed_session: bool,
 }
 
 /// Whether `wsh reverse-connect` offers to prove its identity to the peer.
@@ -478,6 +480,11 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
         username: resolved.user.clone(),
         key_name: Some(identity.to_string()),
         known_host: resolved.known_host.clone(),
+        seal_session: if identity_policy().sealed_session {
+            wsh_client::SessionSeal::Required
+        } else {
+            wsh_client::SessionSeal::Auto
+        },
         ..Default::default()
     };
 
@@ -502,6 +509,9 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
         {
             Ok(client) => {
                 // `-L` / `-R`: the forwards live as long as this connection does.
+                if client.session_sealed() {
+                    eprintln!("wsh: session sealed end to end (a relay in the middle carries ciphertext only)");
+                }
                 crate::commands::forward::start_configured(&client).await?;
                 return Ok(client);
             }
