@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### The README states the gzipped size of each browser entry point, and CI fails when it is stale (#128, the part that was left; tooling and docs only)
+
+Most of #128 was already in place (#115, #131, #138): `"sideEffects": false`, separate browser entry points for the client (`.`), the memory host
+(`./memory`), the connection pieces (`./host`) and the reverse host (`./reverse`), the CBOR codec and the generated tables tree-shake (probes
+bundle a single import), `npm run size` bundles each entry with esbuild and compares it to `scripts/bundle-budget.json` (CI runs it, writes the
+table to the job summary, and a bundle more than 10% over its budget fails), and `test/browser-bundle.test.mjs` rejects a Node built-in or
+`Buffer` in any of them. What was missing: the README did not state the sizes. It now has a table (minified and gzip bytes of each entry point
+and of three single-import probes) between markers, rendered from the budget file; `npm run size -- --update` rewrites budget and table together,
+and `npm run size` (CI) and `test/browser-bundle.test.mjs` fail when the table is not the budget's. No change to the package, no wire change.
+
 ### Spec versus implementation: a generated message matrix, and a compatibility policy (#129; documentation and tooling, no wire change)
 
 - **`spec/message-matrix.md`** lists every message of `spec/wsh-v1.yaml` (110) and whether the JS host, JS client, Rust host and Rust client
