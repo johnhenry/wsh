@@ -76,6 +76,7 @@ function exposedRoots(window, expose) {
   const eventFields = {};
   const handles = {};
   const types = {};
+  const mcpTools = [];
   let limits;
   for (const name of names) {
     const cfg = expose[name];
@@ -104,9 +105,19 @@ function exposedRoots(window, expose) {
     for (const [type, fields] of Object.entries(cfg.eventFields ?? {})) eventFields[type] = [...new Set([...(eventFields[type] ?? []), ...(Array.isArray(fields) ? fields : [])])];
     if (cfg.authorize !== undefined) { if (typeof cfg.authorize !== 'function') throw new TypeError(`createPageHost: expose.${name}.authorize must be a function`); authorizers.set(name, cfg.authorize); }
     if (cfg.limits !== undefined) limits = { ...limits, ...cfg.limits };
+    // An MCP face for named paths of this root (#219): `mcp: { tools: [{ name, description, call: 'app.cart.add', inputSchema }, { name, description, get: 'document.title' }] }`, paths relative to the root.
+    // Off unless written; each tool names one path that the allow-lists above also name. It is served on the `mcp` channel beside the page's WebMCP tools.
+    if (cfg.mcp !== undefined) {
+      if (!isObj(cfg.mcp) || Object.keys(cfg.mcp).some((k) => k !== 'tools') || !Array.isArray(cfg.mcp.tools)) throw new TypeError(`createPageHost: expose.${name}.mcp must be { tools: [...] }: name each path that becomes a tool (nothing is a tool by being allowed)`);
+      for (const tool of cfg.mcp.tools) {
+        if (!isObj(tool)) throw new TypeError(`createPageHost: expose.${name}.mcp.tools entries must be objects`);
+        const qualify = (v) => (typeof v === 'string' ? `${name}.${v}` : v);
+        mcpTools.push({ ...tool, ...(tool.call !== undefined ? { call: qualify(tool.call) } : {}), ...(tool.get !== undefined ? { get: qualify(tool.get) } : {}) });
+      }
+    }
   }
   const authorize = authorizers.size ? (who, op) => (authorizers.has(op.root) ? authorizers.get(op.root)(who, { ...op, path: op.path }) : true) : undefined;
-  return { roots, allow, authorize, limits, eventFields, handles, types };
+  return { roots, allow, authorize, limits, eventFields, handles, types, mcp: mcpTools.length ? { tools: mcpTools } : undefined };
 }
 
 /**
@@ -219,7 +230,7 @@ export async function createPageHost(options = {}) {
     if (!unattended) throw new TypeError('createPageHost: this window has no document to draw the indicator in: supply indicator callbacks, or say unattended: true');
   }
   if (!doc && !unattended && !callbacks) throw new TypeError('createPageHost: this window has no document: supply indicator callbacks, or say unattended: true');
-  if (mcp && (mcp.approve ?? 'consequential') !== 'never' && !doc && !mcp.prompt && !unattended) {
+  if ((mcp || exposed?.mcp) && (mcp?.approve ?? 'consequential') !== 'never' && !doc && !mcp?.prompt && !unattended) {
     throw new TypeError("createPageHost: this window has no document to ask the person in: supply mcp.prompt, mcp.approve: 'never', or unattended: true");
   }
   if (typeof window.WebSocket !== 'function') throw new TypeError('createPageHost: window.WebSocket is needed to dial the relay');
@@ -262,17 +273,22 @@ export async function createPageHost(options = {}) {
   let watch = null;
   let unlisten = null;
 
-  const mcpHandler = mcp ? webmcpTools({
-    ...mcp, window, timers: options.timers, server: { name, ...(mcp.server ?? {}) },
-    // Nobody is in front of an unattended window: without a prompt of the embedder's, what needs approval is denied.
-    prompt: mcp.prompt ?? (unattended ? () => false : undefined),
-    guard: () => gone() ?? mcp.guard?.() ?? null,
-  }) : null;
   const objectsHandler = exposed ? exposeObjects({
-    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, eventFields: exposed.eventFields, handles: exposed.handles, types: exposed.types, timers,
+    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, eventFields: exposed.eventFields, handles: exposed.handles, types: exposed.types, mcp: exposed.mcp, timers,
     // Handle ids come from the served window's own CSPRNG.
     random: (n) => window.crypto.getRandomValues(new Uint8Array(n)),
     guard: () => gone(),
+  }) : null;
+  // The tools of the `mcp` channel: the page's WebMCP tools (`mcp.allow`) and the paths the host named as tools (`expose.ROOT.mcp.tools`). One handler, so one approval, one set of
+  // bounds, one label; a tool made from a path is allowed by being named in `expose`, and still needs the key's `mcp:TOOL` and `objects:ROOT:OP` capabilities.
+  const objectTools = objectsHandler?.mcpTools ?? [];
+  const mcpHandler = mcp || objectTools.length ? webmcpTools({
+    ...(mcp ?? {}), window, timers: options.timers, server: { name, ...(mcp?.server ?? {}) },
+    allow: [...(mcp?.allow ?? []), ...(objectsHandler?.mcpToolNames ?? [])],
+    tools: [...(mcp?.tools ?? []), ...objectTools],
+    // Nobody is in front of an unattended window: without a prompt of the embedder's, what needs approval is denied.
+    prompt: mcp?.prompt ?? (unattended ? () => false : undefined),
+    guard: () => gone() ?? mcp?.guard?.() ?? null,
   }) : null;
   /** What each handler tells and ends: the sessions of a key, or all of them. */
   const closeSessions = async (reason, fingerprint) => {

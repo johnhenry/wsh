@@ -93,6 +93,9 @@ export function exposeObjects(options = {}) {
   handler.capabilityScoped = true;
   handler.rootNames = server.rootNames;
   handler.limits = server.limits;
+  // The MCP face (#219): the tools the host named in `mcp: { tools }` (none unless written), for `webmcpTools({ tools: handler.mcpTools, allow: handler.mcpToolNames })`.
+  handler.mcpTools = server.mcpTools;
+  handler.mcpToolNames = server.mcpToolNames;
   return handler;
 }
 
