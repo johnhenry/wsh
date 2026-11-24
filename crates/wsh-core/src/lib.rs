@@ -17,6 +17,7 @@ pub mod peer_record;
 pub mod qmux;
 pub mod qmux_connection;
 pub mod remote_runtime;
+pub mod rpc_codec;
 pub mod token;
 pub mod transport;
 

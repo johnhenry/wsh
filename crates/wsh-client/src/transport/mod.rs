@@ -24,6 +24,33 @@ pub enum TransportKind {
 ///
 /// Wraps both WebSocket and WebTransport sessions so we can use them
 /// without `dyn TransportSession` (which is not object-safe due to async methods).
+/// Opens client-initiated data streams WITHOUT the transport lock: the client's dispatch loop holds
+/// that lock for as long as it waits for a control message, so a call that needed it (an rpc
+/// channel's stream, wsh #127) would stall until something else woke the loop.
+#[derive(Clone)]
+pub struct StreamOpener(
+    std::sync::Arc<
+        dyn Fn() -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = WshResult<IdentifiedStream>> + Send>,
+            > + Send
+            + Sync,
+    >,
+);
+
+impl StreamOpener {
+    pub(crate) fn new<F, Fut>(f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = WshResult<IdentifiedStream>> + Send + 'static,
+    {
+        Self(std::sync::Arc::new(move || Box::pin(f())))
+    }
+
+    pub async fn open(&self) -> WshResult<IdentifiedStream> {
+        (self.0)().await
+    }
+}
+
 pub enum AnyTransport {
     WebSocket(WebSocketSession),
     WebTransport(WebTransportSession),
@@ -65,6 +92,16 @@ impl AnyTransport {
             Self::Test(_) => Err(WshError::Transport(
                 "test transport does not support streams".into(),
             )),
+        }
+    }
+
+    /// A handle that opens data streams without going through this transport's lock.
+    pub fn stream_opener(&self) -> Option<StreamOpener> {
+        match self {
+            Self::WebSocket(s) => Some(s.stream_opener()),
+            Self::WebTransport(s) => Some(s.stream_opener()),
+            #[cfg(test)]
+            Self::Test(_) => None,
         }
     }
 

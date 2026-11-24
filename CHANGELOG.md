@@ -33,6 +33,42 @@ same refusal sentences (`ListenFail.reason`, `GatewayFail.message`). `wsh-server
 - Out of scope for the Rust server, listed for #145: named endpoints (`OpenEndpoint`) and execution targets (`ListTargets`) are for hosts without a file system and
   are not offered by `wsh-server` (they parse and grant nothing, README); `tls-exporter` channel binding needs a TLS terminated by the process itself.
 
+### `wsh mcp`: the Rust CLI bridges stdio to the `mcp` rpc channel of a host, on a new rpc client in `wsh-client` (#127, the Rust half; Rust only)
+
+The other half of #127 (the npm `wsh-mcp` shipped in 0.44.0). `wsh mcp [user@]host|URL` lets an MCP client that launches a command use an MCP server
+behind a Node host or a memory host, without Node. **No wire change, no new feature string, no default changed**: the channel is #85's, and a Rust
+`wsh-server`, a released JS host and a released Rust client are all untouched. The one spec edit lists `rpc` among the `ChannelKind` values the
+`Open` message already carried (`Open { kind: "rpc" }` has been on the wire since #85; the Rust server reads it from the raw message), so the Rust
+types now have a name for it; the generated JS and Rust files and `spec/wsh-v1.md` follow, which adds one export to the npm package, `CHANNEL_KIND.RPC`
+(`'rpc'`, typed in `index.d.ts`; nothing in the package uses it yet, and the `has exactly 7 kinds` test now says 8).
+
+- **`wsh-client` gets an rpc client.** `WshClient::open_rpc(protocol)` sends `Open { kind: "rpc", command }` (refused before anything is sent when
+  the host did not advertise `rpc` and `rpc-protocol:<name>`), opens the channel's data stream and returns an `RpcChannel` that sends and receives
+  JSON-RPC messages as a CBOR sequence, bounded by the host's `rpc-max-message:<n>` both ways (`rpc_offer()` reads the offer). To make that possible
+  the WebSocket transport can now open a client-initiated QMux data stream (it returned an error before) and announces it with an empty STREAM frame,
+  as the JS client does (`QMuxConnection::announce_stream` in `wsh-core`); streams are opened without the transport lock, which the dispatch loop
+  holds while it waits. The CBOR-sequence decoder (`wsh_core::rpc_codec`) is the one `wsh-server` already uses for the channels it hosts, with the
+  same bound and the same refusals (copied rather than shared: `wsh-server`'s own decoder is untouched).
+- **`wsh mcp` behaves as `wsh-mcp` does**: stdout carries MCP messages only, one per line; `--channel NAME`; reconnect (5 attempts from 500 ms,
+  doubling; `--reconnect-attempts`, `--no-reconnect`) that replays `initialize` / `initialized` without telling the client; a request in flight when
+  the connection drops is answered with `-32603`; what the client sends meanwhile is held (at most 200, the rest of the requests refused);
+  `notifications/cancelled` for a request in flight becomes the channel's `$/cancel`, and the answer to it is not passed on; exit 0 when the client closes,
+  1 when the host is lost for good, 2 when it cannot start, including **a host that offers no such channel, with the channels it does offer**.
+- **Differences, on purpose:** the identity is `-i NAME` (a key in `~/.wsh/keys`, what `wsh keygen NAME` writes), not a file; without `--host-key` the host
+  is checked against `known_hosts` like every `wsh` command (a first use is refused without `--accept-new-host-key`: stdin is the MCP stream and cannot
+  answer a prompt). `--host-key KEY` (64 hex digits or an `ssh-ed25519` line) pins the host through a new `ConnectConfig::expect_host_key`: the host must
+  prove that key before any credential is sent, a host that proves none is refused, and `known_hosts` is neither read nor written. `--via` works. `--target`
+  is refused, as for every command that is not per target.
+- **`wsh-server`:** it serves `wsh-host` (and `wsh-fs` with `[rpc] fs_root`) and **no `mcp` channel**, so `wsh mcp` to it is refused (exit 2, "it offers:
+  wsh-host") rather than working; `wsh tools` is the way to its `[[mcp.tools]]`. `wsh mcp --channel wsh-host` against it works, and is tested.
+- **A released peer:** a JS host serves `mcp` over rpc since 0.25.0 (`mcpServerAdapter`); a released Rust client cannot open rpc channels at all (it has no
+  `open_rpc`), and does not need to change; a host without `rpc` is refused before anything is sent.
+- Not covered: a sealed session carries no rpc channels on any host (`wsh mcp --sealed` is refused); WebTransport opens the stream but is untested against a
+  host (the peer sees a WebTransport stream only at its first byte, which the first message supplies).
+- Tests: `test/rust/wsh-mcp.test.mjs` drives the built `wsh` with the MCP SDK's stdio client against a Node host and a memory host, and covers the same cases
+  as `test/mcp-stdio.test.mjs` (no channel, `--channel`, refused login, pinned and unpinned host key, reconnect, give-up, the held bound, cancellation, signals,
+  the size limit, `--via`), plus `wsh-server`; unit tests in `wsh-core` (`rpc_codec`, `announce_stream`), `wsh-client` (`rpc`) and `wsh-cli` (`mcp`).
+
 ## 0.44.1
 
 ### The README states the gzipped size of each browser entry point, and CI fails when it is stale (#128, the part that was left; tooling and docs only)

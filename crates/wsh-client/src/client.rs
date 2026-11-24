@@ -44,6 +44,11 @@ pub struct ConnectConfig {
     /// connected to with its identity unverified, as before. A host that advertises a key it
     /// cannot prove is always refused.
     pub require_host_key: bool,
+    /// Pin the host to this key fingerprint (the hex SHA-256 of its Ed25519 key, as `known_hosts`
+    /// records it): the host must PROVE that key, whatever `known_hosts` says, or the connection is
+    /// refused before any credential is sent. A host that proves no key is refused too. `None`:
+    /// only `known_hosts` decides. (`wsh mcp --host-key`.)
+    pub expect_host_key: Option<String>,
     /// What to do the first time a PROVEN host key is seen (no `known_hosts` entry): see [`FirstUse`].
     /// A CHANGED key is always refused.
     pub first_use: FirstUse,
@@ -72,6 +77,7 @@ impl Default for ConnectConfig {
             verify_host: true,
             known_host: None,
             require_host_key: false,
+            expect_host_key: None,
             seal_session: SessionSeal::Auto,
             first_use: FirstUse::Refuse,
             known_hosts_path: None,
@@ -305,6 +311,8 @@ pub struct WshClient {
     seal: Arc<SealGate>,
     /// The key this connection logged in with (kept to sign the sealed-session key exchange).
     login_key: Option<ed25519_dalek::SigningKey>,
+    /// Opens data streams without the transport lock (the dispatch loop holds it while it waits).
+    stream_opener: Option<crate::transport::StreamOpener>,
 }
 
 /// Opens connections through the host and listens on it; cheap to clone, usable from any task.
@@ -455,6 +463,7 @@ impl WshClient {
             Ok(Err(err)) => return Err(err),
             Err(_) => return Err(WshError::Timeout),
         };
+        let stream_opener = transport.stream_opener();
         let transport = Arc::new(Mutex::new(transport));
 
         let (control_action_tx, control_action_rx) = mpsc::channel::<ControlAction>(256);
@@ -498,6 +507,7 @@ impl WshClient {
             host_key: None,
             host_key_newly_pinned: false,
             channel_binding_kinds: Vec::new(),
+            stream_opener,
         };
 
         // Perform handshake with timeout
@@ -1167,6 +1177,100 @@ impl WshClient {
         }
     }
 
+    /// What the host's `ServerHello` says about typed rpc channels (wsh #85): whether it serves them, which
+    /// protocols, and the largest message.
+    pub async fn rpc_offer(&self) -> crate::rpc::RpcOffer {
+        crate::rpc::RpcOffer::parse(&self.server_features.lock().await)
+    }
+
+    /// Open a typed rpc channel (wsh #85) speaking `protocol` (`mcp`, `wsh-fs`, `wsh-host`, or a host's own).
+    ///
+    /// Refuses, before sending anything, a protocol the host did not advertise (`rpc` and
+    /// `rpc-protocol:<name>` in its `ServerHello.features`): an older host would not know the kind.
+    /// Needs a transport that can open data streams (WebSocket, WebTransport).
+    pub async fn open_rpc(&self, protocol: &str) -> WshResult<crate::rpc::RpcChannel> {
+        if !crate::rpc::valid_protocol_name(protocol) {
+            return Err(WshError::Other(format!(
+                "{protocol:?} is not a valid rpc protocol name"
+            )));
+        }
+        let offer = self.rpc_offer().await;
+        if !offer.enabled {
+            return Err(WshError::Other(format!(
+                "UNSUPPORTED_PROTOCOL: this host does not advertise \"{}\" channels (cannot open \"{protocol}\")",
+                crate::rpc::RPC_FEATURE
+            )));
+        }
+        if !offer.serves(protocol) {
+            return Err(WshError::Other(format!(
+                "UNSUPPORTED_PROTOCOL: this host does not advertise the \"{protocol}\" rpc protocol"
+            )));
+        }
+        if self.session_sealed() {
+            return Err(WshError::Other(
+                "typed rpc channels are not carried on a sealed session".into(),
+            ));
+        }
+        let envelope = Envelope {
+            msg_type: MsgType::Open,
+            payload: Payload::Open(OpenPayload {
+                kind: ChannelKind::Rpc,
+                command: Some(protocol.to_string()),
+                cols: None,
+                rows: None,
+                env: None,
+                stdio: None,
+                target: None,
+            }),
+        };
+        let response = self.send_and_wait(envelope, MsgType::OpenOk).await?;
+        let ok = match response.payload {
+            Payload::OpenOk(ok) => ok,
+            Payload::OpenFail(fail) => return Err(WshError::Channel(fail.reason)),
+            _ => {
+                return Err(WshError::InvalidMessage(
+                    "unexpected response to OPEN".into(),
+                ))
+            }
+        };
+        let opened = async {
+            if ok.data_mode != SessionDataMode::Stream {
+                return Err(WshError::Channel(
+                    "the host answered an rpc Open with a data mode other than stream".into(),
+                ));
+            }
+            // Not through the transport lock: the dispatch loop holds it while it waits for a control message.
+            match &self.stream_opener {
+                Some(opener) => opener.open().await,
+                None => Err(WshError::Transport(
+                    "this transport cannot open data streams".into(),
+                )),
+            }
+        }
+        .await;
+        let stream = match opened {
+            Ok(s) => s,
+            Err(err) => {
+                self.early.lock().await.release(ok.channel_id);
+                return Err(err);
+            }
+        };
+        // The channel stands in the session table (a virtual stand-in), so the host's `Close` for it
+        // finds something and our own `close` can tell the host.
+        let stub = Arc::new(WshSession::new_virtual(
+            ok.channel_id,
+            ChannelKind::Rpc,
+            self.control_action_tx.clone(),
+            Vec::new(),
+        ));
+        self.register_session(&stub, &ok).await;
+        Ok(crate::rpc::RpcChannel::start(
+            stream.stream,
+            offer.max_message_bytes,
+            stub,
+        ))
+    }
+
     /// Build the `WshSession` (and its stderr companion) an `OpenOk` describes.
     async fn build_session(
         &self,
@@ -1806,7 +1910,7 @@ impl WshClient {
 
         // Host key (wsh #59, #145): trust only a key the host PROVED it holds, over this
         // connection, before any credential leaves. A bare `host_fingerprint` is not a proof.
-        if config.verify_host {
+        if config.verify_host || config.expect_host_key.is_some() {
             let proven = crate::host_key::verify_advert(
                 &advertised_features,
                 host_fingerprint.as_deref(),
@@ -1814,7 +1918,30 @@ impl WshClient {
                 &host_key_nonce,
                 &config.username,
             )?;
+            if let Some(want) = &config.expect_host_key {
+                match &proven {
+                    Some(key) if key.fingerprint.eq_ignore_ascii_case(want) => {}
+                    Some(key) => {
+                        return Err(WshError::AuthFailed(format!(
+                            "HOST KEY MISMATCH for {known_host}: pinned {want}, the host proved {}; \
+                             refusing before sending credentials",
+                            key.fingerprint
+                        )))
+                    }
+                    None => {
+                        return Err(WshError::AuthFailed(format!(
+                            "HOST KEY REQUIRED: {known_host} proved no host key, but {want} is pinned; \
+                             refusing before sending credentials"
+                        )))
+                    }
+                }
+            }
             match proven {
+                // An explicit pin that matched is the whole decision: `known_hosts` is neither
+                // consulted nor written (the person named the key; it is not a trust-on-first-use).
+                Some(key) if config.expect_host_key.is_some() => {
+                    self.host_key = Some(key);
+                }
                 Some(key) => {
                     self.host_key_newly_pinned = self.pin_host_key(config, known_host, &key)?;
                     self.host_key = Some(key);
@@ -3270,6 +3397,7 @@ mod tests {
             host_key: None,
             host_key_newly_pinned: false,
             channel_binding_kinds: Vec::new(),
+            stream_opener: None,
             gateway: Default::default(),
         };
 
@@ -3375,6 +3503,7 @@ mod tests {
             host_key: None,
             host_key_newly_pinned: false,
             channel_binding_kinds: Vec::new(),
+            stream_opener: None,
             gateway: Default::default(),
         };
 
