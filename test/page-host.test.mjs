@@ -13,7 +13,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createPipeRelay } from '@johnhenry/wsh/pipe-relay';
 import { createPageHost, captureWebMcp } from '@johnhenry/wsh/page';
-import { set, on } from '@johnhenry/wsh/objects';
+import { set, on, use, RemoteHandle, NonValue } from '@johnhenry/wsh/objects';
 import {
   WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, exportPrivateKeyPKCS8, fingerprint, mcpClientTransport, cborEncode, MSG,
 } from '@johnhenry/wsh';
@@ -100,8 +100,13 @@ describe('createPageHost: what it refuses to start without', () => {
     await assert.rejects(createPageHost({ ...ok, window: createFakeWindow({ document: false }), indicator: callbacks }), /no document to ask the person/);
   });
   it('expose: handles mode, the wide-open string, a root that is not the window without an object, and an empty expose are refused with a sentence', async () => {
-    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles' } } }), /'handles' is not built/);
-    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: 'everything-i-understand-this-is-remote-control' } } }), /not built/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'values', nodes: true } } }), /only for mode: 'handles'/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles', nodes: 'yes' } } }), /boolean/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles', allow: { call: ['app.**'] } } } }), /wide.*list the paths|wideEntries/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'values', wideEntries: true } } }), /only for mode: 'handles'/);
+    assert.ok(await createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles', wideEntries: true, allow: { call: ['app.**'] } } } }).then((h) => h.close().then(() => true)));
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'sideways' } } }), /must be 'values'/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: 'everything-i-understand-this-is-remote-control' } } }), /not accepted/);
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { app: { allow: { get: ['**'] } } } }), /only a root named "window" is the window/);
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: {} }), /names no root/);
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: { get: [''] } } } }), /non-empty strings/);
@@ -563,6 +568,52 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
       await until(() => listeners === 0, `the listener to go (${how})`);
       await page.host.close();
     }
+  });
+
+  it('handles: a root opts in with mode handles; an app object is a handle usable across calls, a node is not unless nodes is set, and Stop releases everything', async () => {
+    const { win } = worldWindow();
+    class Store { constructor() { this.n = 1; } bump() { this.n++; return this.n; } }
+    class Node {}
+    class Box extends Node { constructor() { super(); this.id = 'box'; } }
+    win.app.store = new Store();
+    win.app.box = new Box();
+    const expose = { window: { mode: 'handles', allow: { get: ['app.store', 'app.box'], call: ['app.store.bump'] } } };
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const { window: remote } = await wsh.openObjects();
+    const store = await remote.app.store;
+    assert.ok(store instanceof RemoteHandle);
+    assert.equal(await use(store).bump(), 2);
+    await assert.rejects(Promise.resolve(use(store).n), (e) => e.reason === 'not-allowed');
+    assert.ok((await remote.app.box) instanceof NonValue, 'a node is named, not a handle, without nodes: true');
+    byRole(win, 'stop')[0].click();
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+    const again = new WshClient(); closers.push(() => again.disconnect());
+    await again.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true }).catch(() => {});
+    await assert.rejects(Promise.resolve(use(store).bump()), /closed|stopped|no such handle/);
+  });
+
+  it('callbacks: a function passed to an entry that says (callback) is a stub in the page; after Stop it is dead, and the page is never made to wait', async () => {
+    const { win } = worldWindow();
+    const stubs = [];
+    win.app.watch = (fn) => { stubs.push(fn); return 'watching'; };
+    win.app.noCallbacks = (fn) => typeof fn;
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: { window: { allow: { call: ['app.watch(callback)', 'app.noCallbacks'] } } } } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const { window: remote } = await wsh.openObjects();
+    const got = [];
+    assert.equal(await remote.app.watch((x) => got.push(x)), 'watching');
+    assert.equal(stubs[0]({ n: 1 }), undefined);
+    await until(() => got.length === 1, 'the callback');
+    assert.deepEqual(got, [{ n: 1 }]);
+    await assert.rejects(Promise.resolve(remote.app.noCallbacks(() => 1)), (e) => e.reason === 'not-allowed' && /does not accept callbacks/.test(e.message));
+    byRole(win, 'stop')[0].click();
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+    assert.doesNotThrow(() => stubs[0]({ n: 2 }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(got, [{ n: 1 }]);
   });
 
   it('authorize(who, op) of a root is asked, with the key of the caller', async () => {

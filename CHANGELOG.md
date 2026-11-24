@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### `wsh-objects` callbacks: a far-side function as an argument of a call that accepts one (#190; JS)
+
+`allow.call: ['window.app.subscribe(callback)']`: an entry that ends in `(callback)` says the call accepts functions as arguments. The page's function receives a **stub** it may keep and call with plain values; the far side's function runs on the far side.
+A call entry without the suffix refuses a function argument (`does not accept callbacks`); a function nested in an argument, a remote reference and a handle are still refused where they are written.
+
+- **One-way:** the stub returns `undefined` at once, so the page cannot be made to wait for the far side; the far side's return value is not delivered (no notation for it yet). Its arguments are plain values only (what cannot be cloned is `null`; never a handle).
+- **Bounds:** `maxCallbacks` (16 per channel, refused by name), `maxCallbacksPerSecond` (20 per callback), `maxCallbackBytes` (16384); calls over the rate, the size or the shared queue are dropped and counted, and `onCallbackDropped({ dropped })` tells the client before the next one. They go through the channel's credit.
+- **Dead after the session:** the channel ending (leaving, Stop, a navigation, a revoke) and `release(fn)` kill the stub; calling it is a counted no-op. A far-side listener's error goes to `onCallbackError` and never reaches the page. The call is a `call` for `authorize` (`op.callbacks`) and for `objects:ROOT:call`.
+- **Wire: nothing new beyond the channel:** a `callbacks: [[argument index, id]]` field on a call or construct op, the method `releaseCallback`, and the notification `callback`. **A released peer (0.47.0 / the next release's predecessor):** an older host ignores the unknown `callbacks` field and would run the call with `null` in place of the function, so use this release on the host before a client passes a function; an older client cannot pass one.
+
+### `wsh-objects` handles, on the path-bound model (#190; JS)
+
+A root can opt in to **handles** (`exposeObjects({ handles: { window: {} } })`, `createPageHost({ expose: { window: { mode: 'handles' } } })`): a function or an object that is not plain data comes back as an opaque `RemoteHandle`
+instead of a named non-value, and `use(handle)` makes a reference that stands on it; `release(handle)` gives its place back. Values stays the default, and the opt-in is per root. The wide-open string from the first design is not accepted: the allow-lists apply to handles too.
+
+- **Path-bound:** a handle stands at the path that produced it (`a.b` for a get, `a.f()` for a call, its members `a.f().x`), and every operation through it is judged by the allow-lists for that path extended by the member. A handle never widens what a path grants; the always-refused names and the entries that must name their path stay refused through it.
+- **Opaque and local:** a 128-bit random id (from the CSPRNG: the page host uses its window's), meaningful only on the channel that produced it and for the key that holds it; nothing of it is enumerable on the far side, it is not thenable and not an argument.
+- **Nodes and the window graph** (Node, Window, Document) are not handed out as handles unless the root sets its own `nodes: true`; even then `ownerDocument`, `defaultView`, `parentNode`, `parentElement`, `getRootNode`, `contentWindow`, `contentDocument`, `self`, `window`, `top`, `parent`, `frames`, `opener`, `globalThis` stay refused until an entry names them.
+- **Bounded:** `maxHandles` (64) per channel, refused by name on overflow and never evicting; everything is released when the channel ends (leaving, Stop, a navigation, a revoke). A preview (up to 8 member names) is present only where a `get` entry names the path.
+- **Previews list only walkable names** (those `describe` would list), and **a wildcard in `call` or `set` on a handles root needs `wideEntries: true`** (or the paths listed): without it the host refuses to start with a sentence saying so. `get`-only wildcards and values roots are not affected.
+- **Capabilities unchanged:** `objects:ROOT[:OP]` apply, and an operation through a handle is the same get, call or set of the producing path.
+- **The indicator is described as best effort** in the README: page code can remove a DOM element; Stop, revoke and the key's capabilities are the controls that hold.
+- **Not built:** callbacks as arguments, events through a handle.
+- **Wire: nothing new beyond the `wsh-objects` channel:** a result `{ h, kind, type?, preview? }`, requests that start from `{ handle }` instead of `{ root }`, and the method `release`. **A released peer (0.47.0):** a 0.47.0 host never returns a handle; a 0.47.0 client against a host that does would not recognise `h` (it sees an unnamed value), so use this release on the client when a host opts in.
+
 ## 0.47.0
 
 npm only (no Rust crate changed since `rust-v0.17.1`). New API: `@johnhenry/wsh/objects` events, and `objects:ROOT[:OP]` key capabilities. **A key line with an `objects:` capability is refused by older JS hosts (0.46.x and before) and by `wsh-server`** (unknown capability: the key does not log in): use this release on the host before adding one.

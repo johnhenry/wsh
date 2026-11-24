@@ -256,6 +256,14 @@ window.h.pageApp = () => {
     state: { user: 'alice', flags: { beta: true } },
     secret: 'planted-app-secret',
   };
+  // An object that cannot be cloned (a class instance with state), for handles.
+  class Account { constructor() { this.balance = 10; } deposit(n) { this.balance += n; return this.balance; } }
+  window.app.account = new Account();
+  // A call that keeps a callback: the page can call it later, as a real application would (a timer, an event).
+  window.__watchers = [];
+  window.app.watch = (fn) => { window.__watchers.push(fn); return 'watching'; };
+  window.app.tick = (n) => { for (const fn of window.__watchers) fn({ n, at: 'page' }); return window.__watchers.length; };
+  window.app.noCallbacks = (fn) => typeof fn;
 };
 window.h.pageHostInfo = () => ({ sessions: pageHostHandle.sessions.map((s) => s.fingerprint), closed: pageHostHandle.closed, closedReason: pageHostHandle.closedReason, cart: window.__cart, ran: window.__ran.map((r) => r.name) });
 window.h.stopPageHost = () => pageHostHandle?.close();

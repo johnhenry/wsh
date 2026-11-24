@@ -72,13 +72,17 @@ function exposedRoots(window, expose) {
   const allow = { get: [], call: [], set: [], on: [] };
   const authorizers = new Map();
   const eventFields = {};
+  const handles = {};
   let limits;
   for (const name of names) {
     const cfg = expose[name];
     if (!isObj(cfg)) throw new TypeError(`createPageHost: expose.${name} must be { mode, allow }`);
-    if (cfg.mode === 'handles') throw new TypeError("createPageHost: expose mode 'handles' is not built: only 'values' exists (handles and callbacks are a later step of #190)");
-    if (cfg.mode !== undefined && cfg.mode !== 'values') throw new TypeError("createPageHost: expose mode must be 'values'");
-    if (typeof cfg.allow === 'string') throw new TypeError('createPageHost: expose allow must be { get, call, set } (the wide-open form belongs to mode handles, which is not built)');
+    if (cfg.mode !== undefined && cfg.mode !== 'values' && cfg.mode !== 'handles') throw new TypeError("createPageHost: expose mode must be 'values' (the default) or 'handles'");
+    if (typeof cfg.allow === 'string') throw new TypeError('createPageHost: expose allow must be { get, call, set, on }: a wide-open string is not accepted, and the allow-lists apply to handles too');
+    // 'handles' is this root's own opt-in; `nodes: true` is a second one, for nodes, windows and documents: control of the page.
+    if (cfg.nodes !== undefined && (cfg.mode !== 'handles' || typeof cfg.nodes !== 'boolean')) throw new TypeError(`createPageHost: expose.${name}.nodes is a boolean, and only for mode: 'handles'`);
+    if (cfg.wideEntries !== undefined && (cfg.mode !== 'handles' || typeof cfg.wideEntries !== 'boolean')) throw new TypeError(`createPageHost: expose.${name}.wideEntries is a boolean, and only for mode: 'handles'`);
+    if (cfg.mode === 'handles') handles[name] = { nodes: cfg.nodes === true, wideEntries: cfg.wideEntries === true };
     const object = cfg.object ?? (name === 'window' ? window : undefined);
     if (object === undefined) throw new TypeError(`createPageHost: expose.${name}: only a root named "window" is the window; give { object } for another root`);
     roots[name] = object;
@@ -96,7 +100,7 @@ function exposedRoots(window, expose) {
     if (cfg.limits !== undefined) limits = { ...limits, ...cfg.limits };
   }
   const authorize = authorizers.size ? (who, op) => (authorizers.has(op.root) ? authorizers.get(op.root)(who, { ...op, path: op.path }) : true) : undefined;
-  return { roots, allow, authorize, limits, eventFields };
+  return { roots, allow, authorize, limits, eventFields, handles };
 }
 
 /** The indicator in the page: one row per connected key, with the key's fingerprint and a Stop control. */
@@ -152,7 +156,7 @@ function createDomIndicator(window, { name }) {
  *   optionally the rendezvous id (default: a fresh random one, exposed as `host.rendezvousId`)
  * @param {Record<string, { mode?: 'values', allow?: { get?: string[], call?: string[], set?: string[] }, authorize?: Function, limits?: object, object?: object }>} [options.expose]
  *   object access, off unless written: named roots (`window` is the window passed; another name needs `object`), each with its allow-lists by
- *   operation (paths relative to the root: `'document.title'`, `'app.**'`; nothing allowed by default). `mode: 'handles'` is refused: not built.
+ *   operation (paths relative to the root: `'document.title'`, `'app.**'`; nothing allowed by default). `mode: 'handles'` is this root's own opt-in to handles (`nodes: true` a second one, for nodes and the window graph).
  *   See `@johnhenry/wsh/objects` for what `values` mode promises.
  * @param {string} options.name - what this tab is called (shown in the indicator, the `serverInfo` of the MCP server)
  * @param {string | Uint8Array | Array<string | Uint8Array>} options.authorizedKeys - who may log in, as `authorized_keys` lines (with their
@@ -253,7 +257,9 @@ export async function createPageHost(options = {}) {
     guard: () => gone() ?? mcp.guard?.() ?? null,
   }) : null;
   const objectsHandler = exposed ? exposeObjects({
-    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, eventFields: exposed.eventFields, timers,
+    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, eventFields: exposed.eventFields, handles: exposed.handles, timers,
+    // Handle ids come from the served window's own CSPRNG.
+    random: (n) => window.crypto.getRandomValues(new Uint8Array(n)),
     guard: () => gone(),
   }) : null;
   /** What each handler tells and ends: the sessions of a key, or all of them. */

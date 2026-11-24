@@ -18,6 +18,22 @@ export class ObjectsError extends Error {
 }
 
 /** What a remote value that cannot be cloned arrives as: named, never a handle. `kind`: `function`, `symbol`, `bigint`, `number` (too large for the wire), `Date`, `RegExp`, `Error`, `object`. */
+/**
+ * What a value that cannot be cloned arrives as on a root that opted in to handles: an opaque token, nothing of it enumerable, not thenable, not an argument.
+ * It stands at the path that produced it: `use(handle)` makes a reference that continues that path; `release(handle)` gives its place back.
+ */
+export class RemoteHandle {
+  readonly kind: 'function' | 'object';
+  /** The class name, or a function's name. */
+  readonly type?: string;
+  /** Up to 8 member names, only if a `get` entry names the handle's path. */
+  readonly preview?: { keys: string[] };
+}
+/** A reference that stands on a handle: `await use(handle).items.length`. Judged by the producing path extended by what you name. */
+export function use(handle: RemoteHandle): any;
+/** Give a handle's place back (releasing a released handle does nothing); or kill the stub of a function that was passed as a callback. */
+export function release(handleOrCallback: RemoteHandle | ((...args: any[]) => unknown)): Promise<void>;
+
 export class NonValue {
   constructor(wire: { u: string; type?: string; text?: string });
   readonly kind: string;
@@ -52,6 +68,14 @@ export interface ObjectsLimits {
   maxEventBytes: number;
   /** Events waiting for the transport's credit, per channel; more are dropped and counted. Default 100. */
   maxQueuedEvents: number;
+  /** Handles per channel on roots that opted in; more are refused by name, nothing is evicted. Default 64. */
+  maxHandles: number;
+  /** Callbacks (stubs of far-side functions) per channel; more are refused. Default 16. */
+  maxCallbacks: number;
+  /** Calls of one callback per second; the rest are dropped and counted. Default 20. */
+  maxCallbacksPerSecond: number;
+  /** Bytes of the arguments of one callback call; a bigger one is dropped and counted. Default 16384. */
+  maxCallbackBytes: number;
 }
 export const OBJECTS_DEFAULT_LIMITS: Readonly<ObjectsLimits>;
 
@@ -61,6 +85,7 @@ export const NEEDS_LISTING: ReadonlyArray<readonly string[]>;
 /** Allow-lists by operation: path patterns from a root (`'window.document.title'`, `'window.app.**'`; `*` is one segment, `**` any number). `call` covers `construct`. Nothing is allowed by default. */
 export interface ObjectsAllow {
   get?: string[];
+  // (`call` entries may end in `(callback)`: the call accepts functions as arguments, which reach the page as one-way stubs.)
   call?: string[];
   set?: string[];
   /** Event sources, as `path@type` (`'window.app.bus@ready'`; the source and the type are named exactly, a wildcard in either is refused). Never implied by the other lists. */
@@ -72,6 +97,8 @@ export interface ObjectsOperation {
   kind: 'get' | 'call' | 'construct' | 'set' | 'on' | 'describe' | 'snapshot';
   /** For `on`: the event type. */
   type?: string;
+  /** For a call that carries callbacks: how many. */
+  callbacks?: number;
   root: string;
   /** The path below the root. */
   path: string[];
@@ -82,8 +109,16 @@ export interface ObjectsOperation {
 export interface ObjectsServerOptions {
   /** The named roots: all that is reachable. */
   roots: Record<string, object>;
-  /** `'values'` is the only mode: `'handles'` is refused (not built). */
+  /** `'values'` (the default). Handles are chosen per root with `handles`, not here. */
   mode?: 'values';
+  /**
+   * Roots that opt in to handles: a value that cannot be cloned comes back as an opaque `RemoteHandle`, judged by the path that produced it. `nodes: true` is a
+   * second opt-in, for DOM nodes, windows and documents (control of the page). Needs `random`.
+   */
+  handles?: Record<string, { nodes?: boolean; wideEntries?: boolean }>;
+  // `wideEntries: true` acknowledges a wildcard in `allow.call` or `allow.set` on that root (without it the host refuses to start: list the paths, or say so).
+  /** The random source for handle ids: `(n) => bytes` from `crypto.getRandomValues`. `exposeObjects` defaults to the platform's, the page host to its window's. */
+  random?: (n: number) => Uint8Array;
   allow?: ObjectsAllow;
   /** Asked for every operation the allow-list let through; anything but `true` (a throw included) refuses. */
   authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>;
@@ -119,7 +154,13 @@ export function createObjectsServer(options: ObjectsServerOptions): {
 export function createDuplexPeer(options: { send(message: object): void; maxMessageBytes?: number }): ObjectsPeer & { receive(message: unknown): void; close(reason?: string): void; readonly closed: boolean };
 
 /** The client half over any peer: the roots, as lazy references. */
-export function createObjectsClient<T = Record<string, any>>(peer: Pick<ObjectsPeer, 'request'> & Partial<ObjectsPeer>, options?: { timeoutMs?: number }): Promise<T>;
+export function createObjectsClient<T = Record<string, any>>(peer: Pick<ObjectsPeer, 'request'> & Partial<ObjectsPeer>, options?: {
+  timeoutMs?: number;
+  /** A callback of ours threw: it stays here, the page never hears of it. */
+  onCallbackError?: (error: unknown) => void;
+  /** The host dropped calls of a callback (rate, size, a slow channel) before the one that follows. */
+  onCallbackDropped?: (info: { dropped: number; fn: (...args: any[]) => unknown }) => void;
+}): Promise<T>;
 
 /** `exposeObjects`: the rpc handler for `wsh-objects`. Usable as `rpc: { 'wsh-objects': exposeObjects({ roots, allow }) }` in any host. */
 export interface ObjectsHandler {

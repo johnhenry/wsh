@@ -290,7 +290,7 @@ describe('events: backpressure and the transport', () => {
     const [c, s] = createDuplexPair();
     createObjectsServer({ roots: { window: makeWorld().win }, allow: { call: ['window.**'] } }).attach(s);
     const page = await createObjectsClient(c);
-    assert.throws(() => page.window.app.bus.addEventListener('ready', () => {}), /cannot be sent as an argument/);
+    await assert.rejects(Promise.resolve(page.window.app.bus.addEventListener('ready', () => {})), (e) => e.reason === 'not-allowed' && /does not accept callbacks/.test(e.message));
     void [createDuplexPeer, ObjectsError, get];
   });
 });
