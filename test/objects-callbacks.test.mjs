@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
-import { exposeObjects, createObjectsServer, createObjectsClient, release, use, NonValue } from '@johnhenry/wsh/objects';
+import { exposeObjects, createObjectsServer, createObjectsClient, release, use, NonValue, ObjectsError } from '@johnhenry/wsh/objects';
 import { createDuplexPair } from './helpers/duplex.mjs';
 
 const rejects = (x, ...rest) => assert.rejects(Promise.resolve(x), ...rest);
@@ -157,6 +157,42 @@ for (const [name, connect] of Object.entries(TRANSPORTS)) {
     });
   });
 }
+
+describe('the host says what it supports; a client does not lose a callback or a handle silently', () => {
+  /** A host as a 0.47.0 one was: `roots` lists roots and says nothing of features; the rest of the protocol is whatever the test registers. */
+  async function oldHost(register = () => {}) {
+    const [c, s] = createDuplexPair();
+    s.onRequest('roots', async () => ({ roots: ['window'] }));
+    register(s);
+    const sent = [];
+    const original = c.request.bind(c);
+    c.request = (m, p, o) => { sent.push(m); return original(m, p, o); };
+    closers.push(async () => { c.close(); s.close(); });
+    return { page: await createObjectsClient(c), sent };
+  }
+
+  it('a new host states its features with the roots: events and callbacks always, handles when a root opted in', async () => {
+    const [c, s] = createDuplexPair();
+    createObjectsServer({ roots: { window: {} }, allow: {} }).attach(s);
+    assert.deepEqual((await c.request('roots', {})).features, ['events', 'callbacks']);
+    const [c2, s2] = createDuplexPair();
+    createObjectsServer({ roots: { window: {} }, allow: {}, random, handles: { window: {} } }).attach(s2);
+    assert.deepEqual((await c2.request('roots', {})).features, ['events', 'callbacks', 'handles']);
+    closers.push(async () => { c.close(); s.close(); c2.close(); s2.close(); });
+  });
+
+  it('a client refuses to send a function to a host that has not said it supports callbacks: a named error, and nothing is sent', async () => {
+    const { page, sent } = await oldHost((s) => s.onRequest('resolve', async () => ({ v: 'ran with null' })));
+    await rejects(page.window.app.subscribe(() => 1), (e) => e instanceof ObjectsError && e.reason === 'unsupported' && /host does not support callbacks/.test(e.message));
+    assert.deepEqual(sent, ['roots'], 'no resolve was sent');
+    assert.equal(await page.window.app.plain(1), 'ran with null', 'a call without a function still works against such a host');
+  });
+
+  it('a handle-shaped result from a host that has not said it supports handles is a named error, not an unnamed value', async () => {
+    const { page } = await oldHost((s) => s.onRequest('resolve', async () => ({ h: 'abcdefghijklmnopqrstuv', kind: 'object', type: 'Cart' })));
+    await rejects(page.window.app.cart, (e) => e instanceof ObjectsError && e.reason === 'unsupported' && /did not say it supports handles/.test(e.message));
+  });
+});
 
 describe('callbacks: notation, capabilities and the page host', () => {
   it('the notation: (callback) only on a call entry, as the last part of the path; a path with () segments is unaffected', () => {

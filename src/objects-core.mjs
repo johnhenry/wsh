@@ -881,7 +881,11 @@ export function createObjectsServer(options = {}) {
       try { return await fn(params, call); } catch (e) { if (e instanceof ObjectsError) throw e; throw wrapThrown(e, name); }
     });
     // A key that may use only some roots is told of those only.
-    method('roots', async (_params, call) => ({ roots: rootNames.filter((name) => typeof call.permit !== 'function' || call.permit(name, 'walk') === true) }));
+    // The host also says what it supports (additive: an older client ignores it), so a client does not send a function to a host that would drop it, nor misread a handle.
+    method('roots', async (_params, call) => ({
+      roots: rootNames.filter((name) => typeof call.permit !== 'function' || call.permit(name, 'walk') === true),
+      features: ['events', 'callbacks', ...(handleRoots.size ? ['handles'] : [])],
+    }));
     method('resolve', resolve);
     method('set', setValue);
     method('describe', describe);
@@ -987,7 +991,10 @@ export class NonValue {
 }
 
 const decodeResult = (res, session) => {
-  if (res && typeof res === 'object' && typeof res.h === 'string' && session) return new RemoteHandle(session, res);
+  if (res && typeof res === 'object' && typeof res.h === 'string' && session) {
+    if (!session.features?.includes('handles')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'the host returned a handle but did not say it supports handles: it is not a host this client understands', { reason: 'unsupported' });
+    return new RemoteHandle(session, res);
+  }
   if (res && typeof res === 'object' && 'u' in res) return res.u === 'undefined' ? undefined : new NonValue(res);
   return res?.v;
 };
@@ -1101,8 +1108,10 @@ function wireOp(session, op) {
 
 async function send(state, { signal } = {}) {
   const { session } = state;
-  const ops = state.ops.map((op) => wireOp(session, op));
   try {
+    // A function would reach a host that does not know callbacks as null: refuse to send it (a named error), unless the host said it supports them.
+    if (state.ops.some((op) => op.fns) && !session.features?.includes('callbacks')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support callbacks (it did not say so): a function cannot be passed to it', { reason: 'unsupported' });
+    const ops = state.ops.map((op) => wireOp(session, op));
     return decodeResult(await session.peer.request('resolve', { ...target(state), ops }, { signal, ...(session.timeoutMs ? { timeoutMs: session.timeoutMs } : {}) }), session);
   } catch (e) { throw asObjectsError(e, session); }
 }
@@ -1165,6 +1174,7 @@ export async function on(ref, type, listener, { fields, onError } = {}) {
   if (typeof listener !== 'function') throw new TypeError('on needs a listener function: listener(data, { type, seq, dropped })');
   const { session } = state;
   if (state.handle !== undefined) throw new TypeError('events are not offered through a handle: name the source by its path');
+  if (!session.features?.includes('events')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support events (it did not say so)', { reason: 'unsupported' });
   const id = session.nextSub++;
   // Registered before the request: an event can follow the answer at once.
   session.subs.set(id, { listener, onError, type });
@@ -1215,7 +1225,12 @@ export async function createObjectsClient(peer, { timeoutMs, onCallbackError, on
   });
   peer.onNotification?.('closing', (params) => { session.closing = typeof params?.reason === 'string' ? clip(params.reason, TEXT_MAX) : 'closing'; });
   let roots;
-  try { roots = (await peer.request('roots', {}))?.roots; } catch (e) { throw asObjectsError(e, session); }
+  try {
+    const answer = await peer.request('roots', {});
+    roots = answer?.roots;
+    // What the host says it supports; a host that says nothing (before 0.48.0) supports none of the three.
+    session.features = Array.isArray(answer?.features) ? answer.features.filter((f) => typeof f === 'string') : [];
+  } catch (e) { throw asObjectsError(e, session); }
   if (!Array.isArray(roots)) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'the host did not list its roots', { reason: 'bad-reply' });
   const page = {};
   for (const name of roots) if (typeof name === 'string' && !ALWAYS_REFUSED.has(name)) page[name] = makeRef(session, name, []);

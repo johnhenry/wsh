@@ -876,6 +876,9 @@ await release(cart);                         // gives its place back; everything
 - **What a handle is not.** The host's real object stays in the page: calling a method runs the page's code with the caller's plain-data arguments, as for any `call`; a handle to an object with a powerful method is as powerful as that method's entry in `call`. A handle is
   a reference to something already reachable by a path, so it cannot reach more than the path's own entries; but a wide entry (`window.app.**`) covers every member of every object under it. Events are not offered through a handle, and callbacks are not built.
 
+A host says what it supports with its roots (`features`: `events`, `callbacks`, and `handles` when a root opted in). A client does not send a function to a host that has not said it supports callbacks, nor use events on one that has not said so (a named `unsupported` error);
+a handle-shaped answer from a host that never said it supports handles is the same error. A 0.47.0 host says nothing, so it counts as supporting none of them.
+
 #### Callbacks
 
 A far-side **function passed as an argument** of a call is a callback, but only where the call's allow-list entry says so by ending in `(callback)`: `allow.call: ['window.app.subscribe(callback)']`. A call entry without it refuses a function
