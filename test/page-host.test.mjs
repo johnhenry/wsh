@@ -531,19 +531,21 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
   });
 });
 
-describe('pipe-url: the relay\'s two pure helpers, kept apart so a page does not bundle the relay', () => {
-  it('agree with the relay module\'s own', async () => {
-    const relayModule = await import('../src/pipe-relay.mjs');
-    const mine = await import('../src/pipe-url.mjs');
+describe('the rendezvous id', () => {
+  it('is 128 random bits from the window\'s own crypto, the id the pipe relay accepts; or one you give', async () => {
     const bytes = Uint8Array.from({ length: 16 }, (_, i) => (i * 37 + 11) & 255);
-    const fixed = { getRandomValues: (b) => { b.set(bytes); return b; } };
+    const win = createFakeWindow();
+    win.crypto = { getRandomValues: (b) => { b.set(bytes); return b; } };
     const expected = btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
-    assert.equal(mine.newRendezvousId(fixed), expected);
-    assert.match(mine.newRendezvousId(globalThis.crypto), /^[A-Za-z0-9_-]{22}$/);
-    for (const role of ['host', 'operator']) assert.equal(mine.pipeUrl('wss://r.example/base/', expected, role), relayModule.pipeUrl('wss://r.example/base/', expected, role));
-    assert.throws(() => mine.pipeUrl('wss://r.example', 'short'), /rendezvous id/);
-    assert.throws(() => mine.pipeUrl('wss://r.example', expected, 'x'), /role/);
-    assert.throws(() => mine.newRendezvousId({}), /getRandomValues/);
+    const a = await startPage({ window: win });
+    assert.equal(a.host.rendezvousId, expected, 'the same encoding as newRendezvousId()');
+    assert.ok(a.host.operatorUrl.endsWith(`/r/${expected}`));
+    const own = await startPage({ relay: { url: await relay(), id: 'B'.repeat(22) } });
+    assert.ok(own.host.operatorUrl.endsWith(`/r/${'B'.repeat(22)}`));
+    const fresh = await startPage();
+    assert.match(fresh.host.rendezvousId, /^[A-Za-z0-9_-]{22}$/);
+    const noCrypto = createFakeWindow(); noCrypto.crypto = undefined;
+    await assert.rejects(createPageHost({ window: noCrypto, relay: 'ws://127.0.0.1:1', name: 'x', authorizedKeys: ['k'], mcp: {} }), /crypto\.getRandomValues/);
   });
 });
 

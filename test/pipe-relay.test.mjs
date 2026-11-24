@@ -35,12 +35,25 @@ describe('pipe relay: what the module can reach', () => {
     return seen;
   }
 
-  it('imports nothing statically, and only ws, node:http and node:https dynamically', async () => {
+  it('the relay module imports nothing, by name or dynamically: it is browser-safe', async () => {
     const g = await graph(path.join(SRC, 'pipe-relay.mjs'));
     assert.equal(g.size, 1, 'it imports no other module of this package');
+    assert.deepEqual([...g.values()].flat(), [], 'no specifier it could be bundled through');
+  });
+
+  it('the Node half (listen) imports only ws, node:http and node:https, dynamically, and nothing that runs code or reads files', async () => {
+    const g = await graph(path.join(SRC, 'pipe-relay-node.mjs'));
+    assert.equal(g.size, 1);
     const specs = [...g.values()].flat();
     assert.deepEqual([...new Set(specs)].sort(), ['node:http', 'node:https', 'ws']);
     assert.ok(specs.every((s) => !FORBIDDEN.test(s)));
+  });
+
+  it('listen() loads the Node half by name from the relay module, so a bundler never follows it', async () => {
+    const src = await readFile(path.join(SRC, 'pipe-relay.mjs'), 'utf8');
+    assert.match(src, /import\(NODE_LISTENER\)/);
+    assert.doesNotMatch(src, /import\(\s*['"]/);
+    assert.match(src, /const NODE_LISTENER = '\.\/pipe-relay-node\.mjs'/);
   });
 
   it('the test itself catches a module that would reach a file or a process (the walker is not blind)', async () => {

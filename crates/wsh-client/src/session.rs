@@ -153,6 +153,9 @@ pub struct WshSession {
     /// file transfer, #140), in arrival order. The sender is dropped when the channel closes, so
     /// a reader drains what arrived and then sees the end.
     file_chunks: FileChunks,
+    /// For an rpc channel in virtual data mode (wsh #191): where its `SessionData` and `GatewayCredit` go instead of
+    /// the read queue (the channel's credit window bounds what is in flight, so nothing here can grow without limit).
+    rpc_inbound: std::sync::OnceLock<Arc<crate::rpc::VirtualInbound>>,
 }
 
 struct FileChunks {
@@ -296,6 +299,7 @@ impl WshSession {
             stream_coalescer: Mutex::new(None),
             stderr: None,
             file_chunks: FileChunks::new(),
+            rpc_inbound: std::sync::OnceLock::new(),
         }
     }
 
@@ -323,6 +327,7 @@ impl WshSession {
             stream_coalescer: Mutex::new(None),
             stderr: None,
             file_chunks: FileChunks::new(),
+            rpc_inbound: std::sync::OnceLock::new(),
         }
     }
 
@@ -890,6 +895,10 @@ impl WshSession {
     pub(crate) async fn mark_closed(&self) {
         // A reader of file chunks drains what arrived and then sees the end.
         self.file_chunks.tx.lock().await.take();
+        // An rpc channel in virtual data mode ends with its session (the host closed it, or the connection is gone).
+        if let Some(inbound) = self.rpc_inbound.get() {
+            inbound.on_close();
+        }
         if let SessionBackend::Virtual(backend) = &self.backend {
             backend.close().await;
         }
@@ -920,8 +929,34 @@ impl WshSession {
         *state = SessionState::Open;
     }
 
+    /// Route this session's `SessionData` to an rpc channel in virtual data mode.
+    pub(crate) fn set_rpc_inbound(&self, inbound: Arc<crate::rpc::VirtualInbound>) {
+        let _ = self.rpc_inbound.set(inbound);
+    }
+
+    /// Credit for this session's rpc channel arrived (`GatewayCredit`); false if it has none.
+    pub(crate) fn rpc_credit(&self, bytes: u32) -> bool {
+        match self.rpc_inbound.get() {
+            Some(inbound) => {
+                inbound.on_credit(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Handle a session-specific control message from the server.
     pub(crate) async fn handle_control(&self, envelope: &Envelope) -> WshResult<()> {
+        if let Some(inbound) = self.rpc_inbound.get() {
+            match &envelope.payload {
+                Payload::SessionData(data) => {
+                    inbound.on_data(&data.data);
+                    return Ok(());
+                }
+                Payload::Close(_) | Payload::Exit(_) => inbound.on_close(),
+                _ => {}
+            }
+        }
         match &envelope.payload {
             Payload::SessionData(data) => match &self.backend {
                 SessionBackend::Virtual(backend) => backend.push_data(data.data.clone()).await,

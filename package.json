@@ -37,6 +37,10 @@
       "types": "./src/objects.d.ts",
       "import": "./src/objects.mjs"
     },
+    "./testing": {
+      "types": "./src/testing.d.ts",
+      "import": "./src/testing.mjs"
+    },
     "./mcp-stdio": {
       "types": "./src/mcp-stdio.d.ts",
       "import": "./src/mcp-stdio.mjs"

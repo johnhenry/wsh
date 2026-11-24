@@ -387,13 +387,11 @@ impl WshServer {
         let gateway_enabled = config.gateway_enabled;
 
         // Typed rpc channels (#86). `wsh-fs` needs an explicit root: file access is opt-in.
-        // A sealed session (#155) carries everything as frames on the control stream; a typed rpc channel rides client-opened
-        // data streams, whose bytes are not frames, so rpc is not offered while sealing is (as the JS host does not offer
-        // `e2e-session` where there are client-opened streams).
-        if config.rpc_enabled && config.seal_session != SealSession::Off {
-            warn!("[server] seal_session is on: typed rpc channels (wsh-fs, ...) are not offered, their data streams cannot be sealed");
-        }
-        let rpc = if config.rpc_enabled && config.seal_session == SealSession::Off {
+        // A sealed session (#155) carries everything as frames on the control stream; client-opened data streams are not
+        // frames and cannot be sealed. With `seal_session` on, the typed rpc channels are therefore offered in virtual data
+        // mode (#191): stated `rpc-virtual` instead of `rpc`, riding `SessionData` (inside the seal when there is one),
+        // metered by credit. With it off they ride client-opened streams as before.
+        let rpc = if config.rpc_enabled {
             if config.rpc_max_message_bytes < crate::rpc::RPC_MIN_MAX_MESSAGE {
                 return Err(WshError::Other(format!(
                     "rpc max_message_bytes must be at least {}",
@@ -415,6 +413,7 @@ impl WshServer {
                 max_message_bytes: config.rpc_max_message_bytes,
                 max_inflight: config.rpc_max_inflight.max(1),
                 fs,
+                virtual_data: config.seal_session != SealSession::Off,
             }))
         } else {
             None
@@ -1785,6 +1784,35 @@ impl WshServer {
                                             continue;
                                         }
                                     }
+                                    // An rpc channel in virtual data mode (#191): its `Open` (a typed one: it arrived in a
+                                    // frame of the sealed session), its `SessionData` and its credit never reach the
+                                    // session or gateway handlers below.
+                                    match &envelope.payload {
+                                        Payload::Open(o) if o.kind == ChannelKind::Rpc => {
+                                            let ctx_ref = ctx.as_ref().expect("ctx set once Authenticated");
+                                            let reply = self.open_rpc(ctx_ref, o.command.as_deref().unwrap_or(""), &mut rpc_sessions);
+                                            let frame = match frame_encode(&reply) {
+                                                Ok(f) => f,
+                                                Err(e) => break 'session Err(e),
+                                            };
+                                            if let Err(e) = write_control(&qmux, &seal, CONTROL_STREAM_ID, frame).await {
+                                                break 'session Err(e);
+                                            }
+                                            continue;
+                                        }
+                                        Payload::SessionData(p) => {
+                                            if rpc_sessions.on_session_data(p.channel_id, p.data.clone()) {
+                                                continue;
+                                            }
+                                        }
+                                        Payload::GatewayCredit(p) => {
+                                            if let Some(channel_id) = wsh_core::rpc_credit::rpc_channel_of_credit(p.gateway_id) {
+                                                rpc_sessions.on_credit(channel_id, p.bytes);
+                                                continue;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
 
                                 match &mut state {
@@ -2343,11 +2371,21 @@ impl WshServer {
         }
         let allow_fs = permissions.has_scope(&crate::auth::permissions::SessionScope::FileTransfer);
         let next = self.next_channel_id.clone();
-        rpc_sessions.open(
-            protocol,
-            move || next.fetch_add(1, Ordering::Relaxed),
-            allow_fs,
-        )
+        // The checks above are the same in both modes; only where the channel's bytes ride differs (#191).
+        if rpc_sessions.is_virtual() {
+            rpc_sessions.open_virtual(
+                protocol,
+                move || next.fetch_add(1, Ordering::Relaxed),
+                allow_fs,
+                ctx.peer_tx.clone(),
+            )
+        } else {
+            rpc_sessions.open(
+                protocol,
+                move || next.fetch_add(1, Ordering::Relaxed),
+                allow_fs,
+            )
+        }
     }
 
     /// What the authorized_keys options of the key `fingerprint` allow (wsh #122). The first line for a key decides, as on the

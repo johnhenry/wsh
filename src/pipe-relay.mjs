@@ -11,10 +11,13 @@
  * What a pipe relay can still do is in the README's Security model: it sees metadata and ciphertext-free traffic
  * volume, can drop or delay bytes, and can offer a host or operator to whoever holds the rendezvous id.
  *
- * THIS MODULE IMPORTS NOTHING STATICALLY, and its only dynamic imports are `ws`, `node:http` and `node:https` (in
- * `listen()`, for embedders that do not already run an HTTP server). test/pipe-relay.test.mjs asserts that the
- * module graph reaches nothing that can execute code or read files. That is the point of shipping it as its own
- * entry point (`@johnhenry/wsh/pipe-relay`) rather than a mode of the server.
+ * THIS MODULE IMPORTS NOTHING, statically or by name: it is browser-safe (a page can bundle it for `pipeUrl`,
+ * `newRendezvousId`, `watchPairing`, or to run `accept()` over sockets it holds). The one Node-only piece, `listen()`
+ * (an HTTP server with `ws`, for embedders that do not already run one), lives in `./pipe-relay-node.mjs` and is
+ * loaded only when `listen()` is called, through a specifier a bundler does not follow. test/pipe-relay.test.mjs
+ * asserts that this module's graph is this one file and that the Node module reaches nothing that can execute code
+ * or read files; test/browser-bundle.test.mjs bundles this entry for the browser. That is the point of shipping it
+ * as its own entry point (`@johnhenry/wsh/pipe-relay`) rather than a mode of the server.
  *
  * Bounds (every one has a default; 0 turns a limit off only where noted):
  *   maxWaiting          halves waiting for a partner, over all ids (default 1024); more are refused
@@ -32,6 +35,8 @@
  */
 
 const OPEN = 1;
+/** The Node-only half (`listen()`): a variable, not a literal, so a bundler does not follow it. */
+const NODE_LISTENER = './pipe-relay-node.mjs';
 const ID_RE = /^[A-Za-z0-9_-]{22,128}$/;
 const ROLES = new Set(['host', 'operator']);
 const MIN_ID_LENGTH = 22; // 16 random bytes, base64url
@@ -45,18 +50,92 @@ export function newRendezvousId() {
 }
 
 /**
+ * The one text frame a relay sends a host that asked for it, when its partner arrives (before anything the partner said).
+ * Everything else on a pipe is binary, so a text frame can never be wsh bytes.
+ */
+export const PAIRED_FRAME = 'wsh-pipe/1 paired';
+
+/**
  * The URL one side dials: `<relay>/r/<id>`, with `?role=host` for the host (the operator is the default).
  * @param {string} relayUrl - `ws://` / `wss://` (or `http(s)://`) base of the relay
  * @param {string} id
  * @param {'host' | 'operator'} [role='operator']
+ * @param {{ notifyPaired?: boolean }} [options] - `notifyPaired` (a host only) adds `&paired=1`: ask the relay to send
+ *   `PAIRED_FRAME` when the operator arrives. A relay that predates it ignores the parameter and never sends it.
  */
-export function pipeUrl(relayUrl, id, role = 'operator') {
+export function pipeUrl(relayUrl, id, role = 'operator', { notifyPaired = false } = {}) {
   if (!ID_RE.test(id)) throw new TypeError(`pipeUrl: the rendezvous id must be ${MIN_ID_LENGTH}-128 base64url characters (use newRendezvousId())`);
   if (!ROLES.has(role)) throw new TypeError("pipeUrl: role must be 'host' or 'operator'");
+  if (notifyPaired && role !== 'host') throw new TypeError('pipeUrl: notifyPaired is for the host side');
   const u = new URL(relayUrl);
   u.pathname = `${u.pathname.replace(/\/+$/, '')}/r/${id}`;
-  u.search = role === 'host' ? '?role=host' : '';
+  u.search = role === 'host' ? (notifyPaired ? '?role=host&paired=1' : '?role=host') : '';
   return u.toString();
+}
+
+const textOf = (data) => {
+  if (typeof data === 'string') return data;
+  try {
+    if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+    if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data);
+    if (Array.isArray(data)) return null;
+    return typeof data?.toString === 'function' ? String(data) : null;
+  } catch { return null; }
+};
+
+/**
+ * Host side of the paired signal. Wrap the socket a host dialled with `notifyPaired` BEFORE anything is attached to it, hand
+ * the returned `socket` to `server.accept()` / `host.accept()` (it is the same socket, with the one `PAIRED_FRAME` text frame
+ * kept out of what the wsh host reads), and await `paired`: it resolves when the operator arrives, and rejects if the socket
+ * closes first. Against a relay that does not know the flag it never resolves (the connection works as it always did): a
+ * host that must know should also bound its wait with its own timer.
+ * @param {object} socket  a WebSocket-like (`ws` or a browser's)
+ * @returns {{ socket: object, paired: Promise<void> }}
+ */
+export function watchPairing(socket) {
+  let resolve; let reject; let settled = false;
+  const paired = new Promise((res, rej) => { resolve = res; reject = rej; });
+  paired.catch(() => {}); // a host that ignores the promise must not crash on an unhandled rejection
+  const isSignal = (data, isBinary) => isBinary !== true && textOf(data) === PAIRED_FRAME;
+  const onSignal = (data, isBinary) => { if (!settled && isSignal(data, isBinary)) { settled = true; resolve(); } };
+  const onClose = () => { if (!settled) { settled = true; reject(new Error('the pipe closed before a partner arrived')); } };
+  if (typeof socket.addEventListener === 'function') {
+    socket.addEventListener('message', (ev) => onSignal(ev?.data));
+    socket.addEventListener('close', onClose);
+  } else if (typeof socket.on === 'function') {
+    socket.on('message', (data, isBinary) => onSignal(data, isBinary));
+    socket.on('close', onClose);
+  } else {
+    throw new TypeError('watchPairing: socket must support on() or addEventListener()');
+  }
+
+  // The same socket for everything else, minus the signal frame for whoever listens for messages through it.
+  const wrapped = new Map();
+  const wrapFor = (style, fn) => {
+    let w = wrapped.get(fn);
+    if (!w) {
+      w = style === 'event'
+        ? (ev) => { if (!isSignal(ev?.data)) fn(ev); }
+        : (data, isBinary) => { if (!isSignal(data, isBinary)) fn(data, isBinary); };
+      wrapped.set(fn, w);
+    }
+    return w;
+  };
+  const proxy = new Proxy(socket, {
+    get(target, prop) {
+      if ((prop === 'addEventListener' || prop === 'on' || prop === 'addListener' || prop === 'once') && typeof target[prop] === 'function') {
+        const style = prop === 'addEventListener' ? 'event' : 'node';
+        return (type, fn, ...rest) => (type === 'message' && typeof fn === 'function' ? target[prop](type, wrapFor(style, fn), ...rest) : target[prop](type, fn, ...rest));
+      }
+      if ((prop === 'removeEventListener' || prop === 'off' || prop === 'removeListener') && typeof target[prop] === 'function') {
+        return (type, fn, ...rest) => target[prop](type, (type === 'message' && wrapped.get(fn)) || fn, ...rest);
+      }
+      const v = Reflect.get(target, prop, target);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+    set(target, prop, value) { target[prop] = value; return true; },
+  });
+  return { socket: proxy, paired };
 }
 
 const sane = (code) => (Number.isInteger(code) && code >= 1000 && code <= 4999 && ![1004, 1005, 1006, 1015].includes(code) ? code : 1000);
@@ -110,7 +189,9 @@ export function createPipeRelay({
   /** Live pipes. */
   const pipes = new Set();
   let closed = false;
-  let server = null;
+  let listening = false;
+  /** What to run when the relay closes (the HTTP server of `listen()`). */
+  const closers = [];
 
   const closeSocket = (socket, code = 1000, reason = '') => { try { socket.close(code, reason); } catch { /* gone */ } };
 
@@ -125,6 +206,10 @@ export function createPipeRelay({
     waiting.delete(first.id);
     const pipe = { halves: [first, second], bytes: 0, last: Date.now(), timers: [], done: false };
     pipes.add(pipe);
+    // A host that asked is told its partner is here, ahead of anything the partner said (not counted as pipe traffic).
+    for (const h of pipe.halves) {
+      if (h.notifyPaired && h.socket.readyState === OPEN) { try { h.socket.send(PAIRED_FRAME); } catch { /* it is gone; the pipe ends when its close arrives */ } }
+    }
     const end = (code, reason, from) => {
       if (pipe.done) return;
       pipe.done = true;
@@ -175,18 +260,20 @@ export function createPipeRelay({
   /**
    * Hand the relay one accepted connection.
    * @param {object} socket - a WebSocket-like duplex (`send`, `close`, `readyState`, `on` or `addEventListener`)
-   * @param {{ id: string, role?: 'host' | 'operator', remote?: object }} who
+   * @param {{ id: string, role?: 'host' | 'operator', remote?: object, notifyPaired?: boolean }} who  `notifyPaired` (a host
+   *   that asked, `?paired=1`): send it `PAIRED_FRAME` once when the operator arrives. Only a host may ask.
    * @returns {Promise<boolean>} whether the connection is now waiting or paired (false: it was refused and closed)
    */
-  async function accept(socket, { id, role = 'operator', remote } = {}) {
+  async function accept(socket, { id, role = 'operator', remote, notifyPaired = false } = {}) {
     if (!socket || typeof socket.send !== 'function' || typeof socket.close !== 'function') throw new TypeError('createPipeRelay.accept: socket must be a WebSocket-like duplex');
+    if (notifyPaired && role !== 'host') throw new TypeError('createPipeRelay.accept: notifyPaired is for the host side');
     const refuse = (code, reason) => { closeSocket(socket, code, reason); return false; };
     if (closed) return refuse(1001, 'relay is shutting down');
     if (typeof id !== 'string' || !ID_RE.test(id)) return refuse(1008, 'bad rendezvous id');
     if (!ROLES.has(role)) return refuse(1008, 'bad role');
 
     // Listeners first, so nothing the peer says while we decide is lost; it is held (bounded) until it can be passed on.
-    const half = { id, role, socket, early: [], earlyBytes: 0, timer: null, forward: null, paused: false, resume: null };
+    const half = { id, role, socket, early: [], earlyBytes: 0, timer: null, forward: null, paused: false, resume: null, notifyPaired: notifyPaired === true };
     let pipeRef = null;
     listenOn(socket, (data, isBinary) => {
       if (half.forward) return half.forward(data, isBinary);
@@ -227,42 +314,24 @@ export function createPipeRelay({
    * Convenience for embedders without an HTTP server; needs the `ws` package. `tls` is the options of `https.createServer`.
    * @returns {Promise<{ port: number, address: string, close(): Promise<void> }>}
    */
-  async function listen({ host = '127.0.0.1', port = 0, path = '/r', tls } = {}) {
-    if (server) throw new Error('createPipeRelay: already listening');
-    const { WebSocketServer } = await import('ws');
-    const http = tls ? await import('node:https') : await import('node:http');
-    const wss = new WebSocketServer({ noServer: true, maxPayload: maxMessageBytes });
-    const srv = tls ? http.createServer(tls) : http.createServer();
-    srv.on('request', (_req, res) => { res.statusCode = 426; res.end('WebSocket only'); });
-    srv.on('upgrade', (req, sock, head) => {
-      let url;
-      try { url = new URL(req.url, 'http://x'); } catch { sock.destroy(); return; }
-      const m = url.pathname.startsWith(`${path}/`) ? url.pathname.slice(path.length + 1) : null;
-      const role = url.searchParams.get('role') ?? 'operator';
-      if (!m || !ID_RE.test(m) || !ROLES.has(role)) { sock.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); sock.destroy(); return; }
-      wss.handleUpgrade(req, sock, head, (ws) => { accept(ws, { id: m, role, remote: { address: req.socket.remoteAddress, headers: req.headers } }).catch(() => closeSocket(ws, 1011, 'error')); });
-    });
-    await new Promise((resolve, reject) => { srv.once('error', reject); srv.listen(port, host, () => { srv.off('error', reject); resolve(); }); });
-    server = { srv, wss };
-    const addr = srv.address();
-    return {
-      port: addr.port, address: addr.address,
-      close: () => close(),
-    };
+  async function listen(options = {}) {
+    if (listening) throw new Error('createPipeRelay: already listening');
+    listening = true;
+    try {
+      // The Node half lives in its own module and is named through a variable, so a bundler building this file for a
+      // browser neither follows it nor needs `ws` or `node:http`.
+      const { listenPipeRelay } = await import(NODE_LISTENER);
+      return await listenPipeRelay({ accept, maxMessageBytes, onClose: (fn) => closers.push(fn), close: () => close() }, options);
+    } catch (e) { listening = false; throw e; }
   }
 
   async function close() {
     closed = true;
+    listening = false;
     for (const h of waiting.values()) { clearTimeout(h.timer); closeSocket(h.socket, 1001, 'relay is shutting down'); }
     waiting.clear();
     for (const p of [...pipes]) p.end(1001, 'relay is shutting down', null);
-    if (server) {
-      const { srv, wss } = server;
-      server = null;
-      for (const c of wss.clients) c.terminate();
-      await new Promise((r) => wss.close(r));
-      await new Promise((r) => { srv.close(() => r()); srv.closeAllConnections?.(); });
-    }
+    for (const fn of closers.splice(0)) await fn();
   }
 
   return {

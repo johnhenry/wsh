@@ -3471,6 +3471,7 @@ dependencies = [
  "argon2",
  "ciborium",
  "clap",
+ "dialoguer",
  "dirs",
  "ed25519-dalek",
  "futures-util",

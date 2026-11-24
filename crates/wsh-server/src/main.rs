@@ -73,20 +73,43 @@ struct Cli {
     /// and shell history: printf '%s' "$PASSWORD" | wsh-server --hash-password
     #[arg(long)]
     hash_password: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-/// `--hash-password`: stdin in, a PHC string on stdout, a status code out.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Print the Argon2id hash of a password, for `[auth.password_hashes]`. The password is read from
+    /// standard input (first line) or, at a terminal, prompted for without echo; it is never an argument.
+    HashPassword,
+}
+
+/// `hash-password` / `--hash-password`: stdin (or a no-echo prompt at a terminal) in, a PHC string on
+/// stdout, a status code out.
 fn hash_password_from_stdin() -> i32 {
     use std::io::{BufRead as _, IsTerminal as _};
-    if std::io::stdin().is_terminal() {
-        eprintln!("Password (typed text is shown; prefer piping it in):");
-    }
-    let mut line = String::new();
-    if let Err(e) = std::io::stdin().lock().read_line(&mut line) {
-        eprintln!("wsh-server: cannot read the password: {e}");
-        return 1;
-    }
-    let password = line.trim_end_matches(['\n', '\r']);
+    let password = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        match dialoguer::Password::new()
+            .with_prompt("Password")
+            .with_confirmation("Repeat password", "The passwords differ")
+            .interact()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("wsh-server: cannot read the password: {e}");
+                return 1;
+            }
+        }
+    } else {
+        let mut line = String::new();
+        if let Err(e) = std::io::stdin().lock().read_line(&mut line) {
+            eprintln!("wsh-server: cannot read the password: {e}");
+            return 1;
+        }
+        line.trim_end_matches(['\n', '\r']).to_string()
+    };
+    let password = password.as_str();
     if password.is_empty() {
         eprintln!("wsh-server: refusing to hash an empty password");
         return 1;
@@ -109,7 +132,7 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    if cli.hash_password {
+    if cli.hash_password || matches!(cli.command, Some(Command::HashPassword)) {
         std::process::exit(hash_password_from_stdin());
     }
 
@@ -212,6 +235,12 @@ fn install_rustls_crypto_provider() {
 /// (rather than the `rustls-pemfile` crate, which is flagged unmaintained —
 /// RUSTSEC-2025-0134) since `rustls-pki-types` is already a transitive
 /// dependency of `rustls` and provides the same PEM-section extraction.
+/// The SHA-256 of a DER certificate as lowercase hex: the value a client pins the server to.
+fn cert_sha256_hex(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(der))
+}
+
 fn load_tls_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
@@ -228,6 +257,15 @@ fn load_tls_config(
             .collect::<Result<Vec<_>, _>>()?;
 
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)?;
+
+    if let Some(leaf) = certs.first() {
+        // What a client pins a self-signed server to: `wsh --cert-hash`, or `serverCertificateHashes`
+        // in a browser or the JS client. (A certificate a public authority signed needs no pin.)
+        info!(
+            sha256 = %cert_sha256_hex(leaf.as_ref()),
+            "certificate hash, for `wsh --cert-hash` / serverCertificateHashes (self-signed certificates only)"
+        );
+    }
 
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -336,6 +374,27 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_certificate_hash_is_the_lowercase_hex_sha256_of_the_der() {
+        // SHA-256 of the empty string.
+        assert_eq!(
+            cert_sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn hash_password_is_a_subcommand_and_still_a_flag_and_never_takes_the_password_as_an_argument()
+    {
+        let sub = Cli::try_parse_from(["wsh-server", "hash-password"]).unwrap();
+        assert!(matches!(sub.command, Some(Command::HashPassword)));
+        let flag = Cli::try_parse_from(["wsh-server", "--hash-password"]).unwrap();
+        assert!(flag.hash_password);
+        // A password on the command line would sit in the process list and the shell history.
+        assert!(Cli::try_parse_from(["wsh-server", "hash-password", "hunter2"]).is_err());
+        assert!(Cli::try_parse_from(["wsh-server", "--hash-password", "hunter2"]).is_err());
+    }
 
     /// The generated development certificate has to work as a SERVER
     /// certificate for a TLS client that trusts it: webpki refuses an end

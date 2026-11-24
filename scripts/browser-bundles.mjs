@@ -26,6 +26,8 @@ export const ENTRY_POINTS = [
   { name: './memory', entry: 'src/memory-host.mjs' },
   { name: './host', entry: 'src/host.mjs' },
   { name: './reverse', entry: 'src/reverse-host.mjs' },
+  { name: './pipe-relay', entry: 'src/pipe-relay.mjs' },
+  { name: './testing', entry: 'src/testing.mjs' },
   { name: './page', entry: 'src/page-host.mjs' },
   { name: './objects', entry: 'src/objects.mjs' },
   { name: '. (generateKeyPair only)', contents: "import { generateKeyPair } from './src/index.mjs'; globalThis.x = generateKeyPair;" },

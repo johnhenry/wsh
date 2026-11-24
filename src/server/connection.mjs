@@ -41,6 +41,7 @@ import { SealedBridge } from '../bridge-seal.mjs';
 import { refusalNotifier, validateOnRefused } from '../refusal.mjs';
 import { HOST_KEY_PREFIX, HOST_KEY_SIG_PREFIX, findClientNonce, hostKeyProofMessage, toHex } from '../host-key.mjs';
 import { checkKeyRequest } from '../key-options.mjs';
+import { resolveUsernamePattern, usernameAllowed } from './username.mjs';
 import { SHARES_FEATURE, createShareSession } from '../shares.mjs';
 
 export const STREAM_ANNOUNCE = 'stream-announce';
@@ -88,7 +89,6 @@ const WRITE_IDLE_MS = 30_000;
 
 const MAX_CHANNELS = 64;
 const REPLAY_CHUNK_BYTES = 32 * 1024;
-const USERNAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
 const enc = new TextEncoder();
 
 const randomUUID = () => crypto.randomUUID();
@@ -133,6 +133,7 @@ export function createConnectionFactory(cfg) {
     methods: cfg.methods ?? { pubkey: true, password: null },
     bindTimeoutMs: cfg.bindTimeoutMs ?? 3000,
     log: cfg.log ?? (() => {}),
+    usernamePattern: resolveUsernamePattern(cfg.usernamePattern, 'createConnectionFactory'),
   };
   validateOnRefused(cfg.onRefused, 'createConnectionFactory');
   const notifyRefused = refusalNotifier(cfg.onRefused, cfg.log);
@@ -510,7 +511,7 @@ export function createConnectionFactory(cfg) {
     async function handleAuth(m) {
       if (m.type === MSG.HELLO) {
         const user = String(m.username ?? '');
-        if (!USERNAME_RE.test(user)) return refuse(`bad username ${JSON.stringify(user)}`);
+        if (!usernameAllowed(cfg.usernamePattern, user)) return refuse(`bad username ${JSON.stringify(user)}`);
         const method = m.auth_method || 'pubkey';
         if (method === 'password') {
           if (!cfg.methods.password) return refuse('password auth is not enabled on this host', 'method-disabled', { username: user });

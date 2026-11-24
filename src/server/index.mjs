@@ -20,11 +20,13 @@ import { validateOnRefused } from '../refusal.mjs';
 import { normalizeGateway, createGatewaySession } from './gateway.mjs';
 import { createRpcHost, mcpServerAdapter } from './rpc.mjs';
 import { bindSocket } from './socket.mjs';
+import { resolveUsernamePattern } from './username.mjs';
 import { TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH, CHANNEL_BINDING_KINDS } from '../channel-binding.mjs';
 
 export { parseAuthorizedKeys, parseAuthorizedKeyEntries, STREAM_ANNOUNCE, mcpServerAdapter };
 export { createReverseHost } from './reverse-host.mjs';
 export { generateSelfSignedCertificate } from './self-signed.mjs';
+export { hashPassword, verifyPassword, passwordVerifier } from './password.mjs';
 
 /** The TLS exporter of a `wss://` connection as a channel binding (#119); null on a plain socket or a TLS-terminating proxy hop. */
 function tlsChannelBinding(socket) {
@@ -115,8 +117,9 @@ function tlsChannelBinding(socket) {
  */
 export function createWshServer({
   host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
-  onShare, onRefused, targets, requireTarget,
+  onShare, onRefused, targets, requireTarget, usernamePattern,
 } = {}) {
+  resolveUsernamePattern(usernamePattern, 'createWshServer');
   validateOnShare(onShare, 'createWshServer');
   validateOnRefused(onRefused, 'createWshServer');
   if (sealSession !== false && sealSession !== 'offer' && sealSession !== 'require') throw new TypeError("createWshServer: sealSession must be false, 'offer' or 'require'");
@@ -175,7 +178,7 @@ export function createWshServer({
       return createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, createGatewaySession, sessions: registry, relay: hub,
-        onShare, onRefused, targets: targetTable, requireTarget: mustHaveTarget,
+        onShare, onRefused, targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
       });
     })();
     ready.catch(() => { ready = null; });
