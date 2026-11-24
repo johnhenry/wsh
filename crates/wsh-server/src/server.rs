@@ -355,6 +355,8 @@ impl WshServer {
             max_connections: config.gateway_max_connections,
             enable_reverse_tunnels: config.gateway_enable_reverse_tunnels,
             reverse_bind_addr: config.gateway_reverse_bind_addr,
+            reverse: config.gateway_reverse.clone(),
+            udp: config.gateway_udp.clone(),
             unix: config.gateway_unix.clone(),
             max_buffered_bytes: config.gateway_max_buffered_bytes,
             max_client_buffered_bytes: config.gateway_max_client_buffered_bytes,
@@ -5180,6 +5182,8 @@ mod wisp_reverse_connect_e2e_tests {
             gateway_max_connections: 10,
             gateway_enable_reverse_tunnels: false,
             gateway_reverse_bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            gateway_reverse: Default::default(),
+            gateway_udp: Default::default(),
             gateway_unix: Default::default(),
             gateway_max_buffered_bytes: crate::gateway::policy::DEFAULT_MAX_BUFFERED_BYTES,
             gateway_max_client_buffered_bytes:

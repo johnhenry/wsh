@@ -31,7 +31,10 @@
 pub mod forwarder;
 pub mod policy;
 pub mod resolver;
+pub mod reverse_conn;
+pub mod reverse_policy;
 pub mod session;
+pub mod udp_policy;
 pub mod unix_policy;
 
 pub use forwarder::GatewayForwarder;
