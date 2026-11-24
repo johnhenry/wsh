@@ -2815,7 +2815,9 @@ export class WshClient {
    */
   #attachTransportHandlers(transport) {
     transport.onControl = (msg) => this.#onTransportControl(msg);
-    transport.onClose = () => this.#handleTransportClose();
+    // A sealed frame is opened asynchronously, so the close of the socket behind the last frame must wait for it: the frames
+    // that arrived before the close are delivered first (the host's last words, the exit of a command), then the close is handled.
+    transport.onClose = () => this.#afterOpens(() => this.#handleTransportClose());
     transport.onError = (err) => this.#handleTransportError(err);
     // A datagram is not a frame: on a sealed session a relay could inject one, so none is heard (UDP uses the reliable path).
     transport.onDatagram = (bytes) => { if (!this.#sessionSeal) this.#gateway?.handleDatagram(bytes); };
@@ -3046,14 +3048,33 @@ export class WshClient {
         this.#countDrop({ reason: 'plaintext-on-sealed-session', messageType: msg.type });
         return;
       }
-      seal.bridge.open(msg).then(
+      this.#trackOpen(seal.bridge.open(msg).then(
         (inner) => { if (this.#sessionSeal === seal) this.#handleControl(inner); },
         (err) => this.#sealedFrameFailed(seal, err),
-      );
+      ));
       return;
     }
     if (msg.type === MSG.KEY_EXCHANGE && msg.session_id === seal.sessionId) { this.#handleControl(msg); return; }
     this.#countDrop({ reason: 'plaintext-before-seal', messageType: msg.type });
+  }
+
+  /** Sealed frames being opened (each is one pending promise), and what is waiting for them to be delivered. */
+  #opening = 0;
+  #afterOpening = [];
+
+  /** @param {Promise<unknown>} p a frame being opened and delivered; never rejects */
+  #trackOpen(p) {
+    this.#opening++;
+    const done = () => {
+      if (--this.#opening > 0) return;
+      for (const fn of this.#afterOpening.splice(0)) fn();
+    };
+    p.then(done, done);
+  }
+
+  /** Run `fn` now, or once every sealed frame that has already arrived has been opened and delivered. */
+  #afterOpens(fn) {
+    if (this.#opening === 0) fn(); else this.#afterOpening.push(fn);
   }
 
   #sealedFrameFailed(seal, err) {
@@ -3231,9 +3252,9 @@ export class WshClient {
       const sealState = this.#sealState;
       if (sealState) {
         if (sealState.bridge?.isFrame(inner)) {
-          sealState.bridge.open(inner)
+          this.#trackOpen(sealState.bridge.open(inner)
             .then((opened) => this.#handleControl(opened, msg.from_fingerprint))
-            .catch((err) => this.#countDrop({ reason: 'unopenable-bridge-frame', detail: err.message }));
+            .catch((err) => this.#countDrop({ reason: 'unopenable-bridge-frame', detail: err.message })));
           return;
         }
         const setup = !sealState.bridge && inner.type === MSG.KEY_EXCHANGE && inner.session_id === sealState.sessionId;

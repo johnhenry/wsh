@@ -15,7 +15,8 @@ hand-edit a `*.gen.*` file.
 ## The verification loop (before every push)
 
 ```bash
-npm test                # node --test test/*.test.mjs -- JS SDK only
+npm test                # node --test on every test/*.test.mjs, one process per file, each file announced and bounded
+                        # (scripts/run-tests.mjs: a file over 5 minutes is killed and named; `npm test -- test/x.test.mjs` runs one) -- JS SDK only
 npm run codegen:check   # spec/wsh-v1.yaml vs the three generated outputs
 cargo build --workspace # if crates/ changed
 cargo test --workspace  # if crates/ changed

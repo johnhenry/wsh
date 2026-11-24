@@ -321,7 +321,11 @@ export class WebSocketTransport extends WshTransport {
     if (!this.#closedByUs) {
       this._emitError(err);
     }
-    this._emitClose();
+    // What arrived before the close is delivered before it is reported: messages are dispatched one per turn, so the close
+    // (a separate event of the socket) could otherwise be handled while earlier ones are still waiting (a host's last words,
+    // the exit of a command).
+    if (this.#inbox.busy) this.#inbox.idle().then(() => this._emitClose(), () => this._emitClose());
+    else this._emitClose();
   }
 
   /**

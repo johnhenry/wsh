@@ -11,7 +11,7 @@ import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSocketServer } from 'ws';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
-import { WshClient, generateKeyPair, exportPublicKeySSH, MSG, cborEncode } from '@johnhenry/wsh';
+import { WshClient, WebSocketTransport, generateKeyPair, exportPublicKeySSH, MSG, cborEncode } from '@johnhenry/wsh';
 import { hostileRelay } from './helpers/hostile-relay.mjs';
 
 const MARKER = 'SECRET-MARKER-ZEBRA-7731';
@@ -272,6 +272,35 @@ describe('a hostile relay cannot work with a sealed session', () => {
     assert.deepEqual(c.droppedMessages, { plaintext: 2, unopened: 0 });
     assert.deepEqual(drops.map((d) => [d.reason, d.messageType]), [['plaintext-on-sealed-session', MSG.SHUTDOWN], ['plaintext-on-sealed-session', MSG.ERROR]]);
     assert.deepEqual(written.filter((l) => /wsh:client/.test(l)), [], 'nothing on the console by default');
+  });
+
+  it('what the host sent just before the connection ended is delivered, not lost to the close that follows it', async () => {
+    // The host's last words and the socket's close arrive back to back (the transport reports the close in the same turn as the
+    // last frame); opening a sealed frame is asynchronous, so the close must wait for the frames that arrived before it.
+    let closeAfterEcho = false;
+    class ClosesBehindTheNextFrame extends WebSocketTransport {
+      _emitControl(msg) {
+        super._emitControl(msg);
+        if (closeAfterEcho && msg.type === MSG.ENCRYPTED_FRAME) { closeAfterEcho = false; this._emitClose(); }
+      }
+    }
+    const s = await setup({ sealSession: 'offer' });
+    const c = new WshClient();
+    closers.push(() => c.disconnect());
+    await c.connectWithTransport(new ClosesBehindTheNextFrame(), s.relay.url, { username: 'alice', keyPair: s.keyPair, sealSession: true });
+    const d = await c.openEndpoint(ENDPOINT);
+    const reader = d.readable.getReader();
+    const writer = d.writable.getWriter();
+    closeAfterEcho = true; // the next sealed frame toward the client is the echo of the write below
+    await writer.write(new TextEncoder().encode('last words'));
+    let got = '';
+    for (;;) {
+      const { value, done } = await Promise.race([reader.read(), sleep(3000).then(() => ({ done: true, timedOut: true }))]);
+      if (done) break;
+      got += new TextDecoder().decode(value);
+      if (got.length >= 'last words'.length) break;
+    }
+    assert.equal(got, 'last words', 'the echo that arrived right before the close reached the application');
   });
 
   it('a throwing onDrop handler does not change what the client does', async () => {
