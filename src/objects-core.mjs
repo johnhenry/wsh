@@ -64,6 +64,12 @@ export const OBJECTS_DEFAULT_LIMITS = Object.freeze({
   maxRequestsPerSecond: 50,
   /** Handles per channel (on roots that opted in): more are refused, nothing is evicted. */
   maxHandles: 64,
+  /** Callbacks (stubs of far-side functions) per channel: more are refused. */
+  maxCallbacks: 16,
+  /** Calls of one callback per second; the rest are dropped and counted. */
+  maxCallbacksPerSecond: 20,
+  /** Bytes of the arguments of one callback call; a bigger one is dropped and counted. */
+  maxCallbackBytes: 16 * 1024,
   /** Event subscriptions per channel. */
   maxSubscriptions: 16,
   /** Events delivered per second, per subscription; the rest are dropped and counted. */
@@ -93,6 +99,7 @@ export const NEEDS_LISTING = Object.freeze([
 ]);
 
 const KEY_MAX = 256;
+const CALLBACK_SUFFIX = '(callback)';
 const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 /** On a root with handles: members that lead from a node back up to the document or window graph. Refused until an allow-list entry names them, nodes opt-in or not. */
 const GRAPH_MEMBERS = Object.freeze(['ownerDocument', 'defaultView', 'parentNode', 'parentElement', 'getRootNode', 'contentWindow', 'contentDocument', 'self', 'window', 'top', 'parent', 'frames', 'opener', 'globalThis']);
@@ -111,9 +118,18 @@ function checkKey(key) {
 function compileList(list, kind) {
   if (list === undefined || list === null) return [];
   if (!Array.isArray(list)) throw new TypeError(`exposeObjects: allow.${kind} must be an array of path patterns`);
-  return list.map((entry) => {
-    if (typeof entry !== 'string' || entry === '') throw new TypeError(`exposeObjects: allow.${kind} entries must be non-empty strings`);
-    const segs = entry.split('.');
+  return list.map((original) => {
+    if (typeof original !== 'string' || original === '') throw new TypeError(`exposeObjects: allow.${kind} entries must be non-empty strings`);
+    // A call entry that ends in `(callback)` says the call accepts functions as arguments (they arrive as stubs the page can call, one-way).
+    let entry = original;
+    let callbacks = false;
+    if (entry.endsWith(CALLBACK_SUFFIX)) {
+      if (kind !== 'call') throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(original)}: only a call entry can accept callbacks`);
+      entry = entry.slice(0, -CALLBACK_SUFFIX.length);
+      callbacks = true;
+    }
+    if (entry.includes(CALLBACK_SUFFIX)) throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(original)}: "(callback)" ends an entry`);
+    const segs = Object.assign(entry.split('.'), { callbacks });
     for (const s of segs) {
       if (s === '') throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(entry)} has an empty segment`);
       if (ALWAYS_REFUSED.has(s)) throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(entry)} names "${s}", which is never reachable`);
@@ -414,7 +430,7 @@ export function createObjectsServer(options = {}) {
   }
 
   /** The checks every operation passes, in order. `terminal` ones need the operation's own list; the rest need only to walk toward something allowed. */
-  async function check(kind, root, segs, ctx, { terminal, type }) {
+  async function check(kind, root, segs, ctx, { terminal, type, callbacks = 0 }) {
     const who = ctx.who;
     const gone = guard?.();
     if (gone) throw refuse('gone', `refused: ${gone}`);
@@ -425,6 +441,7 @@ export function createObjectsServer(options = {}) {
     // 1. the allow-list: the operation's own list for the operation itself, any list for walking toward something
     if (terminal) {
       if (!own.some((p) => matchPath(p, segs))) throw refuse('not-allowed', `refused: ${kind} of ${segs.join('.')} is not in the allow-list`, { path: segs.join('.'), op: kind });
+      if (callbacks > 0 && !own.some((p) => matchPath(p, segs) && p.callbacks)) throw refuse('not-allowed', `refused: ${segs.join('.')} does not accept callbacks (its allow-list entry would end in "${CALLBACK_SUFFIX}")`, { path: segs.join('.'), op: kind });
       if (kind === 'on' && !own.some((p) => matchPath(p, segs) && p.type === type)) throw refuse('not-allowed', `refused: the event type "${type}" of ${segs.join('.')} is not in the allow-list`, { path: segs.join('.'), op: kind, type });
     } else if (!every.some((p) => prefixPath(p, segs))) {
       throw refuse('not-allowed', `refused: ${segs.join('.')} is not on the way to anything the allow-list names`, { path: segs.join('.') });
@@ -438,7 +455,7 @@ export function createObjectsServer(options = {}) {
     }
     if (terminal && authorize) {
       let ok = false;
-      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.'), ...(type !== undefined ? { type } : {}) })) === true; } catch { ok = false; }
+      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.'), ...(type !== undefined ? { type } : {}), ...(callbacks ? { callbacks } : {}) })) === true; } catch { ok = false; }
       if (!ok) throw refuse('authorize', `refused: ${kind} of ${segs.join('.')} was not authorized`, { path: segs.join('.'), op: kind });
     }
   }
@@ -503,19 +520,27 @@ export function createObjectsServer(options = {}) {
       }
       // call / construct
       if (kind === 'call' && typeof cur === 'function' && FUNCTION_REFLECTION.has(key)) throw refuse('always-refused', `refused: "${key}" of a function re-aims it and is never reachable`);
-      await check(kind, root, next, ctx, { terminal: true });
+      // Functions of the far side, passed as arguments: `callbacks: [[index, id], ...]`, with null in `args` at those places.
+      const spec = op.callbacks === undefined ? [] : op.callbacks;
+      if (!Array.isArray(spec) || spec.length > limits.maxArgs || !spec.every((c) => Array.isArray(c) && c.length === 2 && Number.isSafeInteger(c[0]) && c[0] >= 0 && Number.isSafeInteger(c[1]) && c[1] >= 1)) throw invalid('callbacks must be [[argument index, id], ...]');
+      await check(kind, root, next, ctx, { terminal: true, callbacks: spec.length });
       const args = op.args === undefined ? [] : op.args;
       if (!Array.isArray(args)) throw invalid('args must be an array');
       if (args.length > limits.maxArgs) throw limitError('maxArgs', limits.maxArgs, `${args.length} arguments`);
+      if (spec.some(([i]) => i >= args.length || args[i] !== null) || new Set(spec.map(([i]) => i)).size !== spec.length) throw invalid('a callback takes the place of an argument, once');
       const clean = fromWire(args, limits);
+      const made = [];
+      try {
+        for (const [index, id] of spec) { const had = ctx.session.callbacks.has(id); const stub = makeCallback(ctx.session, id); if (!had) made.push(id); clean[index] = stub; }
+      } catch (e) { for (const id of made) killCallback(ctx.session, id); throw e; }
       if (kind === 'call' && isTimerCallee(key) && typeof clean[0] === 'string') throw refuse('always-refused', `refused: ${key} with a string would evaluate it`);
       let fn;
-      try { fn = readKey(cur, key); } catch (e) { throw wrapThrown(e, `reading ${next.join('.')}`); }
-      if (typeof fn !== 'function') throw new ObjectsError(OBJECTS_ERROR.FAILED, `${next.join('.')} is not a function`, { reason: 'not-a-function' });
+      try { fn = readKey(cur, key); } catch (e) { for (const id of made) killCallback(ctx.session, id); throw wrapThrown(e, `reading ${next.join('.')}`); }
+      if (typeof fn !== 'function') { for (const id of made) killCallback(ctx.session, id); throw new ObjectsError(OBJECTS_ERROR.FAILED, `${next.join('.')} is not a function`, { reason: 'not-a-function' }); }
       try {
         const out = kind === 'call' ? Reflect.apply(fn, cur, clean) : Reflect.construct(fn, clean);
         cur = kind === 'call' ? await settle(out, ctx) : out;
-      } catch (e) { throw wrapThrown(e, next.join('.')); }
+      } catch (e) { for (const id of made) killCallback(ctx.session, id); throw wrapThrown(e, next.join('.')); }
       segs = [...segs, `${key}()`];
     }
     return finishValue(cur, root, segs, ctx);
@@ -713,12 +738,58 @@ export function createObjectsServer(options = {}) {
     session.pumping = true;
     try {
       while (session.queue.length && !session.closed) {
-        const { sub, data, dropped } = session.queue.shift();
-        const message = { id: sub.id, seq: ++sub.seq, data, ...(dropped ? { dropped } : {}) };
-        // The write waits for the transport (credit): events behind it queue, to `maxQueuedEvents`, and beyond that are dropped and counted.
-        try { await session.peer.notify('event', message); } catch { /* the channel is going away */ }
+        const { sub, cb, data, dropped } = session.queue.shift();
+        const message = cb ? { id: cb.id, seq: ++cb.seq, args: data, ...(dropped ? { dropped } : {}) } : { id: sub.id, seq: ++sub.seq, data, ...(dropped ? { dropped } : {}) };
+        // The write waits for the transport (credit): events and callback calls behind it queue, to `maxQueuedEvents`, and beyond that are dropped and counted.
+        try { await session.peer.notify(cb ? 'callback' : 'event', message); } catch { /* the channel is going away */ }
       }
     } finally { session.pumping = false; }
+  }
+
+  // ── Callbacks ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  // A far-side function passed to a call whose entry ends in `(callback)` becomes a stub in the page. The stub is one-way: calling it copies its arguments as plain
+  // values (what cannot be cloned is null; never a handle), bounds them, queues a notification through the channel's credit, and returns undefined at once, so
+  // the page cannot be made to wait for the far side and learns nothing of it. After the channel ends, or after a release, a call is a no-op that is counted.
+
+  function makeCallback(session, id) {
+    // The same function sent again (an id the channel already has) is the same stub.
+    const existing = session.callbacks.get(id);
+    if (existing) return existing.stub;
+    if (session.callbacks.size >= limits.maxCallbacks) throw limitError('maxCallbacks', limits.maxCallbacks, 'too many callbacks on this channel: release some');
+    const cb = { id, seq: 0, stamps: [], dropped: 0, dead: false, stub: null };
+    cb.stub = function callback(...args) {
+      try { deliverCallback(session, cb, args); } catch { cb.dropped++; }
+    };
+    session.callbacks.set(id, cb);
+    return cb.stub;
+  }
+
+  function killCallback(session, id) {
+    const cb = session.callbacks.get(id);
+    if (cb) { cb.dead = true; session.callbacks.delete(id); }
+    return !!cb;
+  }
+
+  function deliverCallback(session, cb, args) {
+    if (session.closed || cb.dead || guard?.()) { session.deadCalls++; return; }
+    const t = now();
+    while (cb.stamps.length && t - cb.stamps[0] >= 1000) cb.stamps.shift();
+    // Rate and room first, copy after: a dropped call costs a counter.
+    if (cb.stamps.length >= limits.maxCallbacksPerSecond || session.queue.length >= limits.maxQueuedEvents) { cb.dropped++; return; }
+    let copy;
+    try {
+      copy = args.slice(0, limits.maxArgs).map((a) => { const w = toWire(a, { maxDepth: 4, maxBytes: limits.maxCallbackBytes }); return 'v' in w ? w.v : null; });
+      toWire(copy, { maxDepth: 6, maxBytes: limits.maxCallbackBytes });
+    } catch { cb.dropped++; return; }
+    cb.stamps.push(t);
+    session.queue.push({ cb, data: copy, dropped: cb.dropped });
+    cb.dropped = 0;
+    void pump(session);
+  }
+
+  async function releaseCallback(params, ctx) {
+    if (!killCallback(ctx.session, params.id)) throw invalid('no such callback');
+    return { ok: true };
   }
 
   function deliver(session, sub, args) {
@@ -784,7 +855,7 @@ export function createObjectsServer(options = {}) {
   /** Register the protocol's methods on a peer. `who` is the identity of every call unless the transport gives one per call. */
   function attach(peer, { who } = {}) {
     if (typeof peer?.onRequest !== 'function') throw new TypeError('attach: the peer needs onRequest(method, handler)');
-    const session = { peer, subs: new Map(), queue: [], pumping: false, closed: false, handles: new Map() };
+    const session = { peer, subs: new Map(), queue: [], pumping: false, closed: false, handles: new Map(), callbacks: new Map(), deadCalls: 0 };
     // The end of the channel (the peer left, Stop, a navigation, a revoke) takes every listener out of the page's sources.
     const prior = peer.onClose;
     peer.onClose = (reason) => {
@@ -793,6 +864,8 @@ export function createObjectsServer(options = {}) {
       session.subs.clear();
       session.queue = [];
       session.handles.clear(); // the end of the channel (leaving, Stop, navigation, revoke) releases every handle
+      for (const cb of session.callbacks.values()) cb.dead = true; // and kills every callback stub
+      session.callbacks.clear();
       try { prior?.(reason); } catch { /* ignore */ }
     };
     const stamps = [];
@@ -816,7 +889,8 @@ export function createObjectsServer(options = {}) {
     method('subscribe', subscribe);
     method('unsubscribe', unsubscribe);
     method('release', releaseHandle);
-    return { limits, handleCount: () => session.handles.size };
+    method('releaseCallback', releaseCallback);
+    return { limits, handleCount: () => session.handles.size, callbackCount: () => session.callbacks.size, deadCallbackCalls: () => session.deadCalls };
   }
 
   return { attach, limits: Object.freeze({ ...limits }), rootNames: rootNames.slice() };
@@ -986,20 +1060,48 @@ function makeRef(session, root, ops, handle) {
     apply(_t, _this, args) {
       const last = ops[ops.length - 1];
       if (!last || !('get' in last)) throw new TypeError('only a method reached by name can be called (win.app.cart.add(x)); call a path, not a result');
-      return makeRef(session, root, [...ops.slice(0, -1), { call: last.get, args: plainArgs(args) }], handle);
+      return makeRef(session, root, [...ops.slice(0, -1), { call: last.get, ...callArgs(args) }], handle);
     },
     construct(_t, args) {
       const last = ops[ops.length - 1];
       if (!last || !('get' in last)) throw new TypeError('only a constructor reached by name can be constructed (new win.app.Cart())');
-      return makeRef(session, root, [...ops.slice(0, -1), { construct: last.get, args: plainArgs(args) }], handle);
+      return makeRef(session, root, [...ops.slice(0, -1), { construct: last.get, ...callArgs(args) }], handle);
     },
   };
   // A function as the target so the proxy can be called and constructed.
   return new Proxy(function remote() {}, handler);
 }
 
+/**
+ * The arguments of a call: a function at the top level of the list (not a reference, not a handle) is a CALLBACK: its place is null on the wire, listed in `fns`
+ * (until it is sent, when `send` gives it an id). A function deeper in an argument, a reference and a handle are refused where they are written.
+ */
+function callArgs(args) {
+  const fns = [];
+  const copy = args.map((a, i) => {
+    if (typeof a === 'function' && !a[BRAND]) { fns.push([i, a]); return null; }
+    return a;
+  });
+  plainArgs(copy);
+  return fns.length ? { args: copy, fns } : { args: copy };
+}
+
+const CALLBACK_OF = new WeakMap();
+
+/** The wire form of an op: its callbacks get ids (one per function per channel, the same id each time it is sent) and `fns` goes. */
+function wireOp(session, op) {
+  if (!op.fns) return op;
+  const { fns, ...rest } = op;
+  return { ...rest, callbacks: fns.map(([i, fn]) => {
+    let rec = CALLBACK_OF.get(fn);
+    if (!rec || rec.session !== session || rec.released) { rec = { session, id: session.nextCb++, released: false }; CALLBACK_OF.set(fn, rec); session.callbacks.set(rec.id, fn); }
+    return [i, rec.id];
+  }) };
+}
+
 async function send(state, { signal } = {}) {
-  const { session, ops } = state;
+  const { session } = state;
+  const ops = state.ops.map((op) => wireOp(session, op));
   try {
     return decodeResult(await session.peer.request('resolve', { ...target(state), ops }, { signal, ...(session.timeoutMs ? { timeoutMs: session.timeoutMs } : {}) }), session);
   } catch (e) { throw asObjectsError(e, session); }
@@ -1034,7 +1136,7 @@ export function call(ref, ...args) {
   const state = stateOf(ref);
   const last = state.ops[state.ops.length - 1];
   if (!last || !('get' in last)) throw new TypeError('call needs a method reached by name');
-  return send({ ...state, ops: [...state.ops.slice(0, -1), { call: last.get, args: plainArgs(args) }] });
+  return send({ ...state, ops: [...state.ops.slice(0, -1), { call: last.get, ...callArgs(args) }] });
 }
 
 /** `new` a constructor reached by name: `await construct(win.app.Cart, 'A')`. */
@@ -1042,7 +1144,7 @@ export function construct(ref, ...args) {
   const state = stateOf(ref);
   const last = state.ops[state.ops.length - 1];
   if (!last || !('get' in last)) throw new TypeError('construct needs a constructor reached by name');
-  return send({ ...state, ops: [...state.ops.slice(0, -1), { construct: last.get, args: plainArgs(args) }] });
+  return send({ ...state, ops: [...state.ops.slice(0, -1), { construct: last.get, ...callArgs(args) }] });
 }
 
 /** A bounded deep copy: `await snapshot(win.app.state, { depth: 3, maxBytes: 256_000 })`. Subtrees deeper than `depth` are `null`. */
@@ -1092,9 +1194,17 @@ export async function describe(ref, { signal } = {}) {
  * @param {object} peer
  * @param {{ timeoutMs?: number }} [options]
  */
-export async function createObjectsClient(peer, { timeoutMs } = {}) {
+export async function createObjectsClient(peer, { timeoutMs, onCallbackError, onCallbackDropped } = {}) {
   if (typeof peer?.request !== 'function') throw new TypeError('createObjectsClient: the peer needs request(method, params)');
-  const session = { peer, closing: null, timeoutMs, subs: new Map(), nextSub: 1 };
+  const session = { peer, closing: null, timeoutMs, subs: new Map(), nextSub: 1, callbacks: new Map(), nextCb: 1 };
+  // The page called a stub of one of our functions: run it here. Its errors and its return value stay here (the stub is one-way); `onCallbackDropped({ dropped })`
+  // is told, before the call that follows them, how many calls the host dropped (rate, size, a slow channel).
+  peer.onNotification?.('callback', (params) => {
+    const fn = session.callbacks.get(params?.id);
+    if (!fn || !Array.isArray(params.args)) return;
+    if (Number.isSafeInteger(params.dropped) && params.dropped > 0) { try { onCallbackDropped?.({ dropped: params.dropped, fn }); } catch { /* ours */ } }
+    try { fn(...params.args); } catch (e) { try { onCallbackError?.(e); } catch { /* ours */ } }
+  });
   // An event the host delivers: to the listener that asked, in this process. A listener that throws is this side's business and goes to its `onError`: it never travels back.
   peer.onNotification?.('event', (params) => {
     const sub = session.subs.get(params?.id);
@@ -1123,8 +1233,17 @@ export function use(handle) {
 
 /** Give a handle's place back. Releasing a released handle does nothing. Everything is released when the channel ends. */
 export async function release(handle) {
+  // A function that was passed as a callback: its stub in the page dies, and a call of it is a counted no-op.
+  if (typeof handle === 'function' && CALLBACK_OF.has(handle)) {
+    const cb = CALLBACK_OF.get(handle);
+    if (cb.released) return;
+    cb.released = true;
+    cb.session.callbacks.delete(cb.id);
+    try { await cb.session.peer.request('releaseCallback', { id: cb.id }); } catch (e) { throw asObjectsError(e, cb.session); }
+    return;
+  }
   const rec = handle instanceof RemoteHandle ? HANDLE_ID.get(handle) : undefined;
-  if (!rec) throw new TypeError('release needs a handle');
+  if (!rec) throw new TypeError('release needs a handle, or a function that was passed as a callback');
   if (rec.released) return;
   rec.released = true;
   try { await rec.session.peer.request('release', { handle: rec.id }); } catch (e) { throw asObjectsError(e, rec.session); }

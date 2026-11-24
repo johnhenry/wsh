@@ -26,12 +26,12 @@
       "gzip": 2689
     },
     "./page": {
-      "raw": 297382,
-      "gzip": 94104
+      "raw": 300760,
+      "gzip": 95310
     },
     "./objects": {
-      "raw": 175022,
-      "gzip": 53645
+      "raw": 178611,
+      "gzip": 54688
     },
     ". (generateKeyPair only)": {
       "raw": 404,

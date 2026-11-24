@@ -200,7 +200,7 @@ for (const [transportName, connect] of Object.entries(TRANSPORTS)) {
       assert.deepEqual({ ...(await page.window.node) }, { kind: 'object', type: 'HTMLDivElement' });
       assert.deepEqual({ ...(await page.window.app.huge) }, { kind: 'number', text: '1e+21' });
       // A function, or a reference (a path, which is a function to the engine), is not plain data: refused where it is written, before anything is sent.
-      assert.throws(() => page.window.app.echo(() => 1), /cannot be sent as an argument/);
+      await rejects(page.window.app.echo(() => 1), (e) => e.reason === 'not-allowed' && /does not accept callbacks/.test(e.message));
       assert.throws(() => page.window.app.echo(page.window.app.greet), /cannot be sent as an argument/);
       assert.throws(() => page.window.app.echo({ nested: [{ f() {} }] }), /cannot be sent as an argument/);
     });

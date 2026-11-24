@@ -31,8 +31,8 @@ export class RemoteHandle {
 }
 /** A reference that stands on a handle: `await use(handle).items.length`. Judged by the producing path extended by what you name. */
 export function use(handle: RemoteHandle): any;
-/** Give a handle's place back (releasing a released handle does nothing). */
-export function release(handle: RemoteHandle): Promise<void>;
+/** Give a handle's place back (releasing a released handle does nothing); or kill the stub of a function that was passed as a callback. */
+export function release(handleOrCallback: RemoteHandle | ((...args: any[]) => unknown)): Promise<void>;
 
 export class NonValue {
   constructor(wire: { u: string; type?: string; text?: string });
@@ -70,6 +70,12 @@ export interface ObjectsLimits {
   maxQueuedEvents: number;
   /** Handles per channel on roots that opted in; more are refused by name, nothing is evicted. Default 64. */
   maxHandles: number;
+  /** Callbacks (stubs of far-side functions) per channel; more are refused. Default 16. */
+  maxCallbacks: number;
+  /** Calls of one callback per second; the rest are dropped and counted. Default 20. */
+  maxCallbacksPerSecond: number;
+  /** Bytes of the arguments of one callback call; a bigger one is dropped and counted. Default 16384. */
+  maxCallbackBytes: number;
 }
 export const OBJECTS_DEFAULT_LIMITS: Readonly<ObjectsLimits>;
 
@@ -79,6 +85,7 @@ export const NEEDS_LISTING: ReadonlyArray<readonly string[]>;
 /** Allow-lists by operation: path patterns from a root (`'window.document.title'`, `'window.app.**'`; `*` is one segment, `**` any number). `call` covers `construct`. Nothing is allowed by default. */
 export interface ObjectsAllow {
   get?: string[];
+  // (`call` entries may end in `(callback)`: the call accepts functions as arguments, which reach the page as one-way stubs.)
   call?: string[];
   set?: string[];
   /** Event sources, as `path@type` (`'window.app.bus@ready'`; the source and the type are named exactly, a wildcard in either is refused). Never implied by the other lists. */
@@ -90,6 +97,8 @@ export interface ObjectsOperation {
   kind: 'get' | 'call' | 'construct' | 'set' | 'on' | 'describe' | 'snapshot';
   /** For `on`: the event type. */
   type?: string;
+  /** For a call that carries callbacks: how many. */
+  callbacks?: number;
   root: string;
   /** The path below the root. */
   path: string[];
@@ -145,7 +154,13 @@ export function createObjectsServer(options: ObjectsServerOptions): {
 export function createDuplexPeer(options: { send(message: object): void; maxMessageBytes?: number }): ObjectsPeer & { receive(message: unknown): void; close(reason?: string): void; readonly closed: boolean };
 
 /** The client half over any peer: the roots, as lazy references. */
-export function createObjectsClient<T = Record<string, any>>(peer: Pick<ObjectsPeer, 'request'> & Partial<ObjectsPeer>, options?: { timeoutMs?: number }): Promise<T>;
+export function createObjectsClient<T = Record<string, any>>(peer: Pick<ObjectsPeer, 'request'> & Partial<ObjectsPeer>, options?: {
+  timeoutMs?: number;
+  /** A callback of ours threw: it stays here, the page never hears of it. */
+  onCallbackError?: (error: unknown) => void;
+  /** The host dropped calls of a callback (rate, size, a slow channel) before the one that follows. */
+  onCallbackDropped?: (info: { dropped: number; fn: (...args: any[]) => unknown }) => void;
+}): Promise<T>;
 
 /** `exposeObjects`: the rpc handler for `wsh-objects`. Usable as `rpc: { 'wsh-objects': exposeObjects({ roots, allow }) }` in any host. */
 export interface ObjectsHandler {

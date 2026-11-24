@@ -31,6 +31,10 @@ async function farSide(client: WshClient): Promise<void> {
   void [title, n, r, state, shape.keys[0]?.key, then];
   const stop = await on(page.window.app.bus, 'ready', (data, { type, seq, dropped }) => { void [data, type, seq, dropped]; }, { fields: ['detail'], onError: (e) => { void e; } });
   await off(stop);
+  const cb = (x: unknown): void => { void x; };
+  await page.window.app.subscribe(cb);
+  await release(cb);
+  void createObjectsClient(createDuplexPeer({ send: () => {} }), { onCallbackError: (e) => { void e; }, onCallbackDropped: ({ dropped, fn }) => { void [dropped, fn]; } });
   const cart = await page.window.app.cart;
   if (cart instanceof RemoteHandle) { void [cart.kind, cart.type, cart.preview?.keys]; await use(cart).add({ sku: 'A1' }); await release(cart); }
   await closeObjects(page);

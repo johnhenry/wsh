@@ -133,6 +133,27 @@ test.describe('a page host: object access (values mode) over a sealed relayed se
     } finally { await wsh.disconnect(); }
   });
 
+  test('callbacks: a far-side function reaches the page as a stub it calls with plain values; one-way; refused where the entry does not say (callback); dead after Stop', async ({ page }) => {
+    const expose = { window: { allow: { call: ['app.watch(callback)', 'app.tick', 'app.noCallbacks'] } } };
+    const { wsh, remote } = await start(page, expose);
+    try {
+      const got = [];
+      expect(await remote.app.watch((v) => got.push(v))).toBe('watching');
+      expect(await remote.app.tick(1)).toBe(1);
+      await expect.poll(() => got.length).toBe(1);
+      expect(got[0]).toEqual({ n: 1, at: 'page' });
+      // The stub is one-way: a call from page code returns at once, whatever the far side does.
+      expect(await page.evaluate(() => window.__watchers[0]({ n: 2 }))).toBeUndefined();
+      await expect.poll(() => got.length).toBe(2);
+      await expect(Promise.resolve(remote.app.noCallbacks(() => 1))).rejects.toMatchObject({ reason: 'not-allowed' });
+      await page.locator('[data-wsh-page="indicator"]').getByRole('button', { name: /Stop/ }).click();
+      await expect(page.locator('[data-wsh-page="indicator"]')).toHaveCount(0);
+      expect(await page.evaluate(() => { try { window.__watchers[0]({ n: 3 }); return 'no error'; } catch (e) { return String(e); } })).toBe('no error');
+      await new Promise((r) => setTimeout(r, 150));
+      expect(got.length).toBe(2);
+    } finally { await wsh.disconnect(); }
+  });
+
   test('the indicator is shown while the object session lasts, and Stop ends it', async ({ page }) => {
     const { wsh, remote } = await start(page);
     try {

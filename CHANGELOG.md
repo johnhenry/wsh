@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### `wsh-objects` callbacks: a far-side function as an argument of a call that accepts one (#190; JS)
+
+`allow.call: ['window.app.subscribe(callback)']`: an entry that ends in `(callback)` says the call accepts functions as arguments. The page's function receives a **stub** it may keep and call with plain values; the far side's function runs on the far side.
+A call entry without the suffix refuses a function argument (`does not accept callbacks`); a function nested in an argument, a remote reference and a handle are still refused where they are written.
+
+- **One-way:** the stub returns `undefined` at once, so the page cannot be made to wait for the far side; the far side's return value is not delivered (no notation for it yet). Its arguments are plain values only (what cannot be cloned is `null`; never a handle).
+- **Bounds:** `maxCallbacks` (16 per channel, refused by name), `maxCallbacksPerSecond` (20 per callback), `maxCallbackBytes` (16384); calls over the rate, the size or the shared queue are dropped and counted, and `onCallbackDropped({ dropped })` tells the client before the next one. They go through the channel's credit.
+- **Dead after the session:** the channel ending (leaving, Stop, a navigation, a revoke) and `release(fn)` kill the stub; calling it is a counted no-op. A far-side listener's error goes to `onCallbackError` and never reaches the page. The call is a `call` for `authorize` (`op.callbacks`) and for `objects:ROOT:call`.
+- **Wire: nothing new beyond the channel:** a `callbacks: [[argument index, id]]` field on a call or construct op, the method `releaseCallback`, and the notification `callback`. **A released peer (0.47.0 / the next release's predecessor):** an older host ignores the unknown `callbacks` field and would run the call with `null` in place of the function, so use this release on the host before a client passes a function; an older client cannot pass one.
+
 ### `wsh-objects` handles, on the path-bound model (#190; JS)
 
 A root can opt in to **handles** (`exposeObjects({ handles: { window: {} } })`, `createPageHost({ expose: { window: { mode: 'handles' } } })`): a function or an object that is not plain data comes back as an opaque `RemoteHandle`

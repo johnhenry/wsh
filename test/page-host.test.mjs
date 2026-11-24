@@ -594,6 +594,28 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
     await assert.rejects(Promise.resolve(use(store).bump()), /closed|stopped|no such handle/);
   });
 
+  it('callbacks: a function passed to an entry that says (callback) is a stub in the page; after Stop it is dead, and the page is never made to wait', async () => {
+    const { win } = worldWindow();
+    const stubs = [];
+    win.app.watch = (fn) => { stubs.push(fn); return 'watching'; };
+    win.app.noCallbacks = (fn) => typeof fn;
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: { window: { allow: { call: ['app.watch(callback)', 'app.noCallbacks'] } } } } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const { window: remote } = await wsh.openObjects();
+    const got = [];
+    assert.equal(await remote.app.watch((x) => got.push(x)), 'watching');
+    assert.equal(stubs[0]({ n: 1 }), undefined);
+    await until(() => got.length === 1, 'the callback');
+    assert.deepEqual(got, [{ n: 1 }]);
+    await assert.rejects(Promise.resolve(remote.app.noCallbacks(() => 1)), (e) => e.reason === 'not-allowed' && /does not accept callbacks/.test(e.message));
+    byRole(win, 'stop')[0].click();
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+    assert.doesNotThrow(() => stubs[0]({ n: 2 }));
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(got, [{ n: 1 }]);
+  });
+
   it('authorize(who, op) of a root is asked, with the key of the caller', async () => {
     const { win } = worldWindow();
     const asked = [];
