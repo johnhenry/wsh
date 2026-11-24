@@ -38,6 +38,7 @@ pub mod gateway;
 pub mod keystore;
 pub mod known_hosts;
 pub mod mcp;
+pub mod objects;
 pub mod rpc;
 pub mod seal_gate;
 pub mod session;

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Rust: a `wsh-objects` client and `wsh objects` (#219; needs a Rust release, `rust-v0.18.0`)
+
+**Wire: nothing new.** The Rust client now speaks the existing `wsh-objects` rpc protocol (written down in `spec/objects.md`, shipped in the package) to a JS host: a page host behind a relay, or `exposeObjects` on a memory host. A released JS peer (0.50.0 and before) sees an ordinary client; a released Rust peer (`rust-v0.17.1`, `deny_unknown_fields`) has no objects client and is unaffected. The Rust server still serves no `wsh-objects`.
+
+- `wsh_client::objects`: `ObjectsClient::open`, `roots()`, a `Target` (root or handle) with `get`, `call`, `construct`, `set`, `snapshot`, `describe`, `resolve(Chain)` (a whole chain is one request) and `subscribe` (a bounded `Subscription`; drops by the host and by this side are both counted and told); `Handle`s released by `release()`, on drop and at the end of the session; typed `ObjectsError`s (`Refused`, `Limit`, `NotFound`, `Unsupported`, ...) carrying the host's reason; values as a serde-friendly `Value` (bytes native, non-values named). A feature the host did not state (`events`, `handles`) is refused locally by name before anything is sent. Not built: callbacks, events through a handle.
+- `wsh --sealed [--via RELAY] objects user@host roots | describe | get | call | construct | set | snapshot | watch | session`: sealed sessions only; JSON on stdout; text from the page is printed as JSON strings with every control character escaped; exit 3 refused, 4 not found, 5 unsupported.
+- `wsh-core`: `CborSequenceDecoder::feed_values`, `encode_cbor` and `to_json` expose the rpc codec's CBOR values (a byte string stays a byte string); `WshClient::open_rpc_values` and `RpcChannel::send_values` / `recv_values` use them. `feed`, `open_rpc` and the existing channels behave as before (a byte string is still refused there).
+- Tests: unit tests of values, paths, error mapping, events, handles and escaping; `test/rust/wsh-objects.test.mjs` runs the real binary against a page host through a recording relay (allowed and refused paths, the always-refused names, a `get`-only key refused `call`, an event burst with drops, a handle used across calls and released, a host without `events` / `handles`).
+
 ## 0.50.0
 
 npm only (since `rust-v0.17.1` the only change under `crates/` is the unit test of the capability vectors added in 0.49.0, no binary changes, no `rust-v` tag; the note below in `spec/wsh-v1.yaml` is a comment that generates no code change). **Wire: nothing new.**
