@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.48.0
+
+npm only (no Rust crate changed since `rust-v0.17.1`). **Compatibility:** handles and callbacks need a 0.48.0 host AND client. A 0.47.0 client does not recognise a handle (it sees an unnamed value); a 0.47.0 host does not accept callbacks (it ignores the field and would run the call with `null` in place of the function),
+and a 0.48.0 client therefore refuses to send a function to a host that has not said it supports callbacks (a named error, `reason: 'unsupported'`; the host states `features` with its roots, additive and ignored by older clients). A pre-0.48 client against a 0.48.0 host that has opted in to handles gets an unnamed value for a handle.
+The wide-open handles string from early drafts was never released and is refused with a sentence. The two opt-ins of handles are per root: `nodes` (DOM nodes, windows, documents) and `wideEntries` (a wildcard in `call` or `set`).
 
 ### `wsh-objects` callbacks: a far-side function as an argument of a call that accepts one (#190; JS)
 
@@ -10,7 +14,7 @@ A call entry without the suffix refuses a function argument (`does not accept ca
 - **One-way:** the stub returns `undefined` at once, so the page cannot be made to wait for the far side; the far side's return value is not delivered (no notation for it yet). Its arguments are plain values only (what cannot be cloned is `null`; never a handle).
 - **Bounds:** `maxCallbacks` (16 per channel, refused by name), `maxCallbacksPerSecond` (20 per callback), `maxCallbackBytes` (16384); calls over the rate, the size or the shared queue are dropped and counted, and `onCallbackDropped({ dropped })` tells the client before the next one. They go through the channel's credit.
 - **Dead after the session:** the channel ending (leaving, Stop, a navigation, a revoke) and `release(fn)` kill the stub; calling it is a counted no-op. A far-side listener's error goes to `onCallbackError` and never reaches the page. The call is a `call` for `authorize` (`op.callbacks`) and for `objects:ROOT:call`.
-- **Wire: nothing new beyond the channel:** a `callbacks: [[argument index, id]]` field on a call or construct op, the method `releaseCallback`, and the notification `callback`. **A released peer (0.47.0 / the next release's predecessor):** an older host ignores the unknown `callbacks` field and would run the call with `null` in place of the function, so use this release on the host before a client passes a function; an older client cannot pass one.
+- **Wire: nothing new beyond the channel:** a `callbacks: [[argument index, id]]` field on a call or construct op, the method `releaseCallback`, and the notification `callback`. **A released peer (0.47.0):** an older host ignores the unknown `callbacks` field and would run the call with `null` in place of the function, so this client refuses to send a function unless the host's `roots` answer lists the `callbacks` feature (a named error); an older client cannot pass one.
 
 ### `wsh-objects` handles, on the path-bound model (#190; JS)
 
