@@ -48,6 +48,14 @@ hostKeyStore?, onSession, onRefused })`, `webmcpTools({ window, allow, approve, 
   and Rust client (`rust-v0.16.0`) refuse it exactly as they refuse any virtual-mode rpc host (they look for `rpc`); use this release's client or `wsh-mcp --sealed`. `wsh-server` is unchanged.
 - **Bundle:** `@johnhenry/wsh/page` is 80.8 kB gzipped (it contains the memory host); the other entry points grew by about 100 bytes gzip each at most, from the two small additions to the shared rpc context.
 
+### Behaviour change: `WSH_INSECURE_LOOPBACK_TLS` now applies to loopback destinations only (Rust client and CLI)
+
+The variable (`1` or `true`) skips `wss://` certificate verification, and until now it did so for any host while it was set, whatever its name suggested. It now applies
+**to loopback destinations only**: verification is skipped when the socket actually connected to an address in 127.0.0.0/8 or `::1` (decided on the peer address, so `localhost`
+counts when it resolves to a loopback address and a name that resolves elsewhere does not). For any other destination the variable has no effect, the certificate is
+verified as usual, and the client says once on stderr that the variable was ignored for that host. Loopback test setups keep working unchanged; anyone who set it to reach a
+remote server with a self-signed certificate must trust that certificate instead (`SSL_CERT_FILE`). The JS client never read the variable.
+
 ### rpc channels in virtual data mode, Rust: `wsh mcp --sealed` / `--via` and `wsh-server` with `seal_session` on (#191; Rust)
 
 The Rust halves of the JS change below. **No new wire format**: the feature string `rpc-virtual`, `OpenOk { data_mode: "virtual" }`, `SessionData` and the flagged

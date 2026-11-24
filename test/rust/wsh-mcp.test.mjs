@@ -493,4 +493,34 @@ describe('wsh mcp against the Rust wsh-server (#127)', { skip: !existsSync(SERVE
     assert.ok(byId.two.result.rpc.protocols.includes('wsh-host'));
     assert.equal(byId[3].error.code, -32601);
   });
+
+  // WSH_INSECURE_LOOPBACK_TLS now applies to loopback destinations only (decided on the address the socket reached).
+  const hostPing = `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'host.ping' })}\n`;
+  const runWith = (target, envOverride) => new Promise((resolve) => {
+    const env = { ...cleanEnv(me.home), ...envOverride };
+    for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+    const proc = spawn(WSH_BIN, ['--accept-new-host-key', 'mcp', '--channel', 'wsh-host', target], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = ''; let err = '';
+    proc.stdout.on('data', (d) => { out += d; }); proc.stderr.on('data', (d) => { err += d; });
+    proc.stdin.on('error', () => {});
+    proc.stdin.write(hostPing);
+    setTimeout(() => proc.stdin.end(), 1500);
+    const timer = setTimeout(() => proc.kill('SIGKILL'), 20_000);
+    proc.once('close', (code) => { clearTimeout(timer); resolve({ code, out, err }); });
+  });
+
+  it('WSH_INSECURE_LOOPBACK_TLS still lets a loopback wss:// destination (an address, or localhost) connect to a self-signed certificate', async () => {
+    for (const host of ['127.0.0.1', 'localhost']) {
+      const r = await runWith(`alice@wss://${host}:${port}`, {});
+      assert.equal(r.code, 0, `${host}: ${r.err}`);
+      assert.equal(typeof JSON.parse(r.out.trim().split('\n')[0]).result.time, 'number');
+      assert.doesNotMatch(r.err, /is ignored/);
+    }
+  });
+
+  it('without the variable the self-signed certificate is refused, even on loopback', async () => {
+    const r = await runWith(`alice@wss://127.0.0.1:${port}`, { WSH_INSECURE_LOOPBACK_TLS: undefined });
+    assert.notEqual(r.code, 0);
+    assert.match(r.err, /certificate|UnknownIssuer|invalid peer/i);
+  });
 });
