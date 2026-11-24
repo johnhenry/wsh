@@ -4,7 +4,7 @@
 
 ### `wsh-objects` events in values mode: `on(ref, type, listener)` (#190; JS)
 
-A far side can listen to events of a source the host names: `allow.on: ['window.app.bus@ready', 'window@hashchange']` (`path@type`; the type may be `*`), and `await on(ref, 'ready', (data, { type, seq, dropped }) => ...)`, which resolves to the
+A far side can listen to events of a source the host names: `allow.on: ['window.app.bus@ready', 'window@hashchange']` (`path@type`; the source and the type are named exactly: a wildcard in either is refused when the host is created), and `await on(ref, 'ready', (data, { type, seq, dropped }) => ...)`, which resolves to the
 function that unsubscribes (`off(fn)` does the same). `createPageHost({ expose: { window: { allow: { on: ['@hashchange'] }, eventFields } } })` offers it on a page host (`'@type'` is the root itself).
 
 - **Plain values only, never the event, a node or a handle.** An Event arrives as `{ type, timeStamp, isTrusted }` plus the fields the **host** lists for that type in `eventFields` and the subscriber asked for (each copied as plain data; a node
@@ -13,6 +13,7 @@ function that unsubscribes (`off(fn)` does the same). `createPageHost({ expose: 
   `objects:ROOT:on` all apply.
 - **Bounds, refused by name or counted:** `maxSubscriptions` (16 per channel, refused), `maxEventsPerSecond` (20 per subscription), `maxEventBytes` (16384) and `maxQueuedEvents` (100 per channel): an event over any of those three is dropped, and the
   next one delivered carries `dropped`, how many were lost before it. Events are notifications written through the channel's credit, so a slow reader fills the bounded queue and loses events, counted.
+- **A dropped event costs a counter:** the per-subscription rate and the queue room are checked before the event's fields are read or copied.
 - **Cleanup:** every listener is removed from the page's sources when the channel ends: the operator leaving, Stop, a navigation, a revoke. A listener error on the far side goes to its `onError` and never reaches the page; the host's listener only copies and queues.
 - **Not built:** callbacks as arguments of a call (the design describes them as handles; a function is refused where it is written), handles.
 - **Wire: nothing new.** Two rpc methods (`subscribe`, `unsubscribe`) and a notification (`event`) on the existing `wsh-objects` channel. **A released peer (0.46.x):** a released client has no `on`; a released host answers `method not found` to `subscribe`

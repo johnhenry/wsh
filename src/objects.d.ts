@@ -63,7 +63,7 @@ export interface ObjectsAllow {
   get?: string[];
   call?: string[];
   set?: string[];
-  /** Event sources, as `path@type` (`'window.app.bus@ready'`; the type may be `*`). Never implied by the other lists. */
+  /** Event sources, as `path@type` (`'window.app.bus@ready'`; the source and the type are named exactly, a wildcard in either is refused). Never implied by the other lists. */
   on?: string[];
 }
 

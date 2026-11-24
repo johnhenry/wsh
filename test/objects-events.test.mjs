@@ -34,7 +34,7 @@ function makeWorld() {
 }
 const ALLOW = {
   get: ['window.app.**'],
-  on: ['window.hash@hashchange', 'window.app.bus@ready', 'window.app.bus@*', 'window.app.emitter@tick', 'window.app.notAnEmitter@x'],
+  on: ['window.hash@hashchange', 'window.app.bus@ready', 'window.app.emitter@tick', 'window.app.notAnEmitter@x'],
 };
 const EVENT_FIELDS = { hashchange: ['newURL', 'oldURL', 'node'], '*': ['detail'] };
 
@@ -247,6 +247,43 @@ describe('events: backpressure and the transport', () => {
     assert.throws(() => createObjectsServer({ roots, eventFields: { x: 'newURL' } }), /eventFields/);
     assert.throws(() => createObjectsServer({ roots, eventFields: { x: ['__proto__'] } }), /never/);
     assert.throws(() => createObjectsServer({ roots, limits: { maxSubscriptions: 0 } }), /positive integer/);
+  });
+
+  it('an event source and its type are named exactly: a wildcard in the type or in the path is refused when the host is created, with a sentence', () => {
+    const roots = { window: {} };
+    for (const entry of ['window.bus@*', 'window.bus@re*', 'window.bus@r?', 'window.*@ready', 'window.**@ready', 'window.a.*.b@ready', '**@ready']) {
+      assert.throws(() => createObjectsServer({ roots, allow: { on: [entry] } }), (e) => e instanceof TypeError && /list the (event )?types?|named exactly|exactly/.test(e.message), entry);
+    }
+    assert.doesNotThrow(() => createObjectsServer({ roots, allow: { on: ['window.bus@ready', 'window@hashchange', 'window.bus@app:ready'] } }));
+  });
+
+  it('a dropped event costs a counter, not a copy: the event\'s fields are not read once the rate or the queue says no', async () => {
+    let clock = 1_000_000;
+    const [clientPeer, serverPeer] = createDuplexPair();
+    const world = makeWorld();
+    let reads = 0;
+    const original = serverPeer.notify.bind(serverPeer);
+    let gate; const held = new Promise((r) => { gate = r; });
+    let hold = false;
+    serverPeer.notify = (m, p) => (hold ? held : original(m, p));
+    createObjectsServer({ roots: { window: world.win }, allow: ALLOW, eventFields: { ready: ['detail'] }, limits: { maxEventsPerSecond: 2, maxQueuedEvents: 2 }, now: () => clock }).attach(serverPeer);
+    closers.push(async () => { clientPeer.close(); serverPeer.close(); });
+    const page = await createObjectsClient(clientPeer);
+    const got = [];
+    await on(page.window.app.bus, 'ready', (d) => got.push(d), { fields: ['detail'] });
+    const counting = () => { const e = new Event('ready'); Object.defineProperty(e, 'detail', { get() { reads++; return 1; } }); return e; };
+    // Rate: two are copied, the other eight are only counted.
+    for (let i = 0; i < 10; i++) world.bus.dispatchEvent(counting());
+    assert.equal(reads, 2, 'only the events inside the rate were copied');
+    await until(() => got.length === 2, 'two events');
+    // Queue: with the transport held and the queue full, further events are not copied either.
+    clock += 1000; hold = true; reads = 0;
+    const queueLimitedWorld = world;
+    for (let i = 0; i < 2; i++) queueLimitedWorld.bus.dispatchEvent(counting());
+    clock += 1000;
+    for (let i = 0; i < 6; i++) queueLimitedWorld.bus.dispatchEvent(counting());
+    assert.ok(reads <= 4, `the queue was full, yet ${reads} events were copied`);
+    void gate;
   });
 
   it('what is not offered: a callback as an argument is refused where it is written', async () => {

@@ -653,8 +653,8 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/reverse` (whole entry point) | 220.0 kB | 68.0 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
 | `@johnhenry/wsh/testing` (whole entry point) | 7.9 kB | 2.6 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 284.9 kB | 90.2 kB |
-| `@johnhenry/wsh/objects` (whole entry point) | 165.3 kB | 50.7 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 285.3 kB | 90.2 kB |
+| `@johnhenry/wsh/objects` (whole entry point) | 165.7 kB | 50.8 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 135.9 kB | 40.8 kB |
 | `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 102.9 kB | 33.6 kB |
@@ -836,13 +836,13 @@ chain goes on the *result*, whose path is the callee with `()` (`window.app.getC
 for `describe`, `maxRequestsPerSecond` 50 per channel, `callTimeoutMs` 30000 for a call that returns a promise.
 
 **Events.** `on(ref, 'type', listener)` subscribes to an EventTarget-style source (`addEventListener` / `removeEventListener`) or an emitter-style one (`on` / `off`, or `on` / `removeListener`),
-but only one that an allow-list entry **of its own** names: `allow.on: ['window.app.bus@ready', 'window@hashchange']` (`path@type`, the type may be `*`; in `createPageHost({ expose })` the path is relative to the
+but only one that an allow-list entry **of its own** names: `allow.on: ['window.app.bus@ready', 'window@hashchange']` (`path@type`: **the source and the type are named exactly**; a wildcard in either is refused when the host is created, so list the types one by one; in `createPageHost({ expose })` the path is relative to the
 root and `'@hashchange'` is the root itself). `get` and `call` never imply it, and neither does a wildcard in another list; the refused names, the entries that need naming, `authorize(who, op)` (`op.type` is the
 event type) and the key capability `objects:ROOT:on` all apply. What is delivered is plain data, never the event and never a node or a handle: an **Event** becomes `{ type, timeStamp, isTrusted }` plus the fields the **host**
 lists for that type (`eventFields: { hashchange: ['newURL', 'oldURL'], '*': ['detail'] }`) that the subscriber asked for in `{ fields }` (a field not listed is refused; each is copied as plain data and a node is left out);
 an **emitter's** arguments become `{ type, args }` (what cannot be cloned is `null`). The listener is `listener(data, { type, seq, dropped })`; `await on(...)` resolves to the function that unsubscribes (`off(fn)`
 does the same). Bounds, by name: `maxSubscriptions` 16 per channel (refused), `maxEventsPerSecond` 20 per subscription, `maxEventBytes` 16384 and `maxQueuedEvents` 100 per channel: an event over any of the last three
-is **dropped and counted**, and the next one delivered says how many were lost before it (`dropped`). Events leave as notifications whose write waits for the channel's credit, so a slow reader fills the bounded
+is **dropped and counted** (the rate and the queue are checked before anything of the event is read or copied, so a dropped event costs a counter), and the next one delivered says how many were lost before it (`dropped`). Events leave as notifications whose write waits for the channel's credit, so a slow reader fills the bounded
 queue and then loses events, counted, instead of growing the page's memory. Every listener is taken out of the page's sources when the channel ends: the operator leaves, Stop, a navigation, a revoke. An error in the far
 side's listener goes to its `onError` and stays there; the host's listener only copies and queues and cannot throw into the page's dispatch. Callbacks as arguments of a call are **not offered** (a function cannot be
 sent: it is refused where it is written); the design in #190 describes them as handles, which is the next step.
@@ -854,7 +854,7 @@ reach is exactly the paths the lists name (and, below a `get`, the plain data in
 - **A `call` runs the application's function with the caller's arguments**, with the page's authority: whatever it does, it does. List the functions you would hand to the caller. A wide entry means what it says:
   `window.**` reaches `window.Object.assign`, `window.history.pushState` and every method of every object under it (it still excludes the refused names above).
 - **An event source runs the page's own `addEventListener` or `on`**, and a field of an event is read by name (an accessor on an event is a getter, as for `get`). Naming a source in `allow.on` hands the caller what
-  that source emits, which for `window` or `document` can be every `keydown`, `input` or `message`: list the types, not `*`, and keep `eventFields` to what the caller should see (a `detail` or `data` field
+  that source emits, which for `window` or `document` can be every `keydown`, `input` or `message`: the host has to list the types (no wildcard is accepted), and should keep `eventFields` to what the caller should see (a `detail` or `data` field
   carries whatever the page put there).
 - A Proxy used as a root runs its own traps for the paths that pass the allow-list, and for no others.
 - The list is judged by path text. Give a root its real name: a root called `doc` that *is* the `document` is not recognised as `document.cookie` by the entries that must name it.
@@ -862,7 +862,7 @@ reach is exactly the paths the lists name (and, below a `get`, the plain data in
   written by third parties.
 - A sealed session, a key login and a visible indicator (the page host) are what keep a relay and an unknown caller out; `authorize` is where an embedder asks the person.
 
-Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 50.7 kB gzipped (it contains the client), and
+Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 50.8 kB gzipped (it contains the client), and
 the page entry point is 90.2 kB with it; no other entry point changed. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
 Not built yet (later steps of #190): handles for what cannot be cloned, callbacks as arguments, typed remotes (`Remote<T>`), an MCP face for the allow-listed paths, and a dial-out form.
 

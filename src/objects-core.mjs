@@ -91,7 +91,7 @@ export const NEEDS_LISTING = Object.freeze([
 ]);
 
 const KEY_MAX = 256;
-const EVENT_TYPE_RE = /^(\*|[A-Za-z0-9_$:.-]{1,128})$/;
+const EVENT_TYPE_RE = /^[A-Za-z0-9_$:.-]{1,128}$/;
 
 function checkKey(key) {
   if (typeof key !== 'string' || key === '' || key.length > KEY_MAX) throw invalid(`a path segment must be a string of 1 to ${KEY_MAX} characters`);
@@ -371,14 +371,17 @@ export function createObjectsServer(options = {}) {
     if (!Number.isSafeInteger(v) || v < 1) throw new TypeError(`exposeObjects: limits.${k} must be a positive integer`);
     limits[k] = v;
   }
-  // `on` entries are `path@type` (`'window.app.bus@ready'`, `'window.hash@*'`): the source, and the event type; each is compiled as a path with its type attached.
+  // `on` entries are `path@type` (`'window.app.bus@ready'`): the source and the event type, both named exactly (no wildcard in either); each is compiled as a path with its type attached.
   const compileOn = (list) => {
     if (list === undefined || list === null) return [];
     if (!Array.isArray(list)) throw new TypeError('exposeObjects: allow.on must be an array of "path@type" entries');
     return list.map((entry) => {
       const at = typeof entry === 'string' ? entry.indexOf('@') : -1;
       const type = at < 0 ? '' : entry.slice(at + 1);
-      if (at <= 0 || !EVENT_TYPE_RE.test(type)) throw new TypeError(`exposeObjects: allow.on entry ${JSON.stringify(entry)} must be "path@type" (the type may be "*")`);
+      if (at <= 0) throw new TypeError(`exposeObjects: allow.on entry ${JSON.stringify(entry)} must be "path@type"`);
+      if (/[*?]/.test(type)) throw new TypeError(`exposeObjects: allow.on entry ${JSON.stringify(entry)}: list the event types one by one; a wildcard type would hand over every event of the source`);
+      if (!EVENT_TYPE_RE.test(type)) throw new TypeError(`exposeObjects: allow.on entry ${JSON.stringify(entry)}: the event type must be a name of letters, digits and _ $ : . - (up to 128)`);
+      if (/\*/.test(entry.slice(0, at))) throw new TypeError(`exposeObjects: allow.on entry ${JSON.stringify(entry)}: an event source is named exactly, with no wildcard in the path`);
       const segs = compileList([entry.slice(0, at)], 'on')[0];
       return Object.assign(segs, { type });
     });
@@ -398,7 +401,7 @@ export function createObjectsServer(options = {}) {
     // 1. the allow-list: the operation's own list for the operation itself, any list for walking toward something
     if (terminal) {
       if (!own.some((p) => matchPath(p, segs))) throw refuse('not-allowed', `refused: ${kind} of ${segs.join('.')} is not in the allow-list`, { path: segs.join('.'), op: kind });
-      if (kind === 'on' && !own.some((p) => matchPath(p, segs) && (p.type === '*' || p.type === type))) throw refuse('not-allowed', `refused: the event type "${type}" of ${segs.join('.')} is not in the allow-list`, { path: segs.join('.'), op: kind, type });
+      if (kind === 'on' && !own.some((p) => matchPath(p, segs) && p.type === type)) throw refuse('not-allowed', `refused: the event type "${type}" of ${segs.join('.')} is not in the allow-list`, { path: segs.join('.'), op: kind, type });
     } else if (!every.some((p) => prefixPath(p, segs))) {
       throw refuse('not-allowed', `refused: ${segs.join('.')} is not on the way to anything the allow-list names`, { path: segs.join('.') });
     }
@@ -620,6 +623,8 @@ export function createObjectsServer(options = {}) {
       const t = now();
       while (sub.stamps.length && t - sub.stamps[0] >= 1000) sub.stamps.shift();
       if (sub.stamps.length >= limits.maxEventsPerSecond) { sub.dropped++; return; }
+      // Room first, copy after: a dropped event costs a counter, not a read of the event or a copy of its fields.
+      if (session.queue.length >= limits.maxQueuedEvents) { sub.dropped++; return; }
       let data;
       if (sub.kind === 'target') data = describeEvent(args[0], sub.fields);
       else {
@@ -627,7 +632,6 @@ export function createObjectsServer(options = {}) {
         data = { type: sub.type, args: args.map((a) => { const w = toWire(a, { maxDepth: 4, maxBytes: limits.maxEventBytes }); return 'v' in w ? w.v : null; }) };
       }
       toWire(data, { maxDepth: 6, maxBytes: limits.maxEventBytes });
-      if (session.queue.length >= limits.maxQueuedEvents) { sub.dropped++; return; }
       sub.stamps.push(t);
       // The events dropped since the last accepted one are told with this one: "this many were lost before it".
       session.queue.push({ sub, data, dropped: sub.dropped });
@@ -640,7 +644,7 @@ export function createObjectsServer(options = {}) {
     const { session } = ctx;
     const root = requireRoot(params);
     const type = params.type;
-    if (typeof type !== 'string' || !EVENT_TYPE_RE.test(type) || type === '*') throw invalid('an event type is a name of letters, digits and _ $ : . - (up to 128)');
+    if (typeof type !== 'string' || !EVENT_TYPE_RE.test(type)) throw invalid('an event type is a name of letters, digits and _ $ : . - (up to 128)');
     const id = params.id;
     if (!Number.isSafeInteger(id) || id < 1 || session.subs.has(id)) throw invalid('a subscription id is a whole number the channel has not used');
     const asked = params.fields === undefined ? [] : params.fields;
