@@ -94,11 +94,35 @@ describe('Rust wsh-server: UDP flows are bounded as on the Node host (#145)', ()
     return { received, bytes };
   }
 
+  /**
+   * Send `count` datagrams with at most `window` unanswered: the next goes out as an echo comes back, and the call returns once
+   * all `count` have. UDP over loopback is not lossless when a burst meets a socket buffer (the OS owes no more), so a test that
+   * asserts "nothing was dropped by the server" must not offer the sockets a burst; the window keeps every socket nearly empty.
+   * The 30 s race is only a hang guard: a datagram the server really dropped would leave this waiting for an echo that never comes.
+   */
+  async function windowed(flow, count, size, window = 8) {
+    const w = flow.writable.getWriter(); const r = flow.readable.getReader();
+    const payload = new Uint8Array(size).fill(9);
+    let sent = 0; let received = 0; let bytes = 0;
+    const run = (async () => {
+      for (; sent < Math.min(window, count); sent++) await w.write(payload);
+      while (received < count) {
+        const { value, done } = await r.read();
+        if (done) break;
+        received += 1; bytes += value.length;
+        if (sent < count) { await w.write(payload); sent += 1; }
+      }
+    })();
+    await Promise.race([run, sleep(30_000).then(() => { throw new Error(`only ${received} of ${count} datagrams came back`); })]);
+    flow.destroy();
+    return { received, bytes };
+  }
+
   it('with the defaults a flow round-trips ordinary datagrams (the bounds are generous)', async () => {
     const port = await echoServer();
     const { client } = await setup(port);
     const flow = await client.openUdp('127.0.0.1', port);
-    const { received } = await blast(flow, 50, 100, 800);
+    const { received } = await windowed(flow, 50, 100);
     assert.equal(received, 50);
   });
 
@@ -196,8 +220,11 @@ describe('Rust wsh-server: UDP flows are bounded as on the Node host (#145)', ()
     const port = await echoServer();
     const { client } = await setup(port, 'udp_packets_per_second_per_flow = 0\nudp_packets_per_second_per_client = 0\nudp_bytes_per_second_per_client = 0\n');
     const flow = await client.openUdp('127.0.0.1', port);
-    const { received } = await blast(flow, 300, 200, 1500);
-    assert.ok(received >= 290, `${received} echoed of 300`);
+    // Paced by the echoes (a burst of 300 can overflow an OS socket buffer, which is the OS dropping, not the server): with
+    // no limit, every one of the 300 must come back.
+    const { received, bytes } = await windowed(flow, 300, 200);
+    assert.equal(received, 300);
+    assert.equal(bytes, 300 * 200);
   });
 
   it('closes a flow that has been idle too long, and traffic in either direction keeps it alive', async () => {
