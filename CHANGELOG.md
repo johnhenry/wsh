@@ -73,6 +73,10 @@ remote server with a self-signed certificate must trust that certificate instead
 - Tests: `test/cbor-hardening.test.mjs` (own `__proto__` key, both map forms, nested, through `FrameDecoder`; a table of doubles across 2^53, 2^63, 2^64, 1e21 and their negatives, `-0`, NaN, infinities, and the exact boundary bytes) and a `wsh-core`
   codec test with the same vectors. The map rule and the integer rule were each seen failing before the change.
 
+### Rust dependencies: `rustls` 0.23.46 (lockfile only)
+
+`Cargo.lock` moves `rustls` from 0.23.41 to 0.23.46 (with `rustls-webpki` 0.103.17, `aws-lc-rs` 1.19.0 and `aws-lc-sys` 0.47.0 that it brings), the patched version of four open dependency alerts. No source or wire change; the Rust binaries of the next `rust-v` release carry it.
+
 ### rpc channels in virtual data mode, Rust: `wsh mcp --sealed` / `--via` and `wsh-server` with `seal_session` on (#191; Rust)
 
 The Rust halves of the JS change below. **No new wire format**: the feature string `rpc-virtual`, `OpenOk { data_mode: "virtual" }`, `SessionData` and the flagged
