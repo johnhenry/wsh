@@ -325,7 +325,7 @@ pub async fn run(
     input: mpsc::UnboundedReceiver<Input>,
     out: mpsc::Sender<Vec<u8>>,
 ) -> Ended {
-    run_metered(cfg, protocol, input, out, None).await
+    run_metered(cfg, protocol, input, out, None, None).await
 }
 
 /// Called with the number of received bytes the channel has taken in and dispatched, so a metered transport (an rpc
@@ -341,6 +341,7 @@ pub async fn run_metered(
     mut input: mpsc::UnboundedReceiver<Input>,
     out: mpsc::Sender<Vec<u8>>,
     consumed: Option<Consumed>,
+    aborted: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 ) -> Ended {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel();
     let mut engine = Engine {
@@ -362,8 +363,17 @@ pub async fn run_metered(
                 Some(Input::Violation) => break Ended::HostClosed("credit-violation".to_string()),
                 Some(Input::Data(bytes)) => match decoder.feed(&bytes) {
                     Ok(items) => {
+                        let mut overrun = false;
                         for item in items {
+                            // A peer that has overrun its credit gets no more work done for it.
+                            if aborted.as_ref().is_some_and(|f| f()) {
+                                overrun = true;
+                                break;
+                            }
                             engine.dispatch(item).await;
+                        }
+                        if overrun {
+                            break Ended::HostClosed("credit-violation".to_string());
                         }
                         if let Some(consumed) = &consumed {
                             consumed(bytes.len());
