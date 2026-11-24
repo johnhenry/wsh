@@ -91,6 +91,11 @@ export interface WshMemoryHostOptions {
   /** #163: told once per connection this host turned away (a key it does not allow, a plain client on a host that requires a sealed session, ...), with a stable reason code. */
   onRefused?: WshOnRefused;
   /**
+   * Called once per connection when its session has been sealed (after login). With `sealSession: 'require'` a login is not yet a session
+   * that can do anything: `auth.authorize(who)` is told `who.sealRequired: true`, and audit or an indicator belongs here instead.
+   */
+  onSealed?: (who: { username: string | null; fingerprint: string | null }) => void;
+  /**
    * #121: execution targets, each with its own `exec`, `pty`, `fs` and `endpoints` and an `authorize(who, { target, kind })`.
    * A client names one in `Open`, `FileOp` or `OpenEndpoint` and lists what it may use with `listTargets()`. Off unless given:
    * the host then advertises no `targets` and refuses a request that names one.

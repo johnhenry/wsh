@@ -1,6 +1,6 @@
 {
   "name": "@johnhenry/wsh",
-  "version": "0.48.0",
+  "version": "0.49.0",
   "description": "Web Shell \u2014 browser-native remote command execution over WebTransport and WebSocket with Ed25519 authentication",
   "type": "module",
   "main": "./src/index.mjs",
@@ -44,7 +44,18 @@
     "./mcp-stdio": {
       "types": "./src/mcp-stdio.d.ts",
       "import": "./src/mcp-stdio.mjs"
-    }
+    },
+    "./capabilities": {
+      "types": "./src/capabilities.d.ts",
+      "import": "./src/capabilities.mjs"
+    },
+    "./identity": {
+      "types": "./src/identity.d.ts",
+      "import": "./src/identity.mjs"
+    },
+    "./spec/*.json": "./spec/*.json",
+    "./spec/*.md": "./spec/*.md",
+    "./spec/wsh-v1.yaml": "./spec/wsh-v1.yaml"
   },
   "bin": {
     "wsh-mcp": "./bin/wsh-mcp.mjs"
@@ -54,6 +65,9 @@
   "files": [
     "src",
     "bin",
+    "spec/*.json",
+    "spec/*.md",
+    "spec/wsh-v1.yaml",
     "LICENSE",
     "README.md"
   ],
@@ -83,7 +97,7 @@
   "devDependencies": {
     "@fails-components/webtransport": "^1.6.4",
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
-    "@johnhenry/browsermesh-primitives": "^0.2.0",
+    "@johnhenry/browsermesh-primitives": "^0.5.0",
     "@playwright/test": "^1.65.1",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.0",

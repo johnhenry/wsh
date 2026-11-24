@@ -180,7 +180,8 @@ function createRegistry(sessions, log) {
  * @param {(line: string) => void} [options.onLog]
  */
 export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
-  onShare, onRefused, targets, requireTarget, usernamePattern } = {}) {
+  onShare, onRefused, onSealed, targets, requireTarget, usernamePattern } = {}) {
+  if (onSealed !== undefined && typeof onSealed !== 'function') throw new TypeError('createMemoryHost: onSealed must be a function');
   resolveUsernamePattern(usernamePattern, 'createMemoryHost');
   validateOnShare(onShare, 'createMemoryHost');
   validateOnRefused(onRefused, 'createMemoryHost');
@@ -217,7 +218,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
 
   const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
-    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused,
+    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused, onSealed,
     targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));

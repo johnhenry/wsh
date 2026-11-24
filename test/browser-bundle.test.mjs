@@ -17,7 +17,8 @@ describe('browser entry points (#115, #128)', () => {
     // ./server needs Node. ./pipe-relay IS bundled: its `listen()` (`ws`, `node:http`) is a separate module loaded by name
     // at call time, so a page can import `pipeUrl`, `newRendezvousId`, `watchPairing` or run `accept()` over sockets it holds.
     // ./mcp-stdio (#127) is the `wsh-mcp` bridge: it reads a key file and speaks stdio, so it is Node-only.
-    const expected = Object.keys(pkg.exports).filter((k) => k !== './server' && k !== './mcp-stdio');
+    // ./spec/* are data files (the notation, its vectors, the wire spec), not code.
+    const expected = Object.keys(pkg.exports).filter((k) => k !== './server' && k !== './mcp-stdio' && !k.startsWith('./spec/'));
     assert.deepEqual([...bundled].sort(), expected.sort());
     assert.equal(pkg.sideEffects, false);
   });

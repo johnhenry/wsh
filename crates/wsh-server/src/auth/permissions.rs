@@ -804,6 +804,148 @@ mod tests {
         }
     }
 
+    /// A request of the vectors as the server's own type.
+    fn request_of<'a>(name: &str, r: &'a serde_json::Value) -> KeyRequest<'a> {
+        let s = |k: &str| r[k].as_str().unwrap_or("");
+        let port = r["port"].as_u64().unwrap_or(0) as u16;
+        match (r["kind"].as_str().unwrap(), r["channel"].as_str()) {
+            ("login", _) => KeyRequest::Login,
+            ("open", Some("pty")) => KeyRequest::OpenPty,
+            ("open", Some("exec")) => KeyRequest::OpenExec,
+            ("open", Some("file")) => KeyRequest::OpenFile {
+                upload: s("direction") != "download",
+            },
+            ("open", Some("rpc")) => KeyRequest::OpenRpc(s("protocol")),
+            ("file-op", _) => KeyRequest::FileOp(s("op")),
+            ("mcp", _) => KeyRequest::Mcp,
+            ("mcp-call", _) => KeyRequest::McpCall(s("tool")),
+            ("mcp-tool", _) => KeyRequest::McpTool(s("tool")),
+            ("relay", _) => KeyRequest::Relay,
+            ("key-admin", _) => KeyRequest::KeyAdmin,
+            ("tcp", _) => KeyRequest::Tcp(s("host"), port),
+            ("udp", _) => KeyRequest::Udp(s("host"), port),
+            ("dns", _) => KeyRequest::Dns(s("name")),
+            ("listen-tcp", _) => KeyRequest::ListenTcp(port),
+            ("unix", _) => KeyRequest::Unix(s("path")),
+            ("listen-unix", _) => KeyRequest::ListenUnix(s("path")),
+            other => panic!("{name}: unknown request {other:?}"),
+        }
+    }
+
+    // ── The vectors of the notation (spec/capabilities.md, spec/capabilities.vectors.json) ─────────
+    //
+    // The same file the JS evaluation runs. A case that does not name the `rust` host class is skipped: the server has no
+    // named endpoints, no targets and no `wsh-objects`, and it refuses an `objects:` entry at load (its stated subset).
+
+    const CAPABILITY_VECTORS: &str = include_str!("../../../../spec/capabilities.vectors.json");
+
+    fn runs_here(case: &serde_json::Value) -> bool {
+        case["hosts"]
+            .as_array()
+            .is_none_or(|h| h.iter().any(|x| x == "rust"))
+    }
+
+    fn capability_options(case: &serde_json::Value) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(o) = case["options"].as_str() {
+            parts.push(o.to_string());
+        }
+        if let Some(list) = case["capabilities"].as_array() {
+            let names: Vec<&str> = list.iter().map(|x| x.as_str().unwrap()).collect();
+            parts.push(format!("capabilities=\"{}\"", names.join(",")));
+        }
+        if let Some(e) = case["expires"].as_str() {
+            parts.push(format!("expires=\"{e}\""));
+        }
+        parts.join(",")
+    }
+
+    #[test]
+    fn shared_capability_vectors_version() {
+        let v: serde_json::Value = serde_json::from_str(CAPABILITY_VECTORS).expect("vectors parse");
+        assert_eq!(
+            v["version"], 1,
+            "the notation revision this server implements"
+        );
+    }
+
+    #[test]
+    fn shared_capability_vectors_lists() {
+        let v: serde_json::Value = serde_json::from_str(CAPABILITY_VECTORS).expect("vectors parse");
+        for case in v["lists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| runs_here(c))
+        {
+            let name = case["name"].as_str().unwrap();
+            let options = capability_options(case);
+            let parsed = KeyPermissions::try_from_options("fp".into(), Some(&options));
+            if case["result"] == "ok" {
+                let p = parsed.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                let want: Vec<&str> = case["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_str().unwrap())
+                    .collect();
+                let got: Vec<&str> = p
+                    .capability_names
+                    .as_ref()
+                    .map(|a| a.iter().map(String::as_str).collect())
+                    .unwrap_or_default();
+                assert_eq!(got, want, "{name}");
+            } else {
+                let e = parsed.expect_err(name);
+                assert_eq!(e.code, case["code"].as_str().unwrap(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_capability_vectors_requests() {
+        let v: serde_json::Value = serde_json::from_str(CAPABILITY_VECTORS).expect("vectors parse");
+        for case in v["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| runs_here(c))
+        {
+            let name = case["name"].as_str().unwrap();
+            let parsed =
+                KeyPermissions::try_from_options("fp".into(), Some(&capability_options(case)));
+            if case["invalidList"].as_bool() == Some(true) {
+                assert!(
+                    parsed.is_err(),
+                    "{name}: a list with an entry that is not understood must not load"
+                );
+                continue;
+            }
+            let p = parsed.unwrap_or_else(|e| panic!("{name}: must parse: {e:?}"));
+            let request = request_of(name, &case["request"]);
+            let active = case["activeSessions"].as_u64().unwrap_or(0) as usize;
+            let now = case["now"].as_i64().unwrap_or(0);
+            let got = p.check_at(request, active, now);
+            if case["permitted"].as_bool().unwrap() {
+                assert_eq!(got, Ok(()), "{name}");
+            } else {
+                let refusal = got.expect_err(name);
+                assert_eq!(
+                    refusal.code,
+                    case["code"].as_str().unwrap_or("capability-missing"),
+                    "{name}"
+                );
+                if let Some(cap) = case["capability"].as_str() {
+                    assert_eq!(
+                        refusal.capability.as_deref(),
+                        Some(cap),
+                        "{name}: the refusal names the missing capability"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn shared_vectors_requests() {
         let v = vectors();
@@ -818,31 +960,7 @@ mod tests {
             if hosts.is_some_and(|h| !h.iter().any(|x| x == "rust")) {
                 continue;
             }
-            let r = &case["request"];
-            let s = |k: &str| r[k].as_str().unwrap_or("");
-            let port = r["port"].as_u64().unwrap_or(0) as u16;
-            let request = match (r["kind"].as_str().unwrap(), r["channel"].as_str()) {
-                ("login", _) => KeyRequest::Login,
-                ("open", Some("pty")) => KeyRequest::OpenPty,
-                ("open", Some("exec")) => KeyRequest::OpenExec,
-                ("open", Some("file")) => KeyRequest::OpenFile {
-                    upload: s("direction") != "download",
-                },
-                ("open", Some("rpc")) => KeyRequest::OpenRpc(s("protocol")),
-                ("file-op", _) => KeyRequest::FileOp(s("op")),
-                ("mcp", _) => KeyRequest::Mcp,
-                ("mcp-call", _) => KeyRequest::McpCall(s("tool")),
-                ("mcp-tool", _) => KeyRequest::McpTool(s("tool")),
-                ("relay", _) => KeyRequest::Relay,
-                ("key-admin", _) => KeyRequest::KeyAdmin,
-                ("tcp", _) => KeyRequest::Tcp(s("host"), port),
-                ("udp", _) => KeyRequest::Udp(s("host"), port),
-                ("dns", _) => KeyRequest::Dns(s("name")),
-                ("listen-tcp", _) => KeyRequest::ListenTcp(port),
-                ("unix", _) => KeyRequest::Unix(s("path")),
-                ("listen-unix", _) => KeyRequest::ListenUnix(s("path")),
-                other => panic!("{name}: unknown request {other:?}"),
-            };
+            let request = request_of(name, &case["request"]);
             let active = case["activeSessions"].as_u64().unwrap_or(0) as usize;
             let now = case["now"].as_i64().unwrap_or(0);
             let got = p.check_at(request, active, now);

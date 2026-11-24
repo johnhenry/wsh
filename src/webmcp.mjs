@@ -21,6 +21,7 @@
  */
 
 import { RpcError, RPC_ERROR } from './rpc.mjs';
+import { callerIdentity } from './key-names.mjs';
 
 const TOOL_NAME_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 const APPROVE_MODES = new Set(['never', 'consequential', 'always']);
@@ -441,11 +442,13 @@ export function webmcpTools(options = {}) {
   }
 
   /** What one session may see: allowed, listable, within `maxTools`, and permitted by its key. */
-  async function visible(permits) {
+  async function visible(permits, kind = 'mcp-tool') {
     const out = [];
     for (const tool of (await gather()).values()) {
       if (!allowed.has(tool.name)) continue;
-      if (permits && !permits({ kind: 'mcp-tool', tool: tool.name })) continue;
+      // The hook is told which it is: `mcp-tool` is listing a tool, `mcp-call` is running one (`op` says the same as `'list'` / `'call'`),
+      // so an adapter may scope them apart. The notation's `mcp:TOOL` covers both.
+      if (permits && !permits({ kind, op: kind === 'mcp-call' ? 'call' : 'list', tool: tool.name })) continue;
       const bad = unlistable(tool, limits);
       if (bad) { emit({ outcome: 'unlisted', name: tool.name, limit: bad.limit, detail: bad.detail }); continue; }
       if (out.length >= limits.maxTools) { emit({ outcome: 'unlisted', name: tool.name, limit: 'maxTools', detail: `more than ${limits.maxTools} tools` }); continue; }
@@ -464,7 +467,8 @@ export function webmcpTools(options = {}) {
   };
 
   function handler(channel, ctx = {}) {
-    const who = { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null };
+    // A wsh caller is its key, `{ username, fingerprint }`; a transport that is not wsh (`serveMcpOverDuplex`) gives `ctx.who`, which may carry a `podId`.
+    const who = callerIdentity(ctx.who ?? { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null });
     const permits = typeof ctx.permits === 'function' ? ctx.permits : null;
     const session = { channel, who, inflight: new Map(), starts: [], approvals: Promise.resolve(), unsubscribe: null, listed: null, closed: false };
     sessions.add(session);
@@ -507,7 +511,7 @@ export function webmcpTools(options = {}) {
       if (session.starts.length >= limits.maxCallsPerMinute) throw fail('maxCallsPerMinute', `more than ${limits.maxCallsPerMinute} calls in a minute`, { name });
       session.starts.push(t);
 
-      const tool = (await visible(permits)).find((x) => x.name === name);
+      const tool = (await visible(permits, 'mcp-call')).find((x) => x.name === name);
       // A tool that is not allowed, not permitted to this key or not there looks the same.
       if (!tool) { emit({ outcome: 'unknown', name, who }); throw new RpcError(RPC_ERROR.INVALID_PARAMS, `unknown tool: ${name}`); }
       const text = jsonOrNull(args) ?? '';

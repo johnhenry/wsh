@@ -2,6 +2,8 @@
  * `authorized_keys` options (wsh #122): what a key's leading options mean, parsed the same way by the Node host (this file) and
  * the Rust `wsh-server` (`crates/wsh-server/src/auth/permissions.rs`). `spec/key-options.vectors.json` holds the shared test
  * vectors both suites run, so the two cannot drift. Browser-safe (no Node imports): the in-memory host uses it too.
+ * The notation of capabilities is written in `spec/capabilities.md`, with `spec/capabilities.vectors.json` run by both hosts, and the
+ * pure function over it is `permits()` of `@johnhenry/wsh/capabilities`.
  *
  * A line is `[options] ssh-ed25519 <base64> [comment]`. `options` is one token (no whitespace outside double quotes) of
  * comma-separated items, each `name` or `name=value`, where a value is `"..."` (a `\"` is a quote, any other backslash is

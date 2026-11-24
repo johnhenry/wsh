@@ -24,6 +24,8 @@
  * chain continues on the RESULT, whose path is the callee with `()`: `window.app.getCart().items`. Nothing is allowed by default.
  */
 
+import { callerIdentity } from './key-names.mjs';
+
 export const OBJECTS_PROTOCOL = 'wsh-objects';
 
 /** Error codes, JSON-RPC's where one fits (`reason` in `data` says which rule). */
@@ -460,8 +462,14 @@ export function createObjectsServer(options = {}) {
     }
   }
 
+  /** What the transport says the caller's key may do (`ctx.permit(root, op)`): anything but `true`, and a throw, is no. No `permit`: the transport does not limit. */
+  const keyMay = (ctx, root, op) => {
+    if (typeof ctx.permit !== 'function') return true;
+    try { return ctx.permit(root, op) === true; } catch { return false; }
+  };
+
   function permitted(ctx, root, op) {
-    if (typeof ctx.permit !== 'function' || ctx.permit(root, op) === true) return;
+    if (keyMay(ctx, root, op)) return;
     throw refuse('not-permitted', `refused: this key's capabilities do not allow ${op === 'walk' ? 'reading' : op} on ${root}`, { root, op });
   }
 
@@ -592,7 +600,7 @@ export function createObjectsServer(options = {}) {
   /** A preview is what a `get` on the same path could reveal: the names of a few own members, and only where the get-list names the path. */
   function previewOf(value, root, segs, ctx) {
     if (!lists.get.some((p) => matchPath(p, segs))) return {};
-    if (typeof ctx.permit === 'function' && ctx.permit(root, 'get') !== true) return {};
+    if (!keyMay(ctx, root, 'get')) return {};
     const rel = segs.slice(1).map(bareName);
     for (const seq of [...NEEDS_LISTING, ...GRAPH_MEMBERS.map((n) => [n])]) if (containsSequence(rel, seq) && !lists.get.some((p) => matchPath(p, segs) && patternNames(p, seq))) return {};
     try {
@@ -852,9 +860,14 @@ export function createObjectsServer(options = {}) {
     return { ok: true, dropped: sub.dropped };
   }
 
-  /** Register the protocol's methods on a peer. `who` is the identity of every call unless the transport gives one per call. */
+  /**
+   * Register the protocol's methods on a peer. `who` is the identity of every call unless the transport gives one per call: an object
+   * `{ username, fingerprint, podId? }` (see `callerIdentity`): a caller that has only a `podId` gets the hex `fingerprint` as well, and one
+   * that names two different keys is refused here, not when its first call arrives.
+   */
   function attach(peer, { who } = {}) {
     if (typeof peer?.onRequest !== 'function') throw new TypeError('attach: the peer needs onRequest(method, handler)');
+    const defaultWho = callerIdentity(who);
     const session = { peer, subs: new Map(), queue: [], pumping: false, closed: false, handles: new Map(), callbacks: new Map(), deadCalls: 0 };
     // The end of the channel (the peer left, Stop, a navigation, a revoke) takes every listener out of the page's sources.
     const prior = peer.onClose;
@@ -876,14 +889,14 @@ export function createObjectsServer(options = {}) {
       stamps.push(t);
       // A value is kept under what the transport carries in one message, with room for the envelope.
       const maxBytes = Math.min(limits.maxValueBytes, Math.max(1024, (peer.maxMessageBytes ?? Infinity) - 4096));
-      const call = { ...ctx, signal: ctx.signal, who: ctx.who ?? who, maxBytes, session };
+      const call = { ...ctx, signal: ctx.signal, who: ctx.who === undefined || ctx.who === null ? defaultWho : callerIdentity(ctx.who), maxBytes, session };
       if (params === null || typeof params !== 'object' || Array.isArray(params)) throw invalid('params must be an object');
       try { return await fn(params, call); } catch (e) { if (e instanceof ObjectsError) throw e; throw wrapThrown(e, name); }
     });
     // A key that may use only some roots is told of those only.
     // The host also says what it supports (additive: an older client ignores it), so a client does not send a function to a host that would drop it, nor misread a handle.
     method('roots', async (_params, call) => ({
-      roots: rootNames.filter((name) => typeof call.permit !== 'function' || call.permit(name, 'walk') === true),
+      roots: rootNames.filter((name) => keyMay(call, name, 'walk')),
       features: ['events', 'callbacks', ...(handleRoots.size ? ['handles'] : [])],
     }));
     method('resolve', resolve);
@@ -905,10 +918,20 @@ export function createObjectsServer(options = {}) {
 /**
  * A `Peer` over `send(message)` and `receive(message)` (JSON-RPC-shaped plain objects: requests `{ id, method, params }`, responses
  * `{ id, result }` / `{ id, error }`, notifications `{ method, params }`, and `$/cancel` and `$/progress`). For a transport that is not wsh.
- * @param {{ send(message: object): void, maxMessageBytes?: number }} options
+ *
+ * `who` is who is on the far side, for a transport that knows (a mesh channel knows the pod it is with): an identity object
+ * `{ username?, fingerprint?, podId? }`, so an adapter does not put a pod id in a field named `fingerprint`. Whichever of `fingerprint`
+ * (64 hex digits) and `podId` it gives, `authorize(who, op)` sees the hex `fingerprint`, and the `podId` when it was given; an identity that
+ * names two keys, or is not an object, is refused here. `permit(root, op)` is the transport's own capability check, asked for every
+ * operation (`get`, `call`, `set`, `on`, or `walk` for reading on the way to something): `true` allows, anything else, and a throw,
+ * refuses; with no `permit` the transport limits nothing.
+ *
+ * @param {{ send(message: object): void, maxMessageBytes?: number, who?: { username?: string | null, fingerprint?: string | null, podId?: string | null }, permit?: (root: string, op: string) => boolean }} options
  */
-export function createDuplexPeer({ send, maxMessageBytes = 1024 * 1024 } = {}) {
+export function createDuplexPeer({ send, maxMessageBytes = 1024 * 1024, who, permit } = {}) {
   if (typeof send !== 'function') throw new TypeError('createDuplexPeer: send(message) is required');
+  if (permit !== undefined && typeof permit !== 'function') throw new TypeError('createDuplexPeer: permit must be a function (root, op) => boolean');
+  const identity = callerIdentity(who);
   let nextId = 1;
   let closed = false;
   const pending = new Map();
@@ -948,7 +971,7 @@ export function createDuplexPeer({ send, maxMessageBytes = 1024 * 1024 } = {}) {
         if (!handler) { send({ id, error: { code: -32601, message: `method not found: ${message.method}` } }); return; }
         const ctl = new AbortController();
         inflight.set(id, ctl);
-        const ctx = { signal: ctl.signal, progress: (chunk) => send({ method: '$/progress', params: { id, chunk } }) };
+        const ctx = { signal: ctl.signal, progress: (chunk) => send({ method: '$/progress', params: { id, chunk } }), ...(identity ? { who: identity } : {}), ...(permit ? { permit } : {}) };
         Promise.resolve().then(() => handler(message.params, ctx)).then(
           (result) => { if (ctl.signal.aborted) return; send({ id, result: result === undefined ? null : result }); },
           (e) => { if (ctl.signal.aborted) return; send({ id, error: { code: e?.code ?? OBJECTS_ERROR.FAILED, message: String(e?.message ?? e), ...(e?.data ? { data: e.data } : {}) } }); },

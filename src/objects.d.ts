@@ -92,7 +92,15 @@ export interface ObjectsAllow {
   on?: string[];
 }
 
-export interface ObjectsWho { username: string | null; fingerprint: string | null }
+/**
+ * Who a call is from, as `authorize(who, op)` and the allow-list's hooks see it: `fingerprint` is the hex SHA-256 of the caller's public key
+ * wherever the caller came from (over wsh: the key it logged in with). `podId` is there when the transport knows the caller by one (a mesh
+ * adapter that gave `{ podId }`: then `fingerprint` is derived from it); a wsh caller has no `podId`. `fingerprint` is `null` for a caller
+ * with no key (a password login).
+ */
+export interface ObjectsWho { username: string | null; fingerprint: string | null; podId?: string }
+/** What a transport that is not wsh may say of its caller; whichever of `fingerprint` (64 hex digits) and `podId` it gives, `ObjectsWho` has the hex `fingerprint`. */
+export interface ObjectsIdentity { username?: string | null; fingerprint?: string | null; podId?: string | null }
 export interface ObjectsOperation {
   kind: 'get' | 'call' | 'construct' | 'set' | 'on' | 'describe' | 'snapshot';
   /** For `on`: the event type. */
@@ -134,7 +142,7 @@ export interface ObjectsServerOptions {
 
 /** What the core needs of a transport (an `RpcChannel` is one; `createDuplexPeer` makes one from `send` and `receive`). */
 export interface ObjectsPeer {
-  onRequest(method: string, handler: (params: any, ctx: { signal?: AbortSignal; progress?: (chunk: unknown) => unknown; who?: ObjectsWho }) => unknown): unknown;
+  onRequest(method: string, handler: (params: any, ctx: { signal?: AbortSignal; progress?: (chunk: unknown) => unknown; who?: ObjectsIdentity; permit?: (root: string, op: string) => boolean }) => unknown): unknown;
   onNotification?(method: string, handler: (params: any) => void): unknown;
   request(method: string, params?: unknown, options?: { signal?: AbortSignal; onProgress?: (chunk: unknown) => void }): Promise<any>;
   notify(method: string, params?: unknown): unknown;
@@ -145,13 +153,18 @@ export interface ObjectsPeer {
 
 /** The transport-neutral server half: roots, allow-lists and limits, attachable to any peer. Knows nothing about wsh. */
 export function createObjectsServer(options: ObjectsServerOptions): {
-  attach(peer: Pick<ObjectsPeer, 'onRequest' | 'maxMessageBytes'>, options?: { who?: ObjectsWho }): { limits: ObjectsLimits };
+  /** `who`: the identity of every call unless the peer gives one per call (`ctx.who`); one that names two keys, or is not an identity, throws a `TypeError` here. */
+  attach(peer: Pick<ObjectsPeer, 'onRequest' | 'maxMessageBytes'>, options?: { who?: ObjectsIdentity }): { limits: ObjectsLimits };
   readonly limits: Readonly<ObjectsLimits>;
   readonly rootNames: string[];
 };
 
-/** A peer over `send(message)` and `receive(message)`: the same protocol over any duplex that is not wsh. */
-export function createDuplexPeer(options: { send(message: object): void; maxMessageBytes?: number }): ObjectsPeer & { receive(message: unknown): void; close(reason?: string): void; readonly closed: boolean };
+/**
+ * A peer over `send(message)` and `receive(message)`: the same protocol over any duplex that is not wsh. `who` is who is on the far side, as an
+ * identity object (a pod id goes in `podId`, not in a field named `fingerprint`); `permit(root, op)` is the transport's own capability check
+ * for each operation (`get`, `call`, `set`, `on`, or `walk` for reading on the way): `true` allows, anything else and a throw refuse.
+ */
+export function createDuplexPeer(options: { send(message: object): void; maxMessageBytes?: number; who?: ObjectsIdentity; permit?: (root: string, op: 'get' | 'call' | 'set' | 'on' | 'walk') => boolean }): ObjectsPeer & { receive(message: unknown): void; close(reason?: string): void; readonly closed: boolean };
 
 /** The client half over any peer: the roots, as lazy references. */
 export function createObjectsClient<T = Record<string, any>>(peer: Pick<ObjectsPeer, 'request'> & Partial<ObjectsPeer>, options?: {

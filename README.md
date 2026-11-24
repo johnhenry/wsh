@@ -37,7 +37,7 @@ wsh is a pure-JS client library (with an optional Node server at `@johnhenry/wsh
 - [Browser Compatibility](#browser-compatibility)
 - [Browser tests and bundle size](#browser-tests-and-bundle-size)
 - [Related projects](#related-projects)
-- [Family](#family)
+- [wsh and browsermesh](#wsh-and-browsermesh)
 - [License](#license)
 
 ## Install
@@ -309,7 +309,8 @@ the host has turned on; scope them with `capabilities` below. `no-port-forwardin
 
 #### Capabilities and expiry (#122, step two)
 
-Two more options give a key a finer, **default-deny** licence. Nothing changes for a key line that has neither.
+Two more options give a key a finer, **default-deny** licence. Nothing changes for a key line that has neither. The notation is written
+as a specification in [`spec/capabilities.md`](spec/capabilities.md) (see [Identity and capabilities for other implementations](#identity-and-capabilities-for-other-implementations-220)).
 
 ```
 capabilities="exec,fs:read,gateway:tcp:db.internal:5432,mcp:search"  ssh-ed25519 AAAA... ci@build
@@ -359,6 +360,46 @@ the client already gets (`OpenFail`, a failed `FileResult`, `GatewayFail`, `List
 `ReverseReject`, `AuthFail` for an expired key), and the Node host reports each one to `onRefused` with the stable reason
 `not-permitted` (`detail`: `capability-missing: missing capability exec (open exec)`), or `key-expired`. The Rust server logs them.
 `capabilities` and `expires` apply to **key logins**: a password login has no key and is not narrowed by them.
+
+#### Identity and capabilities for other implementations (#220)
+
+The notation above is written down once, as a specification, with vectors that another implementation can run:
+
+- **`spec/capabilities.md`** is the grammar of one capability, what each wildcard matches (and what it does not: `*.example.com`
+  is not `example.com` and not `evilexample.com`; `/srv/*` is not `/srv`), what each request kind needs, the order of the checks
+  (expiry, the options, the list), and what an implementation does with an entry it does not understand: **fail closed**, the whole
+  list permits nothing and a key line that holds it is refused.
+- **`spec/capabilities.vectors.json`** (with a `version`, and `spec/key-options.vectors.json` for the option syntax) is "does a
+  holder of list L permit request R" as data. The JS evaluation and the Rust `wsh-server` both run it. A case names the host classes
+  it applies to: the Rust server has no named endpoints, no targets and no `wsh-objects`, and **states that subset by refusing**:
+  a key line with an `objects:` capability is refused at load there (`unknown-capability`), rather than accepted and ignored, so a
+  key meant for a page cannot sit unnoticed on a machine that cannot honour it. Both files ship in the npm package:
+  `import vectors from '@johnhenry/wsh/spec/capabilities.vectors.json' with { type: 'json' }`.
+- **`@johnhenry/wsh/capabilities`** exports the evaluation: `permits(capabilities, request, { expires, now })` is a boolean,
+  `checkCapabilities(...)` the refusal (`{ code, capability }`) when not. It is pure, browser-safe and fails closed (no list, an
+  entry it does not know, or a request kind it does not know permits nothing).
+- **`@johnhenry/wsh/identity`** is one stable module for a key's names: the raw 32-byte key, the OpenSSH `ssh-ed25519` line
+  (`rawKeyToOpenSsh`, `openSshToRawKey`, `publicKeyToOpenSsh`), the hex **fingerprint** (SHA-256 of the raw key) and the base64url
+  **pod id** (the same 32 bytes: `fingerprintToPodId`, `podIdToFingerprint`), `identityOf(key)` for all four, and
+  `authorizedKeyLine(key, { capabilities, expires, comment })`, which builds a line for an `authorized_keys` file and **refuses
+  unsafe input**: no `capabilities` unless you say `allowFullAccess: true` out loud (a line with none may do everything), only
+  capabilities the notation knows, a timestamp it can read, no control character or line break in the comment, a plain Ed25519
+  key, and it reads its own line back through a host's parser before returning it.
+- **The gateway error table** is data too: `GATEWAY_FAIL`, `GATEWAY_FAIL_TABLE` and `gatewayFailName(code)` are exported from the
+  package root (`@johnhenry/browsermesh-netway` decodes the same numbers). The table notes that the Rust server sends `5` for a
+  disabled gateway where the Node gateway sends it for a timeout.
+- **For the object and MCP layers**: the identity handed to `authorize(who, op)` is `{ username, fingerprint, podId? }`.
+  `fingerprint` is always the hex hash of the caller's key; `podId` is there when the transport knows the caller by one. A
+  transport that is not wsh gives an identity object (`createDuplexPeer({ send, who: { podId } })`, or `attach(peer, { who })`)
+  instead of putting a pod id in a field named `fingerprint`; whichever of the two it gives, the other is derived, and an identity
+  that names two different keys is refused. A wsh caller keeps the `{ username, fingerprint }` it always had. The transport's own
+  grants are `createDuplexPeer({ permit })`, asked per operation (`get`, `call`, `set`, `on`, and `walk`); `permit` answering anything
+  but `true`, or throwing, refuses.
+
+What none of this is: `permits()` decides what a list says; it does not authenticate the holder, and a list is only as portable as
+the oldest implementation that reads it (a newer notation's entries fail closed on an older reader). `authorizedKeyLine` writes a
+grant; whoever may install it into a file a host reads is who decides, and a browser-stored key that is valid on real machines is
+a decision to make deliberately (see [wsh and browsermesh](#wsh-and-browsermesh)).
 
 ### Gateway (TCP and DNS egress from the host)
 
@@ -623,7 +664,10 @@ bundler drop what you do not use.
 | `@johnhenry/wsh/memory` | `createMemoryHost()`, a host in this realm (above) |
 | `@johnhenry/wsh/host` | the pieces under it, for your own transport: `createConnectionFactory(config)` -- the connection handler `createWshServer`, `createMemoryHost` and `createReverseHost` all run -- plus `bindSocket(socket, ready, { dataStreams })`, `resolveBackends()`, `resolveHostKey()`, `buildAuthorizer()` and `authMethods()`. It does not import the client |
 | `@johnhenry/wsh/reverse` | `createReverseHost()` for a page or Worker: dial out to a relay and serve the operator it bridges. The same function `@johnhenry/wsh/server` exports, minus `exec: true` and `fs: { root }` |
-| `@johnhenry/wsh/testing` | the QMux record and frame codec (`encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, the varint and the other frame encoders), for a test that reads, alters and re-wraps what travels on a connection. **Experimental: not part of the stable API**; it may change or disappear in any release |
+| `@johnhenry/wsh/testing` | the QMux record and frame codec (`encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, the varint and the other frame encoders), for a test that reads, alters and re-wraps what travels on a connection; and two test doubles for code that embeds wsh: `createInProcessPipeRelay({ tap })` (the real pipe relay in this process, with a `WebSocket` that dials it, a record of every message it copied, and a `tap` that may change, drop, repeat or add to what it writes, like a hostile relay) and `createMemoryPair({ host, username })` (a memory host and a client already logged in to it). **Experimental: not part of the stable API**; it may change or disappear in any release. Importing only the codec costs under 1 kB: the doubles are separate exports a bundler drops |
+| `@johnhenry/wsh/identity` | a key in its four spellings, and `authorized_keys` lines: `fingerprint` and `podId` of a raw key, `fingerprintToPodId` / `podIdToFingerprint`, `rawKeyToOpenSsh` / `openSshToRawKey` / `parseOpenSshKey` / `publicKeyToOpenSsh`, `identityOf`, `normalizeIdentity`, `authorizedKeyLine`. Stable; see [Identity and capabilities for other implementations](#identity-and-capabilities-for-other-implementations-220) |
+| `@johnhenry/wsh/capabilities` | `permits(capabilities, request)`: the notation of key capabilities as a pure function, the one `@johnhenry/wsh/server` and the memory host evaluate. Stable; same section |
+| `@johnhenry/wsh/spec/*.json`, `*.md`, `wsh-v1.yaml` | the data files of the specification: `capabilities.md`, `capabilities.vectors.json`, `key-options.vectors.json`, the wire spec |
 | `@johnhenry/wsh/server` | Node only |
 
 ```js
@@ -647,17 +691,20 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 <!-- bundle-size:start (generated by `npm run size -- --update`; do not edit) -->
 | browser bundle | minified | gzip |
 | --- | ---: | ---: |
-| `@johnhenry/wsh` (whole entry point) | 164.0 kB | 49.5 kB |
-| `@johnhenry/wsh/memory` (whole entry point) | 231.5 kB | 72.3 kB |
-| `@johnhenry/wsh/host` (whole entry point) | 126.1 kB | 41.5 kB |
-| `@johnhenry/wsh/reverse` (whole entry point) | 220.0 kB | 68.0 kB |
+| `@johnhenry/wsh` (whole entry point) | 165.8 kB | 50.3 kB |
+| `@johnhenry/wsh/memory` (whole entry point) | 232.6 kB | 72.7 kB |
+| `@johnhenry/wsh/host` (whole entry point) | 127.3 kB | 41.9 kB |
+| `@johnhenry/wsh/reverse` (whole entry point) | 221.1 kB | 68.4 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
-| `@johnhenry/wsh/testing` (whole entry point) | 7.9 kB | 2.6 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 293.7 kB | 93.1 kB |
-| `@johnhenry/wsh/objects` (whole entry point) | 174.4 kB | 53.4 kB |
+| `@johnhenry/wsh/testing` (whole entry point) | 240.4 kB | 75.7 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 301.5 kB | 95.8 kB |
+| `@johnhenry/wsh/objects` (whole entry point) | 177.4 kB | 54.4 kB |
+| `@johnhenry/wsh/capabilities` (whole entry point) | 10.5 kB | 3.8 kB |
+| `@johnhenry/wsh/identity` (whole entry point) | 15.7 kB | 5.7 kB |
+| `import { encodeRecord } from '@johnhenry/wsh/testing'` | 1.8 kB | 0.9 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 135.9 kB | 40.8 kB |
-| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 102.9 kB | 33.6 kB |
+| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 104.0 kB | 34.0 kB |
 <!-- bundle-size:end -->
 
 ### Signing with a page-held signer
@@ -744,6 +791,17 @@ marked read-only is consequential; `consequentialHint` forces it), `'always'` be
 (true allows; anything else, a throw included, denies); the default, where the window has a document, is an accessible modal dialog that names the tool and
 the caller's key fingerprint, shows the input **as text** (nothing is parsed as markup), puts focus on Deny, keeps Tab inside it, treats Escape as Deny,
 returns focus afterwards and denies after 60 seconds. Questions are asked one at a time. Deny is an MCP error and the tool does not run.
+
+**Over any duplex, not only a wsh channel (#220).** `webmcpTools(...)` is a handler written for a channel; `serveMcpOverDuplex(handler,
+{ send, who, permits })` (also from `@johnhenry/wsh/page`) gives it one made of two functions you already have, so a transport that is not
+wsh at all (a mesh channel, a `MessagePort`) can carry the same tools: feed what arrives to `session.receive(message)`, `send` what goes out,
+`session.close(reason)` when the link ends. **The far side speaks plain MCP**: JSON-RPC 2.0 messages as objects (`{ jsonrpc: '2.0', id, method, params }`
+and the matching result or error, notifications with no `id`; no batches), so an MCP SDK `Client` connects through any `Transport` that moves them.
+The handler's bounds, `approve` and `prompt`, `onCall` and the untrusted labelling are unchanged. The seam adds `maxMessageBytes` (default 1 MiB,
+either direction), `maxInflight` (default 64 requests of any kind), one answer per id, and refuses a message that is not JSON-RPC 2.0. `who` is
+`{ username, fingerprint, podId }` (what the prompt and `onCall` see), and `permits` is asked per tool, so `(req) => permits(caps,
+req)` of `@johnhenry/wsh/capabilities` narrows it by `mcp:TOOL`. **It authenticates and seals nothing**: who is on the other end, and what they
+were granted, are the transport's to establish; they are not in the messages.
 
 **The indicator.** While a session is connected, `window.document` has a visible element (`data-wsh-page="indicator"`, `role="status"`) saying so,
 with the key's fingerprint and a **Stop** button that calls `revoke`. Stop ends the session (the operator is told why), and that key is refused until the host
@@ -1553,6 +1611,8 @@ An MCP client configuration:
 { "mcpServers": { "remote": { "command": "wsh-mcp", "args": ["--identity", "/home/me/.wsh/keys/default.pem", "--host-key", "<fingerprint>", "wss://host.example:4422"] } } }
 ```
 
+**Dialling a host behind a pipe relay (a pod's services host, a page host).** Both CLIs dial the operator side of a [pipe relay](#a-pipe-relay-johnhenrywshpipe-relay-118) directly. `wsh-mcp` takes the relay URL as its URL, since that is a `ws://` / `wss://` URL: `wsh-mcp --sealed --host-key <host fingerprint> --identity KEY wss://relay.example/r/<rendezvous id>` (the URL must end in `/r/<22-128 base64url characters>` and must not be the `?role=host` one). The Rust `wsh` has a flag for it: `wsh --sealed --via wss://relay.example/r/<id> mcp user@host` (and `wsh --via wss://relay.example/r/<id> user@host [command...]`), where `user@host` stays the identity the host key is recorded under. A host behind a relay that is a page or a mesh peer serves sealed sessions only, so pass `--sealed` and pin `--host-key`.
+
 stdout carries MCP messages only (one JSON-RPC message per line); every diagnostic goes to stderr. Exit status: `0` the client closed
 its side, `1` the host was lost for good, `2` it could not start -- no connection, a refused login or host key, or **a host that offers
 no such channel** (the error lists the channels it does offer and how to serve one). After a dropped connection it reconnects (5
@@ -2280,7 +2340,8 @@ than left to be found.
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
 | `authorized_keys` options (#122): `restrict`, `permit-*`, `no-pty`, `command=`, `max-sessions=` | `auth.authorizedKeys` lines with options on `createWshServer` / `createMemoryHost`; `parseAuthorizedKeyEntries()` | `wsh-server` reads `~/.wsh/authorized_keys` (then `~/.ssh/authorized_keys`) | **Same rules and the same vectors on both hosts** (`spec/key-options.vectors.json`, run by the JS suite and a Rust test); an option that is not understood keeps the key out, on both. See [Authorized-key options](#authorized-key-options-122) for the per-host column |
-| Per-key capabilities and expiry (#122): `capabilities="..."`, `expires="..."`; `authorize()` may return a set | every entry the host has: `Open` kinds, `FileOp` read vs write, gateway TCP/UDP/unix/endpoint open and listen, MCP discovery and calls, targets, rpc channels, relay; refusals through `onRefused` (`not-permitted`, `key-expired`) | the same, except **no endpoints and no targets** (`endpoint:` / `target:` parse and grant nothing; such requests are refused); refusals are logged, there is no callback; no `authorize` | **Same grammar, same vectors, same refusal codes on both hosts**; default-deny only for a key whose line has `capabilities`. Neither covers sessions already open, see [Security model](#security-model) |
+| Per-key capabilities and expiry (#122): `capabilities="..."`, `expires="..."`; `authorize()` may return a set | every entry the host has: `Open` kinds, `FileOp` read vs write, gateway TCP/UDP/unix/endpoint open and listen, MCP discovery and calls, targets, rpc channels, relay; refusals through `onRefused` (`not-permitted`, `key-expired`) | the same, except **no endpoints and no targets** (`endpoint:` / `target:` parse and grant nothing; such requests are refused); refusals are logged, there is no callback; no `authorize` | **Same grammar, same vectors, same refusal codes on both hosts**; default-deny only for a key whose line has `capabilities`. Neither covers sessions already open, see [Security model](#security-model). The notation is written in `spec/capabilities.md` and its vectors (`spec/capabilities.vectors.json`, `version` 1) ship in the npm package and are run by both; the Rust server's subset is stated by refusal: a key line with an `objects:` capability is refused at load (`unknown-capability`) |
+| `permits(capabilities, request)`, `@johnhenry/wsh/identity` (fingerprint, pod id, OpenSSH line, `authorized_keys` line builder), the `GATEWAY_FAIL` table, `serveMcpOverDuplex`, `createDuplexPeer({ who, permit })` (#220) | exported pure functions and seams of the JS package, browser-safe | none: the Rust server and CLI export no library function of these; the Rust server sends the same `GatewayFail` numbers, with `5` meaning "gateway disabled" where the Node gateway sends it for a timeout | **Notation unified by vectors**; the functions are the JS implementation's and are not a wire feature |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |
 | Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | `--cert-hash <sha256>` (repeatable) and `ConnectConfig.cert_hash`/`cert_hashes`, with the same rules (SHA-256, ECDSA P-256, at most 14 days); `wsh-server` prints its certificate hash at start-up. Without a pin the certificate is validated against the system trust store; `--insecure-skip-cert-verification` is the development-only opt-out | **Not a wire concept**; a default changed in the Rust client, see the CHANGELOG |
 
@@ -2453,6 +2514,12 @@ out explicitly below rather than left to be discovered.
   third-party text and are untrusted to the MCP client; the dialog and the indicator belong to the page and are not a defence against code
   already in it; a fresh host key per page load means no pin outlives it unless `hostKeyStore` is given) are stated in
   [A page as a host](#a-page-as-a-host-johnhenrywshpage-190).
+- **Objects and MCP over a transport that is not wsh (`createDuplexPeer`, `serveMcpOverDuplex`, #220) are only as authenticated as that transport.** The
+  identity they hand to `authorize(who, op)`, a prompt and `onCall` is whatever the adapter gave (`who`, `permit`, `permits`): `fingerprint` and `podId`
+  are checked to agree, nothing else is verified, and the messages carry no proof of either. They bound what they receive (message size, requests in
+  flight, one answer per id), refuse what is not the protocol, and fail closed when a `permit` throws or answers anything but `true`; they do not seal, and
+  a hop that can read the duplex reads every tool result and every value. The capability notation (`spec/capabilities.md`) is a **reading** of a list, not a
+  credential: an implementation that reads it more loosely than the vectors say grants more than the list does, which is why the vectors are shipped.
 - **`wsh-objects` (`@johnhenry/wsh/objects`, #190) lets a key read, call and set the paths an allow-list names on the roots a host names, and nothing else.** An allow-list of paths means what it says
   only because nothing but cloneable values crosses (no handles in `values` mode; on a root that opted in to [handles](#handles), a handle is judged by the path that produced it and never widens it, and nodes need their own opt-in); what it cannot make safe is stated in
   [Remote objects](#remote-objects-johnhenrywshobjects-190): a getter or a setter on an allowed path runs, a called function does whatever it does with the page's authority, a wide pattern means its width, and a
@@ -2775,30 +2842,55 @@ The bundle-size report is described under [Browser entry points](#browser-entry-
 ## Related projects
 
 - **[`@johnhenry/browsermesh-netway`](https://github.com/johnhenry/browsermesh)** takes a `WshClient` as its gateway backend
-  (see [Family](#family) below).
+  and the rest of browsermesh meets wsh in several places (see [wsh and browsermesh](#wsh-and-browsermesh)).
 - **The Rust crates** in [`crates/`](crates) (`wsh-core`, `wsh-client`, `wsh-cli`, `wsh-server`) are a native
   implementation of the same wire protocol, versioned separately (`rust-v*` tags) and generated from the same
   `spec/wsh-v1.yaml`; see [Rust implementation](#rust-implementation) for what each side can do.
 - **[clawser](https://github.com/erisera-code/clawser)** downloads the Rust release binaries by their archive names and is
   where the Rust workspace came from.
 
-## Family
+## wsh and browsermesh
 
-wsh isn't just a standalone remote-shell client -- its `WshClient` is the
-designed transport backing one sibling package's network gateway, and
-`WshClient`'s connected/authenticated shape is a drop-in for that sibling's
-injected-client extension point.
+**wsh** is the authenticated, capability-scoped door into **one machine or one page**: a key login in both directions, a host key a dialler
+can pin, a session sealed end to end, and what a key may do written down as capabilities. **[browsermesh](https://github.com/johnhenry/browsermesh)**
+is the **peer fabric**: pods that find each other, link, route messages and share state, with no machine at the centre. One is a way
+into a place; the other is the place between places. They are separate packages with separate versions, and **wsh has no dependency on
+browsermesh** (a test of the pod id derivation uses `@johnhenry/browsermesh-primitives` as a dev dependency only).
 
-- **[`@johnhenry/browsermesh-netway`](https://github.com/johnhenry/browsermesh)**
-  -- browsermesh-netway's `GatewayBackend` takes a `wshClient` in its
-  constructor and proxies every network operation (socket open/send/close)
-  through it via `sendControl()`, once the client reaches the
-  `'authenticated'` state (`isReady()` checks exactly that). This is a real,
-  verified dependency on wsh's client shape -- `GatewayBackend` is
-  duck-typed against a `WshClient` instance, not declared as an npm
-  dependency -- not a thematic pairing; see
-  `packages/browsermesh-netway/src/gateway-backend.mjs` in the browsermesh
-  repo. wsh itself has no dependency in the other direction.
+**Where they meet**
+
+- **The mesh's wsh peer link** (`@johnhenry/browsermesh-transport`, off by default): a link between two pods is one wsh session, sealed and
+  authenticated in both directions, carrying one named endpoint (`mesh`) on which the mesh's frames travel. A pod's Ed25519 key is its wsh
+  login; the pod id it claims must equal the hash of the key wsh authenticated. wsh supplies the session (login, host key, seal, endpoints);
+  the mesh supplies the frames. `@johnhenry/wsh/identity` is where the pod id and the fingerprint convert.
+- **The relay's pipe route**: browsermesh's relay server serves wsh's [pipe relay](#a-pipe-relay-johnhenrywshpipe-relay-118) (rendezvous and
+  byte copying, no keys), so two pods that cannot reach each other directly still run the ordinary wsh handshake end to end. `@johnhenry/wsh/testing`
+  has the same relay in process, with a tap for a hostile one, as a test double.
+- **netway's gateway backend** (`@johnhenry/browsermesh-netway`): its `GatewayBackend` takes a `WshClient` and proxies every network
+  operation through the host's [gateway](#gateway-tcp-and-dns-egress-from-the-host); it decodes the `GatewayFail` codes of
+  `GATEWAY_FAIL` / `GATEWAY_FAIL_TABLE`, exported here as data so there is one table.
+- **Objects and MCP over a mesh channel**, through the browsermesh adapter package (a separate, small package that peer-depends on
+  `@johnhenry/wsh`): a page's [remote objects](#remote-objects-johnhenrywshobjects-190) and WebMCP tools reachable over a protocol channel
+  with no wsh relay. wsh exports the seams it needs: `createDuplexPeer({ send, who, permit })` and `createObjectsServer(...).attach` for objects,
+  `serveMcpOverDuplex` for MCP, the identity object `{ username, fingerprint, podId }`, and `permits()` of the
+  [capability notation](#identity-and-capabilities-for-other-implementations-220), which the mesh's own grants run the same vectors against.
+
+**What is deliberately not shared**
+
+- **Sealing.** A wsh session is sealed once, after a signed key exchange, and everything after login travels in authenticated frames; the
+  mesh seals one-shot routed messages in its own way. They are two schemes for two shapes of traffic, and neither is built on the other.
+- **Wire codecs and addressing.** wsh speaks CBOR messages over QMux (WebSocket or WebTransport streams) and is reached by a URL or a rendezvous
+  id; the mesh has its own encodings and names pods by id. Neither adopts the other's.
+- **Exec and hosted pods.** Shells, commands, files and the gateway are wsh's; running things for other pods and hosting them is the mesh's.
+  Discovery and state sync stay in the mesh.
+- **Machine rights from mesh trust.** Being a peer of a pod, or holding a mesh grant, never gives a key exec, files or the gateway on a
+  machine. What a mesh grant can reach in a page is objects and MCP tools only, and only what that page's host opted in to.
+
+**One key in both worlds is possible, never automatic.** A pod's key can be exported as an OpenSSH line and a key from `authorized_keys`
+can be imported as a pod identity (`rawKeyToOpenSsh`, `openSshToRawKey`), explicitly. Do not do it for a key that is stored in a browser
+and valid on real machines: a key that can open a shell somewhere should not also be the identity a page presents to every peer it meets.
+Capabilities from the mesh are written as an `authorized_keys` line only by `authorizedKeyLine`, which refuses a line that grants
+more than it was asked for.
 
 ## License
 

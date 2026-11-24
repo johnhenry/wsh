@@ -32,8 +32,10 @@ import { pipeUrl } from './pipe-relay.mjs';
 import { webmcpTools, captureWebMcp, createDomPrompt, timersOf, WEBMCP_DEFAULT_LIMITS } from './webmcp.mjs';
 import { exposeObjects } from './objects.mjs';
 import { OBJECTS_PROTOCOL } from './objects-core.mjs';
+import { serveMcpOverDuplex } from './mcp-duplex.mjs';
 
-export { webmcpTools, captureWebMcp, createDomPrompt, WEBMCP_DEFAULT_LIMITS, exposeObjects };
+export { webmcpTools, captureWebMcp, createDomPrompt, WEBMCP_DEFAULT_LIMITS, exposeObjects, serveMcpOverDuplex };
+export { createDomIndicator as createPageIndicator };
 
 const RECONNECT_START_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
@@ -103,7 +105,13 @@ function exposedRoots(window, expose) {
   return { roots, allow, authorize, limits, eventFields, handles };
 }
 
-/** The indicator in the page: one row per connected key, with the key's fingerprint and a Stop control. */
+/**
+ * The indicator in the page: one row per connected key, with the key's fingerprint and a Stop control. Exported as `createPageIndicator(window,
+ * { name })` for an embedder that serves a session of its own (a mesh adapter) and wants the same badge: `show(who, stop)` adds a row for `who`
+ * (its fingerprint) with a Stop button that calls `stop()`, `hide(who)` removes it, `ensure()` puts the badge back if page code took it out,
+ * `destroy()` removes everything. BEST EFFORT: it is a DOM element of the page, which page code can remove or cover; Stop, a revoke and the
+ * key's capabilities are the controls that hold, not the badge.
+ */
 function createDomIndicator(window, { name }) {
   const doc = window.document;
   const make = (tag, props = {}, text) => {
