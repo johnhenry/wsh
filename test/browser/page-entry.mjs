@@ -5,8 +5,13 @@ import * as memory from '../../src/memory-host.mjs';
 import * as host from '../../src/host.mjs';
 import * as reverse from '../../src/reverse-host.mjs';
 import * as pageHost from '../../src/page-host.mjs';
+import * as capabilities from '../../src/capabilities.mjs';
+import * as identity from '../../src/identity.mjs';
+import * as doubles from '../../src/testing-doubles.mjs';
+import * as objects from '../../src/objects-core.mjs';
+import { newRendezvousId, pipeUrl } from '../../src/pipe-relay.mjs';
 
-const wsh = { ...client, ...memory, ...host, ...reverse, ...pageHost };
+const wsh = { ...client, ...memory, ...host, ...reverse, ...pageHost, ...capabilities, ...identity, ...doubles, newRendezvousId, pipeUrl,createDuplexPeer: objects.createDuplexPeer, createObjectsServer: objects.createObjectsServer, createObjectsClient: objects.createObjectsClient };
 window.wsh = wsh;
 
 const dec = new TextDecoder();
