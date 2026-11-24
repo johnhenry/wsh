@@ -869,7 +869,7 @@ export function createConnectionFactory(cfg) {
           if (requireTarget) return send(openFail({ reason: 'a target is required' }));
           {
             const protocol = typeof m.command === 'string' ? m.command : '';
-            const refusal = keyRefusal({ kind: 'open', channel: 'rpc', protocol, scoped: cfg.rpc?.protocols.get(protocol)?.capabilityScoped === true });
+            const refusal = keyRefusal({ kind: 'open', channel: 'rpc', protocol, scoped: cfg.rpc?.protocols.get(protocol)?.capabilityScoped === true, authorizesItself: cfg.rpc?.protocols.get(protocol)?.authorizesItself === true });
             if (refusal) return send(openFail({ reason: refusal.reason }));
           }
           return openRpc(m);
