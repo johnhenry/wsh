@@ -30,6 +30,7 @@ export const ENTRY_POINTS = [
   { name: './testing', entry: 'src/testing.mjs' },
   { name: './page', entry: 'src/page-host.mjs' },
   { name: './objects', entry: 'src/objects.mjs' },
+  { name: './objects-types', entry: 'src/objects-types.mjs' },
   { name: './capabilities', entry: 'src/capabilities.mjs' },
   { name: './identity', entry: 'src/identity.mjs' },
   { name: './duplex', entry: 'src/duplex.mjs' },

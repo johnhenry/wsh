@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Typed remotes (#219; JS)
+
+**Wire: one new method, `types`, on the existing `wsh-objects` rpc protocol, and one new string, `types`, in the `features` list of the `roots` answer. No new message type, channel or `ServerHello` feature; nothing in `spec/wsh-v1.yaml`.** A 0.50.0 host does not state `types`: a new client then refuses `rootDescription` with a named `unsupported` error and sends nothing; a 0.50.0 client never calls the method. Rust peers do not speak `wsh-objects`.
+
+- **`describeRootTypes(description, { name })`** (`@johnhenry/wsh/objects-types`, a new browser-safe entry point) is a pure function that returns the text of a `.d.ts` for one root. `rootDescription(page.window)` (`@johnhenry/wsh/objects`) fetches the description: the host's allow-list entries for the root, narrowed by **the connecting key's** `objects:ROOT:OP` capabilities, and the host's type map. Only what the key may do appears (a path no entry names, an operation the key lacks and a refused member are not in the file at all); plain values are `RemoteValue<unknown>`, calls `RemoteCall<unknown[], unknown, ...>`, wildcards `RemoteUntyped`, events typed `on` overloads from `allow.on` and `eventFields`, assignable keys a typed `set`.
+- **A host-supplied type map**: `exposeObjects({ types })` and `createPageHost({ expose: { ROOT: { types } } })` (`value`, `args`, `result` and `data` type texts by literal path). It is host-authored text that travels to the far side, so it is checked when the host is created and again by the far side (`checkTypeText`: a conservative subset of type syntax; no new line, comment, `import`, `typeof`, declaration, template literal, unbalanced bracket or `;` / `,` that could end the declaration it sits in; bounded to 1024 characters a text, 256 entries and 32 KiB a root), refused unless an allow-list entry names its path for the operation it types, copied as text and **never evaluated**. A bad text is a `TypeError` where the host is configured.
+- **`Remote<T>`, `RemoteRoots<T>`, `RemoteHandle<T>`** (types only) for hand-written value types: `client.openObjects<RemoteRoots<{ shop: Shop }>>()`. `set` and `on` check the key and the event type for a generated (branded) reference and stay permissive for an untyped one; `use(handle)` returns a `Remote<T>` for a typed handle.
+- **`wsh-objects-types`**, the package's second bin (JS only; the Rust CLI has no `wsh-objects` client): connects like `wsh-mcp`, prints the declarations of one root, and writes a file only with `--out` (not over an existing file without `--force`).
+- A reference is `PromiseLike`, not a `Promise`: the types say so (there is no `catch` or `finally` on a reference).
+
 ## 0.50.0
 
 npm only (since `rust-v0.17.1` the only change under `crates/` is the unit test of the capability vectors added in 0.49.0, no binary changes, no `rust-v` tag; the note below in `spec/wsh-v1.yaml` is a comment that generates no code change). **Wire: nothing new.**

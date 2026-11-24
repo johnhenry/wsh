@@ -25,6 +25,7 @@
  */
 
 import { callerIdentity } from './key-names.mjs';
+import { describeRootTypes, narrowTypes } from './objects-types.mjs';
 
 export const OBJECTS_PROTOCOL = 'wsh-objects';
 
@@ -368,7 +369,7 @@ function isPromiseLike(v) {
  * @param {() => number} [options.now]
  */
 export function createObjectsServer(options = {}) {
-  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, handles = {}, random = null, now = () => Date.now() } = options;
+  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, handles = {}, random = null, types = {}, now = () => Date.now() } = options;
   if (mode === 'handles') throw new TypeError("exposeObjects: handles are chosen per root, not for the host: use handles: { window: {} } (and nodes: true on a root that may hand out nodes)");
   if (mode !== 'values') throw new TypeError("exposeObjects: mode must be 'values' (handles are chosen per root with handles: { ROOT: {} })");
   if (typeof allow === 'string') throw new TypeError('exposeObjects: allow must be { get, call, set, on }: a wide-open string is not accepted, and the allow-lists apply to handles too');
@@ -429,6 +430,21 @@ export function createObjectsServer(options = {}) {
       const wide = lists[kind].find((p) => (p[0] === name || p[0] === '*' || p[0] === '**') && p.some((s) => s === '*' || s === '**'));
       if (wide) throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(wide.join('.'))} is wide on the handles root "${name}": list the paths, or acknowledge it with handles: { ${name}: { wideEntries: true } }`);
     }
+  }
+
+  // Types for the far side's `.d.ts` (`types: { 'window.app.cart.add': { args: '[item: { sku: string }]', result: 'number' } }`): host-authored text that is sent to the far side.
+  // It is checked when the host is created (a conservative type syntax, bounded, and only for a path that an allow-list entry names), so a bad text is a TypeError here, not something the far side finds.
+  if (!types || typeof types !== 'object' || Array.isArray(types)) throw new TypeError('exposeObjects: types must be { [path]: { value?, args?, result?, data? } }');
+  const typesByRoot = new Map();
+  for (const [key, spec] of Object.entries(types)) {
+    const root = key.split(/[.@]/, 1)[0];
+    if (!rootNames.includes(root)) throw new TypeError(`exposeObjects: types names ${JSON.stringify(key.slice(0, 60))}, which is not under a root`);
+    if (!typesByRoot.has(root)) typesByRoot.set(root, {});
+    typesByRoot.get(root)[key] = spec;
+  }
+  const allowStrings = { get: allow.get ?? [], call: allow.call ?? [], set: allow.set ?? [], on: allow.on ?? [] };
+  for (const [root, map] of typesByRoot) {
+    try { describeRootTypes({ root, allow: allowStrings, eventFields, types: map }); } catch (e) { throw new TypeError(String(e?.message ?? e).replace(/^describeRootTypes:/, 'exposeObjects:')); }
   }
 
   /** The checks every operation passes, in order. `terminal` ones need the operation's own list; the rest need only to walk toward something allowed. */
@@ -897,8 +913,24 @@ export function createObjectsServer(options = {}) {
     // The host also says what it supports (additive: an older client ignores it), so a client does not send a function to a host that would drop it, nor misread a handle.
     method('roots', async (_params, call) => ({
       roots: rootNames.filter((name) => keyMay(call, name, 'walk')),
-      features: ['events', 'callbacks', ...(handleRoots.size ? ['handles'] : [])],
+      features: ['events', 'callbacks', 'types', ...(handleRoots.size ? ['handles'] : [])],
     }));
+    // What this key may do on one root, as data a far side turns into a `.d.ts` (`describeRootTypes`): the allow-list entries of that root for the operations the key's
+    // capabilities grant, the host's type map for them, the event fields of the types it may subscribe to. Nothing of another root, and nothing that is not allowed.
+    method('types', async (params, call) => {
+      const root = requireRoot(params);
+      permitted(call, root, 'walk');
+      const ops = ['get', 'call', 'set', 'on'].filter((op) => keyMay(call, root, op));
+      const mine = (list) => (Array.isArray(list) ? list : []).filter((entry) => { const first = String(entry).split(/[.@]/, 1)[0]; return first === root || first === '*' || first === '**'; });
+      const lists = Object.fromEntries(['get', 'call', 'set', 'on'].map((op) => [op, ops.includes(op) ? mine(allowStrings[op]) : []]));
+      const typeMap = narrowTypes({ root, ops, allow: allowStrings, types: typesByRoot.get(root) ?? {} });
+      const offered = new Set(lists.on.map((entry) => entry.slice(entry.indexOf('@') + 1)));
+      const fields = Object.fromEntries(Object.entries(eventFields).filter(([type]) => type === '*' ? offered.size > 0 : offered.has(type)));
+      const answer = { version: 1, root, ops, allow: lists, eventFields: fields, types: typeMap, handles: handleRoots.has(root) };
+      const size = toWire(answer, { maxDepth: 6, maxBytes: call.maxBytes ?? limits.maxValueBytes });
+      if (!('v' in size)) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'the description could not be written', { reason: 'bad-reply' });
+      return size.v;
+    });
     method('resolve', resolve);
     method('set', setValue);
     method('describe', describe);
@@ -1214,6 +1246,18 @@ export async function on(ref, type, listener, { fields, onError } = {}) {
 export async function off(unsubscribe) {
   if (typeof unsubscribe !== 'function') throw new TypeError('off needs what on() returned');
   await unsubscribe();
+}
+
+/**
+ * What this key may do on a root, as data: `{ version, root, ops, allow, eventFields, types, handles }` (the host's allow-list entries for the root, narrowed by the key's
+ * capabilities, and the host's type map for them). Give it to `describeRootTypes` from `@johnhenry/wsh/objects-types` for the text of a `.d.ts`; nothing is written or evaluated here.
+ * Takes a root as `openObjects()` returns it (`page.window`), not a path or a handle.
+ */
+export async function rootDescription(ref, { signal } = {}) {
+  const state = stateOf(ref);
+  if (state.ops.length > 0 || state.handle !== undefined) throw new TypeError('rootDescription takes a root (page.window), not a path or a handle');
+  if (!state.session.features?.includes('types')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support types (it did not say so): it is older than 0.51.0', { reason: 'unsupported' });
+  try { return await state.session.peer.request('types', { root: state.root }, { signal }); } catch (e) { throw asObjectsError(e, state.session); }
 }
 
 /** The shape of an object, for a REPL or completion: `{ type, keys: [{ key, type, own }] }`. Only names the allow-list could walk to are told. */
