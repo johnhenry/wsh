@@ -17,6 +17,10 @@
       "raw": 220638,
       "gzip": 67925
     },
+    "./testing": {
+      "raw": 8040,
+      "gzip": 2689
+    },
     ". (generateKeyPair only)": {
       "raw": 404,
       "gzip": 324
