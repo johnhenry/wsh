@@ -132,13 +132,15 @@ impl Drop for QMuxDataStream {
 }
 
 /// Environment variable that, when set to `1` or `true`, disables TLS
-/// certificate verification for the `wss://` connection this process
-/// makes.
+/// certificate verification for a `wss://` connection **whose socket
+/// connected to a loopback address** (127.0.0.0/8 or `::1`, decided on the
+/// peer address and not on the name in the URL). For any other destination
+/// it has no effect: the certificate is verified and the client says once on
+/// stderr that the variable was ignored.
 ///
 /// **This exists solely for the Phase 1 loopback proof harness
 /// (`tools/guest-image/init.sh`, driven by
-/// `tools/guest-image/boot-test.mjs` — see issue #38) and MUST NOT be set
-/// for any real remote connection.** `wsh-server`'s dev cert is
+/// `tools/guest-image/boot-test.mjs` — see issue #38).** `wsh-server`'s dev cert is
 /// self-signed and there is currently no hash-pinning trust path for
 /// `wss://` in this codebase (WebTransport has `--cert-hash`, see
 /// `transport/webtransport.rs`; trusting the dev cert for `wss://` is
@@ -148,8 +150,7 @@ impl Drop for QMuxDataStream {
 /// for the Phase 1 proof doesn't have anyway (no `/etc/ssl/certs`).
 ///
 /// Nothing in this codebase sets this variable except the loopback test
-/// harness above — it is off by default, and turning it on for a real
-/// connection would allow a MITM to impersonate any server.
+/// harnesses — it is off by default.
 const INSECURE_LOOPBACK_TLS_ENV: &str = "WSH_INSECURE_LOOPBACK_TLS";
 
 /// A pipe-relay URL (`wss://relay/r/<id>`) with its rendezvous id shortened for a log line: the id is a
@@ -176,6 +177,121 @@ fn insecure_loopback_tls_requested() -> bool {
         std::env::var(INSECURE_LOOPBACK_TLS_ENV).as_deref(),
         Ok("1") | Ok("true")
     )
+}
+
+/// What to do about a `wss://` certificate, given whether [`INSECURE_LOOPBACK_TLS_ENV`] is set and the address the
+/// socket actually connected to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsTrust {
+    /// Verify the certificate as usual (the variable is not set).
+    Verify,
+    /// The variable is set but the peer is not a loopback address: verify as usual, and say the variable was ignored.
+    VerifyIgnored,
+    /// The variable is set and the peer is a loopback address: skip verification.
+    SkipLoopback,
+}
+
+/// The decision is made on the address the socket connected to, never on the name in the URL: `localhost` that resolves
+/// to a non-loopback address, or a name that resolves to one, is verified.
+fn tls_trust(requested: bool, peer: std::net::IpAddr) -> TlsTrust {
+    if !requested {
+        TlsTrust::Verify
+    } else if peer.to_canonical().is_loopback() {
+        TlsTrust::SkipLoopback
+    } else {
+        TlsTrust::VerifyIgnored
+    }
+}
+
+/// Connect a `wss://` URL with [`INSECURE_LOOPBACK_TLS_ENV`] set: open the socket first, look at the address it
+/// reached, and only then choose how the certificate is checked.
+async fn connect_wss_checked(
+    url: &str,
+) -> WshResult<(
+    WebSocketStream<MaybeTlsStream<TcpStream>>,
+    tokio_tungstenite::tungstenite::handshake::client::Response,
+)> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let transport = |e: String| WshError::Transport(format!("WebSocket connect error: {e}"));
+    let request = url
+        .into_client_request()
+        .map_err(|e| transport(e.to_string()))?;
+    let uri = request.uri().clone();
+    let host = uri
+        .host()
+        .ok_or_else(|| transport("no host in the URL".into()))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = uri.port_u16().unwrap_or(443);
+    let socket = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| transport(e.to_string()))?;
+    let peer = socket
+        .peer_addr()
+        .map_err(|e| transport(e.to_string()))?
+        .ip();
+    let connector = match tls_trust(true, peer) {
+        TlsTrust::SkipLoopback => {
+            tracing::warn!(
+                "{} is set and {host} is a loopback address: skipping wss:// certificate verification",
+                INSECURE_LOOPBACK_TLS_ENV
+            );
+            Some(build_insecure_loopback_connector())
+        }
+        _ => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                eprintln!(
+                    "wsh: {INSECURE_LOOPBACK_TLS_ENV} is ignored: {host} is not a loopback address, so its certificate is verified"
+                );
+            });
+            None
+        }
+    };
+    tokio_tungstenite::client_async_tls_with_config(request, socket, None, connector)
+        .await
+        .map_err(|e| transport(e.to_string()))
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_peers_skip_verification_when_the_variable_is_set() {
+        for a in ["127.0.0.1", "127.255.255.254", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(tls_trust(true, ip(a)), TlsTrust::SkipLoopback, "{a}");
+        }
+    }
+
+    #[test]
+    fn any_other_peer_is_verified_despite_the_variable() {
+        for a in [
+            "10.0.0.5",
+            "192.0.2.7",
+            "203.0.113.9",
+            "0.0.0.0",
+            "128.0.0.1",
+            "2001:db8::1",
+            "::ffff:10.0.0.5",
+            "fe80::1",
+        ] {
+            assert_eq!(tls_trust(true, ip(a)), TlsTrust::VerifyIgnored, "{a}");
+        }
+    }
+
+    #[test]
+    fn without_the_variable_every_peer_is_verified() {
+        for a in ["127.0.0.1", "::1", "10.0.0.5"] {
+            assert_eq!(tls_trust(false, ip(a)), TlsTrust::Verify, "{a}");
+        }
+    }
 }
 
 /// A `rustls` certificate verifier that accepts any certificate chain,
@@ -298,18 +414,14 @@ impl WebSocketSession {
     /// Connect to a wsh server over WebSocket.
     pub async fn connect(url: &str) -> WshResult<Self> {
         super::install_crypto_provider();
-        let (ws_stream, _response) = if insecure_loopback_tls_requested() {
-            // See INSECURE_LOOPBACK_TLS_ENV's doc comment: only reachable
-            // when the loopback test harness explicitly opts in.
-            tracing::warn!(
-                "{} is set — skipping wss:// certificate verification \
-                 (loopback test harness only, see issue #38)",
-                INSECURE_LOOPBACK_TLS_ENV
-            );
-            let connector = build_insecure_loopback_connector();
-            tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
-                .await
-                .map_err(|e| WshError::Transport(format!("WebSocket connect error: {e}")))?
+        let (ws_stream, _response) = if insecure_loopback_tls_requested()
+            && url
+                .get(..6)
+                .is_some_and(|s| s.eq_ignore_ascii_case("wss://"))
+        {
+            // See INSECURE_LOOPBACK_TLS_ENV's doc comment: skipping verification applies only when the socket
+            // connected to a loopback address.
+            connect_wss_checked(url).await?
         } else {
             connect_async(url)
                 .await

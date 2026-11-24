@@ -2259,7 +2259,9 @@ out explicitly below rather than left to be discovered.
   Verification stops an on-path party from terminating the connection as the server. It does not prove WHICH host a
   person is talking to beyond what the certificate names (a pin proves "this certificate", and `known_hosts` /
   `--host-key` prove the host's own key, which is a separate and stronger check), it does not cover the `wss://`
-  fallback's `WSH_INSECURE_LOOPBACK_TLS` development variable, and a pinned certificate must be re-pinned when it is
+  fallback's `WSH_INSECURE_LOOPBACK_TLS` development variable (which now applies to loopback destinations only: it skips
+  verification when the socket connected to 127.0.0.0/8 or `::1`, judged on the address reached and not on the name, and
+  for any other destination it is ignored, with one line on stderr saying so), and a pinned certificate must be re-pinned when it is
   rotated (at most every 14 days). With the opt-out, a host that proves no key is not authenticated at all.
 - **Password auth has no confidentiality of its own -- it relies entirely
   on the transport.** `AUTH_METHOD.PASSWORD` sends the password as a plain
