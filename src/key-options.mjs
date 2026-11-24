@@ -55,7 +55,7 @@ const TOOL_CAP_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/;
 const DOMAIN_RE = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const OBJECT_ROOT_RE = /^[A-Za-z_$][A-Za-z0-9_$-]{0,63}$/;
 /** The operations of `wsh-objects` a capability can name (`objects:ROOT:OP`). */
-const OBJECT_OPS = ['get', 'call', 'set'];
+const OBJECT_OPS = ['get', 'call', 'set', 'on'];
 const SIMPLE_CAPS =new Set(['exec', 'pty', 'relay', 'fs:read', 'fs:write']);
 
 const capFail = (code, reason) => ({ ok: false, code, reason });
@@ -139,7 +139,7 @@ function parseCapability(raw) {
     // objects:ROOT or objects:ROOT:OP (#190): a root of `wsh-objects` (or `*`), and optionally one operation on it. JS hosts only.
     const parts = raw.slice('objects:'.length).split(':');
     const [root, op, ...rest] = parts;
-    if (rest.length || !(root === '*' || OBJECT_ROOT_RE.test(root))) return bad('expected objects:<root>[:<get|call|set>]');
+    if (rest.length || !(root === '*' || OBJECT_ROOT_RE.test(root))) return bad('expected objects:<root>[:<get|call|set|on>]');
     if (op !== undefined && !OBJECT_OPS.includes(op)) return bad(`the operation must be one of ${OBJECT_OPS.join(', ')}`);
     return { ok: true, cap: { raw, kind: 'objects', name: root, op: op ?? null } };
   }

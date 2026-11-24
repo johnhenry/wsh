@@ -13,7 +13,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createPipeRelay } from '@johnhenry/wsh/pipe-relay';
 import { createPageHost, captureWebMcp } from '@johnhenry/wsh/page';
-import { set } from '@johnhenry/wsh/objects';
+import { set, on } from '@johnhenry/wsh/objects';
 import {
   WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, exportPrivateKeyPKCS8, fingerprint, mcpClientTransport, cborEncode, MSG,
 } from '@johnhenry/wsh';
@@ -534,6 +534,35 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
     byRole(win, 'stop')[0].click();
     await assert.rejects(Promise.resolve(remote.document.title), /stopped this session|closed/);
     await until(() => page.host.sessions.length === 0, 'the session to end');
+  });
+
+  it('events: a subscription is delivered as plain data, and Stop, a navigation and a revoke each take the listener out of the page', async () => {
+    for (const how of ['stop', 'navigate', 'revoke']) {
+      const { win } = worldWindow();
+      let listeners = 0;
+      const bus = new (class extends EventTarget {
+        addEventListener(...a) { listeners++; return super.addEventListener(...a); }
+        removeEventListener(...a) { listeners--; return super.removeEventListener(...a); }
+      })();
+      win.app.bus = bus;
+      const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: { window: { ...EXPOSE.window, allow: { ...EXPOSE.window.allow, on: ['app.bus@ready'] }, eventFields: { ready: ['detail'] } } } } });
+      const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+      await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+      const { window: remote } = await wsh.openObjects();
+      const got = [];
+      await on(remote.app.bus, 'ready', (d) => got.push(d), { fields: ['detail'] });
+      assert.equal(listeners, 1);
+      bus.dispatchEvent(new CustomEvent('ready', { detail: { n: 1 } }));
+      await until(() => got.length === 1, 'the event');
+      assert.deepEqual(got[0].detail, { n: 1 });
+      assert.equal(got[0].type, 'ready');
+      await assert.rejects(on(remote.app.bus, 'other', () => {}), (e) => e.reason === 'not-allowed');
+      if (how === 'stop') byRole(win, 'stop')[0].click();
+      else if (how === 'revoke') await page.host.revoke(aliceFp);
+      else { win.location = { origin: 'https://evil.example' }; page.timers.tick(); }
+      await until(() => listeners === 0, `the listener to go (${how})`);
+      await page.host.close();
+    }
   });
 
   it('authorize(who, op) of a root is asked, with the key of the caller', async () => {

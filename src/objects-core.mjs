@@ -62,6 +62,14 @@ export const OBJECTS_DEFAULT_LIMITS = Object.freeze({
   maxKeys: 200,
   /** Requests accepted per second, per attached peer. */
   maxRequestsPerSecond: 50,
+  /** Event subscriptions per channel. */
+  maxSubscriptions: 16,
+  /** Events delivered per second, per subscription; the rest are dropped and counted. */
+  maxEventsPerSecond: 20,
+  /** Bytes of one delivered event; a bigger one is dropped and counted. */
+  maxEventBytes: 16 * 1024,
+  /** Events waiting for the transport (credit), per channel; more are dropped and counted. */
+  maxQueuedEvents: 100,
   /** How long a call that returns a promise is waited for. */
   callTimeoutMs: 30_000,
 });
@@ -83,6 +91,7 @@ export const NEEDS_LISTING = Object.freeze([
 ]);
 
 const KEY_MAX = 256;
+const EVENT_TYPE_RE = /^(\*|[A-Za-z0-9_$:.-]{1,128})$/;
 
 function checkKey(key) {
   if (typeof key !== 'string' || key === '' || key.length > KEY_MAX) throw invalid(`a path segment must be a string of 1 to ${KEY_MAX} characters`);
@@ -336,12 +345,18 @@ function isPromiseLike(v) {
  * @param {() => number} [options.now]
  */
 export function createObjectsServer(options = {}) {
-  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, now = () => Date.now() } = options;
-  if (mode === 'handles') throw new TypeError("exposeObjects: mode 'handles' is not built: only 'values' exists (handles, events and callbacks are a later step of #190)");
+  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, now = () => Date.now() } = options;
+  if (mode === 'handles') throw new TypeError("exposeObjects: mode 'handles' is not built: only 'values' exists (handles and callbacks are a later step of #190)");
   if (mode !== 'values') throw new TypeError("exposeObjects: mode must be 'values'");
   if (typeof allow === 'string') throw new TypeError('exposeObjects: allow must be { get, call, set } (the wide-open form belongs to mode handles, which is not built)');
   if (!allow || typeof allow !== 'object' || Array.isArray(allow)) throw new TypeError('exposeObjects: allow must be { get, call, set }');
-  for (const k of Object.keys(allow)) if (!['get', 'call', 'set'].includes(k)) throw new TypeError(`exposeObjects: allow.${k} is not an operation (get, call, set)`);
+  for (const k of Object.keys(allow)) if (!['get', 'call', 'set', 'on'].includes(k)) throw new TypeError(`exposeObjects: allow.${k} is not an operation (get, call, set, on)`);
+  // The extra fields of an event a subscriber may ask for, by event type (`'*'`: any type): names of properties read from the event, copied as plain data.
+  if (!eventFields || typeof eventFields !== 'object' || Array.isArray(eventFields)) throw new TypeError('exposeObjects: eventFields must be { [type]: [field names] }');
+  for (const [type, names] of Object.entries(eventFields)) {
+    if (!Array.isArray(names) || !names.every((n) => typeof n === 'string' && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(n))) throw new TypeError(`exposeObjects: eventFields[${JSON.stringify(type)}] must be an array of property names`);
+    for (const n of names) if (ALWAYS_REFUSED.has(n)) throw new TypeError(`exposeObjects: eventFields[${JSON.stringify(type)}] names "${n}", which is never reachable`);
+  }
   if (!roots || typeof roots !== 'object' || Array.isArray(roots)) throw new TypeError('exposeObjects: roots must be an object of { name: object }: the named roots are all that is reachable');
   const rootNames = Object.keys(roots);
   if (rootNames.length === 0) throw new TypeError('exposeObjects: at least one root is needed');
@@ -356,11 +371,23 @@ export function createObjectsServer(options = {}) {
     if (!Number.isSafeInteger(v) || v < 1) throw new TypeError(`exposeObjects: limits.${k} must be a positive integer`);
     limits[k] = v;
   }
-  const lists = { get: compileList(allow.get, 'get'), call: compileList(allow.call, 'call'), set: compileList(allow.set, 'set') };
-  const every = [...lists.get, ...lists.call, ...lists.set];
+  // `on` entries are `path@type` (`'window.app.bus@ready'`, `'window.hash@*'`): the source, and the event type; each is compiled as a path with its type attached.
+  const compileOn = (list) => {
+    if (list === undefined || list === null) return [];
+    if (!Array.isArray(list)) throw new TypeError('exposeObjects: allow.on must be an array of "path@type" entries');
+    return list.map((entry) => {
+      const at = typeof entry === 'string' ? entry.indexOf('@') : -1;
+      const type = at < 0 ? '' : entry.slice(at + 1);
+      if (at <= 0 || !EVENT_TYPE_RE.test(type)) throw new TypeError(`exposeObjects: allow.on entry ${JSON.stringify(entry)} must be "path@type" (the type may be "*")`);
+      const segs = compileList([entry.slice(0, at)], 'on')[0];
+      return Object.assign(segs, { type });
+    });
+  };
+  const lists = { get: compileList(allow.get, 'get'), call: compileList(allow.call, 'call'), set: compileList(allow.set, 'set'), on: compileOn(allow.on) };
+  const every = [...lists.get, ...lists.call, ...lists.set, ...lists.on];
 
   /** The checks every operation passes, in order. `terminal` ones need the operation's own list; the rest need only to walk toward something allowed. */
-  async function check(kind, root, segs, ctx, { terminal }) {
+  async function check(kind, root, segs, ctx, { terminal, type }) {
     const who = ctx.who;
     const gone = guard?.();
     if (gone) throw refuse('gone', `refused: ${gone}`);
@@ -371,6 +398,7 @@ export function createObjectsServer(options = {}) {
     // 1. the allow-list: the operation's own list for the operation itself, any list for walking toward something
     if (terminal) {
       if (!own.some((p) => matchPath(p, segs))) throw refuse('not-allowed', `refused: ${kind} of ${segs.join('.')} is not in the allow-list`, { path: segs.join('.'), op: kind });
+      if (kind === 'on' && !own.some((p) => matchPath(p, segs) && (p.type === '*' || p.type === type))) throw refuse('not-allowed', `refused: the event type "${type}" of ${segs.join('.')} is not in the allow-list`, { path: segs.join('.'), op: kind, type });
     } else if (!every.some((p) => prefixPath(p, segs))) {
       throw refuse('not-allowed', `refused: ${segs.join('.')} is not on the way to anything the allow-list names`, { path: segs.join('.') });
     }
@@ -382,7 +410,7 @@ export function createObjectsServer(options = {}) {
     }
     if (terminal && authorize) {
       let ok = false;
-      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.') })) === true; } catch { ok = false; }
+      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.'), ...(type !== undefined ? { type } : {}) })) === true; } catch { ok = false; }
       if (!ok) throw refuse('authorize', `refused: ${kind} of ${segs.join('.')} was not authorized`, { path: segs.join('.'), op: kind });
     }
   }
@@ -547,9 +575,116 @@ export function createObjectsServer(options = {}) {
     return toWire(cur, { maxDepth: depth, maxBytes: wanted, cut: true });
   }
 
+  // ── Events ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  // A subscription is a listener on an EventTarget-style source (`addEventListener`) or an emitter-style one (`on` / `off`), named by an `allow.on` entry
+  // (`path@type`) of its own. What is delivered is plain data: an Event becomes `{ type, timeStamp, isTrusted }` plus the fields the host lists for its type
+  // (`eventFields`) and the subscriber asked for, each copied as plain data (a node is left out); an emitter's arguments become `{ type, args }`. Never the event,
+  // never a handle. A listener runs in the page's dispatch: it only copies, bounds, queues, and cannot throw into it.
+
+  const sourceMethods = (source) => {
+    const fn = (name) => { try { const f = Reflect.get(Object(source), name, source); return typeof f === 'function' ? f : null; } catch { return null; } };
+    if (fn('addEventListener') && fn('removeEventListener')) return { kind: 'target', add: 'addEventListener', remove: 'removeEventListener' };
+    if (fn('on') && fn('off')) return { kind: 'emitter', add: 'on', remove: 'off' };
+    if (fn('on') && fn('removeListener')) return { kind: 'emitter', add: 'on', remove: 'removeListener' };
+    return null;
+  };
+
+  /** An Event as plain data. */
+  function describeEvent(event, fields) {
+    const read = (name) => { try { return Reflect.get(Object(event), name, event); } catch { return undefined; } };
+    const out = { type: String(read('type') ?? ''), timeStamp: Number.isFinite(read('timeStamp')) ? read('timeStamp') : 0, isTrusted: read('isTrusted') === true };
+    for (const name of fields) {
+      const w = toWire(read(name), { maxDepth: 3, maxBytes: limits.maxEventBytes });
+      if ('v' in w && w.v !== undefined) out[name] = w.v;
+    }
+    return out;
+  }
+
+  async function pump(session) {
+    if (session.pumping) return;
+    session.pumping = true;
+    try {
+      while (session.queue.length && !session.closed) {
+        const { sub, data, dropped } = session.queue.shift();
+        const message = { id: sub.id, seq: ++sub.seq, data, ...(dropped ? { dropped } : {}) };
+        // The write waits for the transport (credit): events behind it queue, to `maxQueuedEvents`, and beyond that are dropped and counted.
+        try { await session.peer.notify('event', message); } catch { /* the channel is going away */ }
+      }
+    } finally { session.pumping = false; }
+  }
+
+  function deliver(session, sub, args) {
+    if (session.closed) return;
+    try {
+      if (guard?.()) return;
+      const t = now();
+      while (sub.stamps.length && t - sub.stamps[0] >= 1000) sub.stamps.shift();
+      if (sub.stamps.length >= limits.maxEventsPerSecond) { sub.dropped++; return; }
+      let data;
+      if (sub.kind === 'target') data = describeEvent(args[0], sub.fields);
+      else {
+        // Emitter arguments: plain values; what cannot be cloned is null (the whole value keeps its position).
+        data = { type: sub.type, args: args.map((a) => { const w = toWire(a, { maxDepth: 4, maxBytes: limits.maxEventBytes }); return 'v' in w ? w.v : null; }) };
+      }
+      toWire(data, { maxDepth: 6, maxBytes: limits.maxEventBytes });
+      if (session.queue.length >= limits.maxQueuedEvents) { sub.dropped++; return; }
+      sub.stamps.push(t);
+      // The events dropped since the last accepted one are told with this one: "this many were lost before it".
+      session.queue.push({ sub, data, dropped: sub.dropped });
+      sub.dropped = 0;
+      void pump(session);
+    } catch { sub.dropped++; }
+  }
+
+  async function subscribe(params, ctx) {
+    const { session } = ctx;
+    const root = requireRoot(params);
+    const type = params.type;
+    if (typeof type !== 'string' || !EVENT_TYPE_RE.test(type) || type === '*') throw invalid('an event type is a name of letters, digits and _ $ : . - (up to 128)');
+    const id = params.id;
+    if (!Number.isSafeInteger(id) || id < 1 || session.subs.has(id)) throw invalid('a subscription id is a whole number the channel has not used');
+    const asked = params.fields === undefined ? [] : params.fields;
+    if (!Array.isArray(asked) || asked.length > 16 || !asked.every((f) => typeof f === 'string')) throw invalid('fields must be an array of property names');
+    const offered = [...(eventFields[type] ?? []), ...(eventFields['*'] ?? [])];
+    for (const f of asked) if (!offered.includes(f)) throw refuse('not-allowed', `refused: the field "${f}" of ${type} events is not offered by this host`, { field: f, type });
+    if (session.subs.size >= limits.maxSubscriptions) throw limitError('maxSubscriptions', limits.maxSubscriptions, 'too many event subscriptions on this channel');
+    const { cur: source, segs } = await walk(root, params.path ?? [], ctx);
+    await check('on', root, segs, ctx, { terminal: true, type });
+    const kind = sourceMethods(source);
+    if (!kind) throw new ObjectsError(OBJECTS_ERROR.FAILED, `${segs.join('.')} is not an event source (it needs addEventListener, or on and off)`, { reason: 'not-an-event-source' });
+    const sub = { id, type, kind: kind.kind, fields: [...new Set(asked)], source, stamps: [], dropped: 0, seq: 0, remove: kind.remove, listener: null };
+    sub.listener = (...args) => deliver(session, sub, args);
+    try { Reflect.apply(Reflect.get(Object(source), kind.add, source), source, [type, sub.listener]); } catch (e) { throw wrapThrown(e, `${segs.join('.')}.${kind.add}`); }
+    session.subs.set(id, sub);
+    return { ok: true };
+  }
+
+  function removeSub(sub) {
+    try { Reflect.apply(Reflect.get(Object(sub.source), sub.remove, sub.source), sub.source, [sub.type, sub.listener]); } catch { /* the page's own source: nothing to tell */ }
+  }
+
+  async function unsubscribe(params, ctx) {
+    const sub = ctx.session.subs.get(params.id);
+    if (!sub) throw invalid('no such subscription');
+    ctx.session.subs.delete(params.id);
+    removeSub(sub);
+    ctx.session.queue = ctx.session.queue.filter((q) => q.sub !== sub);
+    return { ok: true, dropped: sub.dropped };
+  }
+
   /** Register the protocol's methods on a peer. `who` is the identity of every call unless the transport gives one per call. */
   function attach(peer, { who } = {}) {
     if (typeof peer?.onRequest !== 'function') throw new TypeError('attach: the peer needs onRequest(method, handler)');
+    const session = { peer, subs: new Map(), queue: [], pumping: false, closed: false };
+    // The end of the channel (the peer left, Stop, a navigation, a revoke) takes every listener out of the page's sources.
+    const prior = peer.onClose;
+    peer.onClose = (reason) => {
+      session.closed = true;
+      for (const sub of session.subs.values()) removeSub(sub);
+      session.subs.clear();
+      session.queue = [];
+      try { prior?.(reason); } catch { /* ignore */ }
+    };
     const stamps = [];
     const method = (name, fn) => peer.onRequest(name, async (params, ctx = {}) => {
       const t = now();
@@ -558,7 +693,7 @@ export function createObjectsServer(options = {}) {
       stamps.push(t);
       // A value is kept under what the transport carries in one message, with room for the envelope.
       const maxBytes = Math.min(limits.maxValueBytes, Math.max(1024, (peer.maxMessageBytes ?? Infinity) - 4096));
-      const call = { ...ctx, signal: ctx.signal, who: ctx.who ?? who, maxBytes };
+      const call = { ...ctx, signal: ctx.signal, who: ctx.who ?? who, maxBytes, session };
       if (params === null || typeof params !== 'object' || Array.isArray(params)) throw invalid('params must be an object');
       try { return await fn(params, call); } catch (e) { if (e instanceof ObjectsError) throw e; throw wrapThrown(e, name); }
     });
@@ -568,6 +703,8 @@ export function createObjectsServer(options = {}) {
     method('set', setValue);
     method('describe', describe);
     method('snapshot', snapshot);
+    method('subscribe', subscribe);
+    method('unsubscribe', unsubscribe);
     return { limits };
   }
 
@@ -782,6 +919,33 @@ export async function snapshot(ref, { depth, maxBytes, signal } = {}) {
   } catch (e) { throw asObjectsError(e, state.session); }
 }
 
+/**
+ * Listen for an event of a remote source named by the host's `allow.on`: `const stop = await on(win.app.bus, 'ready', (data, { seq, dropped }) => ...)`.
+ * `data` is plain (an Event as `{ type, timeStamp, isTrusted, ...the fields you asked for }`, an emitter's as `{ type, args }`); `dropped` counts the events the
+ * host dropped before this one (rate, size, or a slow channel). `fields` are extra event fields the host lists for the type. Resolves to the function that unsubscribes.
+ */
+export async function on(ref, type, listener, { fields, onError } = {}) {
+  const { state, keys } = pathOf(ref, 'on');
+  if (typeof listener !== 'function') throw new TypeError('on needs a listener function: listener(data, { type, seq, dropped })');
+  const { session } = state;
+  const id = session.nextSub++;
+  // Registered before the request: an event can follow the answer at once.
+  session.subs.set(id, { listener, onError, type });
+  try {
+    await session.peer.request('subscribe', { id, root: state.root, path: keys, type, ...(fields ? { fields } : {}) });
+  } catch (e) { session.subs.delete(id); throw asObjectsError(e, session); }
+  return async function off() {
+    if (!session.subs.delete(id)) return;
+    try { await session.peer.request('unsubscribe', { id }); } catch { /* the channel is already gone: the host removed the listener with it */ }
+  };
+}
+
+/** Stop a subscription: `await off(await on(...))`, the same as calling the function `on` returned. */
+export async function off(unsubscribe) {
+  if (typeof unsubscribe !== 'function') throw new TypeError('off needs what on() returned');
+  await unsubscribe();
+}
+
 /** The shape of an object, for a REPL or completion: `{ type, keys: [{ key, type, own }] }`. Only names the allow-list could walk to are told. */
 export async function describe(ref, { signal } = {}) {
   const { state, keys } = pathOf(ref, 'describe');
@@ -795,7 +959,15 @@ export async function describe(ref, { signal } = {}) {
  */
 export async function createObjectsClient(peer, { timeoutMs } = {}) {
   if (typeof peer?.request !== 'function') throw new TypeError('createObjectsClient: the peer needs request(method, params)');
-  const session = { peer, closing: null, timeoutMs };
+  const session = { peer, closing: null, timeoutMs, subs: new Map(), nextSub: 1 };
+  // An event the host delivers: to the listener that asked, in this process. A listener that throws is this side's business and goes to its `onError`: it never travels back.
+  peer.onNotification?.('event', (params) => {
+    const sub = session.subs.get(params?.id);
+    if (!sub) return;
+    try { sub.listener(params.data, { type: sub.type, seq: params.seq, dropped: Number.isSafeInteger(params.dropped) ? params.dropped : 0 }); } catch (e) {
+      try { sub.onError?.(e); } catch { /* the error handler's own */ }
+    }
+  });
   peer.onNotification?.('closing', (params) => { session.closing = typeof params?.reason === 'string' ? clip(params.reason, TEXT_MAX) : 'closing'; });
   let roots;
   try { roots = (await peer.request('roots', {}))?.roots; } catch (e) { throw asObjectsError(e, session); }

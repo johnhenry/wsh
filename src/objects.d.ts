@@ -44,6 +44,14 @@ export interface ObjectsLimits {
   maxRequestsPerSecond: number;
   /** How long a call that returns a promise is waited for. Default 30000. */
   callTimeoutMs: number;
+  /** Event subscriptions per channel. Default 16. */
+  maxSubscriptions: number;
+  /** Events delivered per second, per subscription; the rest are dropped and counted. Default 20. */
+  maxEventsPerSecond: number;
+  /** Bytes of one delivered event; a bigger one is dropped and counted. Default 16384. */
+  maxEventBytes: number;
+  /** Events waiting for the transport's credit, per channel; more are dropped and counted. Default 100. */
+  maxQueuedEvents: number;
 }
 export const OBJECTS_DEFAULT_LIMITS: Readonly<ObjectsLimits>;
 
@@ -55,11 +63,15 @@ export interface ObjectsAllow {
   get?: string[];
   call?: string[];
   set?: string[];
+  /** Event sources, as `path@type` (`'window.app.bus@ready'`; the type may be `*`). Never implied by the other lists. */
+  on?: string[];
 }
 
 export interface ObjectsWho { username: string | null; fingerprint: string | null }
 export interface ObjectsOperation {
-  kind: 'get' | 'call' | 'construct' | 'set' | 'describe' | 'snapshot';
+  kind: 'get' | 'call' | 'construct' | 'set' | 'on' | 'describe' | 'snapshot';
+  /** For `on`: the event type. */
+  type?: string;
   root: string;
   /** The path below the root. */
   path: string[];
@@ -76,6 +88,8 @@ export interface ObjectsServerOptions {
   /** Asked for every operation the allow-list let through; anything but `true` (a throw included) refuses. */
   authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>;
   limits?: Partial<ObjectsLimits>;
+  /** Extra event fields a subscriber may ask for, by event type (`'*'`: any type): property names read from the event and copied as plain data (a node is left out). */
+  eventFields?: Record<string, string[]>;
   /** Why nothing may be served any more (the window left), else null. */
   guard?: () => string | null;
   /** For `callTimeoutMs`. */
@@ -140,6 +154,13 @@ export function call(ref: any, ...args: unknown[]): Promise<any>;
 export function construct(ref: any, ...args: unknown[]): Promise<any>;
 /** A bounded deep copy; subtrees deeper than `depth` are `null`. */
 export function snapshot(ref: any, options?: { depth?: number; maxBytes?: number; signal?: AbortSignal }): Promise<any>;
+/**
+ * Listen for an event of a remote source named by the host's `allow.on`. `data` is plain: an Event as `{ type, timeStamp, isTrusted, ...fields }`, an emitter's as
+ * `{ type, args }`. `dropped` counts events the host dropped before this one. Resolves to the function that unsubscribes. Never an event object, never a handle.
+ */
+export function on(ref: any, type: string, listener: (data: any, info: { type: string; seq: number; dropped: number }) => void, options?: { fields?: string[]; onError?: (error: unknown) => void }): Promise<() => Promise<void>>;
+/** Stop a subscription: what `on` resolved to. */
+export function off(unsubscribe: () => Promise<void>): Promise<void>;
 /** The shape of an object, for completion: the names and types the allow-list could walk to. */
 export function describe(ref: any, options?: { signal?: AbortSignal }): Promise<{ type: string; keys: Array<{ key: string; type: string; own: boolean }>; truncated?: boolean }>;
 /** End the connection behind what `openObjects()` returned. */

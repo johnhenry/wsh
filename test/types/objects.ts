@@ -1,5 +1,5 @@
 /** Type-only fixture: `@johnhenry/wsh/objects` (#190), values mode: the host handler, the lazy references, the helpers. */
-import { exposeObjects, createObjectsServer, createObjectsClient, createDuplexPeer, get, set, call, construct, snapshot, describe, closeObjects, NonValue, ObjectsError, OBJECTS_DEFAULT_LIMITS, type ObjectsHandler } from '@johnhenry/wsh/objects';
+import { exposeObjects, createObjectsServer, createObjectsClient, createDuplexPeer, get, set, call, construct, snapshot, describe, on, off, closeObjects, NonValue, ObjectsError, OBJECTS_DEFAULT_LIMITS, type ObjectsHandler } from '@johnhenry/wsh/objects';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { createPageHost } from '@johnhenry/wsh/page';
 import { WshClient } from '@johnhenry/wsh';
@@ -28,8 +28,11 @@ async function farSide(client: WshClient): Promise<void> {
   const then = await get(page.window.app, 'then');
   if (c instanceof NonValue) void [c.kind, c.type, c.text];
   void [title, n, r, state, shape.keys[0]?.key, then];
+  const stop = await on(page.window.app.bus, 'ready', (data, { type, seq, dropped }) => { void [data, type, seq, dropped]; }, { fields: ['detail'], onError: (e) => { void e; } });
+  await off(stop);
   await closeObjects(page);
 }
+void exposeObjects({ roots: { window: win }, allow: { on: ['window.app.bus@ready'] }, eventFields: { hashchange: ['newURL'] }, limits: { maxSubscriptions: 4, maxEventsPerSecond: 5 } });
 
 const peer = createDuplexPeer({ send: () => {} });
 const server = createObjectsServer({ roots: { app: {} }, allow: { get: ['app.**'] } });

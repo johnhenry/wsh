@@ -3,7 +3,7 @@
 import { test, expect } from './fixtures.mjs';
 import { startPipe } from './nodes.mjs';
 import { WshClient, WebSocketTransport, generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
-import { set, snapshot, describe, NonValue } from '@johnhenry/wsh/objects';
+import { set, snapshot, describe, on, NonValue } from '@johnhenry/wsh/objects';
 
 test.describe('a page host: object access (values mode) over a sealed relayed session', () => {
   let pipe; let alice; let aliceLine;
@@ -68,6 +68,27 @@ test.describe('a page host: object access (values mode) over a sealed relayed se
       await again.connect(wsh2Pipe.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true, expectHostKey: host.fingerprint });
       try { expect(await (await again.openObjects()).window.document.cookie).toBe('sid=planted-cookie-value'); } finally { await again.disconnect(); }
     } finally { await wsh2Pipe.close(); }
+  });
+
+  test('a real DOM event (hashchange) arrives as plain data with the fields the host lists, never the event; Stop removes the listener', async ({ page }) => {
+    const { wsh, remote } = await start(page, { window: { allow: { on: ['@hashchange', '@click'] }, eventFields: { hashchange: ['newURL', 'oldURL'] } } });
+    try {
+      const got = [];
+      await on(remote, 'hashchange', (d) => got.push(d), { fields: ['newURL', 'oldURL'] });
+      await page.evaluate(() => { window.location.hash = '#next'; });
+      await expect.poll(() => got.length).toBe(1);
+      expect(Object.keys(got[0]).sort()).toEqual(['isTrusted', 'newURL', 'oldURL', 'timeStamp', 'type']);
+      expect(got[0].newURL).toMatch(/#next$/);
+      expect(got[0].type).toBe('hashchange');
+      // A field the host did not list is refused (a node is never one), and a type not named is refused.
+      await expect(on(remote, 'hashchange', () => {}, { fields: ['target'] })).rejects.toMatchObject({ reason: 'not-allowed' });
+      await expect(on(remote, 'beforeunload', () => {})).rejects.toMatchObject({ reason: 'not-allowed' });
+      await page.locator('[data-wsh-page="indicator"]').getByRole('button', { name: /Stop/ }).click();
+      await expect(page.locator('[data-wsh-page="indicator"]')).toHaveCount(0);
+      await page.evaluate(() => { window.location.hash = '#after'; });
+      await new Promise((r) => setTimeout(r, 200));
+      expect(got.length).toBe(1);
+    } finally { await wsh.disconnect(); }
   });
 
   test('the indicator is shown while the object session lasts, and Stop ends it', async ({ page }) => {

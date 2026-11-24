@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### `wsh-objects` events in values mode: `on(ref, type, listener)` (#190; JS)
+
+A far side can listen to events of a source the host names: `allow.on: ['window.app.bus@ready', 'window@hashchange']` (`path@type`; the type may be `*`), and `await on(ref, 'ready', (data, { type, seq, dropped }) => ...)`, which resolves to the
+function that unsubscribes (`off(fn)` does the same). `createPageHost({ expose: { window: { allow: { on: ['@hashchange'] }, eventFields } } })` offers it on a page host (`'@type'` is the root itself).
+
+- **Plain values only, never the event, a node or a handle.** An Event arrives as `{ type, timeStamp, isTrusted }` plus the fields the **host** lists for that type in `eventFields` and the subscriber asked for (each copied as plain data; a node
+  is left out; an unlisted field is refused). An emitter's arguments arrive as `{ type, args }`.
+- **An entry of its own:** an event source is never implied by `get` or `call` or by a wildcard in another list. The always-refused names, the entries that must name a path, `authorize(who, op)` (`op.type`) and the key capability
+  `objects:ROOT:on` all apply.
+- **Bounds, refused by name or counted:** `maxSubscriptions` (16 per channel, refused), `maxEventsPerSecond` (20 per subscription), `maxEventBytes` (16384) and `maxQueuedEvents` (100 per channel): an event over any of those three is dropped, and the
+  next one delivered carries `dropped`, how many were lost before it. Events are notifications written through the channel's credit, so a slow reader fills the bounded queue and loses events, counted.
+- **Cleanup:** every listener is removed from the page's sources when the channel ends: the operator leaving, Stop, a navigation, a revoke. A listener error on the far side goes to its `onError` and never reaches the page; the host's listener only copies and queues.
+- **Not built:** callbacks as arguments of a call (the design describes them as handles; a function is refused where it is written), handles.
+- **Wire: nothing new.** Two rpc methods (`subscribe`, `unsubscribe`) and a notification (`event`) on the existing `wsh-objects` channel. **A released peer (0.46.x):** a released client has no `on`; a released host answers `method not found` to `subscribe`
+  (so `on` fails against it with a clear error); a released host's key lines refuse `objects:ROOT:on` (unknown capability: fails closed).
+
 ### `objects:ROOT[:OP]` key capabilities for `wsh-objects` (#190; JS)
 
 A key's capability list can now limit it to named roots and operations of a `wsh-objects` host: `objects:window` (every operation on that root), `objects:window:get` (`get`, `call` or `set` only), `objects:*:get` (every root).
