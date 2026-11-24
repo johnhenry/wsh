@@ -1,0 +1,43 @@
+/** Type-only fixture: `@johnhenry/wsh/objects` (#190), values mode: the host handler, the lazy references, the helpers. */
+import { exposeObjects, createObjectsServer, createObjectsClient, createDuplexPeer, get, set, call, construct, snapshot, describe, closeObjects, NonValue, ObjectsError, OBJECTS_DEFAULT_LIMITS, type ObjectsHandler } from '@johnhenry/wsh/objects';
+import { createMemoryHost } from '@johnhenry/wsh/memory';
+import { createPageHost } from '@johnhenry/wsh/page';
+import { WshClient } from '@johnhenry/wsh';
+
+declare const win: Window;
+
+const handler: ObjectsHandler = exposeObjects({
+  roots: { window: win },
+  mode: 'values',
+  allow: { get: ['window.document.title', 'window.app.**'], call: ['window.app.**'], set: [] },
+  authorize: (who, op) => who.username === 'alice' && op.kind !== 'set' && op.path.length > 0,
+  limits: { maxOps: 16, maxValueBytes: 65536 },
+});
+const host = createMemoryHost({ auth: { authorizedKeys: 'ssh-ed25519 AAAA' }, rpc: { 'wsh-objects': handler } });
+void [host, handler.rootNames, handler.limits.maxDepth, handler.closeSessions('bye', 'ab'), OBJECTS_DEFAULT_LIMITS.maxOps];
+
+async function farSide(client: WshClient): Promise<void> {
+  const page = await client.openObjects<{ window: any }>();
+  const title: string = await page.window.document.title;
+  const n = await page.window.app.cart.items.length;
+  await set(page.window.document, 'title', 'Paid');
+  const r = await call(page.window.app.cart.add, { sku: 'A1' });
+  const c = await construct(page.window.app.Cart, 'x');
+  const state = await snapshot(page.window.app.state, { depth: 3, maxBytes: 256_000 });
+  const shape = await describe(page.window.app);
+  const then = await get(page.window.app, 'then');
+  if (c instanceof NonValue) void [c.kind, c.type, c.text];
+  void [title, n, r, state, shape.keys[0]?.key, then];
+  await closeObjects(page);
+}
+
+const peer = createDuplexPeer({ send: () => {} });
+const server = createObjectsServer({ roots: { app: {} }, allow: { get: ['app.**'] } });
+server.attach(peer, { who: { username: 'u', fingerprint: null } });
+void [farSide, createObjectsClient(peer), new ObjectsError(-32003, 'x', { reason: 'not-allowed' }).reason];
+
+// The page host: object access beside the MCP bridge, paths relative to the root.
+void createPageHost({
+  window: win, relay: 'wss://relay.example/pipe', name: 'tab', authorizedKeys: ['ssh-ed25519 AAAA'],
+  expose: { window: { mode: 'values', allow: { get: ['document.title', 'app.**'], call: ['app.**'] }, limits: { maxOps: 8 } } },
+});

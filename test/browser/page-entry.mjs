@@ -4,8 +4,9 @@ import * as client from '../../src/index.mjs';
 import * as memory from '../../src/memory-host.mjs';
 import * as host from '../../src/host.mjs';
 import * as reverse from '../../src/reverse-host.mjs';
+import * as pageHost from '../../src/page-host.mjs';
 
-const wsh = { ...client, ...memory, ...host, ...reverse };
+const wsh = { ...client, ...memory, ...host, ...reverse, ...pageHost };
 window.wsh = wsh;
 
 const dec = new TextDecoder();
@@ -221,5 +222,42 @@ window.h.startReverseHost = async ({ url, acceptFingerprints, requireOperatorPro
 };
 window.h.reverseInfo = (id) => { const { host, accepted, ran, log } = reverseHosts.get(id); return { accepted, ran, log, operators: host.operators }; };
 window.h.stopReverseHost = (id) => reverseHosts.get(id).host.close();
+
+// ── A page host (`@johnhenry/wsh/page`): the page's WebMCP tools as MCP ───────────────────────────────────────────────────
+// What an application does: install the capture shim first, then register tools through `document.modelContext`, then start the host.
+window.h.pageTools = async () => {
+  wsh.captureWebMcp(window);
+  window.__cart = [];
+  window.__ran = [];
+  const tool = (name, description, annotations, run) => document.modelContext.registerTool({
+    name, description, annotations, inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+    execute: async (input, { signal }) => { window.__ran.push({ name, input, aborted: signal.aborted }); return run(input); },
+  });
+  await tool('search', 'Search the catalogue', { readOnlyHint: true }, ({ text }) => ({ hits: [`found ${text}`] }));
+  await tool('add_to_cart', 'Put an item in the cart', {}, ({ text }) => { window.__cart.push(text); return { cart: window.__cart.slice() }; });
+  await tool('read_secret', 'Read something the page keeps to itself', { readOnlyHint: true }, () => ({ secret: 'not for the agent' }));
+};
+let pageHostHandle = null;
+window.h.startPageHost = async ({ relay, authorizedKeys, allow, approve, expose }) => {
+  pageHostHandle = await wsh.createPageHost({
+    window, relay, name: 'shop-tab', authorizedKeys,
+    ...(allow ? { mcp: { allow, ...(approve ? { approve } : {}) } } : {}),
+    ...(expose ? { expose } : {}),
+  });
+  return { fingerprint: pageHostHandle.fingerprint, origin: pageHostHandle.origin };
+};
+/** An application object for object access to reach into, a title, and a cookie that must stay unreachable. */
+window.h.pageApp = () => {
+  document.title = 'Planted Shop Title';
+  document.cookie = 'sid=planted-cookie-value; path=/';
+  window.__calls = [];
+  window.app = {
+    cart: { items: [{ sku: 'A1', qty: 1 }], add(item) { window.__calls.push(item); this.items.push(item); return { count: this.items.length }; } },
+    state: { user: 'alice', flags: { beta: true } },
+    secret: 'planted-app-secret',
+  };
+};
+window.h.pageHostInfo = () => ({ sessions: pageHostHandle.sessions.map((s) => s.fingerprint), closed: pageHostHandle.closed, closedReason: pageHostHandle.closedReason, cart: window.__cart, ran: window.__ran.map((r) => r.name) });
+window.h.stopPageHost = () => pageHostHandle?.close();
 
 window.wshReady = true;

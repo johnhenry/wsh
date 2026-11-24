@@ -29,6 +29,14 @@
       "types": "./src/reverse-host.d.ts",
       "import": "./src/reverse-host.mjs"
     },
+    "./page": {
+      "types": "./src/page-host.d.ts",
+      "import": "./src/page-host.mjs"
+    },
+    "./objects": {
+      "types": "./src/objects.d.ts",
+      "import": "./src/objects.mjs"
+    },
     "./testing": {
       "types": "./src/testing.d.ts",
       "import": "./src/testing.mjs"

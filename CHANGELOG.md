@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### `@johnhenry/wsh/objects`: remote objects by path, `values` mode, and `createPageHost({ expose })` (#190; JS)
+
+A host can now name objects as **roots** (a page's `window`, a worker's `self`, any object) and let a key read, call and set the paths an allow-list names. New entry point `@johnhenry/wsh/objects` and the rpc
+protocol `wsh-objects`: `exposeObjects({ roots, mode: 'values', allow: { get, call, set }, authorize(who, op), limits })` is the handler for any host's `rpc`; `client.openObjects()` (added by importing the
+entry point) returns the roots as lazy references; the helper functions `get`, `set`, `call`, `construct`, `snapshot`, `describe`, `closeObjects` are functions, not methods, so they never collide with a remote property.
+`createPageHost({ expose: { window: { mode: 'values', allow } } })` serves it on a page host, beside or without `mcp`.
+
+- **Pipelining:** a reference is a lazy path; `await` sends the whole chain (gets, calls, constructs) in ONE `resolve` request. There is no `eval`, so it works under a strict Content-Security-Policy. Assignment with `=` throws a
+  sentence naming `set()`; `ref.then` is the awaiting function and a remote property named `then` is reached with `get(ref, 'then')`.
+- **Only cloneable values cross, which is what makes an allow-list of paths mean what it says:** plain data and bytes come back as themselves; a function, symbol, `Date`, DOM node or other object comes back as a named
+  `NonValue`, never a handle. What is sent is plain data, copied, and refused if an object has a prototype of its own or a refused key.
+- **Always refused:** the segments `__proto__`, `prototype`, `constructor`, `__defineGetter__` and its three siblings, `eval`, `Function`, `import`, `execScript`; `call` / `apply` / `bind` of a function; timers given a string.
+  **Refused until an entry names them:** `document.cookie`, `localStorage`, `sessionStorage`, `indexedDB`, `navigator.credentials`, `fetch`, `XMLHttpRequest`, `postMessage`, `open` (a wildcard does not). Per-operation allow-lists by
+  path glob; nothing is allowed by default. Getters with side effects are still gets, and the README says so.
+- **Bounds, each refused by name:** `maxOps`, `maxArgs`, `maxDepth`, `maxValueBytes` (also kept under the transport's message size), `maxKeys`, `maxRequestsPerSecond`, `callTimeoutMs`.
+- **The core is transport-neutral** (`objects-core.mjs`; a duplex seam of `onRequest`, `request` with cancel, `notify`, `onClose`, a per-call identity and a maximum message size; `createDuplexPeer({ send })` is one over a bare
+  `send` / `receive`): one test suite runs over a bare in-memory duplex and over a wsh rpc channel.
+- **Not built (`mode: 'handles'` is refused with a sentence):** handles, events and callbacks, `objects:ROOT` capabilities, typed remotes. The key capability `rpc:wsh-objects` gates the channel today.
+- **A released peer.** No wire change: an rpc channel named `wsh-objects` on the existing `rpc` / `rpc-virtual` feature, advertised like any `rpc-protocol:<name>`. A released JS client (0.45.0) or Rust client (`rust-v0.16.0`)
+  can open it where the host serves stream-mode rpc, but has nothing that speaks it; a released host does not offer it. `wsh-server` does not serve `wsh-objects`.
+- **Bundle:** `@johnhenry/wsh/objects` is 48.4 kB gzipped; `@johnhenry/wsh/page` grows from 80.8 to 87.6 kB with it. No other entry point changed.
+
+### `@johnhenry/wsh/page`: a page's WebMCP tools served as MCP behind a pipe relay (#190; JS)
+
+A web page can now be a wsh host for **the tools it has registered with WebMCP**, and an MCP client (`wsh-mcp --sealed`, or `client.openRpc('mcp')` with `mcpClientTransport`) can list
+and call them. New entry point `@johnhenry/wsh/page`: `createPageHost({ window, relay, name, authorizedKeys, mcp: { allow, approve, tools? }, indicator?, unattended?, hostKey?,
+hostKeyStore?, onSession, onRefused })`, `webmcpTools({ window, allow, approve, tools? })` (an rpc handler for `mcp`, usable in any host) and `captureWebMcp(window)`.
+
+- **Key login only, a sealed session required, nothing else offered:** no anonymous mode, no password login, no exec, no file access, no object access (that is a later step of #190).
+  The window is passed in and is the only realm touched (a test greps the entry point for ambient globals); passing it exposes nothing by itself.
+- **Three sources of tools:** an explicit list (the same definitions given to `registerTool`); a capture shim installed before the application's code, wrapping `registerTool` on
+  `document.modelContext` and the older `navigator.modelContext`, honouring abort signals and `unregister()`, and providing a minimal `modelContext` where the browser has none; and
+  the browser's own `getTools()` / `executeTool()` where it has them (the current draft's; feature-detected, tested against a fake only).
+- **Mapping to MCP:** `tools/list` (name, title, description, schemas, annotations; what MCP lacks in `_meta`), `tools/call` to `execute(input, { signal })` with MCP cancel aborting the signal, structured
+  results plus a text rendering, a thrown error as `isError` with the message and never a stack, `notifications/tools/list_changed`. Results are labelled untrusted.
+- **Bounds, refused by name:** `maxTools`, `maxSchemaBytes`, `maxInputBytes`, `maxResultBytes`, `maxInflight`, `maxCallsPerMinute` (and `callTimeoutMs`).
+- **Safety the browser would have supplied:** an allow-list by tool name (nothing allowed by default); `approve: 'never' | 'consequential' | 'always'` (default `'consequential'`: anything not marked
+  `readOnlyHint`) asking the person at the page through `prompt(call, who)`, with an accessible default dialog; a visible indicator with the key's fingerprint and a Stop control (`revoke`);
+  `indicator: false` only with `unattended: true`; the host closes, telling the operator why, when the window leaves its origin or closes; a host key per page load, or one kept through an injected `hostKeyStore`.
+- **Per-key narrowing, and an additive change to every JS host's rpc context:** `capabilities="mcp:TOOL"` limits a key to those tools. To allow it, an rpc handler's `ctx` now has `capabilities`
+  (the key's list or `null`) and `permits(request)`; a handler that filters by `permits` sets `capabilityScoped = true`, and only then may a key holding `mcp:TOOL` but not `mcp:*` open the
+  `mcp` channel. **No default changed:** every other `mcp` handler still needs `mcp:*`.
+- **A released peer.** No wire change at all: no message, field or feature string is new. The far side is the `mcp` rpc channel in virtual mode that #191 added, so a released JS client (0.45.0)
+  and Rust client (`rust-v0.16.0`) refuse it exactly as they refuse any virtual-mode rpc host (they look for `rpc`); use this release's client or `wsh-mcp --sealed`. `wsh-server` is unchanged.
+- **Bundle:** `@johnhenry/wsh/page` is 80.8 kB gzipped (it contains the memory host); the other entry points grew by about 100 bytes gzip each at most, from the two small additions to the shared rpc context.
+
 ### Behaviour change: `WSH_INSECURE_LOOPBACK_TLS` now applies to loopback destinations only (Rust client and CLI)
 
 The variable (`1` or `true`) skips `wss://` certificate verification, and until now it did so for any host while it was set, whatever its name suggested. It now applies

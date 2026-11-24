@@ -6,16 +6,16 @@
       "gzip": 50238
     },
     "./memory": {
-      "raw": 234754,
-      "gzip": 73248
+      "raw": 235052,
+      "gzip": 73341
     },
     "./host": {
-      "raw": 127450,
-      "gzip": 41921
+      "raw": 127753,
+      "gzip": 42022
     },
     "./reverse": {
-      "raw": 223016,
-      "gzip": 68869
+      "raw": 223322,
+      "gzip": 68942
     },
     "./pipe-relay": {
       "raw": 7172,
@@ -24,6 +24,14 @@
     "./testing": {
       "raw": 8040,
       "gzip": 2689
+    },
+    "./page": {
+      "raw": 284090,
+      "gzip": 89751
+    },
+    "./objects": {
+      "raw": 162050,
+      "gzip": 49544
     },
     ". (generateKeyPair only)": {
       "raw": 404,
@@ -34,8 +42,8 @@
       "gzip": 41325
     },
     "./host (createConnectionFactory only)": {
-      "raw": 103653,
-      "gzip": 33839
+      "raw": 103956,
+      "gzip": 33926
     }
   }
 }
