@@ -212,6 +212,12 @@ fn install_rustls_crypto_provider() {
 /// (rather than the `rustls-pemfile` crate, which is flagged unmaintained —
 /// RUSTSEC-2025-0134) since `rustls-pki-types` is already a transitive
 /// dependency of `rustls` and provides the same PEM-section extraction.
+/// The SHA-256 of a DER certificate as lowercase hex: the value a client pins the server to.
+fn cert_sha256_hex(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(der))
+}
+
 fn load_tls_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
@@ -228,6 +234,15 @@ fn load_tls_config(
             .collect::<Result<Vec<_>, _>>()?;
 
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)?;
+
+    if let Some(leaf) = certs.first() {
+        // What a client pins a self-signed server to: `wsh --cert-hash`, or `serverCertificateHashes`
+        // in a browser or the JS client. (A certificate a public authority signed needs no pin.)
+        info!(
+            sha256 = %cert_sha256_hex(leaf.as_ref()),
+            "certificate hash, for `wsh --cert-hash` / serverCertificateHashes (self-signed certificates only)"
+        );
+    }
 
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -336,6 +351,15 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_certificate_hash_is_the_lowercase_hex_sha256_of_the_der() {
+        // SHA-256 of the empty string.
+        assert_eq!(
+            cert_sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 
     /// The generated development certificate has to work as a SERVER
     /// certificate for a TLS client that trusts it: webpki refuses an end

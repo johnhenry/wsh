@@ -8,7 +8,7 @@ pub mod websocket;
 pub mod webtransport;
 
 pub use websocket::WebSocketSession;
-pub use webtransport::WebTransportSession;
+pub use webtransport::{CertPolicy, WebTransportSession};
 
 use wsh_core::error::{WshError, WshResult};
 use wsh_core::transport::{IdentifiedStream, TransportSession};
@@ -167,18 +167,33 @@ pub fn install_crypto_provider() {
     });
 }
 
-/// Connect to a wsh server, auto-selecting the transport from the URL scheme.
+/// Connect to a wsh server, auto-selecting the transport from the URL scheme. A WebTransport
+/// server's certificate is validated against the system trust store ([`CertPolicy::SystemRoots`]).
 pub async fn auto_connect(url: &str) -> WshResult<AnyTransport> {
+    auto_connect_with(url, &CertPolicy::default()).await
+}
+
+/// [`auto_connect`] under a certificate policy. The policy governs WebTransport only: a `ws://` /
+/// `wss://` URL with a pin or the opt-out is refused rather than connected with the setting
+/// silently ignored (a `wss://` certificate is always checked against the system trust store).
+pub async fn auto_connect_with(url: &str, policy: &CertPolicy) -> WshResult<AnyTransport> {
     install_crypto_provider();
     let kind = detect_transport(url)?;
 
     match kind {
         TransportKind::WebSocket => {
+            if *policy != CertPolicy::SystemRoots {
+                return Err(WshError::Transport(
+                    "a certificate hash or --insecure-skip-cert-verification applies to WebTransport \
+                     (https://) only; a wss:// certificate is checked against the system trust store"
+                        .into(),
+                ));
+            }
             let session = WebSocketSession::connect(url).await?;
             Ok(AnyTransport::WebSocket(session))
         }
         TransportKind::WebTransport => {
-            let session = WebTransportSession::connect(url).await?;
+            let session = WebTransportSession::connect_with(url, policy).await?;
             Ok(AnyTransport::WebTransport(session))
         }
     }

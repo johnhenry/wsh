@@ -57,9 +57,21 @@ pub struct ConnectConfig {
     /// Refuse to log in unless the signature is bound to this connection (wsh #119): the host
     /// must offer a binding kind this client can supply, or nothing is signed.
     pub require_channel_binding: bool,
-    /// The SHA-256 of the WebTransport certificate this connection is pinned to, when it is
-    /// pinned to exactly one: the `cert-hash` binding kind.
+    /// The SHA-256 of the WebTransport certificate this connection is pinned to (the JS client's
+    /// `serverCertificateHashes`): the server's certificate must have exactly this hash, and no
+    /// certificate authority is consulted. When the connection is pinned to exactly one
+    /// certificate it is also the `cert-hash` channel-binding kind. The certificate must be an
+    /// ECDSA P-256 one valid for at most 14 days (`wsh-server --generate-cert` makes one).
+    /// `None` and `cert_hashes` empty: the certificate is validated against the system trust store.
     pub cert_hash: Option<[u8; 32]>,
+    /// More certificate hashes to accept, for a rotation (the current and the next certificate),
+    /// pinned together with `cert_hash`. Not a channel binding unless it is the only pin.
+    pub cert_hashes: Vec<[u8; 32]>,
+    /// Do NOT verify the WebTransport server's certificate at all. Development only: anyone on
+    /// the path can be the server, and every connection prints a warning. Contradicts a pin, and
+    /// is refused with a password login (a password cannot be sealed, so it would cross a channel
+    /// whose other end is unverified). `wsh --insecure-skip-cert-verification`.
+    pub insecure_skip_cert_verification: bool,
     /// Seal the whole session end to end (wsh #155): see [`SessionSeal`].
     pub seal_session: SessionSeal,
     /// Ping interval in seconds (0 = disabled).
@@ -83,8 +95,56 @@ impl Default for ConnectConfig {
             known_hosts_path: None,
             require_channel_binding: false,
             cert_hash: None,
+            cert_hashes: Vec::new(),
+            insecure_skip_cert_verification: false,
             ping_interval_secs: 30,
             timeout_secs: 10,
+        }
+    }
+}
+
+impl ConnectConfig {
+    /// How the WebTransport server's certificate is to be checked, or why this configuration is
+    /// refused: the default validates it, pins are used when given, and skipping the check is only
+    /// ever the explicit `insecure_skip_cert_verification`.
+    pub fn cert_policy(&self) -> WshResult<transport::CertPolicy> {
+        let pins: Vec<[u8; 32]> = self
+            .cert_hash
+            .iter()
+            .chain(self.cert_hashes.iter())
+            .copied()
+            .collect();
+        if self.insecure_skip_cert_verification {
+            if !pins.is_empty() {
+                return Err(WshError::Other(
+                    "a certificate hash and --insecure-skip-cert-verification contradict each other: \
+                     pin the certificate, or do not verify it, not both"
+                        .into(),
+                ));
+            }
+            if self.password.is_some() {
+                return Err(WshError::Other(
+                    "a password login is refused with --insecure-skip-cert-verification: a password cannot be \
+                     sealed end to end, so it would be sent to whoever answers the unverified connection. \
+                     Verify the certificate (system roots, or --cert-hash), or log in with a key"
+                        .into(),
+                ));
+            }
+            return Ok(transport::CertPolicy::InsecureSkipVerification);
+        }
+        Ok(if pins.is_empty() {
+            transport::CertPolicy::SystemRoots
+        } else {
+            transport::CertPolicy::Pinned(pins)
+        })
+    }
+
+    /// The certificate hash the login signature is bound to: the one pin, when there is exactly one.
+    pub fn bound_cert_hash(&self) -> Option<[u8; 32]> {
+        let mut all = self.cert_hash.iter().chain(self.cert_hashes.iter());
+        match (all.next(), all.next()) {
+            (Some(h), None) => Some(*h),
+            _ => None,
         }
     }
 }
@@ -456,13 +516,15 @@ impl WshClient {
             None => known_host_label(url)?,
         };
         let timeout = Duration::from_secs(config.timeout_secs);
+        let cert_policy = config.cert_policy()?;
 
         // Auto-select and connect transport within the configured connection timeout.
-        let transport = match time::timeout(timeout, transport::auto_connect(url)).await {
-            Ok(Ok(transport)) => transport,
-            Ok(Err(err)) => return Err(err),
-            Err(_) => return Err(WshError::Timeout),
-        };
+        let transport =
+            match time::timeout(timeout, transport::auto_connect_with(url, &cert_policy)).await {
+                Ok(Ok(transport)) => transport,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Err(WshError::Timeout),
+            };
         let stream_opener = transport.stream_opener();
         let transport = Arc::new(Mutex::new(transport));
 
@@ -1992,7 +2054,7 @@ impl WshClient {
                 if let Some(k) = &self.host_key {
                     available.push(("host", k.public_key.to_vec()));
                 }
-                if let Some(h) = &config.cert_hash {
+                if let Some(h) = &config.bound_cert_hash() {
                     available.push(("cert-hash", h.to_vec()));
                 }
                 let (binding, kinds) =
@@ -2875,6 +2937,91 @@ impl Drop for WshClient {
         if let Some(h) = self.keepalive_handle.take() {
             h.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod cert_policy_tests {
+    use super::ConnectConfig;
+    use crate::transport::CertPolicy;
+
+    #[test]
+    fn the_default_config_validates_the_certificate() {
+        assert_eq!(
+            ConnectConfig::default().cert_policy().unwrap(),
+            CertPolicy::SystemRoots
+        );
+    }
+
+    #[test]
+    fn pins_from_both_fields_are_pinned_together() {
+        let config = ConnectConfig {
+            cert_hash: Some([1; 32]),
+            cert_hashes: vec![[2; 32]],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.cert_policy().unwrap(),
+            CertPolicy::Pinned(vec![[1; 32], [2; 32]])
+        );
+    }
+
+    #[test]
+    fn the_opt_out_is_explicit_and_cannot_be_mixed_with_a_pin() {
+        let config = ConnectConfig {
+            insecure_skip_cert_verification: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.cert_policy().unwrap(),
+            CertPolicy::InsecureSkipVerification
+        );
+        let both = ConnectConfig {
+            insecure_skip_cert_verification: true,
+            cert_hash: Some([1; 32]),
+            ..Default::default()
+        };
+        assert!(
+            both.cert_policy().is_err(),
+            "pinning and not verifying contradict each other"
+        );
+    }
+
+    #[test]
+    fn a_password_is_never_sent_over_an_unverified_certificate() {
+        let config = ConnectConfig {
+            insecure_skip_cert_verification: true,
+            password: Some("pw".into()),
+            ..Default::default()
+        };
+        let err = config.cert_policy().unwrap_err().to_string();
+        assert!(err.contains("password"), "{err}");
+        // A password with a verified certificate is the ordinary case.
+        let ok = ConnectConfig {
+            password: Some("pw".into()),
+            ..Default::default()
+        };
+        assert!(ok.cert_policy().is_ok());
+    }
+
+    #[test]
+    fn only_a_single_pin_is_a_channel_binding() {
+        let one = ConnectConfig {
+            cert_hash: Some([1; 32]),
+            ..Default::default()
+        };
+        assert_eq!(one.bound_cert_hash(), Some([1; 32]));
+        let two = ConnectConfig {
+            cert_hash: Some([1; 32]),
+            cert_hashes: vec![[2; 32]],
+            ..Default::default()
+        };
+        assert_eq!(two.bound_cert_hash(), None);
+        let only_list = ConnectConfig {
+            cert_hashes: vec![[3; 32]],
+            ..Default::default()
+        };
+        assert_eq!(only_list.bound_cert_hash(), Some([3; 32]));
     }
 }
 

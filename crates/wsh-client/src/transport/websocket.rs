@@ -184,9 +184,8 @@ fn insecure_loopback_tls_requested() -> bool {
 ///
 /// Only ever constructed when [`INSECURE_LOOPBACK_TLS_ENV`] is set — see
 /// that constant's doc comment for the full scoping rationale. This is
-/// the `wss://` analogue of `wtransport`'s built-in
-/// `with_no_cert_validation()`, which the WebTransport transport
-/// (`transport/webtransport.rs`) already uses unconditionally today.
+/// the `wss://` analogue of the WebTransport opt-out
+/// (`CertPolicy::InsecureSkipVerification`, `transport/webtransport.rs`).
 #[derive(Debug)]
 struct NoOpServerCertVerifier {
     supported_schemes: Vec<rustls::SignatureScheme>,
