@@ -667,6 +667,7 @@ bundler drop what you do not use.
 | `@johnhenry/wsh/testing` | the QMux record and frame codec (`encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, the varint and the other frame encoders), for a test that reads, alters and re-wraps what travels on a connection; and two test doubles for code that embeds wsh: `createInProcessPipeRelay({ tap })` (the real pipe relay in this process, with a `WebSocket` that dials it, a record of every message it copied, and a `tap` that may change, drop, repeat or add to what it writes, like a hostile relay) and `createMemoryPair({ host, username })` (a memory host and a client already logged in to it). **Experimental: not part of the stable API**; it may change or disappear in any release. Importing only the codec costs under 1 kB: the doubles are separate exports a bundler drops |
 | `@johnhenry/wsh/identity` | a key in its four spellings, and `authorized_keys` lines: `fingerprint` and `podId` of a raw key, `fingerprintToPodId` / `podIdToFingerprint`, `rawKeyToOpenSsh` / `openSshToRawKey` / `parseOpenSshKey` / `publicKeyToOpenSsh`, `identityOf`, `normalizeIdentity`, `authorizedKeyLine`. Stable; see [Identity and capabilities for other implementations](#identity-and-capabilities-for-other-implementations-220) |
 | `@johnhenry/wsh/duplex` | a full wsh session over a duplex of messages another library provides: `serveWshOverDuplex(host, { send })`, `connectWshOverDuplex({ send }, credentials)`, `createDuplexSocket`. Sealed by default; see [wsh over a duplex](#wsh-over-a-duplex-220) |
+| `@johnhenry/wsh/objects-types` | `describeRootTypes(description, { name })`: the `.d.ts` text for a root of `wsh-objects`, from what a key may do (a pure function), and `checkTypeText`; see [Typed remotes](#typed-remotes-219) |
 | `@johnhenry/wsh/capabilities` | `permits(capabilities, request)`: the notation of key capabilities as a pure function, the one `@johnhenry/wsh/server` and the memory host evaluate. Stable; same section |
 | `@johnhenry/wsh/spec/*.json`, `*.md`, `wsh-v1.yaml` | the data files of the specification: `capabilities.md`, `capabilities.vectors.json`, `key-options.vectors.json`, the wire spec |
 | `@johnhenry/wsh/server` | Node only |
@@ -698,8 +699,9 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/reverse` (whole entry point) | 221.7 kB | 68.6 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
 | `@johnhenry/wsh/testing` (whole entry point) | 241.2 kB | 76.0 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 302.4 kB | 96.0 kB |
-| `@johnhenry/wsh/objects` (whole entry point) | 177.4 kB | 54.4 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 327.0 kB | 104.1 kB |
+| `@johnhenry/wsh/objects` (whole entry point) | 201.5 kB | 62.0 kB |
+| `@johnhenry/wsh/objects-types` (whole entry point) | 10.2 kB | 4.2 kB |
 | `@johnhenry/wsh/capabilities` (whole entry point) | 10.6 kB | 3.8 kB |
 | `@johnhenry/wsh/identity` (whole entry point) | 15.7 kB | 5.7 kB |
 | `@johnhenry/wsh/duplex` (whole entry point) | 140.1 kB | 42.4 kB |
@@ -934,10 +936,16 @@ await release(cart);                         // gives its place back; everything
   so, `handles: { window: { wideEntries: true } }` (in `createPageHost`, `wideEntries: true` beside `mode: 'handles'`), or lists the paths. A wildcard in `get` alone needs no acknowledgement. A values root is not affected.
 - **Capabilities.** `objects:ROOT[:OP]` apply unchanged: an operation through a handle is the same `get`, `call`, `set` of the producing path (a key with `objects:window:get` can read through a handle and cannot call through it).
 - **What a handle is not.** The host's real object stays in the page: calling a method runs the page's code with the caller's plain-data arguments, as for any `call`; a handle to an object with a powerful method is as powerful as that method's entry in `call`. A handle is
-  a reference to something already reachable by a path, so it cannot reach more than the path's own entries; but a wide entry (`window.app.**`) covers every member of every object under it. Events are not offered through a handle, and callbacks are not built.
+  a reference to something already reachable by a path, so it cannot reach more than the path's own entries; but a wide entry (`window.app.**`) covers every member of every object under it. Callbacks are one-way (see below).
+- **Events through a handle** (`on(use(handle).bus, 'ready', listener)`, or `on(use(handle), ...)` when the handle is the source itself). The source is the handle's **producing path extended as written**, and it is judged exactly as a path subscription for that
+  path would be: an `allow.on` entry that names that path and the type exactly (no wildcard in either), the key's `objects:ROOT:on`, and `authorize` (`op.text` is the extended path, `op.type` the type). **Never implied by `get` or `call`**, and never inherited: the same object reached by
+  another path is a different path with its own entry. A node handle keeps its rules (no node handle without `nodes: true`; the graph members need an entry that names them). The subscription **ends with the handle**: `release(handle)` takes the page's listener out
+  and drops what it had queued; it also ends with the channel, Stop, a navigation and a revoke, as a path subscription does. A handle released while its subscription was being authorized leaves no listener. `maxSubscriptions`, the rate, size and queue bounds and the drop counting are the same ones, shared with path subscriptions.
+  The delivery is the same too: plain copies, never the event, never a handle.
 
-A host says what it supports with its roots (`features`: `events`, `callbacks`, and `handles` when a root opted in). A client does not send a function to a host that has not said it supports callbacks, nor use events on one that has not said so (a named `unsupported` error);
-a handle-shaped answer from a host that never said it supports handles is the same error. A 0.47.0 host says nothing, so it counts as supporting none of them.
+A host says what it supports with its roots (`features`: `events`, `callbacks`, and `handles` and `handle-events` when a root opted in). A client does not send a function to a host that has not said it supports callbacks, nor use events on one that has not said so, nor subscribe through
+a handle on one that has not said `handle-events` (0.50.0 and before; a named `unsupported` error, nothing is sent);
+a handle-shaped answer from a host that never said it supports handles is the same error. A 0.47.0 host says nothing, so it counts as supporting none of them. A 0.50.0 client never sends a handle subscription (it refuses to write one), so it is unaffected by a 0.51.0 host.
 
 #### Callbacks
 
@@ -957,6 +965,34 @@ await release(fn);                                          // kills the stub (a
 - The call with callbacks is a `call` for `authorize` (`op.callbacks` is how many) and for the key's `objects:ROOT:call` capability. A callback is a channel for the page's own code to push plain values to the caller: it can send whatever the page's code puts in it, within the bounds, so list `(callback)` only on calls whose
   stub the page will use for what the caller should see.
 
+#### An MCP face for allow-listed paths (#219)
+
+An MCP client can use named paths of a root without the objects client: `exposeObjects({ roots, allow, mcp: { tools: [...] } })` (and, in a page host, `createPageHost({ expose: { window: { allow, mcp: { tools: [...] } } } })`, with paths relative to the root) makes **exactly the paths it names** into MCP tools:
+
+```js
+const handler = exposeObjects({
+  roots: { window }, allow: { get: ['window.document.title'], call: ['window.app.cart.add', 'window.app.cart.clearAll'] },
+  mcp: { tools: [
+    { name: 'cart_add', description: 'Add a product to the cart', call: 'window.app.cart.add',
+      inputSchema: { type: 'object', properties: { sku: { type: 'string', minLength: 1 }, qty: { type: 'integer', minimum: 1 } }, required: ['sku'], additionalProperties: false } },
+    { name: 'page_title', description: 'The title of the page', get: 'window.document.title' },
+  ] },
+});   // clearAll is allowed by call and is NOT a tool: nothing is a tool by being allowed
+const mcp = webmcpTools({ window, tools: handler.mcpTools, allow: handler.mcpToolNames });   // createPageHost does this itself; any host with `rpc: { mcp }` or serveMcpOverDuplex can
+```
+
+- **What a tool is.** A **call** of one named method (`call: 'window.app.cart.add'`), or a **get** of one named value (`get: 'window.document.title'`; add `readOnly: true` to skip the question for it); a literal member path (no wildcard, no path through a call result), that the allow-lists name for that operation and that needs no listing it does not have (checked when the host is created: a tool never widens
+  the allow-list, and a path that is not listed there is a `TypeError`, not a silent tool). Each tool has a host-authored `name`, `description` and `inputSchema`, and `readOnly` (**only `readOnly: true` marks a tool read-only, a get included: with nothing said a tool asks the person like any other, because a getter can have effects**). `args: 'object'` passes the validated input as the call's one argument (the default when the schema lists properties), `args: ['a', 'b']` passes those properties as the arguments in order.
+  There is no tool for an event, a handle or a callback, and none can be made: an argument is plain data, a result is plain data or an error (a function, or an object that is not plain data, is an error that says so, never a handle).
+- **Arguments are validated before anything runs.** `inputSchema` is checked against the far side's arguments before the person is asked and before the page's function is called, by a small bounded subset of JSON Schema (`type`, `enum`, `const`, `properties`, `required`, `additionalProperties`, `items`, `minItems`, `maxItems`, `minLength`, `maxLength`, `minimum`, `maximum`, `anyOf`; depth 8, 2000 values; no key that climbs to a prototype). **A schema that uses another keyword
+  (`$ref`, `pattern`, `oneOf`, ...) is refused when the host is created**, so what is advertised is what is checked. Write `additionalProperties: false`: with `args: 'object'` an extra property is passed to the page's function otherwise. The arguments then go through the same copy as an objects call.
+- **The same approval, bounds and label as the WebMCP bridge**, because they are served by the same handler: a tool that is not marked read-only asks the person at the page first (`approve`, `prompt`; with no way to ask it is denied); `maxInputBytes`, `maxResultBytes`, `maxInflight`, `maxCallsPerMinute`, the call timeout, the schema size; every result is labelled untrusted page content (`_meta['wsh/untrusted']`); a page function that throws is an error result with its message and no stack.
+  `onCall` sees the calls. Remember what a read-only mark is: the host's word. A getter that has effects is still a getter, and marking it read-only skips the question.
+- **Two notations, both required.** A key lists and calls a tool only if its capabilities permit `mcp:TOOL` (or `mcp:*`) **and** the operation on that root (`objects:ROOT` or `objects:ROOT:call` for a call, `objects:ROOT` or `objects:ROOT:get` for a get): `capabilities="mcp:cart_add,objects:window:call"`. A key that has a capability line with `mcp:TOOL` and no `objects:` entry for the root sees no tool and can call none; a key with `objects:` and no `mcp:` entry cannot open the channel. A key with no capability line has both, as for every capability.
+  The `objects:` grant is asked again when the tool runs, with the allow-list, the names that need listing and `authorize(who, op)` (`op.kind` is `get` or `call`): **a tool never widens what the objects client would be allowed for that key.**
+- **What it does not do.** It does not make the page's function safe (it runs with the page's authority and the caller's arguments); it does not label a result as true, only as untrusted; it is no more than the allow-list plus the tool list plus the approval, and a wide allow-list entry under a tool path does not widen the tool (the tool names one path) but does widen the objects client. Wire: nothing new (the existing `mcp` channel and its methods); Rust hosts and clients have no `wsh-objects`, so there is no Rust equivalent of the host side,
+  but a Rust `wsh --sealed --via ... mcp` reaches a page host's `mcp` channel and so lists and calls these tools like any others.
+
 **The indicator is best effort.** The page host shows a visible element while a session is connected, puts it back if the page removes it, and has a Stop button. Page code can always remove or cover a DOM element, and a tool or a
 function the caller may call runs with the page's authority. What holds is **Stop and revoke** (they close the channel from the page's own code, whatever is on screen) and **the key's capabilities and the host's allow-lists**.
 
@@ -975,9 +1011,35 @@ reach is exactly the paths the lists name (and, below a `get`, the plain data in
   written by third parties.
 - A sealed session, a key login and a visible indicator (the page host) are what keep a relay and an unknown caller out; `authorize` is where an embedder asks the person.
 
-Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 53.4 kB gzipped (it contains the client), and
-the page entry point is 93.1 kB with it; no other entry point changed. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
-Not built yet (later steps of #190): typed remotes (`Remote<T>`), an MCP face for the allow-listed paths, and a dial-out form.
+Size: see the size table (`npm run size`) for `@johnhenry/wsh/objects` (it contains the client and the checks the host runs on a type map), `@johnhenry/wsh/objects-types` and the page entry point. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
+Not built yet: a dial-out form.
+
+#### Typed remotes (#219)
+
+`@johnhenry/wsh/objects` ships `.d.ts`; `client.openObjects<T>()` returns `T`, so a typed Proxy is a `T` you give it. Three ways, from least to most generated:
+
+1. **Write the value types.** `Remote<T>` maps a value type to the reference type (it `await`s to the value, has the members as references, and its methods return references); `RemoteRoots<T>` does it for the roots:
+   `const { shop } = await client.openObjects<RemoteRoots<{ shop: Shop }>>(); const n: number = await shop.cart.add({ sku: 'A' });`. It says what you believe the host exposes; the host's allow-lists still decide. A reference is `PromiseLike`, not a `Promise`
+   (there is no `catch` or `finally` on it: `ref.catch` is a remote property), and arguments stay plain data. `RemoteHandle<T>` carries a value type to `use(handle)`.
+2. **Generate them for the key that connects.** `describeRootTypes(description, { name })` from `@johnhenry/wsh/objects-types` is a **pure function** that returns the text of a `.d.ts` for one root, and `rootDescription(page.window)` fetches the `description`
+   (the host's `types` answer): the host's allow-list entries for that root, narrowed by **this key's** `objects:ROOT:OP` capabilities, and the host's type map. A path appears in the file only if an entry names it for an operation the key holds; an operation the key lacks,
+   a path no entry names, and a member the host refuses are not there at all (not even as `never`). A plain value is `RemoteValue<unknown>` (a `PromiseLike<unknown>`), a call is `RemoteCall<unknown[], unknown, ...>` (`(...args: unknown[]) => PromiseLike<unknown>`, continuing as the members the allow-list names under `f()`),
+   a wildcard (`*`, `**`) is `RemoteUntyped` (`any`: the members behind it are not guessed), `allow.on` and `eventFields` become typed `on` overloads (a source offers its listed types, and a listener gets `{ type, timeStamp, isTrusted, ...fields }` or `{ type, args }`),
+   and an entry in `allow.set` makes `set(ref, key, value)` check the key. Use it as `client.openObjects<{ window: WindowRemote }>()`.
+3. **Add precise types as the host.** `exposeObjects({ types: { 'window.app.cart.add': { args: '[item: { sku: string }]', result: 'number' }, 'window.document.title': { value: 'string' }, 'window.app.bus@ready': { data: '{ n: number }' } } })`
+   (`createPageHost({ expose: { window: { types } } })` takes the same with paths relative to the root). `value` is the awaited value of a get (or the value a set takes), `args` a tuple and `result` the awaited value of a call, `data` what an event listener receives; a text may use `RemoteHandle<{ ... }>`.
+
+**The host's type text is untrusted text.** It travels to the far side and is written into a file, so the far side checks it again: `checkTypeText` accepts a conservative subset of type syntax (identifiers, literals, and the punctuation of object, tuple, function, union, intersection, generic, conditional and indexed types) and refuses a new line or anything
+outside printable ASCII, comments (`//`, `/*`), `\`, backticks, `@`, `#`, the words `import`, `export`, `require`, `declare`, `module`, `namespace`, `global`, `typeof`, `class`, `function`, `enum`, `interface` and `eval`, unbalanced or mismatched brackets, a `;` outside braces and a `,` outside any bracket (so a text cannot close the declaration it sits in or add a member to it).
+Bounds: 1024 characters a text, 256 entries and 32 KiB for a root, 16 levels of nesting. A text is also refused unless an allow-list entry names its path for the operation it types, **when the host is created** and again when the far side builds the file. The text is **never evaluated**: it is copied into the string `describeRootTypes` returns, and nothing is written to a file
+unless you do it (the CLI below writes only when given `--out`, and not over an existing file without `--force`). A path segment that is not an identifier is written as a quoted name.
+
+**What the types do not promise.** They are advisory and erased before anything runs: a type never widens what the host allows, and `authorize`, the always-refused names and the paths that must be named (`fetch`, cookies, storage, ...) still refuse at call time whatever the file says; a type can be wrong (the host's text is what the host believes, and
+a hand-written `T` is what you believe); `authorize` is dynamic and is not reflected; a wildcard region is untyped; whether a value arrives as a plain value, a named non-value or a handle depends on the page's data at run time, which no file can say (on a root with handles a get is `unknown` unless the host typed it `RemoteHandle<...>`); and the file describes the key that fetched it:
+another key gets another file, and a key that changes or expires changes the answer. The `types` answer tells a key the allow-list entries it may use, which is what `describe` would reveal path by path and nothing about a member the key may not reach.
+
+**The CLI.** `wsh-objects-types [--root NAME] [--name TYPE] [--out FILE [--force]] [--sealed] [--host-key KEY] [--identity FILE] [user@]<url>` (the package's second bin; JavaScript only) connects like `wsh-mcp` does, asks for the description of one root and prints the declarations, or writes them with `--out`.
+The Rust `wsh` has no `wsh-objects` client and no equivalent. A host before 0.51.0 does not state the `types` feature in the `features` of its `roots` answer, and `rootDescription` then refuses with a named `unsupported` error without sending anything.
 
 ### WebTransport listener
 
@@ -1648,7 +1710,7 @@ wsh-host` works (it is the same rpc channel, and a handy check). `wsh mcp` follo
 `SessionData` with credit (#191), so `wsh mcp --sealed` and `wsh --via <pipe relay> mcp` work against a JS host, as the npm `wsh-mcp --sealed` does. Not covered: WebTransport (`https://`) opens the channel's stream but the Rust client has only
 been run against WebSocket hosts.
 
-**Rust: `wsh objects`** reads and drives a host's remote objects (`wsh-objects`, written down in `spec/objects.md`; a Rust release after `rust-v0.17.1` carries it). It is a client only, for **sealed sessions only**:
+**Rust: `wsh objects`** reads and drives a host's remote objects (`wsh-objects`, written down in `spec/objects.md`; `rust-v0.18.0` carries it). It is a client only, for **sealed sessions only**:
 
 ```
 wsh --sealed [--via RELAY] objects user@host roots
@@ -2171,7 +2233,7 @@ instead of dragging its own toolchain and CI job into an unrelated
 browser-app repo. It was previously deleted from clawser by accident
 (2026-03-14) and restored (2026-07-05) before this move.
 
-Four crates, workspace-versioned (currently `0.17.1`):
+Four crates, workspace-versioned (currently `0.18.0`):
 
 | Crate | Kind | Description |
 |-------|------|--------------|
@@ -2342,7 +2404,10 @@ than left to be found.
 | Dial target | a URL | `wsh [user@]host` (dials `https://` then `wss://` on `--port`), or a full URL: `wsh wss://host:8443/rendezvous/ab12 command`, `ws://127.0.0.1:PORT/` | **CLI-only convenience**: a URL is dialled exactly as given (no transport fallback; `--port` and `--transport` do not apply). Plain `ws://` is accepted only to a loopback host |
 | Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. `wsh scp` works against such a host with the Rust client of the next `rust-v` release (it speaks `FileChunk`, #140); a released `rust-v0.11.0` or older `wsh scp` hangs against it (`wsh ls` and exec work) |
 | A page's WebMCP tools served as MCP, behind a pipe relay (#190) | `createPageHost`, `webmcpTools`, `captureWebMcp` from `@johnhenry/wsh/page`; the far side is `wsh-mcp --sealed` or `openRpc('mcp')` | the far side only: `wsh --sealed --via <relay>/r/<id> mcp user@host` (the Rust CLI, `rust-v0.17.1`+) lists and calls a page host's tools (`test/rust/wsh-mcp-page-host.test.mjs`); the Rust `wsh objects` is a `wsh-objects` client (next row), and no Rust host serves either | **JS-only** host (a page); the far side is unchanged wire (`mcp` rpc in virtual mode, #191) |
-| Remote objects by path, `values` mode (#190): `wsh-objects`, `client.openObjects()` | `exposeObjects` / `createObjectsServer` / `createPageHost({ expose })` host side; `get`, `set`, `call`, `construct`, `snapshot`, `describe` far side (`@johnhenry/wsh/objects`) | **Client only** (a Rust release after `rust-v0.17.1`, #219): `wsh_client::objects` (`ObjectsClient`, values mode, events with a bounded `Subscription`, handles) and `wsh --sealed [--via RELAY] objects user@host roots\|get\|call\|set\|snapshot\|describe\|watch\|session` (sealed sessions only; JSON on stdout; exit 3 refused, 4 not found, 5 unsupported); a feature the host does not state is refused locally. Not built: callbacks, events through a handle. `wsh-server` serves no `wsh-objects` and refuses an `objects:` key capability. The wire is `spec/objects.md`; tested against a real page host through a recording relay (`test/rust/wsh-objects.test.mjs`) | **JS host, Rust or JS far side**; an rpc protocol on the existing `rpc` channel (no new message or feature string), so a released peer simply does not offer or open it. The Rust codec gained a CBOR-value read path so byte strings survive (the existing `rpc` channels still reject them) |
+| Remote objects by path, `values` mode (#190): `wsh-objects`, `client.openObjects()` | `exposeObjects` / `createObjectsServer` / `createPageHost({ expose })` host side; `get`, `set`, `call`, `construct`, `snapshot`, `describe` far side (`@johnhenry/wsh/objects`) | **Client only** (`rust-v0.18.0`, #219): `wsh_client::objects` (`ObjectsClient`, values mode, events with a bounded `Subscription`, handles) and `wsh --sealed [--via RELAY] objects user@host roots\|get\|call\|set\|snapshot\|describe\|watch\|session` (sealed sessions only; JSON on stdout; exit 3 refused, 4 not found, 5 unsupported); a feature the host does not state is refused locally. Not built: callbacks, events through a handle. `wsh-server` serves no `wsh-objects` and refuses an `objects:` key capability. The wire is `spec/objects.md`; tested against a real page host through a recording relay (`test/rust/wsh-objects.test.mjs`) | **JS host, Rust or JS far side**; an rpc protocol on the existing `rpc` channel (no new message or feature string), so a released peer simply does not offer or open it. The Rust codec gained a CBOR-value read path so byte strings survive (the existing `rpc` channels still reject them) |
+| Events through a handle (#219): `on(use(handle).path, type, listener)` | `@johnhenry/wsh/objects` (`exposeObjects({ handles })`); the host states `handle-events` in the `features` of its `roots` answer | none: no Rust `wsh-objects` client or host | **JS-only**; a new `subscribe` parameter (`handle`) on the existing `wsh-objects` rpc channel, offered only to a client that saw `handle-events`. A 0.50.0 host does not say it, and a new client then refuses to subscribe through a handle with a named `unsupported` error without sending anything; a 0.50.0 client cannot write such a request |
+| Typed remotes (#219): `describeRootTypes`, `rootDescription`, `Remote<T>`, `wsh-objects-types` | `@johnhenry/wsh/objects` (the `types` method, the `types` option, `Remote<T>`, `RemoteRoots<T>`), `@johnhenry/wsh/objects-types` (the pure generator), the `wsh-objects-types` bin | none: no Rust `wsh-objects` client or host, and the Rust CLI has no equivalent of the bin | **JS-only**; a new `types` method on the existing `wsh-objects` rpc channel and a `types` string in the `features` of its `roots` answer (no new message type or `ServerHello` feature). A 0.50.0 host does not state it, and a new client then refuses with a named `unsupported` error and sends nothing; a 0.50.0 client never calls it |
+| An MCP face for named object paths (#219): `exposeObjects({ mcp: { tools } })`, `createPageHost({ expose: { ROOT: { mcp: { tools } } } })` | `@johnhenry/wsh/objects` (`handler.mcpTools`, `server.invoke`) served by `webmcpTools` / `serveMcpOverDuplex` on the `mcp` channel; the far side is any MCP client (`wsh-mcp --sealed`, `client.openRpc('mcp')`) | the far side only: `wsh --sealed --via <relay>/r/<id> mcp user@host` lists and calls these tools like any `mcp` tool; no Rust `wsh-objects` host | **JS-only host**; **wire: nothing new** (the existing `mcp` rpc channel and its methods, no feature string), so any released MCP-speaking peer reaches it |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side. **Several operators per peer (#93): both relays** (`maxOperatorsPerPeer`; `[relay] max_operators_per_peer`, default 1) **and both peers** (`createReverseHost({ maxOperators })`; `wsh --max-operators n reverse` / `agent run`, default 1), negotiated by `relay-multi-operator`; a Rust peer serving several operators does not seal bridges (see the reverse-mode notes), and the Rust relay leaves a peer connected when its operator leaves. The signed `KeyExchange` (`e2e-sign`) is carried by the Rust relay too |
@@ -2421,7 +2486,7 @@ plus one `SHA256SUMS` file covering every archive in the release. These
 names are a stable contract other repos (clawser) pin and download by --
 do not change them without coordinating downstream.
 
-`wsh --version` and `wsh-server --version` print the workspace version the binary was built from (`wsh 0.17.1`), which is the
+`wsh --version` and `wsh-server --version` print the workspace version the binary was built from (`wsh 0.18.0`), which is the
 number in the `rust-vX.Y.Z` tag. Binaries of `rust-v0.9.0` to `rust-v0.10.0` printed a fixed `0.1.0`, so against one of those the
 version cannot be read from the binary (look for a flag in `wsh --help` instead).
 
@@ -2544,9 +2609,9 @@ out explicitly below rather than left to be discovered.
   a hop that can read the duplex reads every tool result and every value. The capability notation (`spec/capabilities.md`) is a **reading** of a list, not a
   credential: an implementation that reads it more loosely than the vectors say grants more than the list does, which is why the vectors are shipped.
 - **`wsh-objects` (`@johnhenry/wsh/objects`, #190) lets a key read, call and set the paths an allow-list names on the roots a host names, and nothing else.** An allow-list of paths means what it says
-  only because nothing but cloneable values crosses (no handles in `values` mode; on a root that opted in to [handles](#handles), a handle is judged by the path that produced it and never widens it, and nodes need their own opt-in); what it cannot make safe is stated in
+  only because nothing but cloneable values crosses (no handles in `values` mode; on a root that opted in to [handles](#handles), a handle is judged by the path that produced it and never widens it, and nodes need their own opt-in; an event subscription through a handle needs the producing path's own `allow.on` entry and ends with the handle); what it cannot make safe is stated in
   [Remote objects](#remote-objects-johnhenrywshobjects-190): a getter or a setter on an allowed path runs, a called function does whatever it does with the page's authority, a wide pattern means its width, and a
-  few paths (`document.cookie`, storage, `fetch`, ...) need an entry that names them. Object access is off on every host unless `exposeObjects` or `createPageHost({ expose })` is written, and `rpc:wsh-objects` is the key capability that gates it.
+  few paths (`document.cookie`, storage, `fetch`, ...) need an entry that names them. The generated types (#219) are advisory text: the host's type map is host-authored text that is checked, bounded and never evaluated (see [Typed remotes](#typed-remotes-219)), and the file says only what the fetching key may do. The MCP face for named paths (#219) is the allow-list **plus** a list of the paths that are tools, **plus** the WebMCP bridge's approval for any tool not marked read-only: a tool needs the key's `mcp:TOOL` and `objects:ROOT:OP`, its arguments are validated before the person is asked, its results are labelled untrusted, and it makes no handle, event or callback; a called function still does whatever it does with the page's authority. Object access is off on every host unless `exposeObjects` or `createPageHost({ expose })` is written, and `rpc:wsh-objects` is the key capability that gates it.
 - **`wsh-mcp` runs as a client with your key (#127).** It reads a private key file you point it at (no passphrase support: protect the
   file, `0600`), logs in as you and hands the MCP client everything the host's `mcp` channel serves; whatever the MCP client (or the
   model behind it) asks of those tools is done as you. It does not pin the host unless you pass `--host-key` (it warns once on stderr),

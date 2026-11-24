@@ -22,15 +22,63 @@ export class ObjectsError extends Error {
  * What a value that cannot be cloned arrives as on a root that opted in to handles: an opaque token, nothing of it enumerable, not thenable, not an argument.
  * It stands at the path that produced it: `use(handle)` makes a reference that continues that path; `release(handle)` gives its place back.
  */
-export class RemoteHandle {
+export class RemoteHandle<T = any> {
   readonly kind: 'function' | 'object';
   /** The class name, or a function's name. */
   readonly type?: string;
   /** Up to 8 member names, only if a `get` entry names the handle's path. */
   readonly preview?: { keys: string[] };
+  /** Type-only: the shape of the value behind the handle, for `use` (a host's type map, or a type you write). Not there at run time. */
+  readonly [handleShape]?: T;
 }
-/** A reference that stands on a handle: `await use(handle).items.length`. Judged by the producing path extended by what you name. */
-export function use(handle: RemoteHandle): any;
+declare const handleShape: unique symbol;
+declare const eventsBrand: unique symbol;
+declare const setBrand: unique symbol;
+
+// ── Typed remotes (#219) ────────────────────────────────────────────────────────────────────────────────────────────────────
+// A reference is a lazy path whose `await` is the value: it is `PromiseLike` (not a `Promise`: there is no `catch` or `finally` on it, and `ref.catch` would be a
+// remote property named "catch"). `describeRootTypes` (from `@johnhenry/wsh/objects-types`) writes types for one root out of these pieces; you can write them by hand.
+
+/** Anything: what a wildcard in an allow-list entry is typed as (the members behind it are not guessed). */
+export type RemoteUntyped = any;
+/** A path whose `await` is a `V` (a get). */
+export type RemoteValue<V = unknown> = PromiseLike<V>;
+/** A method: calling it gives a reference whose `await` is an `R` and that continues as `M` (`window.app.makeBus().ping`). Arguments are plain data. */
+export type RemoteCall<A extends unknown[] = unknown[], R = unknown, M = unknown> = (...args: A) => PromiseLike<R> & M;
+/** What a listener receives: an Event as `{ type, timeStamp, isTrusted, ...the fields you asked for }`, an emitter's as `{ type, args }`. */
+export type RemoteEventData<F extends string = never> = { type: string; timeStamp?: number; isTrusted?: boolean; args?: unknown[] } & { [K in F]?: unknown };
+/** The events a source offers, as `{ [type]: { data, fields } }`: it makes `on(ref, type, listener)` check the type, the data and the fields. */
+export type WithEvents<E extends Record<string, { data: unknown; fields: string }>> = { readonly [eventsBrand]: E };
+/** The properties of a node that may be assigned, as `{ [key]: valueType }`: it makes `set(ref, key, value)` check the key and the value. */
+export type WithSet<S extends Record<string, unknown>> = { readonly [setBrand]: S };
+
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type EventMapOf<R> = IsAny<R> extends true ? never : R extends { readonly [eventsBrand]: infer E } ? E : never;
+type EventTypeOf<R> = [EventMapOf<R>] extends [never] ? string : Extract<keyof EventMapOf<R>, string>;
+type EventDataOf<R, K> = [EventMapOf<R>] extends [never] ? any : K extends keyof EventMapOf<R> ? (EventMapOf<R>[K] extends { data: infer D } ? D : any) : any;
+type EventFieldsOf<R, K> = [EventMapOf<R>] extends [never] ? string : K extends keyof EventMapOf<R> ? (EventMapOf<R>[K] extends { fields: infer F extends string } ? F : string) : string;
+type SetMapOf<R> = IsAny<R> extends true ? never : R extends { readonly [setBrand]: infer S } ? S : never;
+type SetKeyOf<R> = [SetMapOf<R>] extends [never] ? string | number : Extract<keyof SetMapOf<R>, string>;
+type SetValueOf<R, K> = [SetMapOf<R>] extends [never] ? unknown : K extends keyof SetMapOf<R> ? SetMapOf<R>[K] : unknown;
+
+type RemotePrimitive = string | number | boolean | bigint | symbol | null | undefined;
+/**
+ * The reference type of a value type you write: `Remote<{ cart: { add(item: Item): number; items: Item[] } }>` is what `await`s to the value, has the members as references,
+ * and has methods that return references. Hand-written `T` says what you believe the host exposes; the host's allow-lists still decide. Arguments stay plain data.
+ */
+export type Remote<T> =
+  0 extends 1 & T ? any
+  : T extends RemotePrimitive ? PromiseLike<T>
+  : T extends (...args: infer A) => infer R ? (...args: A) => Remote<Awaited<R>>
+  : T extends Uint8Array | ArrayBuffer ? PromiseLike<T>
+  : T extends readonly (infer U)[] ? PromiseLike<T> & { readonly length: PromiseLike<number>; readonly [index: number]: Remote<U> }
+  : T extends object ? PromiseLike<T> & WithSet<{ [K in keyof T]: T[K] }> & { readonly [K in keyof T]: Remote<T[K]> }
+  : PromiseLike<T>;
+/** The roots as `openObjects` returns them, for value types you write: `client.openObjects<RemoteRoots<{ window: MyWindow }>>()`. A generated `{ window: WindowRemote }` is already remote-shaped. */
+export type RemoteRoots<T> = { readonly [K in keyof T]: Remote<T[K]> };
+
+/** A reference that stands on a handle: `await use(handle).items.length`. Judged by the producing path extended by what you name. With a typed handle (`RemoteHandle<Cart>`), a `Remote<Cart>`. */
+export function use<T = any>(handle: RemoteHandle<T>): 0 extends 1 & T ? any : Remote<T>;
 /** Give a handle's place back (releasing a released handle does nothing); or kill the stub of a function that was passed as a callback. */
 export function release(handleOrCallback: RemoteHandle | ((...args: any[]) => unknown)): Promise<void>;
 
@@ -133,6 +181,14 @@ export interface ObjectsServerOptions {
   limits?: Partial<ObjectsLimits>;
   /** Extra event fields a subscriber may ask for, by event type (`'*'`: any type): property names read from the event and copied as plain data (a node is left out). */
   eventFields?: Record<string, string[]>;
+  /**
+   * Types for the far side's `.d.ts`, by qualified path (`'window.app.cart.add': { args: '[item: { sku: string }]', result: 'number' }`; `value` for a get, `data` for an
+   * event `'window.app.bus@ready'`). Host-authored text that is sent to the far side: checked when the host is created (a conservative type syntax, bounded, only for a path
+   * an allow-list entry names), copied into a file there and never evaluated. A bad text or an unlisted path is a `TypeError` here.
+   */
+  types?: Record<string, { value?: string; args?: string; result?: string; data?: string }>;
+  /** An MCP face for named paths, off unless written: `{ tools: [{ name, description, call: 'window.app.cart.add', inputSchema }, { name, description, get: 'window.document.title' }] }`. */
+  mcp?: { tools: ObjectsMcpTool[] };
   /** Why nothing may be served any more (the window left), else null. */
   guard?: () => string | null;
   /** For `callTimeoutMs`. */
@@ -155,9 +211,48 @@ export interface ObjectsPeer {
 export function createObjectsServer(options: ObjectsServerOptions): {
   /** `who`: the identity of every call unless the peer gives one per call (`ctx.who`); one that names two keys, or is not an identity, throws a `TypeError` here. */
   attach(peer: Pick<ObjectsPeer, 'onRequest' | 'maxMessageBytes'>, options?: { who?: ObjectsIdentity }): { limits: ObjectsLimits };
+  /**
+   * One `get` or `call` of a named path (`path` starts with the root), through the same checks as an objects call (the key's grants as `permit(root, op)`, the allow-lists,
+   * the names that need listing, `authorize`, the window guard). No session, so no handle and no callback; resolves with the wire value (`{ v }`, or a named non-value `{ u }`).
+   */
+  invoke(request: { kind: 'get' | 'call'; path: string[]; args?: unknown[] }, ctx?: { who?: ObjectsIdentity; permit?: (root: string, op: string) => boolean; signal?: AbortSignal }): Promise<{ v: unknown } | { u: string; type?: string; text?: string }>;
   readonly limits: Readonly<ObjectsLimits>;
   readonly rootNames: string[];
+  /** The tools the host named in `mcp: { tools }` (none unless written), as definitions for `webmcpTools({ tools })`. */
+  readonly mcpTools: ObjectsMcpToolDefinition[];
+  readonly mcpToolNames: string[];
 };
+
+/**
+ * One path made into an MCP tool (#219). Nothing is a tool by being allowed: the host writes each one. Exactly one of `call` (a method, as the objects client would call it) and `get`
+ * (a value) names the path, a literal one that the allow-lists name for that operation. `inputSchema` is a small subset of JSON Schema (an unsupported keyword is refused when the host is made)
+ * that the far side's arguments are checked against before the person is asked and before the page runs anything; with none, the tool takes no arguments.
+ */
+export interface ObjectsMcpTool {
+  /** 1-128 characters of letters, digits, `_`, `-` and `.`. */
+  name: string;
+  title?: string;
+  /** What the far side reads to decide when to call it: written by the host. */
+  description: string;
+  /** A method path from a root, qualified (`'window.app.cart.add'`) in `exposeObjects`; relative to the root (`'app.cart.add'`) in `createPageHost({ expose })`. */
+  call?: string;
+  /** A value path, as for `call`. Read-only by default. */
+  get?: string;
+  inputSchema?: Record<string, unknown>;
+  /** For a call: `'object'` (the validated input is the one argument) or the property names to pass, in order. Default: `'object'` when the schema lists properties, else none. */
+  args?: 'object' | string[];
+  /** `true` marks the tool read-only; with nothing said, neither a get nor a call is (a getter can have effects). A tool not marked read-only asks the person at the page first (the WebMCP bridge's approval). */
+  readOnly?: boolean;
+}
+/** A tool as `webmcpTools({ tools })` takes it (what `exposeObjects` builds from an `ObjectsMcpTool`). */
+export interface ObjectsMcpToolDefinition {
+  name: string;
+  title?: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations: { readOnlyHint: boolean };
+  execute(input: Record<string, any>, options?: { signal?: AbortSignal; who?: ObjectsIdentity; permits?: (request: { kind: string; [k: string]: unknown }) => boolean }): Promise<unknown>;
+}
 
 /**
  * A peer over `send(message)` and `receive(message)`: the same protocol over any duplex that is not wsh. `who` is who is on the far side, as an
@@ -182,6 +277,9 @@ export interface ObjectsHandler {
   closeSessions(reason: string, fingerprint?: string): Promise<number>;
   readonly rootNames: string[];
   readonly limits: Readonly<ObjectsLimits>;
+  /** The MCP face (#219): the tools named in `mcp: { tools }`, for `webmcpTools({ window, tools: handler.mcpTools, allow: handler.mcpToolNames })`. Empty unless written. */
+  readonly mcpTools: ObjectsMcpToolDefinition[];
+  readonly mcpToolNames: string[];
 }
 export function exposeObjects(options: ObjectsServerOptions): ObjectsHandler;
 
@@ -201,7 +299,7 @@ declare module './index.js' {
 /** The value at a reference, or at a property of it: `await get(ref, 'then')` reaches a property that `ref.then` cannot. */
 export function get(ref: any, ...keys: Array<string | number>): Promise<any>;
 /** Assign a property of a remote object (not `=`: that throws). The reference must be a plain path. */
-export function set(ref: any, key: string | number, value: unknown): Promise<void>;
+export function set<R, K extends SetKeyOf<R>>(ref: R, key: K, value: SetValueOf<R, K>): Promise<void>;
 /** Call a method reached by name, with plain-data arguments. */
 export function call(ref: any, ...args: unknown[]): Promise<any>;
 /** `new` a constructor reached by name. */
@@ -212,7 +310,17 @@ export function snapshot(ref: any, options?: { depth?: number; maxBytes?: number
  * Listen for an event of a remote source named by the host's `allow.on`. `data` is plain: an Event as `{ type, timeStamp, isTrusted, ...fields }`, an emitter's as
  * `{ type, args }`. `dropped` counts events the host dropped before this one. Resolves to the function that unsubscribes. Never an event object, never a handle.
  */
-export function on(ref: any, type: string, listener: (data: any, info: { type: string; seq: number; dropped: number }) => void, options?: { fields?: string[]; onError?: (error: unknown) => void }): Promise<() => Promise<void>>;
+/**
+ * `ref` is a path reached from a root, or a reference that stands on a handle (`use(handle).bus`): the source is then the handle's producing path extended as
+ * written, and needs its own `allow.on` entry naming the type, the key's `objects:ROOT:on` and `authorize`. The subscription ends when the handle is released.
+ * A host before 0.51.0 does not say it supports this (`unsupported`).
+ */
+export function on<R, K extends EventTypeOf<R>>(ref: R, type: K, listener: (data: EventDataOf<R, K>, info: { type: string; seq: number; dropped: number }) => void, options?: { fields?: Array<EventFieldsOf<R, K>>; onError?: (error: unknown) => void }): Promise<() => Promise<void>>;
+/**
+ * What this key may do on a root, as data (`{ version, root, ops, allow, eventFields, types }`): the host's allow-list entries for the root narrowed by the key's capabilities,
+ * and the host's type map for them. Pass it to `describeRootTypes` (`@johnhenry/wsh/objects-types`) for the text of a `.d.ts`. A host before 0.51.0 does not say it supports this (`unsupported`).
+ */
+export function rootDescription(root: unknown, options?: { signal?: AbortSignal }): Promise<import('./objects-types.js').RootDescription & { version: number; ops: Array<'get' | 'call' | 'set' | 'on'>; handles: boolean }>;
 /** Stop a subscription: what `on` resolved to. */
 export function off(unsubscribe: () => Promise<void>): Promise<void>;
 /** The shape of an object, for completion: the names and types the allow-list could walk to. */

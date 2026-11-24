@@ -25,6 +25,8 @@
  */
 
 import { callerIdentity } from './key-names.mjs';
+import { describeRootTypes, narrowTypes } from './objects-types.mjs';
+import { buildMcpTools } from './objects-mcp.mjs';
 
 export const OBJECTS_PROTOCOL = 'wsh-objects';
 
@@ -368,7 +370,7 @@ function isPromiseLike(v) {
  * @param {() => number} [options.now]
  */
 export function createObjectsServer(options = {}) {
-  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, handles = {}, random = null, now = () => Date.now() } = options;
+  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, handles = {}, random = null, types = {}, mcp, now = () => Date.now() } = options;
   if (mode === 'handles') throw new TypeError("exposeObjects: handles are chosen per root, not for the host: use handles: { window: {} } (and nodes: true on a root that may hand out nodes)");
   if (mode !== 'values') throw new TypeError("exposeObjects: mode must be 'values' (handles are chosen per root with handles: { ROOT: {} })");
   if (typeof allow === 'string') throw new TypeError('exposeObjects: allow must be { get, call, set, on }: a wide-open string is not accepted, and the allow-lists apply to handles too');
@@ -431,6 +433,21 @@ export function createObjectsServer(options = {}) {
     }
   }
 
+  // Types for the far side's `.d.ts` (`types: { 'window.app.cart.add': { args: '[item: { sku: string }]', result: 'number' } }`): host-authored text that is sent to the far side.
+  // It is checked when the host is created (a conservative type syntax, bounded, and only for a path that an allow-list entry names), so a bad text is a TypeError here, not something the far side finds.
+  if (!types || typeof types !== 'object' || Array.isArray(types)) throw new TypeError('exposeObjects: types must be { [path]: { value?, args?, result?, data? } }');
+  const typesByRoot = new Map();
+  for (const [key, spec] of Object.entries(types)) {
+    const root = key.split(/[.@]/, 1)[0];
+    if (!rootNames.includes(root)) throw new TypeError(`exposeObjects: types names ${JSON.stringify(key.slice(0, 60))}, which is not under a root`);
+    if (!typesByRoot.has(root)) typesByRoot.set(root, {});
+    typesByRoot.get(root)[key] = spec;
+  }
+  const allowStrings = { get: allow.get ?? [], call: allow.call ?? [], set: allow.set ?? [], on: allow.on ?? [] };
+  for (const [root, map] of typesByRoot) {
+    try { describeRootTypes({ root, allow: allowStrings, eventFields, types: map }); } catch (e) { throw new TypeError(String(e?.message ?? e).replace(/^describeRootTypes:/, 'exposeObjects:')); }
+  }
+
   /** The checks every operation passes, in order. `terminal` ones need the operation's own list; the rest need only to walk toward something allowed. */
   async function check(kind, root, segs, ctx, { terminal, type, callbacks = 0 }) {
     const who = ctx.who;
@@ -438,6 +455,19 @@ export function createObjectsServer(options = {}) {
     if (gone) throw refuse('gone', `refused: ${gone}`);
     // 0. what the caller's key may do on this root, if the transport says (`ctx.permit(root, op)`, asked afresh: an expiry holds at call time)
     permitted(ctx, root, kind === 'get' && !terminal ? 'walk' : kind === 'construct' ? 'call' : kind === 'describe' || kind === 'snapshot' ? 'get' : kind);
+    staticCheck(kind, root, segs, { terminal, type, callbacks });
+    if (terminal && authorize) {
+      let ok = false;
+      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.'), ...(type !== undefined ? { type } : {}), ...(callbacks ? { callbacks } : {}) })) === true; } catch { ok = false; }
+      if (!ok) throw refuse('authorize', `refused: ${kind} of ${segs.join('.')} was not authorized`, { path: segs.join('.'), op: kind });
+    }
+  }
+
+  /**
+   * The part of `check` that needs nothing of the caller: the allow-lists and the names that need listing. It is what makes an MCP tool for a path possible when the host is
+   * configured (the path must pass it for its operation), and it is the same code every call passes.
+   */
+  function staticCheck(kind, root, segs, { terminal, type, callbacks = 0 }) {
     const rel = segs.slice(1).map(bareName);
     const own = lists[kind === 'construct' ? 'call' : kind === 'describe' || kind === 'snapshot' ? 'get' : kind];
     // 1. the allow-list: the operation's own list for the operation itself, any list for walking toward something
@@ -454,11 +484,6 @@ export function createObjectsServer(options = {}) {
       if (!containsSequence(rel, seq)) continue;
       const listed = terminal ? own.some((p) => matchPath(p, segs) && patternNames(p, seq)) : every.some((p) => prefixPath(p, segs) && patternNames(p, seq));
       if (!listed) throw refuse('needs-listing', `refused: "${rel.join('.')}" is refused until an allow-list entry names ${seq.join('.')} (a wildcard does not)`, { path: segs.join('.') });
-    }
-    if (terminal && authorize) {
-      let ok = false;
-      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.'), ...(type !== undefined ? { type } : {}), ...(callbacks ? { callbacks } : {}) })) === true; } catch { ok = false; }
-      if (!ok) throw refuse('authorize', `refused: ${kind} of ${segs.join('.')} was not authorized`, { path: segs.join('.'), op: kind });
     }
   }
 
@@ -613,6 +638,13 @@ export function createObjectsServer(options = {}) {
   async function releaseHandle(params, ctx) {
     const { session } = ctx;
     if (typeof params.handle !== 'string' || !session.handles.delete(params.handle)) throw invalid('no such handle (it was released, belongs to another session, or never existed)');
+    // The event subscriptions made through the handle end with it: the listeners leave the page's sources, and what they had queued is dropped.
+    for (const [id, sub] of [...session.subs]) {
+      if (sub.handle !== params.handle) continue;
+      session.subs.delete(id);
+      removeSub(sub);
+      session.queue = session.queue.filter((q) => q.sub !== sub);
+    }
     return { ok: true };
   }
 
@@ -826,7 +858,12 @@ export function createObjectsServer(options = {}) {
 
   async function subscribe(params, ctx) {
     const { session } = ctx;
-    const root = requireRoot(params);
+    // Where the source is looked for starts at a root, or at a handle of THIS channel: a handle stands at the path that produced it, and what is subscribed to is that
+    // path extended by `params.path`, judged exactly as a path subscription for it (its own `allow.on` entry naming the type, the key's `on`, `authorize`).
+    const start = startOf(params, ctx);
+    const { root } = start;
+    const handleId = params.handle;
+    const handleRec = handleId === undefined ? null : session.handles.get(handleId);
     const type = params.type;
     if (typeof type !== 'string' || !EVENT_TYPE_RE.test(type)) throw invalid('an event type is a name of letters, digits and _ $ : . - (up to 128)');
     const id = params.id;
@@ -836,11 +873,16 @@ export function createObjectsServer(options = {}) {
     const offered = [...(eventFields[type] ?? []), ...(eventFields['*'] ?? [])];
     for (const f of asked) if (!offered.includes(f)) throw refuse('not-allowed', `refused: the field "${f}" of ${type} events is not offered by this host`, { field: f, type });
     if (session.subs.size >= limits.maxSubscriptions) throw limitError('maxSubscriptions', limits.maxSubscriptions, 'too many event subscriptions on this channel');
-    const { cur: source, segs } = await walk({ root, cur: roots[root], segs: [root] }, params.path ?? [], ctx);
+    const { cur: source, segs } = await walk(start, params.path ?? [], ctx);
     await check('on', root, segs, ctx, { terminal: true, type });
+    // The checks above may have waited (`authorize`): the handle may have been released, the channel may have ended, another subscribe may have taken the last place.
+    if (session.closed) throw refuse('gone', 'refused: the channel ended');
+    if (handleRec &&session.handles.get(handleId) !== handleRec) throw invalid('no such handle (it was released, belongs to another session, or never existed)');
+    if (session.subs.has(id)) throw invalid('a subscription id is a whole number the channel has not used');
+    if (session.subs.size >= limits.maxSubscriptions) throw limitError('maxSubscriptions', limits.maxSubscriptions, 'too many event subscriptions on this channel');
     const kind = sourceMethods(source);
     if (!kind) throw new ObjectsError(OBJECTS_ERROR.FAILED, `${segs.join('.')} is not an event source (it needs addEventListener, or on and off)`, { reason: 'not-an-event-source' });
-    const sub = { id, type, kind: kind.kind, fields: [...new Set(asked)], source, stamps: [], dropped: 0, seq: 0, remove: kind.remove, listener: null };
+    const sub = { id, type, kind: kind.kind, fields: [...new Set(asked)], source, stamps: [], dropped: 0, seq: 0, remove: kind.remove, listener: null, handle: handleRec ? handleId : undefined };
     sub.listener = (...args) => deliver(session, sub, args);
     try { Reflect.apply(Reflect.get(Object(source), kind.add, source), source, [type, sub.listener]); } catch (e) { throw wrapThrown(e, `${segs.join('.')}.${kind.add}`); }
     session.subs.set(id, sub);
@@ -897,8 +939,24 @@ export function createObjectsServer(options = {}) {
     // The host also says what it supports (additive: an older client ignores it), so a client does not send a function to a host that would drop it, nor misread a handle.
     method('roots', async (_params, call) => ({
       roots: rootNames.filter((name) => keyMay(call, name, 'walk')),
-      features: ['events', 'callbacks', ...(handleRoots.size ? ['handles'] : [])],
+      features: ['events', 'callbacks', 'types', ...(handleRoots.size ? ['handles', 'handle-events'] : [])],
     }));
+    // What this key may do on one root, as data a far side turns into a `.d.ts` (`describeRootTypes`): the allow-list entries of that root for the operations the key's
+    // capabilities grant, the host's type map for them, the event fields of the types it may subscribe to. Nothing of another root, and nothing that is not allowed.
+    method('types', async (params, call) => {
+      const root = requireRoot(params);
+      permitted(call, root, 'walk');
+      const ops = ['get', 'call', 'set', 'on'].filter((op) => keyMay(call, root, op));
+      const mine = (list) => (Array.isArray(list) ? list : []).filter((entry) => { const first = String(entry).split(/[.@]/, 1)[0]; return first === root || first === '*' || first === '**'; });
+      const lists = Object.fromEntries(['get', 'call', 'set', 'on'].map((op) => [op, ops.includes(op) ? mine(allowStrings[op]) : []]));
+      const typeMap = narrowTypes({ root, ops, allow: allowStrings, types: typesByRoot.get(root) ?? {} });
+      const offered = new Set(lists.on.map((entry) => entry.slice(entry.indexOf('@') + 1)));
+      const fields = Object.fromEntries(Object.entries(eventFields).filter(([type]) => type === '*' ? offered.size > 0 : offered.has(type)));
+      const answer = { version: 1, root, ops, allow: lists, eventFields: fields, types: typeMap, handles: handleRoots.has(root) };
+      const size = toWire(answer, { maxDepth: 6, maxBytes: call.maxBytes ?? limits.maxValueBytes });
+      if (!('v' in size)) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'the description could not be written', { reason: 'bad-reply' });
+      return size.v;
+    });
     method('resolve', resolve);
     method('set', setValue);
     method('describe', describe);
@@ -910,7 +968,32 @@ export function createObjectsServer(options = {}) {
     return { limits, handleCount: () => session.handles.size, callbackCount: () => session.callbacks.size, deadCallbackCalls: () => session.deadCalls };
   }
 
-  return { attach, limits: Object.freeze({ ...limits }), rootNames: rootNames.slice() };
+  /**
+   * One `get` or `call` of a named path (`path` starts with the root: `['window', 'app', 'cart', 'add']`), through the same checks as an objects call: the key's grants
+   * (`permit(root, op)`), the allow-lists, the names that need listing, `authorize` and the window guard. No session: nothing here makes a handle or takes a callback, and the
+   * answer is the wire value (`{ v }`, or a named non-value `{ u }`). `args` are plain data, copied and bounded like the arguments of a call. This is what an MCP tool runs.
+   * @param {{ kind: 'get' | 'call', path: string[], args?: unknown[] }} request
+   * @param {{ who?: object, permit?: (root: string, op: string) => boolean, signal?: AbortSignal }} [ctx]
+   */
+  async function invoke({ kind, path, args = [] } = {}, { who, permit, signal } = {}) {
+    if (kind !== 'get' && kind !== 'call') throw invalid('invoke: kind must be get or call');
+    if (!Array.isArray(path) || path.length < 2 || !path.every((s) => typeof s === 'string')) throw invalid('invoke: path must be a root and at least one member');
+    if (!Array.isArray(args)) throw invalid('invoke: args must be an array');
+    const root = requireRoot({ root: path[0] });
+    const last = path.length - 2;
+    const ops = path.slice(1).map((key, i) => (kind === 'call' && i === last ? { call: key, args } : { get: key }));
+    return resolve({ root, ops }, { who: callerIdentity(who) ?? undefined, permit, signal, maxBytes: limits.maxValueBytes });
+  }
+
+  // The MCP face (#219): tools for named allow-listed paths, built from the host's `mcp: { tools }`. Empty unless the host wrote it.
+  const mcpTools = buildMcpTools({
+    mcp,
+    rootNames,
+    allows: (kind, root, segs) => staticCheck(kind, root, segs, { terminal: true }),
+    invoke,
+  });
+
+  return { attach, invoke, limits: Object.freeze({ ...limits }), rootNames: rootNames.slice(), mcpTools, mcpToolNames: mcpTools.map((t) => t.name) };
 }
 
 // ── A bare duplex as a peer ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1196,13 +1279,14 @@ export async function on(ref, type, listener, { fields, onError } = {}) {
   const { state, keys } = pathOf(ref, 'on');
   if (typeof listener !== 'function') throw new TypeError('on needs a listener function: listener(data, { type, seq, dropped })');
   const { session } = state;
-  if (state.handle !== undefined) throw new TypeError('events are not offered through a handle: name the source by its path');
   if (!session.features?.includes('events')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support events (it did not say so)', { reason: 'unsupported' });
+  // Through a handle: a host before 0.51.0 would not know the request, so it is not sent unless the host said it supports it.
+  if (state.handle !== undefined && !session.features.includes('handle-events')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support events through a handle (it did not say so): name the source by its path instead', { reason: 'unsupported' });
   const id = session.nextSub++;
   // Registered before the request: an event can follow the answer at once.
-  session.subs.set(id, { listener, onError, type });
+  session.subs.set(id, { listener, onError, type, handle: state.handle });
   try {
-    await session.peer.request('subscribe', { id, root: state.root, path: keys, type, ...(fields ? { fields } : {}) });
+    await session.peer.request('subscribe', { id, ...target(state), path: keys, type, ...(fields ? { fields } : {}) });
   } catch (e) { session.subs.delete(id); throw asObjectsError(e, session); }
   return async function off() {
     if (!session.subs.delete(id)) return;
@@ -1214,6 +1298,18 @@ export async function on(ref, type, listener, { fields, onError } = {}) {
 export async function off(unsubscribe) {
   if (typeof unsubscribe !== 'function') throw new TypeError('off needs what on() returned');
   await unsubscribe();
+}
+
+/**
+ * What this key may do on a root, as data: `{ version, root, ops, allow, eventFields, types, handles }` (the host's allow-list entries for the root, narrowed by the key's
+ * capabilities, and the host's type map for them). Give it to `describeRootTypes` from `@johnhenry/wsh/objects-types` for the text of a `.d.ts`; nothing is written or evaluated here.
+ * Takes a root as `openObjects()` returns it (`page.window`), not a path or a handle.
+ */
+export async function rootDescription(ref, { signal } = {}) {
+  const state = stateOf(ref);
+  if (state.ops.length > 0 || state.handle !== undefined) throw new TypeError('rootDescription takes a root (page.window), not a path or a handle');
+  if (!state.session.features?.includes('types')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support types (it did not say so): it is older than 0.51.0', { reason: 'unsupported' });
+  try { return await state.session.peer.request('types', { root: state.root }, { signal }); } catch (e) { throw asObjectsError(e, state.session); }
 }
 
 /** The shape of an object, for a REPL or completion: `{ type, keys: [{ key, type, own }] }`. Only names the allow-list could walk to are told. */
@@ -1284,6 +1380,8 @@ export async function release(handle) {
   if (!rec) throw new TypeError('release needs a handle, or a function that was passed as a callback');
   if (rec.released) return;
   rec.released = true;
+  // The host ends the subscriptions made through the handle with it: forget them here too.
+  for (const [id, sub] of [...rec.session.subs]) if (sub.handle === rec.id) rec.session.subs.delete(id);
   try { await rec.session.peer.request('release', { handle: rec.id }); } catch (e) { throw asObjectsError(e, rec.session); }
 }
 

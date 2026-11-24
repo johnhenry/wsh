@@ -13,7 +13,8 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createPipeRelay } from '@johnhenry/wsh/pipe-relay';
 import { createPageHost, captureWebMcp } from '@johnhenry/wsh/page';
-import { set, on, use, RemoteHandle, NonValue } from '@johnhenry/wsh/objects';
+import { set, on, use, RemoteHandle, NonValue, rootDescription } from '@johnhenry/wsh/objects';
+import { describeRootTypes } from '@johnhenry/wsh/objects-types';
 import {
   WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, exportPrivateKeyPKCS8, fingerprint, mcpClientTransport, cborEncode, MSG,
 } from '@johnhenry/wsh';
@@ -454,6 +455,71 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
     await assert.rejects(wsh.openRpc('mcp'), /not supported|UNSUPPORTED/);
     // And nothing else is: no exec, no files.
     await assert.rejects(wsh.openSession({ type: 'exec', command: 'ls' }));
+  });
+
+  it('typed remotes: the types answer is the root-relative allow-lists and type map of the page host, narrowed by the key (#219)', async () => {
+    const { win } = worldWindow();
+    const expose = { window: { allow: { get: ['document.title', 'app.cart.**'], call: ['app.cart.add'] }, types: { 'document.title': { value: 'string' }, 'app.cart.add': { args: '[item: { sku: string }]', result: '{ count: number }' } } } };
+    const page = await startPage({ window: win, registered: [], authorizedKeys: [aliceLine, `capabilities="objects:window:get" ${bobLine}`], mcp: undefined, host: { mcp: undefined, expose } });
+    // One session at a time: the first key leaves before the second arrives.
+    const describeAs = async (keyPair, username) => {
+      const wsh = new WshClient();
+      await wsh.connect(page.host.operatorUrl, { username, keyPair, transport: 'ws', sealSession: true });
+      try { return await rootDescription((await wsh.openObjects()).window); } finally { await wsh.disconnect(); }
+    };
+    const full = await describeAs(alice, 'alice');
+    assert.deepEqual(full.allow.call, ['window.app.cart.add']);
+    assert.match(describeRootTypes(full), /readonly add: RemoteCall<\[item: \{ sku: string \}\], \{ count: number \}, unknown>/);
+    await until(() => page.host.sessions.length === 0, 'the first session to end');
+    const readOnly = await describeAs(bob, 'bob');
+    assert.deepEqual(readOnly.ops, ['get']);
+    assert.doesNotMatch(describeRootTypes(readOnly).slice(describeRootTypes(readOnly).indexOf('export type')), /RemoteCall|add/);
+    await assert.rejects(createPageHost({ relay: 'ws://127.0.0.1:1', name: 'x', authorizedKeys: ['k'], window: createFakeWindow(), expose: { window: { allow: { get: ['a'] }, types: { b: { value: 'string' } } } } }), /allows that path/);
+    await assert.rejects(createPageHost({ relay: 'ws://127.0.0.1:1', name: 'x', authorizedKeys: ['k'], window: createFakeWindow(), expose: { window: { allow: { get: ['a'] }, types: { a: { value: 'import("x")' } } } } }), /import/);
+  });
+
+  it('an MCP face for named paths (#219): the tools sit beside the page\'s WebMCP tools behind one approval, and the key needs mcp:TOOL and objects:ROOT:OP', async () => {
+    const { win, calls } = worldWindow();
+    const asked = [];
+    const expose = { window: { allow: { get: ['document.title', 'app.cart.**'], call: ['app.cart.add'] }, mcp: { tools: [
+      { name: 'cart_add', description: 'Add a product to the cart', call: 'app.cart.add', inputSchema: { type: 'object', properties: { sku: { type: 'string' } }, required: ['sku'], additionalProperties: false } },
+      { name: 'page_title', description: 'The page title', get: 'document.title', readOnly: true },
+    ] } } };
+    const page = await startPage({
+      window: win, host: { expose }, mcp: { prompt: async (call) => { asked.push(call.name); return true; } },
+      authorizedKeys: [aliceLine, `capabilities="mcp:page_title,objects:window:get" ${bobLine}`],
+    });
+    const a = await operator(page.host);
+    assert.deepEqual((await a.mcp.listTools()).tools.map((t) => t.name).sort(), ['buy', 'cart_add', 'page_title', 'search']);
+    assert.equal((await a.mcp.callTool({ name: 'page_title', arguments: {} })).content[0].text, 'Shop');
+    assert.deepEqual(asked, [], 'a read does not ask');
+    assert.deepEqual((await a.mcp.callTool({ name: 'cart_add', arguments: { sku: 'Q' } })).structuredContent, { count: 2 });
+    assert.deepEqual(asked, ['cart_add'], 'a call that is not read-only asks the person, as a WebMCP tool does');
+    assert.deepEqual(calls, [{ sku: 'Q' }]);
+    await assert.rejects(a.mcp.callTool({ name: 'cart_add', arguments: { sku: 'Q', extra: 1 } }), /invalid arguments/);
+    assert.equal(asked.length, 1, 'the arguments are checked before the person is asked');
+    await a.wsh.disconnect();
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+    // A key with mcp:page_title and objects:window:get sees the read and nothing else.
+    const b = await operator(page.host, { keyPair: bob, username: 'bob' });
+    assert.deepEqual((await b.mcp.listTools()).tools.map((t) => t.name), ['page_title']);
+    assert.equal((await b.mcp.callTool({ name: 'page_title', arguments: {} })).content[0].text, 'Shop');
+    await assert.rejects(b.mcp.callTool({ name: 'cart_add', arguments: { sku: 'Z' } }), /unknown tool/);
+    assert.equal(calls.length, 1);
+  });
+
+  it('the MCP face alone is enough to serve the mcp channel, is refused without a way to ask, and a name that is a WebMCP tool\'s too is refused', async () => {
+    const ok = { relay: 'ws://127.0.0.1:1', name: 'x', authorizedKeys: ['k'] };
+    const { win } = worldWindow();
+    const expose = (extra = {}) => ({ window: { allow: { call: ['app.cart.add'] }, mcp: { tools: [{ name: 'cart_add', description: 'Add', call: 'app.cart.add', ...extra }] } } });
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: expose() } });
+    assert.deepEqual(page.host.sessions, []);
+    const ui = { connected() {}, disconnected() {} };
+    await assert.rejects(createPageHost({ ...ok, window: createFakeWindow({ document: false }), indicator: ui, expose: expose() }), /no document to ask the person in/);
+    assert.ok(await createPageHost({ ...ok, window: createFakeWindow({ document: false }), indicator: ui, mcp: { prompt: async () => false }, expose: expose() }).then((h) => h.close().then(() => true)), 'with a way to ask it is served');
+    await assert.rejects(createPageHost({ ...ok, window: createFakeWindow(), expose: { window: { allow: { call: ['app.cart.add'] }, mcp: { tools: [{ name: 'cart_add', description: 'Add', call: 'app.cart.hidden' }] } } } }), /allow-list/);
+    await assert.rejects(createPageHost({ ...ok, window: createFakeWindow(), expose: expose(), mcp: { tools: [{ name: 'cart_add', description: 'Same name', inputSchema: { type: 'object' }, execute: () => 1 }] } }), /listed twice/);
+    await assert.rejects(createPageHost({ ...ok, window: createFakeWindow(), expose: { window: { mcp: { all: true } } } }), /mcp must be \{ tools/);
   });
 
   it('both facilities at once: mcp tools and object access, each its own channel, each with its own capability', async () => {

@@ -24,6 +24,12 @@ import { RpcError, RPC_ERROR } from './rpc.mjs';
 import { callerIdentity } from './key-names.mjs';
 
 const TOOL_NAME_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+/**
+ * The key of the part of a tool definition that only the host's own code may set: `{ caller?: true, validate?(input) => string | null, available?({ permits }) => boolean }`.
+ * `caller` makes `execute` receive `{ who, permits }` of the session beside its signal; `validate` is run on the arguments before the person is asked; `available` hides the
+ * tool from a session whose key may not use it. Honoured only for the definitions passed in `webmcpTools({ tools })`.
+ */
+export const INTERNAL_TOOL = Symbol.for('wsh.webmcp.internal');
 const APPROVE_MODES = new Set(['never', 'consequential', 'always']);
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 
@@ -90,7 +96,7 @@ export function timersOf(window, injected = {}) {
  * annotations?, execute }`. The schemas are copied as JSON (the draft does the same at registration). Throws a `TypeError` that
  * says what is wrong.
  */
-export function normalizeTool(tool, who = 'webmcp') {
+export function normalizeTool(tool, who = 'webmcp', { internal = false } = {}) {
   if (!isObj(tool)) throw new TypeError(`${who}: a tool must be an object { name, description, execute, ... }`);
   if (typeof tool.name !== 'string' || !TOOL_NAME_RE.test(tool.name)) throw new TypeError(`${who}: tool name ${JSON.stringify(tool.name)} must be 1-128 characters of letters, digits, "_", "-" and "."`);
   if (typeof tool.description !== 'string' || tool.description === '') throw new TypeError(`${who}: tool "${tool.name}" needs a description`);
@@ -103,7 +109,11 @@ export function normalizeTool(tool, who = 'webmcp') {
     return JSON.parse(s);
   };
   const annotations = copy(tool.annotations, 'annotations') ?? {};
+  // What the host's own code attaches to a tool it passes in `webmcpTools({ tools })` (an object path made into a tool, `objects-mcp.mjs`): never copied from a tool the
+  // page registers itself, so page code cannot ask for who is calling or for the key's grants.
+  const hostPart = internal && isObj(tool[INTERNAL_TOOL]) ? { [INTERNAL_TOOL]: tool[INTERNAL_TOOL] } : {};
   return {
+    ...hostPart,
     name: tool.name,
     ...(typeof tool.title === 'string' && tool.title ? { title: tool.title } : {}),
     description: tool.description,
@@ -423,7 +433,7 @@ export function webmcpTools(options = {}) {
   }
   const explicit = new Map();
   for (const t of tools) {
-    const entry = normalizeTool(t, 'webmcpTools');
+    const entry = normalizeTool(t, 'webmcpTools', { internal: true });
     if (explicit.has(entry.name)) throw new TypeError(`webmcpTools: tool "${entry.name}" is listed twice`);
     explicit.set(entry.name, entry);
   }
@@ -449,6 +459,8 @@ export function webmcpTools(options = {}) {
       // The hook is told which it is: `mcp-tool` is listing a tool, `mcp-call` is running one (`op` says the same as `'list'` / `'call'`),
       // so an adapter may scope them apart. The notation's `mcp:TOOL` covers both.
       if (permits && !permits({ kind, op: kind === 'mcp-call' ? 'call' : 'list', tool: tool.name })) continue;
+      // A tool made from an object path is also limited by what the key may do on that root (`objects:ROOT:OP`): both notations must permit it.
+      if (tool[INTERNAL_TOOL]?.available && !tool[INTERNAL_TOOL].available({ permits })) continue;
       const bad = unlistable(tool, limits);
       if (bad) { emit({ outcome: 'unlisted', name: tool.name, limit: bad.limit, detail: bad.detail }); continue; }
       if (out.length >= limits.maxTools) { emit({ outcome: 'unlisted', name: tool.name, limit: 'maxTools', detail: `more than ${limits.maxTools} tools` }); continue; }
@@ -517,7 +529,8 @@ export function webmcpTools(options = {}) {
       const text = jsonOrNull(args) ?? '';
       if (utf8Length(text) > limits.maxInputBytes) throw fail('maxInputBytes', `the arguments are larger than ${limits.maxInputBytes} bytes`, { name });
       if (session.inflight.size >= limits.maxInflight) throw fail('maxInflight', `more than ${limits.maxInflight} calls in flight`, { name });
-      const problem = checkInput(tool.inputSchema, args);
+      const host = tool[INTERNAL_TOOL];
+      const problem = checkInput(tool.inputSchema, args) ?? (host?.validate ? host.validate(args) : null);
       if (problem) throw new RpcError(RPC_ERROR.INVALID_PARAMS, `invalid arguments: ${problem}`);
 
       const ctl = new AbortController();
@@ -542,7 +555,7 @@ export function webmcpTools(options = {}) {
         timedOut.catch(() => {});
         let value;
         try {
-          value = await Promise.race([Promise.resolve().then(() => tool.execute(args, { signal: ctl.signal })), timedOut]);
+          value = await Promise.race([Promise.resolve().then(() => tool.execute(args, { signal: ctl.signal, ...(host?.caller ? { who, permits } : {}) })), timedOut]);
         } catch (e) {
           if (rpc.signal.aborted) throw e;
           emit({ outcome: 'error', name, who });
