@@ -666,6 +666,7 @@ bundler drop what you do not use.
 | `@johnhenry/wsh/reverse` | `createReverseHost()` for a page or Worker: dial out to a relay and serve the operator it bridges. The same function `@johnhenry/wsh/server` exports, minus `exec: true` and `fs: { root }` |
 | `@johnhenry/wsh/testing` | the QMux record and frame codec (`encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, the varint and the other frame encoders), for a test that reads, alters and re-wraps what travels on a connection; and two test doubles for code that embeds wsh: `createInProcessPipeRelay({ tap })` (the real pipe relay in this process, with a `WebSocket` that dials it, a record of every message it copied, and a `tap` that may change, drop, repeat or add to what it writes, like a hostile relay) and `createMemoryPair({ host, username })` (a memory host and a client already logged in to it). **Experimental: not part of the stable API**; it may change or disappear in any release. Importing only the codec costs under 1 kB: the doubles are separate exports a bundler drops |
 | `@johnhenry/wsh/identity` | a key in its four spellings, and `authorized_keys` lines: `fingerprint` and `podId` of a raw key, `fingerprintToPodId` / `podIdToFingerprint`, `rawKeyToOpenSsh` / `openSshToRawKey` / `parseOpenSshKey` / `publicKeyToOpenSsh`, `identityOf`, `normalizeIdentity`, `authorizedKeyLine`. Stable; see [Identity and capabilities for other implementations](#identity-and-capabilities-for-other-implementations-220) |
+| `@johnhenry/wsh/duplex` | a full wsh session over a duplex of messages another library provides: `serveWshOverDuplex(host, { send })`, `connectWshOverDuplex({ send }, credentials)`, `createDuplexSocket`. Sealed by default; see [wsh over a duplex](#wsh-over-a-duplex-220) |
 | `@johnhenry/wsh/capabilities` | `permits(capabilities, request)`: the notation of key capabilities as a pure function, the one `@johnhenry/wsh/server` and the memory host evaluate. Stable; same section |
 | `@johnhenry/wsh/spec/*.json`, `*.md`, `wsh-v1.yaml` | the data files of the specification: `capabilities.md`, `capabilities.vectors.json`, `key-options.vectors.json`, the wire spec |
 | `@johnhenry/wsh/server` | Node only |
@@ -701,6 +702,7 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/objects` (whole entry point) | 177.4 kB | 54.4 kB |
 | `@johnhenry/wsh/capabilities` (whole entry point) | 10.5 kB | 3.8 kB |
 | `@johnhenry/wsh/identity` (whole entry point) | 15.7 kB | 5.7 kB |
+| `@johnhenry/wsh/duplex` (whole entry point) | 140.1 kB | 42.4 kB |
 | `import { encodeRecord } from '@johnhenry/wsh/testing'` | 1.8 kB | 0.9 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 135.9 kB | 40.8 kB |
@@ -2341,6 +2343,7 @@ than left to be found.
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
 | `authorized_keys` options (#122): `restrict`, `permit-*`, `no-pty`, `command=`, `max-sessions=` | `auth.authorizedKeys` lines with options on `createWshServer` / `createMemoryHost`; `parseAuthorizedKeyEntries()` | `wsh-server` reads `~/.wsh/authorized_keys` (then `~/.ssh/authorized_keys`) | **Same rules and the same vectors on both hosts** (`spec/key-options.vectors.json`, run by the JS suite and a Rust test); an option that is not understood keeps the key out, on both. See [Authorized-key options](#authorized-key-options-122) for the per-host column |
 | Per-key capabilities and expiry (#122): `capabilities="..."`, `expires="..."`; `authorize()` may return a set | every entry the host has: `Open` kinds, `FileOp` read vs write, gateway TCP/UDP/unix/endpoint open and listen, MCP discovery and calls, targets, rpc channels, relay; refusals through `onRefused` (`not-permitted`, `key-expired`) | the same, except **no endpoints and no targets** (`endpoint:` / `target:` parse and grant nothing; such requests are refused); refusals are logged, there is no callback; no `authorize` | **Same grammar, same vectors, same refusal codes on both hosts**; default-deny only for a key whose line has `capabilities`. Neither covers sessions already open, see [Security model](#security-model). The notation is written in `spec/capabilities.md` and its vectors (`spec/capabilities.vectors.json`, `version` 1) ship in the npm package and are run by both; the Rust server's subset is stated by refusal: a key line with an `objects:` capability is refused at load (`unknown-capability`) |
+| A session over a caller-supplied duplex (#220): `serveWshOverDuplex`, `connectWshOverDuplex` from `@johnhenry/wsh/duplex` | exported, browser-safe; sealed by default | none: the Rust server and client dial a WebSocket, TLS or a pipe relay (a pipe relay carries the same bytes) | **Unified on the wire** (nothing new); the binding is the JS implementation's |
 | `permits(capabilities, request)`, `@johnhenry/wsh/identity` (fingerprint, pod id, OpenSSH line, `authorized_keys` line builder), the `GATEWAY_FAIL` table, `serveMcpOverDuplex`, `createDuplexPeer({ who, permit })` (#220) | exported pure functions and seams of the JS package, browser-safe | none: the Rust server and CLI export no library function of these; the Rust server sends the same `GatewayFail` numbers, with `5` meaning "gateway disabled" where the Node gateway sends it for a timeout | **Notation unified by vectors**; the functions are the JS implementation's and are not a wire feature |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |
 | Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | `--cert-hash <sha256>` (repeatable) and `ConnectConfig.cert_hash`/`cert_hashes`, with the same rules (SHA-256, ECDSA P-256, at most 14 days); `wsh-server` prints its certificate hash at start-up. Without a pin the certificate is validated against the system trust store; `--insecure-skip-cert-verification` is the development-only opt-out | **Not a wire concept**; a default changed in the Rust client, see the CHANGELOG |
@@ -2874,6 +2877,37 @@ browsermesh** (a test of the pod id derivation uses `@johnhenry/browsermesh-prim
   with no wsh relay. wsh exports the seams it needs: `createDuplexPeer({ send, who, permit })` and `createObjectsServer(...).attach` for objects,
   `serveMcpOverDuplex` for MCP, the identity object `{ username, fingerprint, podId }`, and `permits()` of the
   [capability notation](#identity-and-capabilities-for-other-implementations-220), which the mesh's own grants run the same vectors against.
+
+#### wsh over a duplex (#220)
+
+`@johnhenry/wsh/duplex` runs a whole wsh session (login, host-key proof, sealed session, channels) over a duplex of messages that another library
+provides, so a browser with no relay can be reached by hopping through a mesh peer, and a pod can reach a wsh host without a relay. The transport
+is the one wsh already runs over a WebSocket; `createDuplexSocket` is a WebSocket-shaped object whose messages are the duplex's.
+
+```js
+// host (a page, a pod): a host with a host key
+const host = createMemoryHost({ auth: { authorizedKeys }, hostKey: true, dataStreams: false, exec });
+const served = serveWshOverDuplex(host, { send: (bytes) => channel.send(bytes) });
+channel.onmessage = (bytes) => served.receive(bytes);
+// client: it names the host key it expects (over a mesh: podIdToFingerprint(peerPodId))
+const link = connectWshOverDuplex({ send: (bytes) => channel.send(bytes) }, { username, keyPair, expectHostKey });
+channel.onmessage = (bytes) => link.receive(bytes);
+const client = await link.connected;
+```
+
+**The duplex must** deliver messages of bytes reliably and in order, with a maximum size both ends know (`maxMessageBytes`, default 64 KiB; a larger
+write is cut, a larger incoming message ends the link), and apply backpressure by `send` returning a promise (what waits is bounded by
+`maxBufferedBytes`, default 4 MiB). One duplex carries one session. The full statement is [`spec/duplex-binding.md`](spec/duplex-binding.md).
+
+**Channel binding here is not TLS's.** There is none of `cert-hash` or `tls-exporter`. The authentication is carried by the host-key proof (the client
+compares the key with the one it named), the login bound to that key (`requireChannelBinding: ['host']`, the default) and the sealed session. So a hop on
+the duplex cannot read or change a command, an output or a credential after login, cannot replay one, and cannot answer as the host to a client that named
+its key. It can see that a session exists, its timing and sizes, and the plain handshake (the host key, the username, the client's public key); it can
+drop or delay (the session stalls) or end the link. It is **not** protected against: a client that does not name the host key (`trustOnFirstUse: true` is
+said out loud: the first answer is trusted), a **password** login (sent before the seal; refused unless `allowUnsealed: true`), or what the host's own
+`auth` and capabilities allow. **Unsealed is refused by default**: the host serves a duplex only sealed (it needs a host key; `sealSession: 'require'`
+can now be asked of one connection, `host.accept(socket, { sealSession: 'require' })`, and only strengthens the host's setting), and the client
+refuses a host that cannot seal. `allowUnsealed: true` on either lifts it, and then a hop can read and change everything.
 
 **What is deliberately not shared**
 

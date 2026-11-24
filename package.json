@@ -49,6 +49,10 @@
       "types": "./src/capabilities.d.ts",
       "import": "./src/capabilities.mjs"
     },
+    "./duplex": {
+      "types": "./src/duplex.d.ts",
+      "import": "./src/duplex.mjs"
+    },
     "./identity": {
       "types": "./src/identity.d.ts",
       "import": "./src/identity.mjs"
