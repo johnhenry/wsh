@@ -369,6 +369,35 @@ pub struct IdentityPolicy {
     pub sealed: bool,
     /// Every other command that dials one host: seal the whole session or fail (`--sealed`, #155).
     pub sealed_session: bool,
+    /// `--cert-hash`: pin a WebTransport server to a certificate (SHA-256), no authority involved.
+    pub cert_hashes: Vec<[u8; 32]>,
+    /// `--insecure-skip-cert-verification`: do not verify a WebTransport server's certificate.
+    pub insecure_skip_cert_verification: bool,
+}
+
+/// Put the certificate flags into the config of one connection. They apply to WebTransport URLs
+/// only: a `wss://` fallback of the same target is checked against the system trust store as ever.
+pub fn apply_cert_flags(config: &mut ConnectConfig, p: &IdentityPolicy, url: &str) {
+    if transport_label(url) != "wt" {
+        return;
+    }
+    let mut pins = p.cert_hashes.iter().copied();
+    config.cert_hash = pins.next();
+    config.cert_hashes = pins.collect();
+    config.insecure_skip_cert_verification = p.insecure_skip_cert_verification;
+}
+
+/// A certificate flag with no WebTransport URL to apply it to would protect nothing: refuse it
+/// instead of dialling a `wss://` connection the person thinks is pinned.
+pub fn check_cert_flags_apply(p: &IdentityPolicy, urls: &[String]) -> Result<()> {
+    let given = !p.cert_hashes.is_empty() || p.insecure_skip_cert_verification;
+    if given && !urls.iter().any(|u| transport_label(u) == "wt") {
+        anyhow::bail!(
+            "--cert-hash and --insecure-skip-cert-verification apply to WebTransport (https://) only, \
+             and this connection uses wss:// (a wss:// certificate is checked against the system trust store)"
+        );
+    }
+    Ok(())
 }
 
 /// Whether `wsh reverse-connect` offers to prove its identity to the peer.
@@ -449,6 +478,7 @@ pub async fn connect_checked(
     use std::io::IsTerminal;
     let mut config = config.clone();
     apply_identity_policy(&mut config);
+    apply_cert_flags(&mut config, &identity_policy(), url);
     let mut result = WshClient::connect(url, config.clone()).await;
     if let Err(wsh_client::WshError::HostKeyUnknown { fingerprint, .. }) = &result {
         let fingerprint = fingerprint.clone();
@@ -528,6 +558,11 @@ pub async fn connect_client_with(
             .cloned()
             .map(|url| (transport_label(&url), url)),
     );
+
+    check_cert_flags_apply(
+        &identity_policy(),
+        &attempts.iter().map(|(_, u)| u.clone()).collect::<Vec<_>>(),
+    )?;
 
     let mut errors = Vec::new();
     for (label, url) in attempts {
@@ -702,6 +737,67 @@ fn transport_label(url: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── WebTransport certificate flags ────────────────────────────────
+
+    fn pinned_policy() -> IdentityPolicy {
+        IdentityPolicy {
+            cert_hashes: vec![[7; 32]],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pin_applies_to_webtransport_urls_and_never_to_websocket_ones() {
+        let policy = pinned_policy();
+        let mut wt = ConnectConfig::default();
+        apply_cert_flags(&mut wt, &policy, "https://host:4422");
+        assert_eq!(wt.cert_hash, Some([7; 32]));
+        let mut ws = ConnectConfig::default();
+        apply_cert_flags(&mut ws, &policy, "wss://host:4422");
+        assert_eq!(ws.cert_hash, None);
+        assert!(ws.cert_hashes.is_empty());
+    }
+
+    #[test]
+    fn several_pins_are_all_kept() {
+        let policy = IdentityPolicy {
+            cert_hashes: vec![[1; 32], [2; 32]],
+            ..Default::default()
+        };
+        let mut wt = ConnectConfig::default();
+        apply_cert_flags(&mut wt, &policy, "wt://host");
+        assert_eq!(wt.cert_hash, Some([1; 32]));
+        assert_eq!(wt.cert_hashes, vec![[2; 32]]);
+    }
+
+    #[test]
+    fn the_opt_out_is_off_unless_the_flag_was_given() {
+        let mut config = ConnectConfig::default();
+        apply_cert_flags(&mut config, &IdentityPolicy::default(), "https://host");
+        assert!(!config.insecure_skip_cert_verification);
+        let policy = IdentityPolicy {
+            insecure_skip_cert_verification: true,
+            ..Default::default()
+        };
+        apply_cert_flags(&mut config, &policy, "https://host");
+        assert!(config.insecure_skip_cert_verification);
+        let mut ws = ConnectConfig::default();
+        apply_cert_flags(&mut ws, &policy, "wss://host");
+        assert!(!ws.insecure_skip_cert_verification);
+    }
+
+    #[test]
+    fn a_certificate_flag_with_only_websocket_urls_is_an_error_not_ignored() {
+        let urls = vec!["wss://host:4422".to_string()];
+        assert!(check_cert_flags_apply(&pinned_policy(), &urls).is_err());
+        let both = vec![
+            "https://host:4422".to_string(),
+            "wss://host:4422".to_string(),
+        ];
+        assert!(check_cert_flags_apply(&pinned_policy(), &both).is_ok());
+        assert!(check_cert_flags_apply(&IdentityPolicy::default(), &urls).is_ok());
+    }
 
     #[test]
     fn resolve_target_defaults_to_webtransport_then_websocket() {

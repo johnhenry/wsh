@@ -39,6 +39,26 @@ An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence o
   it did before. A released Rust client (`rust-v0.16.0`) likewise looks for `rpc` and refuses. A released relay (JS or Rust) forwards `SessionData` and `GatewayCredit`
   as it always has. The Rust halves follow in the entry above.
 
+### **Breaking** (Rust client): the Rust client now verifies the server's certificate on WebTransport connections
+
+`wsh` and `wsh-client` now validate the certificate of an `https://` (WebTransport) server against the system trust store. **Who is affected:** anyone who uses the Rust client over
+WebTransport against a server whose certificate is not signed by an authority the system trusts (for example a `wsh-server --generate-cert` certificate). **What to do:** pin the
+certificate with `--cert-hash <sha256>` (below), or point the client at a CA-signed certificate. A `wss://` connection is unchanged: it was already validated.
+
+- **New: `--cert-hash <SHA256>`** (global flag, repeatable) on `wsh`, and `ConnectConfig.cert_hash` / `ConnectConfig.cert_hashes` for the library: the server's certificate must
+  have one of these SHA-256 hashes, no certificate authority involved, with the rules of the JS client's `serverCertificateHashes` (ECDSA P-256 key, validity of at most 14 days;
+  `--generate-cert` makes such a certificate). The value is 64 hex digits, colons allowed, or the whole `SHA256 Fingerprint=...` line `openssl x509 -fingerprint -sha256` prints.
+  `wsh-server` now logs its certificate hash at start-up. With exactly one pin the connection also has the `cert-hash` channel-binding kind (it was available to a library caller
+  before, but nothing checked the certificate it named).
+- **New: `--insecure-skip-cert-verification`** (`ConnectConfig.insecure_skip_cert_verification`), for development only: the certificate is not checked and a warning is printed
+  on every connection. It is refused together with `--cert-hash`, and with a password login (a password login cannot be sealed end to end, so the password would go to whoever
+  answers the unverified connection); a login by key is still covered by `known_hosts` / `--host-key`.
+- `--cert-hash` or the opt-out with a `wss://` URL is an error, not ignored. A target that is tried over WebTransport and then `wss://` applies them to the WebTransport attempt only.
+- **Wire:** none. **A released peer:** nothing is negotiated; a released `wsh-server` and a JS host are unaffected, and a released `wsh` keeps its old behaviour.
+- Tests: `crates/wsh-client` runs a real in-process WebTransport server with a fresh self-signed certificate: refused by default, accepted with its hash, refused with a wrong hash,
+  accepted (with one warning per connection) under the opt-out, and the configuration rules (`cert_policy`) and the hash parser; the CLI's flag handling in `commands/common.rs`.
+  The default was broken once to see its test fail.
+
 ## 0.45.0 / Rust `rust-v0.16.0`
 
 ### Rust `wsh-server`: UDP flows as WebTransport datagrams, `gateway-datagram` (#124, #145, the last open item of the parity epic; Rust only)
