@@ -212,6 +212,11 @@ export function snapshot(ref: any, options?: { depth?: number; maxBytes?: number
  * Listen for an event of a remote source named by the host's `allow.on`. `data` is plain: an Event as `{ type, timeStamp, isTrusted, ...fields }`, an emitter's as
  * `{ type, args }`. `dropped` counts events the host dropped before this one. Resolves to the function that unsubscribes. Never an event object, never a handle.
  */
+/**
+ * `ref` is a path reached from a root, or a reference that stands on a handle (`use(handle).bus`): the source is then the handle's producing path extended as
+ * written, and needs its own `allow.on` entry naming the type, the key's `objects:ROOT:on` and `authorize`. The subscription ends when the handle is released.
+ * A host before 0.51.0 does not say it supports this (`unsupported`).
+ */
 export function on(ref: any, type: string, listener: (data: any, info: { type: string; seq: number; dropped: number }) => void, options?: { fields?: string[]; onError?: (error: unknown) => void }): Promise<() => Promise<void>>;
 /** Stop a subscription: what `on` resolved to. */
 export function off(unsubscribe: () => Promise<void>): Promise<void>;

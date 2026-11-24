@@ -177,7 +177,7 @@ describe('the host says what it supports; a client does not lose a callback or a
     assert.deepEqual((await c.request('roots', {})).features, ['events', 'callbacks']);
     const [c2, s2] = createDuplexPair();
     createObjectsServer({ roots: { window: {} }, allow: {}, random, handles: { window: {} } }).attach(s2);
-    assert.deepEqual((await c2.request('roots', {})).features, ['events', 'callbacks', 'handles']);
+    assert.deepEqual((await c2.request('roots', {})).features, ['events', 'callbacks', 'handles', 'handle-events']);
     closers.push(async () => { c.close(); s.close(); c2.close(); s2.close(); });
   });
 
