@@ -48,6 +48,10 @@ hostKeyStore?, onSession, onRefused })`, `webmcpTools({ window, allow, approve, 
   and Rust client (`rust-v0.16.0`) refuse it exactly as they refuse any virtual-mode rpc host (they look for `rpc`); use this release's client or `wsh-mcp --sealed`. `wsh-server` is unchanged.
 - **Bundle:** `@johnhenry/wsh/page` is 80.8 kB gzipped (it contains the memory host); the other entry points grew by about 100 bytes gzip each at most, from the two small additions to the shared rpc context.
 
+### Fix: `wsh-server` could lose WebTransport control messages when a frame arrived in pieces (Rust)
+
+The post-login loop of a WebTransport connection waited for the next length-prefixed frame with a read that is not safe to abandon. When another event (a reply to push, a shutdown) was ready while a frame was half read, the bytes already taken were thrown away and the stream was out of step from then on, so later messages were misread or never arrived. It showed under load with frames larger than a packet (a 5000-byte UDP payload on the control stream, the test `udp_datagrams = false keeps every flow on the control stream`). The frame is now accumulated across reads, so nothing read is lost. No wire change.
+
 ### Behaviour change: `WSH_INSECURE_LOOPBACK_TLS` now applies to loopback destinations only (Rust client and CLI)
 
 The variable (`1` or `true`) skips `wss://` certificate verification, and until now it did so for any host while it was set, whatever its name suggested. It now applies

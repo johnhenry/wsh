@@ -2306,6 +2306,9 @@ impl WshServer {
         mut peer_rx: mpsc::Receiver<Envelope>,
     ) -> WshResult<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // The partly read frame lives here, outside the `select!`: a frame that spans several QUIC reads is not lost
+        // when another arm wins while it is half read.
+        let mut frames = WtFrameReader::default();
 
         loop {
             tokio::select! {
@@ -2332,7 +2335,7 @@ impl WshServer {
                         .map_err(|e| WshError::Transport(format!("WebTransport write: {e}")))?;
                 }
 
-                frame_result = read_webtransport_frame(recv) => {
+                frame_result = frames.next(recv) => {
                     match frame_result {
                         Ok(data) => {
                             let envelope = decode_envelope(&data)?;
@@ -5128,6 +5131,115 @@ async fn read_webtransport_frame(recv: &mut wtransport::RecvStream) -> WshResult
         .map_err(|e| WshError::Transport(format!("WebTransport read payload failed: {e}")))?;
 
     Ok(buf)
+}
+
+/// Length-prefixed frames off a WebTransport stream, safe to wait on inside `tokio::select!`.
+///
+/// `read_webtransport_frame` uses `read_exact`, which is not cancel safe: if another `select!` arm wins while a frame is
+/// half read, the bytes already taken are gone and the stream is out of step (every later frame misread). This reader
+/// keeps what it has read between calls and only awaits `read`, which is cancel safe.
+#[derive(Default)]
+struct WtFrameReader {
+    buf: Vec<u8>,
+}
+
+impl WtFrameReader {
+    const MAX_FRAME: usize = 1_048_576;
+
+    /// The next complete frame already buffered, if any.
+    fn take(&mut self) -> WshResult<Option<Vec<u8>>> {
+        if self.buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+        if len > Self::MAX_FRAME {
+            return Err(WshError::InvalidMessage(format!(
+                "frame too large: {len} bytes"
+            )));
+        }
+        if self.buf.len() < 4 + len {
+            return Ok(None);
+        }
+        let frame = self.buf[4..4 + len].to_vec();
+        self.buf.drain(..4 + len);
+        Ok(Some(frame))
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Cancel safe: dropping the future loses nothing that was read.
+    async fn next(&mut self, recv: &mut wtransport::RecvStream) -> WshResult<Vec<u8>> {
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            if let Some(frame) = self.take()? {
+                return Ok(frame);
+            }
+            match recv.read(&mut chunk).await {
+                Ok(Some(n)) => self.push(&chunk[..n]),
+                Ok(None) => {
+                    return Err(WshError::Transport(
+                        "WebTransport read failed: stream finished".into(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(WshError::Transport(format!(
+                        "WebTransport read failed: {e}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wt_frame_reader_tests {
+    use super::*;
+
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut v = (payload.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn a_frame_split_at_every_byte_comes_out_whole_and_in_order() {
+        let mut wire = frame(&[1u8; 100]);
+        wire.extend(frame(&[2u8; 5000]));
+        wire.extend(frame(&[]));
+        let mut r = WtFrameReader::default();
+        let mut got = Vec::new();
+        for b in &wire {
+            r.push(&[*b]);
+            while let Some(f) = r.take().unwrap() {
+                got.push(f);
+            }
+        }
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], vec![1u8; 100]);
+        assert_eq!(got[1], vec![2u8; 5000]);
+        assert!(got[2].is_empty());
+        assert!(r.take().unwrap().is_none() && r.buf.is_empty());
+    }
+
+    #[test]
+    fn a_half_read_frame_is_kept_not_dropped() {
+        let wire = frame(&[7u8; 300]);
+        let mut r = WtFrameReader::default();
+        r.push(&wire[..150]);
+        assert!(r.take().unwrap().is_none());
+        // (a `select!` arm won here: the reader is still the same value)
+        r.push(&wire[150..]);
+        assert_eq!(r.take().unwrap().unwrap(), vec![7u8; 300]);
+    }
+
+    #[test]
+    fn an_oversized_frame_is_refused_from_its_length() {
+        let mut r = WtFrameReader::default();
+        r.push(&(2_000_000u32).to_be_bytes());
+        assert!(r.take().is_err());
+    }
 }
 
 // ── #38 Phase 2: WISP reverse-connect end-to-end proof ──────────────────
