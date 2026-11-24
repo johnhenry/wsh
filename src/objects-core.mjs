@@ -613,6 +613,13 @@ export function createObjectsServer(options = {}) {
   async function releaseHandle(params, ctx) {
     const { session } = ctx;
     if (typeof params.handle !== 'string' || !session.handles.delete(params.handle)) throw invalid('no such handle (it was released, belongs to another session, or never existed)');
+    // The event subscriptions made through the handle end with it: the listeners leave the page's sources, and what they had queued is dropped.
+    for (const [id, sub] of [...session.subs]) {
+      if (sub.handle !== params.handle) continue;
+      session.subs.delete(id);
+      removeSub(sub);
+      session.queue = session.queue.filter((q) => q.sub !== sub);
+    }
     return { ok: true };
   }
 
@@ -826,7 +833,12 @@ export function createObjectsServer(options = {}) {
 
   async function subscribe(params, ctx) {
     const { session } = ctx;
-    const root = requireRoot(params);
+    // Where the source is looked for starts at a root, or at a handle of THIS channel: a handle stands at the path that produced it, and what is subscribed to is that
+    // path extended by `params.path`, judged exactly as a path subscription for it (its own `allow.on` entry naming the type, the key's `on`, `authorize`).
+    const start = startOf(params, ctx);
+    const { root } = start;
+    const handleId = params.handle;
+    const handleRec = handleId === undefined ? null : session.handles.get(handleId);
     const type = params.type;
     if (typeof type !== 'string' || !EVENT_TYPE_RE.test(type)) throw invalid('an event type is a name of letters, digits and _ $ : . - (up to 128)');
     const id = params.id;
@@ -836,11 +848,16 @@ export function createObjectsServer(options = {}) {
     const offered = [...(eventFields[type] ?? []), ...(eventFields['*'] ?? [])];
     for (const f of asked) if (!offered.includes(f)) throw refuse('not-allowed', `refused: the field "${f}" of ${type} events is not offered by this host`, { field: f, type });
     if (session.subs.size >= limits.maxSubscriptions) throw limitError('maxSubscriptions', limits.maxSubscriptions, 'too many event subscriptions on this channel');
-    const { cur: source, segs } = await walk({ root, cur: roots[root], segs: [root] }, params.path ?? [], ctx);
+    const { cur: source, segs } = await walk(start, params.path ?? [], ctx);
     await check('on', root, segs, ctx, { terminal: true, type });
+    // The checks above may have waited (`authorize`): the handle may have been released, the channel may have ended, another subscribe may have taken the last place.
+    if (session.closed) throw refuse('gone', 'refused: the channel ended');
+    if (handleRec &&session.handles.get(handleId) !== handleRec) throw invalid('no such handle (it was released, belongs to another session, or never existed)');
+    if (session.subs.has(id)) throw invalid('a subscription id is a whole number the channel has not used');
+    if (session.subs.size >= limits.maxSubscriptions) throw limitError('maxSubscriptions', limits.maxSubscriptions, 'too many event subscriptions on this channel');
     const kind = sourceMethods(source);
     if (!kind) throw new ObjectsError(OBJECTS_ERROR.FAILED, `${segs.join('.')} is not an event source (it needs addEventListener, or on and off)`, { reason: 'not-an-event-source' });
-    const sub = { id, type, kind: kind.kind, fields: [...new Set(asked)], source, stamps: [], dropped: 0, seq: 0, remove: kind.remove, listener: null };
+    const sub = { id, type, kind: kind.kind, fields: [...new Set(asked)], source, stamps: [], dropped: 0, seq: 0, remove: kind.remove, listener: null, handle: handleRec ? handleId : undefined };
     sub.listener = (...args) => deliver(session, sub, args);
     try { Reflect.apply(Reflect.get(Object(source), kind.add, source), source, [type, sub.listener]); } catch (e) { throw wrapThrown(e, `${segs.join('.')}.${kind.add}`); }
     session.subs.set(id, sub);
@@ -897,7 +914,7 @@ export function createObjectsServer(options = {}) {
     // The host also says what it supports (additive: an older client ignores it), so a client does not send a function to a host that would drop it, nor misread a handle.
     method('roots', async (_params, call) => ({
       roots: rootNames.filter((name) => keyMay(call, name, 'walk')),
-      features: ['events', 'callbacks', ...(handleRoots.size ? ['handles'] : [])],
+      features: ['events', 'callbacks', ...(handleRoots.size ? ['handles', 'handle-events'] : [])],
     }));
     method('resolve', resolve);
     method('set', setValue);
@@ -1196,13 +1213,14 @@ export async function on(ref, type, listener, { fields, onError } = {}) {
   const { state, keys } = pathOf(ref, 'on');
   if (typeof listener !== 'function') throw new TypeError('on needs a listener function: listener(data, { type, seq, dropped })');
   const { session } = state;
-  if (state.handle !== undefined) throw new TypeError('events are not offered through a handle: name the source by its path');
   if (!session.features?.includes('events')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support events (it did not say so)', { reason: 'unsupported' });
+  // Through a handle: a host before 0.51.0 would not know the request, so it is not sent unless the host said it supports it.
+  if (state.handle !== undefined && !session.features.includes('handle-events')) throw new ObjectsError(OBJECTS_ERROR.FAILED, 'this host does not support events through a handle (it did not say so): name the source by its path instead', { reason: 'unsupported' });
   const id = session.nextSub++;
   // Registered before the request: an event can follow the answer at once.
-  session.subs.set(id, { listener, onError, type });
+  session.subs.set(id, { listener, onError, type, handle: state.handle });
   try {
-    await session.peer.request('subscribe', { id, root: state.root, path: keys, type, ...(fields ? { fields } : {}) });
+    await session.peer.request('subscribe', { id, ...target(state), path: keys, type, ...(fields ? { fields } : {}) });
   } catch (e) { session.subs.delete(id); throw asObjectsError(e, session); }
   return async function off() {
     if (!session.subs.delete(id)) return;
@@ -1284,6 +1302,8 @@ export async function release(handle) {
   if (!rec) throw new TypeError('release needs a handle, or a function that was passed as a callback');
   if (rec.released) return;
   rec.released = true;
+  // The host ends the subscriptions made through the handle with it: forget them here too.
+  for (const [id, sub] of [...rec.session.subs]) if (sub.handle === rec.id) rec.session.subs.delete(id);
   try { await rec.session.peer.request('release', { handle: rec.id }); } catch (e) { throw asObjectsError(e, rec.session); }
 }
 

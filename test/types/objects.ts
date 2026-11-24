@@ -36,7 +36,7 @@ async function farSide(client: WshClient): Promise<void> {
   await release(cb);
   void createObjectsClient(createDuplexPeer({ send: () => {} }), { onCallbackError: (e) => { void e; }, onCallbackDropped: ({ dropped, fn }) => { void [dropped, fn]; } });
   const cart = await page.window.app.cart;
-  if (cart instanceof RemoteHandle) { void [cart.kind, cart.type, cart.preview?.keys]; await use(cart).add({ sku: 'A1' }); await release(cart); }
+  if (cart instanceof RemoteHandle) { void [cart.kind, cart.type, cart.preview?.keys]; await use(cart).add({ sku: 'A1' }); const stopCart = await on(use(cart).bus, 'ready', (data) => { void data; }); await off(stopCart); await release(cart); }
   await closeObjects(page);
 }
 void exposeObjects({ roots: { window: win }, allow: { on: ['window.app.bus@ready'] }, eventFields: { hashchange: ['newURL'] }, limits: { maxSubscriptions: 4, maxEventsPerSecond: 5 } });

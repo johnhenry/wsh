@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Events through a handle (#219; JS)
+
+`on(use(handle).path, type, listener)` (and `on(use(handle), type, listener)` when the handle is the source itself) subscribes to an event source reached through a handle of a root that opted in to handles. **Wire: one new optional parameter, `handle`, on the existing `subscribe` request of the `wsh-objects` rpc protocol, and one new string in the `features` list of the `roots` answer (`handle-events`, stated only by a host with a handles root). No new message type, channel or `ServerHello` feature.**
+
+- **The same rule as a path subscription, for the path that produced the handle, extended as written.** The host needs an `allow.on` entry that names that path and the type exactly (no wildcard in either), the key's `objects:ROOT:on` capability, and `authorize` (asked with the extended path and the type). `get` and `call` never imply it, and a handle to an object reached by another path does not inherit the entry. A node handle keeps its `nodes: true` and graph-member rules.
+- **It ends with the handle.** `release(handle)` removes the page's listener and drops what it had queued; the session ending, Stop, a navigation and a revoke end it as they end a path subscription. A handle released while its subscription was being authorized leaves no listener. The same bounds (`maxSubscriptions`, the rate, size and queue limits) and the same drop counting apply, shared with path subscriptions. The re-check after `authorize` also closes a race in which two simultaneous subscriptions could pass `maxSubscriptions`.
+- **Older peers.** A 0.50.0 client never writes a handle subscription (it refuses with a `TypeError`), so a new host is unaffected by it. A new client against a 0.50.0 host (which does not state `handle-events`) refuses with a named `unsupported` error and sends nothing, rather than sending a request the old host would answer as "no such root". Rust peers do not speak `wsh-objects`.
+- The `features` list a host with handles states is now `events`, `callbacks`, `handles`, `handle-events`.
+
 ### Rust: a `wsh-objects` client and `wsh objects` (#219; needs a Rust release, `rust-v0.18.0`)
 
 **Wire: nothing new.** The Rust client now speaks the existing `wsh-objects` rpc protocol (written down in `spec/objects.md`, shipped in the package) to a JS host: a page host behind a relay, or `exposeObjects` on a memory host. A released JS peer (0.50.0 and before) sees an ordinary client; a released Rust peer (`rust-v0.17.1`, `deny_unknown_fields`) has no objects client and is unaffected. The Rust server still serves no `wsh-objects`.
