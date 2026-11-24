@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.47.0
+
+npm only (no Rust crate changed since `rust-v0.17.1`). New API: `@johnhenry/wsh/objects` events, and `objects:ROOT[:OP]` key capabilities. **A key line with an `objects:` capability is refused by older JS hosts (0.46.x and before) and by `wsh-server`** (unknown capability: the key does not log in): use this release on the host before adding one.
 
 ### `wsh-objects` events in values mode: `on(ref, type, listener)` (#190; JS)
 
