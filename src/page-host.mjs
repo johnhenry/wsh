@@ -69,31 +69,34 @@ function exposedRoots(window, expose) {
   const names = Object.keys(expose);
   if (names.length === 0) throw new TypeError('createPageHost: expose names no root');
   const roots = {};
-  const allow = { get: [], call: [], set: [] };
+  const allow = { get: [], call: [], set: [], on: [] };
   const authorizers = new Map();
+  const eventFields = {};
   let limits;
   for (const name of names) {
     const cfg = expose[name];
     if (!isObj(cfg)) throw new TypeError(`createPageHost: expose.${name} must be { mode, allow }`);
-    if (cfg.mode === 'handles') throw new TypeError("createPageHost: expose mode 'handles' is not built: only 'values' exists (handles, events and callbacks are a later step of #190)");
+    if (cfg.mode === 'handles') throw new TypeError("createPageHost: expose mode 'handles' is not built: only 'values' exists (handles and callbacks are a later step of #190)");
     if (cfg.mode !== undefined && cfg.mode !== 'values') throw new TypeError("createPageHost: expose mode must be 'values'");
     if (typeof cfg.allow === 'string') throw new TypeError('createPageHost: expose allow must be { get, call, set } (the wide-open form belongs to mode handles, which is not built)');
     const object = cfg.object ?? (name === 'window' ? window : undefined);
     if (object === undefined) throw new TypeError(`createPageHost: expose.${name}: only a root named "window" is the window; give { object } for another root`);
     roots[name] = object;
     for (const [op, list] of Object.entries(cfg.allow ?? {})) {
-      if (!(op in allow)) throw new TypeError(`createPageHost: expose.${name}.allow.${op} is not an operation (get, call, set)`);
+      if (!(op in allow)) throw new TypeError(`createPageHost: expose.${name}.allow.${op} is not an operation (get, call, set, on)`);
       if (!Array.isArray(list)) throw new TypeError(`createPageHost: expose.${name}.allow.${op} must be an array of path patterns`);
       for (const entry of list) {
         if (typeof entry !== 'string' || entry === '') throw new TypeError(`createPageHost: expose.${name}.allow.${op} entries must be non-empty strings (paths relative to ${name})`);
-        allow[op].push(`${name}.${entry}`);
+        // An event source is `path@type`; with no path (`'@hashchange'`) it is the root itself.
+        allow[op].push(op === 'on' && entry.startsWith('@') ? `${name}${entry}` : `${name}.${entry}`);
       }
     }
+    for (const [type, fields] of Object.entries(cfg.eventFields ?? {})) eventFields[type] = [...new Set([...(eventFields[type] ?? []), ...(Array.isArray(fields) ? fields : [])])];
     if (cfg.authorize !== undefined) { if (typeof cfg.authorize !== 'function') throw new TypeError(`createPageHost: expose.${name}.authorize must be a function`); authorizers.set(name, cfg.authorize); }
     if (cfg.limits !== undefined) limits = { ...limits, ...cfg.limits };
   }
   const authorize = authorizers.size ? (who, op) => (authorizers.has(op.root) ? authorizers.get(op.root)(who, { ...op, path: op.path }) : true) : undefined;
-  return { roots, allow, authorize, limits };
+  return { roots, allow, authorize, limits, eventFields };
 }
 
 /** The indicator in the page: one row per connected key, with the key's fingerprint and a Stop control. */
@@ -250,7 +253,7 @@ export async function createPageHost(options = {}) {
     guard: () => gone() ?? mcp.guard?.() ?? null,
   }) : null;
   const objectsHandler = exposed ? exposeObjects({
-    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, timers,
+    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, eventFields: exposed.eventFields, timers,
     guard: () => gone(),
   }) : null;
   /** What each handler tells and ends: the sessions of a key, or all of them. */

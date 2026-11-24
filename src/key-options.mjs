@@ -53,7 +53,10 @@ const fail = (code, reason) => ({ ok: false, code, reason });
 const NAME_CAP_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const TOOL_CAP_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/;
 const DOMAIN_RE = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
-const SIMPLE_CAPS = new Set(['exec', 'pty', 'relay', 'fs:read', 'fs:write']);
+const OBJECT_ROOT_RE = /^[A-Za-z_$][A-Za-z0-9_$-]{0,63}$/;
+/** The operations of `wsh-objects` a capability can name (`objects:ROOT:OP`). */
+const OBJECT_OPS = ['get', 'call', 'set', 'on'];
+const SIMPLE_CAPS =new Set(['exec', 'pty', 'relay', 'fs:read', 'fs:write']);
 
 const capFail = (code, reason) => ({ ok: false, code, reason });
 
@@ -132,6 +135,14 @@ function parseCapability(raw) {
   if (raw.startsWith('target:')) return named('target:', 'target', NAME_CAP_RE, true);
   if (raw.startsWith('mcp:')) return named('mcp:', 'mcp', TOOL_CAP_RE, true);
   if (raw.startsWith('rpc:')) return named('rpc:', 'rpc', NAME_CAP_RE, false);
+  if (raw.startsWith('objects:')) {
+    // objects:ROOT or objects:ROOT:OP (#190): a root of `wsh-objects` (or `*`), and optionally one operation on it. JS hosts only.
+    const parts = raw.slice('objects:'.length).split(':');
+    const [root, op, ...rest] = parts;
+    if (rest.length || !(root === '*' || OBJECT_ROOT_RE.test(root))) return bad('expected objects:<root>[:<get|call|set|on>]');
+    if (op !== undefined && !OBJECT_OPS.includes(op)) return bad(`the operation must be one of ${OBJECT_OPS.join(', ')}`);
+    return { ok: true, cap: { raw, kind: 'objects', name: root, op: op ?? null } };
+  }
   return capFail('unknown-capability', `unknown capability ${JSON.stringify(raw)}`);
 }
 
@@ -340,6 +351,8 @@ function capabilityRefusal(p, req) {
         // A handler that narrows by capability itself (`capabilityScoped`, req.scoped) may be opened by a key that names any
         // tool; every other `mcp` handler would show a `mcp:search` key all of its tools, so it still needs `mcp:*`.
         else if (proto === 'mcp') r = req.scoped ? need('mcp:<tool>', has('mcp')) : need('mcp:*', caps.some((c) => c.kind === 'mcp' && c.name === '*'));
+        // Same for `wsh-objects`: a key that names roots (`objects:window:get`) may open it without `rpc:wsh-objects`, and is limited to them.
+        else if (proto === 'wsh-objects' && req.scoped) r = need('rpc:wsh-objects', has('objects') || caps.some((c) => c.kind === 'rpc' && c.name === proto));
         else r = need(`rpc:${proto}`, caps.some((c) => c.kind === 'rpc' && c.name === proto));
       } else r = need(req.channel, false);
       return r ?? target();
@@ -350,6 +363,13 @@ function capabilityRefusal(p, req) {
     }
     case 'mcp': return need('mcp:*', has('mcp'));
     case 'mcp-call': case 'mcp-tool': return need(`mcp:${req.tool}`, caps.some((c) => c.kind === 'mcp' && nameMatches(c, req.tool)));
+    // An operation of `wsh-objects` on a root (`op`: get, call, set, or `walk`: reading on the way to something): a key that names no root
+    // with `objects:` is limited by `rpc:wsh-objects` alone (all roots, as before); one that names roots is limited to them.
+    case 'objects': {
+      const named = caps.filter((c) => c.kind === 'objects');
+      if (!named.length) return need('rpc:wsh-objects', caps.some((c) => c.kind === 'rpc' && c.name === 'wsh-objects'));
+      return need(`objects:${req.root}${req.op === 'walk' ? '' : `:${req.op}`}`, named.some((c) => nameMatches(c, req.root) && (req.op === 'walk' || c.op === null || c.op === req.op)));
+    }
     case 'relay': return need('relay', has('relay'));
     // Installing a key gives a key with no capability list, so a key with one never may.
     case 'key-admin': return { code: 'key-admin-not-permitted', reason: 'installing a key is not permitted for a restricted key' };
@@ -426,7 +446,7 @@ function optionsRefusal(p, req, activeSessions) {
     case 'mcp': case 'mcp-call': case 'mcp-tool': return p.mcp ? null : no('mcp-not-permitted', 'MCP not permitted for this key');
     case 'relay': return p.relay ? null : no('relay-not-permitted', 'relay not permitted for this key');
     // The gateway, endpoints and targets are not scoped by the options (only by capabilities).
-    case 'tcp': case 'udp': case 'dns': case 'listen-tcp': case 'unix': case 'listen-unix': case 'endpoint': case 'target': return null;
+    case 'tcp': case 'udp': case 'dns': case 'listen-tcp': case 'unix': case 'listen-unix': case 'endpoint': case 'target': case 'objects': return null;
     // Installing another key (`AuthorizedKeyAdd`, which the Rust server serves): the new key has no options, so only a key that
     // is not restricted at all may add one -- a restricted key would otherwise mint an unrestricted one.
     case 'key-admin':
