@@ -238,9 +238,24 @@ window.h.pageTools = async () => {
   await tool('read_secret', 'Read something the page keeps to itself', { readOnlyHint: true }, () => ({ secret: 'not for the agent' }));
 };
 let pageHostHandle = null;
-window.h.startPageHost = async ({ relay, authorizedKeys, allow, approve }) => {
-  pageHostHandle = await wsh.createPageHost({ window, relay, name: 'shop-tab', authorizedKeys, mcp: { allow, ...(approve ? { approve } : {}) } });
+window.h.startPageHost = async ({ relay, authorizedKeys, allow, approve, expose }) => {
+  pageHostHandle = await wsh.createPageHost({
+    window, relay, name: 'shop-tab', authorizedKeys,
+    ...(allow ? { mcp: { allow, ...(approve ? { approve } : {}) } } : {}),
+    ...(expose ? { expose } : {}),
+  });
   return { fingerprint: pageHostHandle.fingerprint, origin: pageHostHandle.origin };
+};
+/** An application object for object access to reach into, a title, and a cookie that must stay unreachable. */
+window.h.pageApp = () => {
+  document.title = 'Planted Shop Title';
+  document.cookie = 'sid=planted-cookie-value; path=/';
+  window.__calls = [];
+  window.app = {
+    cart: { items: [{ sku: 'A1', qty: 1 }], add(item) { window.__calls.push(item); this.items.push(item); return { count: this.items.length }; } },
+    state: { user: 'alice', flags: { beta: true } },
+    secret: 'planted-app-secret',
+  };
 };
 window.h.pageHostInfo = () => ({ sessions: pageHostHandle.sessions.map((s) => s.fingerprint), closed: pageHostHandle.closed, closedReason: pageHostHandle.closedReason, cart: window.__cart, ran: window.__ran.map((r) => r.name) });
 window.h.stopPageHost = () => pageHostHandle?.close();

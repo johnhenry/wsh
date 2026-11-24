@@ -1,6 +1,9 @@
 import type { RpcChannel } from './index.js';
 import type { WshRpcContext } from './server/index.js';
 import type { WshOnRefused } from './host.js';
+import type { ObjectsAllow, ObjectsWho, ObjectsOperation, ObjectsLimits } from './objects.js';
+
+export { exposeObjects } from './objects.js';
 
 /** The part of a `Window` (or `WorkerGlobalScope`, or a test double) this entry point reads. Everything is optional except what the call needs. */
 export interface WshPageWindow {
@@ -157,8 +160,14 @@ export interface WshPageHostOptions {
   name: string;
   /** Who may log in: `authorized_keys` lines (options such as `capabilities="mcp:search"` apply) or raw 32-byte keys. Required. */
   authorizedKeys: string | Uint8Array | Array<string | Uint8Array>;
-  /** The page's WebMCP tools as MCP. */
-  mcp: Omit<WebMcpToolsOptions, 'window' | 'guard' | 'timers'>;
+  /** The page's WebMCP tools as MCP. At least one of `mcp` and `expose` is needed. */
+  mcp?: Omit<WebMcpToolsOptions, 'window' | 'guard' | 'timers'>;
+  /**
+   * Object access (`wsh-objects`, `values` mode), off unless written: named roots, each with its allow-lists by operation (paths RELATIVE to the root:
+   * `'document.title'`, `'app.**'`; nothing allowed by default). A root named `window` is the window that was passed; another name needs `object`.
+   * `mode: 'handles'` is refused: not built. See `@johnhenry/wsh/objects`.
+   */
+  expose?: Record<string, { mode?: 'values'; allow?: ObjectsAllow; authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>; limits?: Partial<ObjectsLimits>; object?: object }>;
   /** `true` (default): the badge in `window.document`. Callbacks: for a context with no document, or your own UI. `false` needs `unattended: true`. */
   indicator?: boolean | WshPageIndicatorCallbacks;
   /** Nobody is in front of this window. Allows `indicator: false` and a window with no document; what needs approval is then denied unless `mcp.prompt` answers. */

@@ -33,6 +33,10 @@
       "types": "./src/page-host.d.ts",
       "import": "./src/page-host.mjs"
     },
+    "./objects": {
+      "types": "./src/objects.d.ts",
+      "import": "./src/objects.mjs"
+    },
     "./mcp-stdio": {
       "types": "./src/mcp-stdio.d.ts",
       "import": "./src/mcp-stdio.mjs"

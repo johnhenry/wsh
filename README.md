@@ -636,7 +636,8 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/memory` (whole entry point) | 227.2 kB | 70.6 kB |
 | `@johnhenry/wsh/host` (whole entry point) | 124.0 kB | 40.8 kB |
 | `@johnhenry/wsh/reverse` (whole entry point) | 215.8 kB | 66.4 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 253.4 kB | 79.8 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 274.9 kB | 86.7 kB |
+| `@johnhenry/wsh/objects` (whole entry point) | 156.7 kB | 47.6 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 133.2 kB | 39.7 kB |
 | `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 100.7 kB | 32.9 kB |
@@ -690,7 +691,7 @@ registered (`window.document.modelContext`, the older `window.navigator.modelCon
 (`window.document`), which `WebSocket` dials the relay, and whose origin is reported. A test greps the entry point's source for
 `globalThis`, `document`, `navigator`, timers and so on. So the same code serves an iframe's `contentWindow`, a popup, a worker's `self`
 (no document: supply `indicator` callbacks and a `prompt`, or say `unattended: true`), or a fake window in a test. **Passing `window` is not
-exposing it**: nothing of the page's object graph is reachable. One window per host; serving two is two hosts with two names. The host
+exposing it**: nothing of the page's object graph is reachable unless `expose` is written as well (see [Remote objects](#remote-objects-johnhenrywshobjects-190)). One window per host; serving two is two hosts with two names. The host
 **never follows a navigation to another origin**: when `window.location.origin` changes (or cannot be read, as for a frame that went
 cross-origin) or the window closes, it tells the operator why, ends the sessions and closes (`host.closedReason`, `onClose`). It checks on
 `pagehide`, every second, and before every call. A host that runs in another realm than the window it serves (an opener serving a
@@ -755,7 +756,83 @@ earlier load will not match and trust-on-first-use gives no continuity. To keep 
 - **The approval dialog is the page's own.** A page script (or a tool) can remove, cover or click it; the indicator is put back, not guarded. The bridge protects the person from a remote
   caller, not from code already running in the page.
 - A host that is left open (`reconnect`, the default) can be reached by anyone who holds the rendezvous id **and** an authorized key; the id is a secret, not a credential.
-- What is not offered: exec, files, gateway, the object graph of the page (`window` is not exposed; that is a different, later feature), more than one operator at a time.
+- What is not offered: exec, files, gateway, more than one operator at a time, and (unless `expose` is written) any access to the page's objects. With `expose`, what that adds is stated in
+  [Remote objects](#remote-objects-johnhenrywshobjects-190); `createPageHost({ expose })` then also serves the `wsh-objects` channel, under its own capability (`rpc:wsh-objects`),
+  with the same sealing, indicator, Stop and window guard.
+
+### Remote objects: `@johnhenry/wsh/objects` (#190)
+
+`wsh-objects` is an rpc protocol that reaches an object graph by path: a page's `window`, a worker's `self`, any object a host names as a **root**. It is `values` mode:
+only plain cloneable values ever cross (there are no handles, no events and no callbacks yet; `mode: 'handles'` is refused with a sentence saying it is not built).
+Nothing is reachable but the named roots, and nothing in them is allowed until an allow-list says so.
+
+```js
+// the host: any host that takes `rpc` (a Node server, a memory host, a reverse host, a page host)
+import { exposeObjects } from '@johnhenry/wsh/objects';
+createMemoryHost({ auth, hostKey: true, dataStreams: false, sealSession: 'require', rpc: {
+  'wsh-objects': exposeObjects({
+    roots: { window },                                          // named roots: all that is reachable
+    mode: 'values',
+    allow: {                                                    // by operation, as paths from a root; `*` is one segment, `**` any number
+      get:  ['window.document.title', 'window.location.href', 'window.app.**'],
+      call: ['window.app.**'],                                  // covers construct
+      set:  ['window.app.settings.theme'],
+    },
+    authorize(who, op) { return true; },                        // asked for each operation the allow-list let through: { kind, root, path, text }
+    limits: { maxOps: 32, maxValueBytes: 262144 },
+  }) } });
+
+// the far side (importing the entry point also adds client.openObjects())
+import { get, set, call, construct, snapshot, describe } from '@johnhenry/wsh/objects';
+const { window: win } = await client.openObjects();            // the roots, as lazy references
+await win.document.title;                                       // a reference is a lazy path: this one `await` sends ONE `resolve` request,
+await win.app.cart.items.length;                                // whatever the length of the chain, calls included
+await win.app.cart.add({ sku: 'A1', qty: 2 });                  // a call with plain-data arguments; `this` is the object the method was found on
+await set(win.document, 'title', 'Paid');                       // not `=`: an assignment cannot be awaited or report a refusal, so it throws a sentence naming set()
+await snapshot(win.app.state, { depth: 3, maxBytes: 256_000 }); // a bounded deep copy (subtrees past `depth` are null)
+await describe(win.app);                                        // names and types the allow-list could walk to, for a REPL or completion
+await get(win.app, 'then');                                     // a remote property really named "then" (`ref.then` is the awaiting function)
+```
+
+`createPageHost({ ..., expose: { window: { mode: 'values', allow: { get: ['document.title', 'app.**'], call: ['app.**'] } } } })` is the same thing on a page host (paths relative to the
+root, which is the `window` that was passed; another root needs `{ object }`), with the sealing, the indicator and Stop, the window guard and the key capability `rpc:wsh-objects`.
+The wire is `roots`, `resolve { root, ops: [{ get } | { call, args } | { construct, args }] }`, `set { root, path, value }`, `describe`, `snapshot { root, path, depth, maxBytes }` (a notification
+`closing { reason }` precedes a host's ending of a session); a value is `{ v }`, or `{ u: kind, type?, text? }` for what cannot be cloned. The core (`objects-core.mjs`: paths,
+serialisation, limits, allow-lists) knows nothing of wsh and needs only a duplex seam (`createDuplexPeer({ send })` is one over a bare `send` / `receive`; an `RpcChannel` is another);
+one test suite runs over both.
+
+**What crosses.** A result is plain data (null, booleans, numbers, strings, bytes as `Uint8Array`, arrays, plain objects; bounded in depth and bytes) or a **named non-value**: a
+function, a symbol, a bigint, a `Date`, a `RegExp`, an `Error`, a DOM node or any other object arrives as a `NonValue` (`{ kind, type?, text? }`, e.g. `{ kind: 'object', type: 'HTMLDivElement' }`), **never as a
+handle**. Inside an object or array a member that cannot be cloned is left out (`null` in an array), as JSON does; the keys `__proto__`, `constructor` and `prototype` are never copied; a circular
+reference is left out; an integer past 2^63 is named (it does not survive the integer encoding). What is sent *to* the host is plain data too, copied, and refused if an object has a prototype of its own or
+a refused key. A function, or a remote reference (a path, not a value), cannot be passed as an argument.
+
+**Always refused, in every list:** the path segments `__proto__`, `prototype`, `constructor`, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__`; `eval`, `Function`, `import`,
+`execScript`; `call`, `apply` and `bind` of a function (they re-aim it); `setTimeout`, `setInterval` and `setImmediate` with a string. An allow-list entry that names one is a configuration error.
+**Refused until an entry names them** (a wildcard such as `window.**` does not): `document.cookie`, `localStorage`, `sessionStorage`, `indexedDB`, `navigator.credentials`, `fetch`, `XMLHttpRequest`,
+`postMessage`, `open` (as a path segment anywhere, so an application method called `open` needs its own entry). **Per-operation allow-lists by path glob; nothing is allowed by default**, and with no `call`
+and no `set` entries the access is read-only for real. To walk to an allowed path a session may read the properties on the way (`window.app` toward `window.app.cart.items`) and no others; after a call the
+chain goes on the *result*, whose path is the callee with `()` (`window.app.getCart().items`). The order of checks is: the always-refused names, the allow-list, the entries that must name a path,
+`authorize(who, op)`, then the operation.
+
+**Bounds, each refused by name** (`limits`): `maxOps` 32 per request, `maxArgs` 16, `maxDepth` 8, `maxValueBytes` 262144 (and always under what the transport carries in one message), `maxKeys` 200
+for `describe`, `maxRequestsPerSecond` 50 per channel, `callTimeoutMs` 30000 for a call that returns a promise.
+
+**Threat model of `values` mode.** An allow-list of paths means what it says **only because nothing but cloneable values crosses**: a result can never be walked somewhere else, so what a session can
+reach is exactly the paths the lists name (and, below a `get`, the plain data inside that value). That holds up to what the named paths themselves do:
+- **Getters with side effects are still gets.** Reading an accessor property runs its getter, and setting one runs its setter; an entry that allows the path allows the effect. The copy of a value never runs a getter or a `toJSON`
+  (an accessor member is left out).
+- **A `call` runs the application's function with the caller's arguments**, with the page's authority: whatever it does, it does. List the functions you would hand to the caller. A wide entry means what it says:
+  `window.**` reaches `window.Object.assign`, `window.history.pushState` and every method of every object under it (it still excludes the refused names above).
+- A Proxy used as a root runs its own traps for the paths that pass the allow-list, and for no others.
+- The list is judged by path text. Give a root its real name: a root called `doc` that *is* the `document` is not recognised as `document.cookie` by the entries that must name it.
+- It does not protect against the page's own code, against a function reachable by a listed path doing something unlisted, or against what a person at the keyboard can see. The remote caller sees results, which may hold text
+  written by third parties.
+- A sealed session, a key login and a visible indicator (the page host) are what keep a relay and an unknown caller out; `authorize` is where an embedder asks the person.
+
+Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 47.6 kB gzipped (it contains the client), and
+the page entry point grows to 86.7 kB with it; no other entry point changed. Not built yet (later steps of #190): handles for what cannot be cloned, events and callbacks, a capability per root
+(`objects:ROOT`), typed remotes (`Remote<T>`), an MCP face for the allow-listed paths, and a dial-out form.
 
 ### WebTransport listener
 
@@ -2041,6 +2118,7 @@ than left to be found.
 | Dial target | a URL | `wsh [user@]host` (dials `https://` then `wss://` on `--port`), or a full URL: `wsh wss://host:8443/rendezvous/ab12 command`, `ws://127.0.0.1:PORT/` | **CLI-only convenience**: a URL is dialled exactly as given (no transport fallback; `--port` and `--transport` do not apply). Plain `ws://` is accepted only to a loopback host |
 | Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. `wsh scp` works against such a host with the Rust client of the next `rust-v` release (it speaks `FileChunk`, #140); a released `rust-v0.11.0` or older `wsh scp` hangs against it (`wsh ls` and exec work) |
 | A page's WebMCP tools served as MCP, behind a pipe relay (#190) | `createPageHost`, `webmcpTools`, `captureWebMcp` from `@johnhenry/wsh/page`; the far side is `wsh-mcp --sealed` or `openRpc('mcp')` | the far side works where the Rust client speaks virtual-mode rpc: it does not yet, so `wsh mcp` cannot reach a page host | **JS-only** host (a page); the far side is unchanged wire (`mcp` rpc in virtual mode, #191) |
+| Remote objects by path, `values` mode (#190): `wsh-objects`, `client.openObjects()` | `exposeObjects` / `createObjectsServer` / `createPageHost({ expose })` host side; `get`, `set`, `call`, `construct`, `snapshot`, `describe` far side (`@johnhenry/wsh/objects`) | none: the Rust client and `wsh-server` do not speak `wsh-objects`, and `wsh-server` has no handler for it | **JS-only**; an rpc protocol on the existing `rpc` channel (no new message or feature string), so a released peer simply does not offer or open it |
 | Interactive shell UI | none -- this SDK is a protocol client, not a terminal emulator; pair with xterm.js/ghostty-web | `wsh connect`, `wsh sftp` (line-oriented REPL) | **Deliberately not unified** -- a browser embeds a terminal widget the host page owns; a CLI process owns its own TTY |
 | Attach / resume | `attachSession()`, `resumeSession()`, `WshSession.seq` | `attach_session()`, `resume_session()` | **Wire-unified** (`Attach`/`Resume`/`Presence`); `seq` = cumulative output bytes. `@johnhenry/wsh/server` honours `last_seq` (bounded ring, gap errors) and answers Presence with `channel_id`/`seq`; the Rust `wsh-server` does the same (`rust-v0.2.0`+; fixed 256 KiB ring) |
 | Reverse-connect / relay peer | `connectReverse()`, `trustRelayPeer()`; `@johnhenry/wsh/server`: `relay` option and `createReverseHost()` | `wsh reverse`, `wsh agent` (persistent, with startup-unit install) | **Wire-unified** (registration, discovery, signed peer records); **daemonization is CLI-only** -- a browser tab cannot be a background OS service. The Node relay is default-deny and bridges one operator per peer unless `maxOperatorsPerPeer` is raised (`busy:` reasons say so); E2E and bridged feature gates need `rust-v0.3.0`+ on the Rust side. **Several operators per peer (#93): both relays** (`maxOperatorsPerPeer`; `[relay] max_operators_per_peer`, default 1) **and both peers** (`createReverseHost({ maxOperators })`; `wsh --max-operators n reverse` / `agent run`, default 1), negotiated by `relay-multi-operator`; a Rust peer serving several operators does not seal bridges (see the reverse-mode notes), and the Rust relay leaves a peer connected when its operator leaves. The signed `KeyExchange` (`e2e-sign`) is carried by the Rust relay too |
@@ -2233,6 +2311,10 @@ out explicitly below rather than left to be discovered.
   third-party text and are untrusted to the MCP client; the dialog and the indicator belong to the page and are not a defence against code
   already in it; a fresh host key per page load means no pin outlives it unless `hostKeyStore` is given) are stated in
   [A page as a host](#a-page-as-a-host-johnhenrywshpage-190).
+- **`wsh-objects` (`@johnhenry/wsh/objects`, #190) lets a key read, call and set the paths an allow-list names on the roots a host names, and nothing else.** An allow-list of paths means what it says
+  only because nothing but cloneable values crosses (no handles in `values` mode); what it cannot make safe is stated in
+  [Remote objects](#remote-objects-johnhenrywshobjects-190): a getter or a setter on an allowed path runs, a called function does whatever it does with the page's authority, a wide pattern means its width, and a
+  few paths (`document.cookie`, storage, `fetch`, ...) need an entry that names them. Object access is off on every host unless `exposeObjects` or `createPageHost({ expose })` is written, and `rpc:wsh-objects` is the key capability that gates it.
 - **`wsh-mcp` runs as a client with your key (#127).** It reads a private key file you point it at (no passphrase support: protect the
   file, `0600`), logs in as you and hands the MCP client everything the host's `mcp` channel serves; whatever the MCP client (or the
   model behind it) asks of those tools is done as you. It does not pin the host unless you pass `--host-key` (it warns once on stderr),

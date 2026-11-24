@@ -13,6 +13,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createPipeRelay } from '@johnhenry/wsh/pipe-relay';
 import { createPageHost, captureWebMcp } from '@johnhenry/wsh/page';
+import { set } from '@johnhenry/wsh/objects';
 import {
   WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, exportPrivateKeyPKCS8, fingerprint, mcpClientTransport, cborEncode, MSG,
 } from '@johnhenry/wsh';
@@ -98,8 +99,16 @@ describe('createPageHost: what it refuses to start without', () => {
     const callbacks = { connected() {}, disconnected() {} };
     await assert.rejects(createPageHost({ ...ok, window: createFakeWindow({ document: false }), indicator: callbacks }), /no document to ask the person/);
   });
-  it('expose (object access) is not offered here', async () => {
-    await assert.rejects(createPageHost({ ...ok, window: win(), expose: { window: {} } }), /expose.*not available/);
+  it('expose: handles mode, the wide-open string, a root that is not the window without an object, and an empty expose are refused with a sentence', async () => {
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles' } } }), /'handles' is not built/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: 'everything-i-understand-this-is-remote-control' } } }), /not built/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { app: { allow: { get: ['**'] } } } }), /only a root named "window" is the window/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: {} }), /names no root/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: { get: [''] } } } }), /non-empty strings/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: { read: ['x'] } } } }), /not an operation/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: { get: ['constructor.x'] } } } }), /never reachable/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: 5 }), /named roots/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined }), /nothing to serve/);
   });
   it('a window whose origin cannot be read, and one with no WebSocket', async () => {
     const w1 = win(); w1.location = undefined;
@@ -407,6 +416,121 @@ describe('the far side needs nothing new', () => {
   });
 });
 
+describe('object access through the page host (wsh-objects, values mode)', () => {
+  /** A window with something to read: a title, a cookie, an application object. */
+  function worldWindow() {
+    const win = createFakeWindow();
+    win.document.title = 'Shop';
+    win.document.cookie = 'sid=secret-cookie';
+    const calls = [];
+    win.app = { cart: { items: [{ sku: 'A1' }], add(item) { calls.push(item); this.items.push(item); return { count: this.items.length }; } }, secret: 'not listed' };
+    win.localStorage = { getItem: () => 'stored' };
+    return { win, calls };
+  }
+  const EXPOSE = { window: { mode: 'values', allow: { get: ['document.title', 'app.cart.**'], call: ['app.cart.add'], set: [] } } };
+
+  it('reads document.title and calls an allow-listed function through a sealed relayed session, and is refused document.cookie', async () => {
+    const { win, calls } = worldWindow();
+    const page = await startPage({ window: win, registered: [], host: { mcp: undefined, expose: EXPOSE }, mcp: undefined });
+    void page;
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    assert.equal(wsh.sessionSealed, true);
+    const { window: remote } = await wsh.openObjects();
+    assert.equal(await remote.document.title, 'Shop');
+    assert.deepEqual(await remote.app.cart.add({ sku: 'B2' }), { count: 2 });
+    assert.deepEqual(calls, [{ sku: 'B2' }]);
+    await assert.rejects(Promise.resolve(remote.document.cookie), (e) => e.reason === 'not-allowed' && /document\.cookie/.test(e.message));
+    await assert.rejects(Promise.resolve(remote.app.secret), (e) => e.reason === 'not-allowed');
+    await assert.rejects(Promise.resolve(remote.localStorage.getItem('k')), (e) => e.reason === 'not-allowed');
+    await assert.rejects(set(remote.document, 'title', 'x'), (e) => e.reason === 'not-allowed');
+    assert.equal(win.document.title, 'Shop');
+    // The MCP bridge was not asked for: that channel is not there.
+    await assert.rejects(wsh.openRpc('mcp'), /not supported|UNSUPPORTED/);
+    // And nothing else is: no exec, no files.
+    await assert.rejects(wsh.openSession({ type: 'exec', command: 'ls' }));
+  });
+
+  it('both facilities at once: mcp tools and object access, each its own channel, each with its own capability', async () => {
+    const { win } = worldWindow();
+    const page = await startPage({
+      window: win, authorizedKeys: [aliceLine, `capabilities="rpc:wsh-objects" ${bobLine}`, `capabilities="mcp:search" ${await exportPublicKeySSH((await generateKeyPair(true)).publicKey)}`],
+      host: { expose: EXPOSE }, mcp: { prompt: async () => true },
+    });
+    const a = await operator(page.host);
+    assert.equal((await a.mcp.listTools()).tools.length, 2);
+    assert.equal(await (await a.wsh.openObjects()).window.document.title, 'Shop');
+    await a.wsh.disconnect();
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+    // A key that holds only rpc:wsh-objects reads the page but cannot open the mcp channel.
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'bob', keyPair: bob, transport: 'ws', sealSession: true });
+    assert.equal(await (await wsh.openObjects()).window.document.title, 'Shop');
+    await assert.rejects(wsh.openRpc('mcp'), /capability/);
+  });
+
+  it('a key with mcp capabilities only cannot open object access', async () => {
+    const { win } = worldWindow();
+    const page = await startPage({ window: win, authorizedKeys: [`capabilities="mcp:*" ${aliceLine}`], host: { expose: EXPOSE } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    await assert.rejects(wsh.openObjects(), /capability|rpc:wsh-objects/);
+  });
+
+  it('a root other than the window needs its object, and its paths are relative to its name', async () => {
+    const { win } = worldWindow();
+    const store = { count: 3, bump() { this.count++; return this.count; } };
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: { store: { object: store, allow: { get: ['count'], call: ['bump'] } } } } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const pageRoots = await wsh.openObjects();
+    assert.deepEqual(Object.keys(pageRoots), ['store'], 'the window was not named, so it is not reachable');
+    assert.equal(await pageRoots.store.count, 3);
+    assert.equal(await pageRoots.store.bump(), 4);
+  });
+
+  it('the window leaving ends object sessions too, telling them why, and a call after the navigation is refused', async () => {
+    const { win } = worldWindow();
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: EXPOSE } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const { window: remote } = await wsh.openObjects();
+    assert.equal(await remote.document.title, 'Shop');
+    win.location = { origin: 'https://evil.example' };
+    await assert.rejects(Promise.resolve(remote.document.title), (e) => /navigated to another origin/.test(e.message));
+    page.timers.tick();
+    await until(() => page.host.closed, 'the host to close');
+    assert.match(page.host.closedReason, /another origin/);
+  });
+
+  it('Stop ends an object session and keeps the key out', async () => {
+    const { win } = worldWindow();
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: EXPOSE } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const { window: remote } = await wsh.openObjects();
+    await until(() => byRole(win, 'stop').length === 1, 'the indicator');
+    byRole(win, 'stop')[0].click();
+    await assert.rejects(Promise.resolve(remote.document.title), /stopped this session|closed/);
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+  });
+
+  it('authorize(who, op) of a root is asked, with the key of the caller', async () => {
+    const { win } = worldWindow();
+    const asked = [];
+    const page = await startPage({
+      window: win, registered: [], mcp: undefined,
+      host: { mcp: undefined, expose: { window: { ...EXPOSE.window, authorize: (who, op) => { asked.push([who.fingerprint, op.text]); return op.text !== 'window.app.cart.add'; } } } },
+    });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const { window: remote } = await wsh.openObjects();
+    assert.equal(await remote.document.title, 'Shop');
+    await assert.rejects(Promise.resolve(remote.app.cart.add({ sku: 'x' })), (e) => e.reason === 'authorize');
+    assert.deepEqual(asked, [[aliceFp, 'window.document.title'], [aliceFp, 'window.app.cart.add']]);
+  });
+});
+
 describe('pipe-url: the relay\'s two pure helpers, kept apart so a page does not bundle the relay', () => {
   it('agree with the relay module\'s own', async () => {
     const relayModule = await import('../src/pipe-relay.mjs');
@@ -441,7 +565,7 @@ describe('the entry point touches only the window it is given', () => {
     return out;
   }
   const AMBIENT = /(?<![.\w$])(globalThis|document|navigator|location|localStorage|sessionStorage|indexedDB|fetch|XMLHttpRequest|WebSocket|setTimeout|clearTimeout|setInterval|clearInterval|requestAnimationFrame|queueMicrotask|crypto|self|alert|confirm|history|postMessage)\b(?!\s*:)/g;
-  for (const file of ['page-host.mjs', 'webmcp.mjs']) {
+  for (const file of ['page-host.mjs', 'webmcp.mjs', 'objects-core.mjs']) {
     it(`src/${file} names no ambient global (window, window.document and window.navigator only)`, async () => {
       const source = await readFile(path.join(here, '..', 'src', file), 'utf8');
       const code = codeOf(source);

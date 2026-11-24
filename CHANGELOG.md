@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### `@johnhenry/wsh/objects`: remote objects by path, `values` mode, and `createPageHost({ expose })` (#190; JS)
+
+A host can now name objects as **roots** (a page's `window`, a worker's `self`, any object) and let a key read, call and set the paths an allow-list names. New entry point `@johnhenry/wsh/objects` and the rpc
+protocol `wsh-objects`: `exposeObjects({ roots, mode: 'values', allow: { get, call, set }, authorize(who, op), limits })` is the handler for any host's `rpc`; `client.openObjects()` (added by importing the
+entry point) returns the roots as lazy references; the helper functions `get`, `set`, `call`, `construct`, `snapshot`, `describe`, `closeObjects` are functions, not methods, so they never collide with a remote property.
+`createPageHost({ expose: { window: { mode: 'values', allow } } })` serves it on a page host, beside or without `mcp`.
+
+- **Pipelining:** a reference is a lazy path; `await` sends the whole chain (gets, calls, constructs) in ONE `resolve` request. There is no `eval`, so it works under a strict Content-Security-Policy. Assignment with `=` throws a
+  sentence naming `set()`; `ref.then` is the awaiting function and a remote property named `then` is reached with `get(ref, 'then')`.
+- **Only cloneable values cross, which is what makes an allow-list of paths mean what it says:** plain data and bytes come back as themselves; a function, symbol, `Date`, DOM node or other object comes back as a named
+  `NonValue`, never a handle. What is sent is plain data, copied, and refused if an object has a prototype of its own or a refused key.
+- **Always refused:** the segments `__proto__`, `prototype`, `constructor`, `__defineGetter__` and its three siblings, `eval`, `Function`, `import`, `execScript`; `call` / `apply` / `bind` of a function; timers given a string.
+  **Refused until an entry names them:** `document.cookie`, `localStorage`, `sessionStorage`, `indexedDB`, `navigator.credentials`, `fetch`, `XMLHttpRequest`, `postMessage`, `open` (a wildcard does not). Per-operation allow-lists by
+  path glob; nothing is allowed by default. Getters with side effects are still gets, and the README says so.
+- **Bounds, each refused by name:** `maxOps`, `maxArgs`, `maxDepth`, `maxValueBytes` (also kept under the transport's message size), `maxKeys`, `maxRequestsPerSecond`, `callTimeoutMs`.
+- **The core is transport-neutral** (`objects-core.mjs`; a duplex seam of `onRequest`, `request` with cancel, `notify`, `onClose`, a per-call identity and a maximum message size; `createDuplexPeer({ send })` is one over a bare
+  `send` / `receive`): one test suite runs over a bare in-memory duplex and over a wsh rpc channel.
+- **Not built (`mode: 'handles'` is refused with a sentence):** handles, events and callbacks, `objects:ROOT` capabilities, typed remotes. The key capability `rpc:wsh-objects` gates the channel today.
+- **A released peer.** No wire change: an rpc channel named `wsh-objects` on the existing `rpc` / `rpc-virtual` feature, advertised like any `rpc-protocol:<name>`. A released JS client (0.45.0) or Rust client (`rust-v0.16.0`)
+  can open it where the host serves stream-mode rpc, but has nothing that speaks it; a released host does not offer it. `wsh-server` does not serve `wsh-objects`.
+- **Bundle:** `@johnhenry/wsh/objects` is 47.6 kB gzipped; `@johnhenry/wsh/page` grows from 79.8 to 86.7 kB with it. No other entry point changed.
+
 ### `@johnhenry/wsh/page`: a page's WebMCP tools served as MCP behind a pipe relay (#190; JS)
 
 A web page can now be a wsh host for **the tools it has registered with WebMCP**, and an MCP client (`wsh-mcp --sealed`, or `client.openRpc('mcp')` with `mcpClientTransport`) can list

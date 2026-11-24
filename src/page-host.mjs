@@ -15,7 +15,9 @@
  * ```
  *
  * What a remote session can do is exactly: open the `mcp` rpc channel and list and call the tools named in `mcp.allow` (narrowed
- * further by the key's `capabilities="mcp:TOOL"`). There is no exec, no file access, no gateway. The session must be SEALED (the pipe
+ * further by the key's `capabilities="mcp:TOOL"`), and, if `expose` is written, open the `wsh-objects` channel and read, call and set the
+ * paths its allow-lists name on the roots it names (`rpc:wsh-objects` is the capability for that channel). Nothing is exposed by default,
+ * and passing `window` is not exposing it. There is no exec, no file access, no gateway. The session must be SEALED (the pipe
  * relay then sees ciphertext only), a visible indicator with a Stop control is in the page while anyone is connected, and a
  * consequential tool waits for the person at the page to allow it. What this cannot make safe is in the README's Security model.
  *
@@ -28,8 +30,10 @@ import { resolveHostKey } from './host-backends.mjs';
 import { generateKeyPair } from './auth.mjs';
 import { newRendezvousId, pipeUrl } from './pipe-url.mjs';
 import { webmcpTools, captureWebMcp, createDomPrompt, timersOf, WEBMCP_DEFAULT_LIMITS } from './webmcp.mjs';
+import { exposeObjects } from './objects.mjs';
+import { OBJECTS_PROTOCOL } from './objects-core.mjs';
 
-export { webmcpTools, captureWebMcp, createDomPrompt, WEBMCP_DEFAULT_LIMITS };
+export { webmcpTools, captureWebMcp, createDomPrompt, WEBMCP_DEFAULT_LIMITS, exposeObjects };
 
 const RECONNECT_START_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
@@ -39,6 +43,42 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 function readOrigin(window) {
   try { const o = window.location?.origin; return typeof o === 'string' ? o : null; } catch { return null; }
+}
+
+/**
+ * `expose: { window: { mode: 'values', allow: { get: ['document.title'], call: ['app.**'] } } }` as the roots, allow-lists (qualified with the root's
+ * name: the paths in `expose` are relative to their root) and the rest `exposeObjects` takes. A root named `window` is the window that was passed;
+ * any other root names its object. Nothing else is reachable.
+ */
+function exposedRoots(window, expose) {
+  const names = Object.keys(expose);
+  if (names.length === 0) throw new TypeError('createPageHost: expose names no root');
+  const roots = {};
+  const allow = { get: [], call: [], set: [] };
+  const authorizers = new Map();
+  let limits;
+  for (const name of names) {
+    const cfg = expose[name];
+    if (!isObj(cfg)) throw new TypeError(`createPageHost: expose.${name} must be { mode, allow }`);
+    if (cfg.mode === 'handles') throw new TypeError("createPageHost: expose mode 'handles' is not built: only 'values' exists (handles, events and callbacks are a later step of #190)");
+    if (cfg.mode !== undefined && cfg.mode !== 'values') throw new TypeError("createPageHost: expose mode must be 'values'");
+    if (typeof cfg.allow === 'string') throw new TypeError('createPageHost: expose allow must be { get, call, set } (the wide-open form belongs to mode handles, which is not built)');
+    const object = cfg.object ?? (name === 'window' ? window : undefined);
+    if (object === undefined) throw new TypeError(`createPageHost: expose.${name}: only a root named "window" is the window; give { object } for another root`);
+    roots[name] = object;
+    for (const [op, list] of Object.entries(cfg.allow ?? {})) {
+      if (!(op in allow)) throw new TypeError(`createPageHost: expose.${name}.allow.${op} is not an operation (get, call, set)`);
+      if (!Array.isArray(list)) throw new TypeError(`createPageHost: expose.${name}.allow.${op} must be an array of path patterns`);
+      for (const entry of list) {
+        if (typeof entry !== 'string' || entry === '') throw new TypeError(`createPageHost: expose.${name}.allow.${op} entries must be non-empty strings (paths relative to ${name})`);
+        allow[op].push(`${name}.${entry}`);
+      }
+    }
+    if (cfg.authorize !== undefined) { if (typeof cfg.authorize !== 'function') throw new TypeError(`createPageHost: expose.${name}.authorize must be a function`); authorizers.set(name, cfg.authorize); }
+    if (cfg.limits !== undefined) limits = { ...limits, ...cfg.limits };
+  }
+  const authorize = authorizers.size ? (who, op) => (authorizers.has(op.root) ? authorizers.get(op.root)(who, { ...op, path: op.path }) : true) : undefined;
+  return { roots, allow, authorize, limits };
 }
 
 /** The indicator in the page: one row per connected key, with the key's fingerprint and a Stop control. */
@@ -92,6 +132,10 @@ function createDomIndicator(window, { name }) {
  *   and whose origin is reported. Passing it exposes nothing by itself.
  * @param {string | { url: string, id?: string }} options.relay - a pipe relay (`@johnhenry/wsh/pipe-relay`): its `ws://` / `wss://` URL, and
  *   optionally the rendezvous id (default: a fresh random one, exposed as `host.rendezvousId`)
+ * @param {Record<string, { mode?: 'values', allow?: { get?: string[], call?: string[], set?: string[] }, authorize?: Function, limits?: object, object?: object }>} [options.expose]
+ *   object access, off unless written: named roots (`window` is the window passed; another name needs `object`), each with its allow-lists by
+ *   operation (paths relative to the root: `'document.title'`, `'app.**'`; nothing allowed by default). `mode: 'handles'` is refused: not built.
+ *   See `@johnhenry/wsh/objects` for what `values` mode promises.
  * @param {string} options.name - what this tab is called (shown in the indicator, the `serverInfo` of the MCP server)
  * @param {string | Uint8Array | Array<string | Uint8Array>} options.authorizedKeys - who may log in, as `authorized_keys` lines (with their
  *   options, e.g. `capabilities="mcp:search_products"`) or raw keys. Required and non-empty.
@@ -119,17 +163,19 @@ function createDomIndicator(window, { name }) {
  * @param {(line: string) => void} [options.onLog]
  */
 export async function createPageHost(options = {}) {
-  const { window, relay, name, authorizedKeys, mcp, indicator = true, unattended = false, hostKey, hostKeyStore, onSession, onSessionEnd, onRefused, onClose, reconnect = true, onLog = () => {} } = options;
+  const { window, relay, name, authorizedKeys, mcp, expose, indicator = true, unattended = false, hostKey, hostKeyStore, onSession, onSessionEnd, onRefused, onClose, reconnect = true, onLog = () => {} } = options;
   if (!window || (typeof window !== 'object' && typeof window !== 'function')) {
     throw new TypeError('createPageHost: window is required: it is the realm served and the only thing this reads (pass `window`, an iframe\'s contentWindow, or a worker\'s self)');
   }
   if (typeof name !== 'string' || !name) throw new TypeError('createPageHost: name is required (what this tab is called)');
-  if (options.expose !== undefined) throw new TypeError('createPageHost: expose (object access) is not available in this build; the WebMCP bridge (mcp) is');
   if (typeof unattended !== 'boolean') throw new TypeError('createPageHost: unattended must be true or false');
   if (authorizedKeys === undefined || authorizedKeys === null || (Array.isArray(authorizedKeys) && authorizedKeys.length === 0) || authorizedKeys === '') {
     throw new TypeError('createPageHost: authorizedKeys is required: a page host has no anonymous mode and no password login');
   }
-  if (!isObj(mcp)) throw new TypeError('createPageHost: nothing to serve: pass mcp: { allow: [...tool names] }');
+  if (mcp !== undefined && !isObj(mcp)) throw new TypeError('createPageHost: mcp must be an object { allow: [...tool names] }');
+  if (expose !== undefined && !isObj(expose)) throw new TypeError('createPageHost: expose must be an object of named roots: { window: { mode: \'values\', allow: { get: [...] } } }');
+  if (mcp === undefined && expose === undefined) throw new TypeError('createPageHost: nothing to serve: pass mcp: { allow: [...tool names] } and/or expose: { window: { allow } }');
+  const exposed = expose === undefined ? null : exposedRoots(window, expose);
   const doc = window.document ?? null;
   const callbacks = isObj(indicator) ? indicator : null;
   if (callbacks && (typeof callbacks.connected !== 'function' || typeof callbacks.disconnected !== 'function')) throw new TypeError('createPageHost: indicator callbacks need connected(who, control) and disconnected(who)');
@@ -139,7 +185,7 @@ export async function createPageHost(options = {}) {
     if (!unattended) throw new TypeError('createPageHost: this window has no document to draw the indicator in: supply indicator callbacks, or say unattended: true');
   }
   if (!doc && !unattended && !callbacks) throw new TypeError('createPageHost: this window has no document: supply indicator callbacks, or say unattended: true');
-  if ((mcp.approve ?? 'consequential') !== 'never' && !doc && !mcp.prompt && !unattended) {
+  if (mcp && (mcp.approve ?? 'consequential') !== 'never' && !doc && !mcp.prompt && !unattended) {
     throw new TypeError("createPageHost: this window has no document to ask the person in: supply mcp.prompt, mcp.approve: 'never', or unattended: true");
   }
   if (typeof window.WebSocket !== 'function') throw new TypeError('createPageHost: window.WebSocket is needed to dial the relay');
@@ -182,12 +228,21 @@ export async function createPageHost(options = {}) {
   let watch = null;
   let unlisten = null;
 
-  const handler = webmcpTools({
+  const mcpHandler = mcp ? webmcpTools({
     ...mcp, window, timers: options.timers, server: { name, ...(mcp.server ?? {}) },
     // Nobody is in front of an unattended window: without a prompt of the embedder's, what needs approval is denied.
     prompt: mcp.prompt ?? (unattended ? () => false : undefined),
     guard: () => gone() ?? mcp.guard?.() ?? null,
-  });
+  }) : null;
+  const objectsHandler = exposed ? exposeObjects({
+    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, timers,
+    guard: () => gone(),
+  }) : null;
+  /** What each handler tells and ends: the sessions of a key, or all of them. */
+  const closeSessions = async (reason, fingerprint) => {
+    const counts = await Promise.all([mcpHandler, objectsHandler].filter(Boolean).map((h) => h.closeSessions(reason, fingerprint).catch(() => 0)));
+    return Math.max(0, ...counts);
+  };
 
   const memory = createMemoryHost({
     auth: {
@@ -203,7 +258,7 @@ export async function createPageHost(options = {}) {
     hostKey: keyOption,
     dataStreams: false,
     sealSession: 'require',
-    rpc: { mcp: handler },
+    rpc: { ...(mcpHandler ? { mcp: mcpHandler } : {}), ...(objectsHandler ? { [OBJECTS_PROTOCOL]: objectsHandler } : {}) },
     onRefused,
     onLog,
   });
@@ -256,7 +311,7 @@ export async function createPageHost(options = {}) {
   async function shutdown(reason, { tell = true } = {}) {
     if (closed) return;
     closedReason = reason;
-    if (tell) await handler.closeSessions(reason).catch(() => {});
+    if (tell) await closeSessions(reason).catch(() => {});
     closed = true;
     timers.clearTimeout(redialTimer);
     if (watch !== null) timers.clearInterval(watch);
@@ -288,7 +343,7 @@ export async function createPageHost(options = {}) {
      */
     async revoke(fingerprint) {
       revoked.add(fingerprint);
-      const n = await handler.closeSessions('the person at the page stopped this session', fingerprint);
+      const n = await closeSessions('the person at the page stopped this session', fingerprint);
       if (current?.who.fingerprint === fingerprint) { try { current.socket.close(1000); } catch { /* gone */ } }
       return n > 0 || current?.who.fingerprint === fingerprint;
     },

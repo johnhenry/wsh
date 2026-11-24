@@ -18,8 +18,12 @@
       "gzip": 68028
     },
     "./page": {
-      "raw": 259471,
-      "gzip": 81716
+      "raw": 281500,
+      "gzip": 88741
+    },
+    "./objects": {
+      "raw": 160461,
+      "gzip": 48792
     },
     ". (generateKeyPair only)": {
       "raw": 404,
