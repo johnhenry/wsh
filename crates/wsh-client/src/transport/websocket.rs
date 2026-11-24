@@ -140,10 +140,9 @@ impl Drop for QMuxDataStream {
 /// `tools/guest-image/boot-test.mjs` — see issue #38) and MUST NOT be set
 /// for any real remote connection.** `wsh-server`'s dev cert is
 /// self-signed and there is currently no hash-pinning trust path for
-/// `wss://` in this codebase (unlike WebTransport, which pins on the
-/// server's certificate hash via `wtransport`'s
-/// `ClientConfig::with_no_cert_validation()` — see
-/// `transport/webtransport.rs`). Skipping verification is the only way to
+/// `wss://` in this codebase (WebTransport has `--cert-hash`, see
+/// `transport/webtransport.rs`; trusting the dev cert for `wss://` is
+/// `SSL_CERT_FILE`). Skipping verification is, for that harness, the only way to
 /// complete a loopback `wss://127.0.0.1` handshake against that cert
 /// without a CA-trusted certificate, which the minimal guest image used
 /// for the Phase 1 proof doesn't have anyway (no `/etc/ssl/certs`).
