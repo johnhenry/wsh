@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.46.0 / Rust `rust-v0.17.0`
+
+### Breaking defaults (read these before upgrading; the entries below say who is affected and what to do)
+
+- **The Rust client verifies the server's certificate on WebTransport connections.** A server with a self-signed certificate (for example `wsh-server --generate-cert`) is refused until the client pins it with `--cert-hash <sha256>`
+  (or `ConnectConfig.cert_hash`); `--insecure-skip-cert-verification` is the development-only opt-out. `wss://` is unchanged.
+- **`wsh-server` gateway host-name rules reach public addresses only.** A name in `allowed_destinations` no longer reaches a loopback, private or link-local address it resolves to; name the address or range (`"10.1.2.3/32:5432"`) to allow that.
+- **`WSH_INSECURE_LOOPBACK_TLS` applies to loopback destinations only** (Rust client and CLI); for any other host the certificate is verified and the client says once on stderr that the variable was ignored.
+- **A plain message dropped on a sealed session is counted, not logged:** the JS client no longer writes it to the console; read `client.onDrop` / `client.droppedMessages`.
+
+Everything else in this release is additive (new options, entry points and negotiated features with the defaults unchanged), or a fix.
 
 ### `@johnhenry/wsh/objects`: remote objects by path, `values` mode, and `createPageHost({ expose })` (#190; JS)
 
@@ -48,10 +58,6 @@ hostKeyStore?, onSession, onRefused })`, `webmcpTools({ window, allow, approve, 
   and Rust client (`rust-v0.16.0`) refuse it exactly as they refuse any virtual-mode rpc host (they look for `rpc`); use this release's client or `wsh-mcp --sealed`. `wsh-server` is unchanged.
 - **Bundle:** `@johnhenry/wsh/page` is 80.8 kB gzipped (it contains the memory host); the other entry points grew by about 100 bytes gzip each at most, from the two small additions to the shared rpc context.
 
-### Fix: `wsh-server` could lose WebTransport control messages when a frame arrived in pieces (Rust)
-
-The post-login loop of a WebTransport connection waited for the next length-prefixed frame with a read that is not safe to abandon. When another event (a reply to push, a shutdown) was ready while a frame was half read, the bytes already taken were thrown away and the stream was out of step from then on, so later messages were misread or never arrived. It showed under load with frames larger than a packet (a 5000-byte UDP payload on the control stream, the test `udp_datagrams = false keeps every flow on the control stream`). The frame is now accumulated across reads, so nothing read is lost. No wire change.
-
 ### Behaviour change: `WSH_INSECURE_LOOPBACK_TLS` now applies to loopback destinations only (Rust client and CLI)
 
 The variable (`1` or `true`) skips `wss://` certificate verification, and until now it did so for any host while it was set, whatever its name suggested. It now applies
@@ -59,19 +65,6 @@ The variable (`1` or `true`) skips `wss://` certificate verification, and until 
 counts when it resolves to a loopback address and a name that resolves elsewhere does not). For any other destination the variable has no effect, the certificate is
 verified as usual, and the client says once on stderr that the variable was ignored for that host. Loopback test setups keep working unchanged; anyone who set it to reach a
 remote server with a self-signed certificate must trust that certificate instead (`SSL_CERT_FILE`). The JS client never read the variable.
-
-### CBOR codec: a decoded map is plain data, and every finite number round-trips (JS; `src/cbor.mjs`)
-
-- **A decoded map's keys never change what the object inherits.** The decoder used to assign `obj[key] = value`, so a map key `__proto__` ran the prototype setter and gave the decoded object another prototype. Entries are now
-  own data properties: a `__proto__` key is an ordinary own member (definite- and indefinite-length maps, nested maps), and `constructor` / `prototype` / `toString` were already ordinary own members and still are. The rpc
-  message copy (`prune` in `src/rpc.mjs`) copies such a member the same way. The Rust codec has no prototypes and needs no change.
-- **The encoder writes every finite double so that it decodes to the same number.** An integral double at or beyond 2^64 in magnitude (for example `1e21`) was written as a wrapped 64-bit integer and decoded as a different number; `-0` was
-  written as the integer 0; a negative integer below -2^53 decoded one step off. Now: integral values within the uint64 / nint64 ranges stay integers (exactly, from a BigInt past 2^53, as before for those that were exact), and anything else
-  (a fraction, `-0`, NaN, an infinity, an integer at or beyond 2^64 in magnitude) is a float64. NaN and the infinities were already floats.
-- **Wire:** none new; the bytes of every value that round-tripped before are unchanged. **A released peer:** a released JS peer reading a float64 where it used to read a wrapped integer gets the correct number; a released Rust peer
-  decodes float64 as it always has (a Rust test asserts the boundary vectors).
-- Tests: `test/cbor-hardening.test.mjs` (own `__proto__` key, both map forms, nested, through `FrameDecoder`; a table of doubles across 2^53, 2^63, 2^64, 1e21 and their negatives, `-0`, NaN, infinities, and the exact boundary bytes) and a `wsh-core`
-  codec test with the same vectors. The map rule and the integer rule were each seen failing before the change.
 
 ### rpc channels in virtual data mode, Rust: `wsh mcp --sealed` / `--via` and `wsh-server` with `seal_session` on (#191; Rust)
 
@@ -217,6 +210,27 @@ a client asks for that address, not when a name resolves to it; an address range
 - **Wire:** none. **A released peer:** nothing is negotiated; the Rust server's Argon2id strings and these scrypt strings are not interchangeable and neither side reads the other's.
 - Tests: `test/server-password-hash.test.mjs` (PHC shape and salts, right and wrong passwords, malformed and oversized stored values, the same derivation for an unknown user, the legacy
   entry refused and allowed, a real login over `createWshServer`), and a clap test that `hash-password` takes no password argument. The unknown-user rule was broken once to see its test fail.
+
+### Fix: `wsh-server` could lose WebTransport control messages when a frame arrived in pieces (Rust)
+
+The post-login loop of a WebTransport connection waited for the next length-prefixed frame with a read that is not safe to abandon. When another event (a reply to push, a shutdown) was ready while a frame was half read, the bytes already taken were thrown away and the stream was out of step from then on, so later messages were misread or never arrived. It showed under load with frames larger than a packet (a 5000-byte UDP payload on the control stream, the test `udp_datagrams = false keeps every flow on the control stream`). The frame is now accumulated across reads, so nothing read is lost. No wire change.
+
+### CBOR codec: a decoded map is plain data, and every finite number round-trips (JS; `src/cbor.mjs`)
+
+- **A decoded map's keys never change what the object inherits.** The decoder used to assign `obj[key] = value`, so a map key `__proto__` ran the prototype setter and gave the decoded object another prototype. Entries are now
+  own data properties: a `__proto__` key is an ordinary own member (definite- and indefinite-length maps, nested maps), and `constructor` / `prototype` / `toString` were already ordinary own members and still are. The rpc
+  message copy (`prune` in `src/rpc.mjs`) copies such a member the same way. The Rust codec has no prototypes and needs no change.
+- **The encoder writes every finite double so that it decodes to the same number.** An integral double at or beyond 2^64 in magnitude (for example `1e21`) was written as a wrapped 64-bit integer and decoded as a different number; `-0` was
+  written as the integer 0; a negative integer below -2^53 decoded one step off. Now: integral values within the uint64 / nint64 ranges stay integers (exactly, from a BigInt past 2^53, as before for those that were exact), and anything else
+  (a fraction, `-0`, NaN, an infinity, an integer at or beyond 2^64 in magnitude) is a float64. NaN and the infinities were already floats.
+- **Wire:** none new; the bytes of every value that round-tripped before are unchanged. **A released peer:** a released JS peer reading a float64 where it used to read a wrapped integer gets the correct number; a released Rust peer
+  decodes float64 as it always has (a Rust test asserts the boundary vectors).
+- Tests: `test/cbor-hardening.test.mjs` (own `__proto__` key, both map forms, nested, through `FrameDecoder`; a table of doubles across 2^53, 2^63, 2^64, 1e21 and their negatives, `-0`, NaN, infinities, and the exact boundary bytes) and a `wsh-core`
+  codec test with the same vectors. The map rule and the integer rule were each seen failing before the change.
+
+### Rust dependencies: `rustls` 0.23.46 (lockfile only)
+
+`Cargo.lock` moves `rustls` from 0.23.41 to 0.23.46 (with `rustls-webpki` 0.103.17, `aws-lc-rs` 1.19.0 and `aws-lc-sys` 0.47.0 that it brings), the patched version of four open dependency alerts. No source or wire change; the Rust binaries of the next `rust-v` release carry it.
 
 ## 0.45.0 / Rust `rust-v0.16.0`
 
