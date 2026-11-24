@@ -384,7 +384,7 @@ function decodeHashString(str) {
   // Strip the separators OpenSSL and friends emit, plus any surrounding
   // whitespace: "SHA256 Fingerprint=" style output is colon-separated,
   // and hand-copied values often carry spaces or dashes.
-  const compact = str.trim().replace(/^[^=]*fingerprint[^=]*=\s*/i, '');
+  const compact = str.trim().replace(/^[^=]{0,64}fingerprint[^=]{0,64}=\s*/i, '');
   const hexish = compact.replace(/[\s:-]/g, '');
 
   if (/^[0-9a-fA-F]+$/.test(hexish) && hexish.length % 2 === 0) {
