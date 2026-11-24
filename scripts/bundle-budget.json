@@ -14,8 +14,8 @@
       "gzip": 40847
     },
     "./reverse": {
-      "raw": 215989,
-      "gzip": 66580
+      "raw": 216283,
+      "gzip": 66697
     },
     ". (generateKeyPair only)": {
       "raw": 404,
