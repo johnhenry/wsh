@@ -18,8 +18,6 @@
   lists the messages nobody names).
 - No wire change, no feature string, no default changed, no generated file touched.
 
-## 0.44.0 / Rust `rust-v0.15.0`
-
 ### Fix: a sealed reverse bridge no longer drops an operator's first frame that outruns the host's key derivation (#162)
 
 `test/operator-proof.test.mjs` ("injects an Open stamped with the operator's fingerprint ...") failed now and then with
@@ -32,6 +30,8 @@ if the exchange fails). Frames before any `KeyExchange`, for another session or 
 that must be sealed is still dropped; nothing is sent differently, so no wire change, no feature string, no default changed.
 Regression test: a hostile hop that makes the order certain (it delivers the operator's first frame ahead of its ciphertext) fails on 20 of 20
 runs before the fix and passes 20 of 20 after.
+
+## 0.44.0 / Rust `rust-v0.15.0`
 
 ### `wsh-mcp`: a stdio bridge so MCP clients can reach an MCP server behind a wsh host (#127, partial; JS only)
 
