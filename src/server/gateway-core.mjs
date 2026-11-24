@@ -9,10 +9,10 @@
 import { MSG, gatewayOk, gatewayFail, gatewayClose, gatewayData, gatewayCredit, listenFail } from '../messages.gen.mjs';
 import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW } from '../gateway-channel.mjs';
 
-/** Numeric codes of GatewayFail (the same table `@johnhenry/browsermesh-netway` decodes). */
-export const GATEWAY_FAIL = Object.freeze({
-  CONNECTION_REFUSED: 1, HOST_UNREACHABLE: 2, DNS_FAILED: 3, POLICY_DENIED: 4, TIMEOUT: 5, CLOSED: 6, QUEUE_FULL: 7,
-});
+import { GATEWAY_FAIL } from '../gateway-errors.mjs';
+
+/** Numeric codes of GatewayFail: the table of `gateway-errors.mjs` (what `@johnhenry/browsermesh-netway` decodes), under its old name here. */
+export { GATEWAY_FAIL };
 
 export const DEFAULT_MAX_CONNECTIONS = 32;
 export const DEFAULT_MAX_BUFFERED = 4 * 1024 * 1024;

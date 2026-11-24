@@ -2251,6 +2251,17 @@ export const GATEWAY_DATAGRAM_FEATURE: 'gateway-datagram';
 /** A GatewayFail / ListenFail as an Error: `code` 4 = refused by the host's policy, 7 = too many connections, 1 = refused by the target. */
 export class GatewayError extends Error { code: number }
 
+/** The codes of `GatewayFail` by name (the one table the Node gateway, the page host and netway share). Frozen; a number is never reused. */
+export const GATEWAY_FAIL: Readonly<{
+  CONNECTION_REFUSED: 1; HOST_UNREACHABLE: 2; DNS_FAILED: 3; POLICY_DENIED: 4; TIMEOUT: 5; CLOSED: 6; QUEUE_FULL: 7;
+}>;
+/** The same codes with their meaning; `alsoSentAs` is a second name another implementation gives the number (the Rust server sends `5` for a disabled gateway). */
+export const GATEWAY_FAIL_TABLE: ReadonlyArray<Readonly<{ name: keyof typeof GATEWAY_FAIL; code: number; meaning: string; alsoSentAs?: readonly string[] }>>;
+/** Codes a client gives its own `GatewayError` when it never asked the host (not on the wire): `UNSUPPORTED` is `0`, a feature the host did not advertise. */
+export const GATEWAY_FAIL_LOCAL: Readonly<{ UNSUPPORTED: 0 }>;
+/** The name of a wire or client-local code, or `null`. */
+export function gatewayFailName(code: number): string | null;
+
 /** The feature a client lists in `Hello.features` and a host in `ServerHello.features` to meter gateway data with `GatewayCredit`. */
 export const GATEWAY_CREDIT_FEATURE: 'gateway-credit';
 /** Credit, in bytes, each direction of a gateway connection starts with. */

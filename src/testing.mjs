@@ -20,6 +20,9 @@ export {
   QMuxProtocolError,
 } from './qmux.mjs';
 
+// Test doubles: a pipe relay that lives in this process (with a tap for a hostile relay), and a memory host with a client logged in.
+export { createInProcessPipeRelay, createMemoryPair } from './testing-doubles.mjs';
+
 /** Machine-readable form of the notice above, so a test (or a reader) can check what it imported. */
 export const QMUX_TESTING_API = Object.freeze({
   stable: false,

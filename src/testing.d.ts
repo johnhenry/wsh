@@ -46,5 +46,49 @@ export class QMuxProtocolError extends Error {
   readonly errorCode: number;
 }
 
+import type { WshClient } from './index.js';
+import type { WshMemoryHost, WshMemoryHostOptions, WshMemoryConnectOptions } from './memory-host.js';
+import type { PipeRelay, PipeRelayOptions } from './pipe-relay.js';
+
+/** One message the in-process relay wrote. */
+export interface RelayTapInfo { to: 'host' | 'operator'; id: string; bytes: Uint8Array }
+
+/** A pipe relay that lives in this process (see `createInProcessPipeRelay`). */
+export interface InProcessPipeRelay {
+  /** The real relay (`createPipeRelay()`); `accept` is wired to the sockets `WebSocket` hands out. */
+  relay: PipeRelay;
+  /** Every message the relay wrote, before `tap` ran: `to` is the role it was written to. */
+  recorded: Array<{ to: 'host' | 'operator'; id: string; bytes: Uint8Array }>;
+  /** Called for each message the relay writes: `undefined` passes it, `null` drops it, bytes (or an array of them) are written instead. May be set at any time. */
+  tap: ((info: RelayTapInfo) => Uint8Array | Uint8Array[] | null | undefined) | null;
+  /** A `WebSocket` constructor that dials this relay: `new env.WebSocket(pipeUrl(anyBase, id, role))`. */
+  WebSocket: new (url: string) => any;
+  stats(): { waiting: number; pipes: number };
+  /** End every pipe at once, as a relay restart would. */
+  dropAll(): void;
+  close(): Promise<void>;
+}
+
+/** The real pipe relay running in this process, with a record and a tap for a hostile one. No port, no Node built-in. */
+export function createInProcessPipeRelay(options?: { tap?: InProcessPipeRelay['tap']; relayOptions?: PipeRelayOptions }): Promise<InProcessPipeRelay>;
+
+export interface MemoryPair {
+  host: WshMemoryHost;
+  client: WshClient;
+  username: string;
+  /** The key the client logged in with (`null` when `host.auth` was given and the client logs in some other way). */
+  keyPair: CryptoKeyPair | null;
+  /** Disconnects the client, then closes the host. */
+  close(): Promise<void>;
+}
+
+/** A memory host and a client already logged in to it. Without `host.auth`, it makes (or uses) a key and authorizes exactly that key. */
+export function createMemoryPair(options?: {
+  host?: WshMemoryHostOptions;
+  username?: string;
+  keyPair?: CryptoKeyPair;
+  credentials?: Partial<WshMemoryConnectOptions>;
+}): Promise<MemoryPair>;
+
 /** Machine-readable form of the notice: `stable` is `false`. */
 export const QMUX_TESTING_API: Readonly<{ stable: false; notice: string }>;
