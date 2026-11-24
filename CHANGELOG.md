@@ -22,6 +22,19 @@ An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence o
   it did before. A released Rust client (`rust-v0.16.0`) likewise looks for `rpc` and refuses. A released relay (JS or Rust) forwards `SessionData` and `GatewayCredit`
   as it always has. `wsh-server` does not offer virtual-mode rpc yet, and the Rust `wsh mcp` does not speak it yet (`--sealed` against it is still refused).
 
+### **Breaking** (Rust `wsh-server`): a gateway host-name rule reaches public addresses only, as the Node host's does
+
+In `[gateway] allowed_destinations`, a host-name rule (`"db.internal"`, `"localhost:5432"`) now allows that name only at a **public** address, like `"*"`. Before, a name rule also let
+the name reach a loopback, private, link-local, carrier-grade-NAT, unique-local or unspecified address it resolved to. A literal-address rule (`"127.0.0.1:5432"`) now matches when
+a client asks for that address, not when a name resolves to it; an address range (`"10.0.0.0/8:5432"`) still matches both. The Node host's gateway already worked this way
+(`allowPrivate`, 0.38.0). `ResolveDns` answers are filtered the same way.
+
+- **Who is affected:** a `wsh-server` with `enabled = true` whose `allowed_destinations` lists a host name that is meant to resolve inside the host's network. **What to do:** add the
+  address or range the name resolves to (`"10.1.2.3/32:5432"`, `"127.0.0.1:5432"`); the name rule can stay.
+- **Wire:** none. **A released peer:** nothing is negotiated; a client sees `POLICY_DENIED` for a destination that is no longer allowed.
+- Tests: the rule table in `gateway/policy.rs` (name rules at every kind of non-public address, mixed answers, literal versus range) and `gateway/forwarder.rs`; the rule was
+  broken once to see its tests fail. The Node host's resolved-address policy and its fake-resolver tests (`test/gateway-address-policy.test.mjs`) are unchanged.
+
 ## 0.45.0 / Rust `rust-v0.16.0`
 
 ### Rust `wsh-server`: UDP flows as WebTransport datagrams, `gateway-datagram` (#124, #145, the last open item of the parity epic; Rust only)
