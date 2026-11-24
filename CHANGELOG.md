@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.49.0
 
 npm only (the Rust crates changed only in a unit test of the capability vectors; no binary changes, no `rust-v` tag). **Wire: nothing new.** No message, field or feature string was added; a 0.48.0 peer and a released Rust peer (`rust-v0.17.1`) interoperate unchanged. Everything below is exports, one specification with its vectors, and seams in the object and MCP layers (#220, the wsh side of making wsh and browsermesh a pair; wsh still has no dependency on browsermesh).
 
