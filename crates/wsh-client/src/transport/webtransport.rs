@@ -106,6 +106,34 @@ impl WebTransportSession {
     }
 }
 
+impl WebTransportSession {
+    /// A handle that opens data streams without the transport lock. The peer sees a WebTransport
+    /// stream only once its first byte arrives (there is no empty announce frame here), which a
+    /// typed rpc channel's first message provides.
+    pub fn stream_opener(&self) -> super::StreamOpener {
+        let connection = self.connection.clone();
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1 << 30));
+        super::StreamOpener::new(move || {
+            let connection = connection.clone();
+            let next = next.clone();
+            async move {
+                let (send, recv) = connection
+                    .open_bi()
+                    .await
+                    .map_err(|e| WshError::Transport(format!("failed to open stream: {e}")))?
+                    .await
+                    .map_err(|e| {
+                        WshError::Transport(format!("failed to initialize stream: {e}"))
+                    })?;
+                Ok(IdentifiedStream {
+                    id: next.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    stream: Box::new(WebTransportStream { send, recv }),
+                })
+            }
+        })
+    }
+}
+
 fn install_rustls_crypto_provider() {
     super::install_crypto_provider();
 }

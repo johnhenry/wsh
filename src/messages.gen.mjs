@@ -183,6 +183,7 @@ export const CHANNEL_KIND = Object.freeze({
   TCP:   'tcp',
   UDP:   'udp',
   JOB:   'job',
+  RPC:   'rpc',
 });
 
 // ── Auth methods ──────────────────────────────────────────────────────

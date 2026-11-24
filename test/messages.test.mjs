@@ -384,8 +384,12 @@ describe('CHANNEL_KIND extensions', () => {
     assert.equal(CHANNEL_KIND.FILE, 'file');
   });
 
-  it('has exactly 7 kinds', () => {
-    assert.equal(Object.keys(CHANNEL_KIND).length, 7);
+  it('has rpc, the kind client.openRpc() sends (#85; named in the spec so the Rust client can send it, #127)', () => {
+    assert.equal(CHANNEL_KIND.RPC, 'rpc');
+  });
+
+  it('has exactly 8 kinds', () => {
+    assert.equal(Object.keys(CHANNEL_KIND).length, 8);
   });
 });
 

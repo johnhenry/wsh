@@ -488,6 +488,27 @@ impl QMuxConnection {
         Ok(())
     }
 
+    /// Make a locally opened stream visible to the peer before any payload is written: a stream is
+    /// created lazily on the wire, and the peer first learns of it from the first STREAM frame, so
+    /// this sends an empty one (legal QUIC, no FIN). A no-op once anything has been sent. The JS
+    /// QMux client does the same when it opens a data stream (`QMuxStream.announce()`).
+    pub fn announce_stream(&self, stream_id: u64) -> Result<(), QMuxError> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let stream = inner.streams.get_mut(&stream_id).ok_or_else(|| {
+                QMuxError::new(
+                    ErrorCode::InternalError,
+                    format!("announce of unknown stream {stream_id}"),
+                )
+            })?;
+            if stream.send_offset > 0 || !matches!(stream.send_state, SendState::Ready) {
+                return Ok(());
+            }
+            stream.send_state = SendState::Send;
+        }
+        self.send_stream_chunk(stream_id, &[], false)
+    }
+
     /// Half-close the send side: send FIN. No more `write_stream` calls after this.
     pub fn close_stream(&self, stream_id: u64) -> Result<(), QMuxError> {
         let already_done = {
@@ -1168,6 +1189,30 @@ mod tests {
         }
         assert_eq!(got_data.unwrap(), b"hello");
         assert!(got_end);
+    }
+
+    #[tokio::test]
+    async fn announce_makes_a_stream_known_to_the_peer_before_any_payload() {
+        let mut pair = make_pair();
+        handshake(&pair).await;
+
+        let stream_id = pair.client.open_stream().await.unwrap();
+        // Nothing sent yet: the peer cannot know the stream.
+        tokio::task::yield_now().await;
+        assert!(pair.server_events.try_recv().is_err());
+        pair.client.announce_stream(stream_id).unwrap();
+        match pair.server_events.recv().await.unwrap() {
+            QMuxEvent::StreamOpen { stream_id: id } => assert_eq!(id, stream_id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // Announcing twice, or after data, is a no-op and the stream still carries data.
+        pair.client.announce_stream(stream_id).unwrap();
+        pair.client.write_stream(stream_id, b"x").await.unwrap();
+        pair.client.announce_stream(stream_id).unwrap();
+        match pair.server_events.recv().await.unwrap() {
+            QMuxEvent::StreamData { data, .. } => assert_eq!(data, b"x"),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[tokio::test]

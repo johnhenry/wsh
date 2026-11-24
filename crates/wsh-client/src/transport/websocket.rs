@@ -12,9 +12,10 @@
 //! `wsh_core::codec::{frame_encode, FrameDecoder}` -- because this server
 //! always declares `SessionDataMode::Virtual` (see that constant's doc
 //! comment in `server.rs`: no per-session second QMux stream exists yet).
-//! `open_stream`/`accept_stream` are consequently never exercised against
-//! this server and return an error rather than pretending to support
-//! something nothing on the wire actually implements.
+//! `open_stream` opens a client-initiated data stream, which only a typed
+//! `rpc` channel (wsh #85, `Open { kind: "rpc" }`) uses; `accept_stream`
+//! returns an error rather than pretending to support something nothing
+//! on the wire implements.
 //!
 //! This replaces an earlier, unrelated hand-rolled `[type][stream_id]`
 //! framing that predated the server's QMux migration and was never
@@ -35,7 +36,100 @@ use wsh_core::codec::FrameDecoder;
 use wsh_core::error::{WshError, WshResult};
 use wsh_core::qmux::ErrorCode;
 use wsh_core::qmux_connection::{QMuxConnection, QMuxConnectionConfig, QMuxEvent};
-use wsh_core::transport::{IdentifiedStream, TransportSession};
+use wsh_core::transport::{ByteStream, IdentifiedStream, TransportSession};
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+
+/// What a client-opened data stream is told by the connection's event loop.
+enum StreamItem {
+    Data(Vec<u8>),
+    /// The peer finished its side (FIN).
+    End,
+    /// The peer reset the stream, or the connection died under it.
+    Reset,
+}
+
+/// Where the event loop delivers the bytes of each client-opened data stream, by QMux stream id.
+type StreamSinks = Arc<std::sync::Mutex<HashMap<u64, mpsc::UnboundedSender<StreamItem>>>>;
+
+/// A client-opened QMux data stream as a `ByteStream` (wsh #127: the typed `rpc` channel rides one).
+/// Received bytes are bounded by QMux's own flow-control windows, so the queue behind `rx` cannot
+/// grow past what the connection granted.
+struct QMuxDataStream {
+    qmux: Arc<QMuxConnection>,
+    id: u64,
+    rx: mpsc::UnboundedReceiver<StreamItem>,
+    leftover: Vec<u8>,
+    ended: bool,
+    sinks: StreamSinks,
+}
+
+impl ByteStream for QMuxDataStream {
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> Pin<Box<dyn Future<Output = WshResult<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            loop {
+                if !self.leftover.is_empty() {
+                    let n = self.leftover.len().min(buf.len());
+                    buf[..n].copy_from_slice(&self.leftover[..n]);
+                    self.leftover.drain(..n);
+                    return Ok(n);
+                }
+                if self.ended {
+                    return Ok(0);
+                }
+                match self.rx.recv().await {
+                    Some(StreamItem::Data(d)) => self.leftover = d,
+                    Some(StreamItem::End) | None => {
+                        self.ended = true;
+                        return Ok(0);
+                    }
+                    Some(StreamItem::Reset) => {
+                        self.ended = true;
+                        return Err(WshError::Transport(format!(
+                            "QMux stream {} was reset",
+                            self.id
+                        )));
+                    }
+                }
+            }
+        })
+    }
+
+    fn write_all<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = WshResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if data.is_empty() {
+                return Ok(());
+            }
+            self.qmux
+                .write_stream(self.id, data)
+                .await
+                .map_err(WshError::from)
+        })
+    }
+
+    fn close(&mut self) -> Pin<Box<dyn Future<Output = WshResult<()>> + Send + '_>> {
+        Box::pin(async move { self.qmux.close_stream(self.id).map_err(WshError::from) })
+    }
+}
+
+impl Drop for QMuxDataStream {
+    fn drop(&mut self) {
+        if let Ok(mut sinks) = self.sinks.lock() {
+            sinks.remove(&self.id);
+        }
+    }
+}
 
 /// Environment variable that, when set to `1` or `true`, disables TLS
 /// certificate verification for the `wss://` connection this process
@@ -165,9 +259,44 @@ pub struct WebSocketSession {
     io_handle: tokio::task::JoinHandle<()>,
     event_handle: tokio::task::JoinHandle<()>,
     connected: Arc<Mutex<bool>>,
+    streams: StreamSinks,
+}
+
+/// Open and announce a client-initiated QMux data stream (see `TransportSession::open_stream` below).
+async fn open_qmux_stream(
+    qmux: Arc<QMuxConnection>,
+    streams: StreamSinks,
+) -> WshResult<IdentifiedStream> {
+    let id = qmux.open_stream().await.map_err(WshError::from)?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    streams
+        .lock()
+        .map_err(|_| WshError::Transport("stream table poisoned".into()))?
+        .insert(id, tx);
+    let stream = QMuxDataStream {
+        qmux: qmux.clone(),
+        id,
+        rx,
+        leftover: Vec::new(),
+        ended: false,
+        sinks: streams,
+    };
+    // Dropping `stream` on failure removes the sink again.
+    qmux.announce_stream(id).map_err(WshError::from)?;
+    Ok(IdentifiedStream {
+        id: id as u32,
+        stream: Box::new(stream),
+    })
 }
 
 impl WebSocketSession {
+    /// A handle that opens data streams without the transport lock.
+    pub fn stream_opener(&self) -> super::StreamOpener {
+        let qmux = self.qmux.clone();
+        let streams = self.streams.clone();
+        super::StreamOpener::new(move || open_qmux_stream(qmux.clone(), streams.clone()))
+    }
+
     /// Connect to a wsh server over WebSocket.
     pub async fn connect(url: &str) -> WshResult<Self> {
         super::install_crypto_provider();
@@ -235,8 +364,17 @@ impl WebSocketSession {
 
         let (control_tx, control_rx) = mpsc::channel::<Vec<u8>>(256);
         let alive_for_events = alive.clone();
+        let streams: StreamSinks = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let streams_for_events = streams.clone();
         let event_handle = tokio::spawn(async move {
-            Self::event_loop(event_rx, control_stream_id, control_tx, alive_for_events).await;
+            Self::event_loop(
+                event_rx,
+                control_stream_id,
+                control_tx,
+                alive_for_events,
+                streams_for_events,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -246,6 +384,7 @@ impl WebSocketSession {
             io_handle,
             event_handle,
             connected: alive,
+            streams,
         })
     }
 
@@ -304,19 +443,59 @@ impl WebSocketSession {
         control_stream_id: u64,
         control_tx: mpsc::Sender<Vec<u8>>,
         alive: Arc<Mutex<bool>>,
+        streams: StreamSinks,
     ) {
         let mut control_decoder = FrameDecoder::new();
+        // Tell every open data stream the connection is gone (their readers see a reset).
+        let finish_streams = |streams: &StreamSinks| {
+            if let Ok(mut sinks) = streams.lock() {
+                for (_, sink) in sinks.drain() {
+                    let _ = sink.send(StreamItem::Reset);
+                }
+            }
+        };
+        let deliver = |streams: &StreamSinks, stream_id: u64, item: StreamItem, last: bool| {
+            let sink = {
+                let Ok(mut sinks) = streams.lock() else {
+                    return false;
+                };
+                if last {
+                    sinks.remove(&stream_id)
+                } else {
+                    sinks.get(&stream_id).cloned()
+                }
+            };
+            match sink {
+                Some(sink) => {
+                    let _ = sink.send(item);
+                    true
+                }
+                None => false,
+            }
+        };
         while let Some(event) = event_rx.recv().await {
             match event {
                 QMuxEvent::StreamData { stream_id, data } if stream_id == control_stream_id => {
                     for frame in control_decoder.feed_raw(&data) {
                         if control_tx.send(frame).await.is_err() {
+                            finish_streams(&streams);
                             return;
                         }
                     }
                 }
-                QMuxEvent::StreamData { stream_id, .. } => {
-                    tracing::warn!(stream_id, "ignoring StreamData on non-control QMux stream");
+                QMuxEvent::StreamData { stream_id, data } => {
+                    if !deliver(&streams, stream_id, StreamItem::Data(data), false) {
+                        tracing::warn!(stream_id, "ignoring StreamData on an unknown QMux stream");
+                    }
+                }
+                QMuxEvent::StreamEnd { stream_id } if stream_id != control_stream_id => {
+                    deliver(&streams, stream_id, StreamItem::End, true);
+                }
+                QMuxEvent::StreamReset { stream_id, .. }
+                | QMuxEvent::StreamDestroyed { stream_id }
+                    if stream_id != control_stream_id =>
+                {
+                    deliver(&streams, stream_id, StreamItem::Reset, true);
                 }
                 QMuxEvent::StreamEnd { stream_id } | QMuxEvent::StreamReset { stream_id, .. }
                     if stream_id == control_stream_id =>
@@ -338,13 +517,12 @@ impl WebSocketSession {
                 _ => {}
             }
         }
+        finish_streams(&streams);
         *alive.lock().await = false;
     }
 
-    /// This server always declares `SessionDataMode::Virtual` (see its
-    /// doc comment in server.rs), so no session ever asks a WebSocket
-    /// transport to open a real second QMux stream in practice. Fail
-    /// loudly instead of pretending to support it.
+    /// Server-initiated streams are not used by any message this client speaks yet: fail loudly
+    /// instead of pretending to support them.
     fn no_real_data_stream_error() -> WshResult<IdentifiedStream> {
         Err(WshError::Transport(
             "WebSocket transport does not support real data streams for this server".into(),
@@ -367,8 +545,11 @@ impl TransportSession for WebSocketSession {
             .ok_or_else(|| WshError::Transport("control channel closed".into()))
     }
 
+    /// Open a client-initiated QMux data stream and announce it, so the host sees it before the
+    /// first payload byte (the typed `rpc` channel needs this: wsh #127). The server this client
+    /// was written against only ever asks for it when it answered `OpenOk` with `data_mode: stream`.
     async fn open_stream(&mut self) -> WshResult<IdentifiedStream> {
-        Self::no_real_data_stream_error()
+        open_qmux_stream(self.qmux.clone(), self.streams.clone()).await
     }
 
     async fn accept_stream(&mut self) -> WshResult<IdentifiedStream> {
