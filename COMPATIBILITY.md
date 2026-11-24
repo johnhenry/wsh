@@ -1,0 +1,112 @@
+# Compatibility policy
+
+How the wsh protocol and its two implementations (the npm package `@johnhenry/wsh` and the Rust crates `wsh-core`, `wsh-client`,
+`wsh-cli`, `wsh-server`) change without breaking a peer somebody already runs. It describes what the repository already does, and it is
+the checklist for a change to `spec/wsh-v1.yaml`, to a default, or to a file format that two implementations both read.
+
+Which message each implementation actually handles is [`spec/message-matrix.md`](spec/message-matrix.md) (generated; CI fails when it is
+stale). What each side can do beyond the messages is the README's [capability matrix](README.md#rust-implementation).
+
+## Versions and what a release may change
+
+- The two implementations are versioned separately: the npm package by `package.json` (`vX.Y.Z` tags), the Rust workspace by `Cargo.toml`
+  (`rust-vX.Y.Z` tags). The wire protocol is `wsh-v1` (`Hello.version`); it does not change inside a major version of the protocol.
+- **The packages are 0.x.** A minor version of either may add features and may tighten what a peer accepts. It does not change what a
+  message already on the wire means. Anything that can break an existing deployment is listed in the CHANGELOG as **breaking**, with who is
+  affected and what to do, in the release that makes the change, never silently. A change of a DEFAULT is such a change.
+- **Before 1.0 the supported combination is "the latest release of each side, and the one before it".** Older peers are kept working
+  where it costs nothing and where the rules below make it free; no peer is promised beyond the last two releases of its implementation.
+  Every CHANGELOG entry that touches the wire has a **A released peer** paragraph saying what an older client, host, relay or Rust
+  binary does with the change; a change without one is not finished.
+- Release binary names (`wsh-<target>` archives under a `rust-vX.Y.Z` release) are an external contract; do not rename them
+  (AGENTS.md).
+
+## The rules for a wire change
+
+### 1. A new field is optional on decode, and omitted on encode when unset
+
+Every field added to an existing message is optional: the codec treats a missing value as "not sent" (`required: false` in the spec; in Rust
+`Option<T>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`, or a defaulted `Vec`). A message built without the field is
+byte-for-byte what the previous release built. A new message type is an addition of its own; nothing that existed refers to it. A field
+that is **required** may only be on a message that is itself new.
+
+### 2. What a released peer does with something it does not know
+
+This is the half of the rule that is not symmetric, and it is why a new field is never simply "added":
+
+- **JS** decoders and handlers ignore a field they do not know and log and ignore a message type they do not know. A released JS host
+  that is sent `Open.target` runs the command on its default target: the field is silently ignored, which is wrong when the field was a
+  request for something specific.
+- **Rust** payload structs are `#[serde(deny_unknown_fields)]` (every generated payload struct). A released Rust peer that receives a
+  known message with a field it does not know **fails to decode it**: the message is refused, and on some paths (the relay, a reverse
+  connection) the connection is dropped. A message type it does not know fails the same way. So a new field on an existing message is
+  safe against a released Rust peer only if that peer never receives it.
+
+So one of two things must be true of every addition, and the CHANGELOG entry says which:
+
+1. **It is gated by a feature string** (rule 3), or
+2. a released peer ignoring it is harmless, and a released Rust peer never receives it (it is only ever sent to an implementation that
+   cannot be a released Rust peer, or it travels in a place the Rust types do not cover, such as a `features` string list or an
+   opaque `json` value).
+
+Counter-examples this repository has paid for: `ReverseAccept.features` was rejected by every Rust peer and relay older than
+`rust-v0.3.0` (hence `reportFeatures: false`); `McpCall.call_id`, `Open.target`, `ReverseConnect.features` and
+`KeyExchange.signature` were each added with a feature string because the Rust types would have rejected them.
+
+### 3. A feature string gates anything a released peer would reject or silently ignore
+
+- A host states what it can do in `ServerHello.features` (and, behind a relay or a bridge, `ReverseAccept.features`); the other side sends
+  the new field or message **only** to a peer that stated the feature. Examples: `mcp-call-id`, `mcp-cancel`, `targets`,
+  `relay-multi-operator`, `e2e-sign`, `operator-proof`, `e2e-sealed`, `e2e-session`, `exec-pipes`, `stream-announce`. The names live in
+  `src/features.mjs` and next to their handlers in the Rust crates; add the new one to both and to the README's capability matrix.
+- The receiving side of a feature is built before the sending side is turned on, and a peer that did not state the feature is never
+  sent it, **even when it is probably fine**: a peer that predates the feature can only be assumed to reject or ignore it.
+- "Silently ignores" is as dangerous as "rejects", and harder to see. If a released peer would ignore a restriction, a requirement or
+  a request and carry on, the feature gate must also make the new sender refuse to proceed against a peer without it (a sealed bridge
+  fails with a sentence when the peer does not state `e2e-sealed`: nothing is sent that a peer could take as unsealed).
+- **A feature string is not a version number.** It says "this peer does this one thing". Do not infer one from another, and do not
+  gate a new thing on the version string.
+- A feature that changes a default or turns something on is opt-in (an option on the host or the client), unless the old behaviour is
+  a defect; then it is a breaking change and is called out as one.
+
+### 4. The hazard outside the codec: the same input read by two implementations
+
+The `capabilities=` / `expires=` options of 0.44.0 show the case rule 2 does not cover. They are not wire messages: they are text in an
+`authorized_keys` file that a Node host and a Rust server both read. A released Rust server (`rust-v0.14.0`) **ignored an option it did
+not know and served the key everything**; a released Node host skipped any line with options. Nothing was rejected, so no feature string
+could have protected anyone. The only remedies are on the side that can still change:
+
+- **Parsing is fail-closed.** An option that is not in the table, a malformed value, a duplicate, a stray comma, a differently-cased name
+  keeps the key off the allowlist and logs a stable code (`unknown-option`, `bad-syntax`, `bad-value`, `duplicate-option`). It is never
+  "skip it and grant the rest". This holds for every restriction-bearing input, on both implementations, and a new option is added to
+  both parsers and to `spec/key-options.vectors.json` (run by `test/key-options.test.mjs` and `cargo test`) in the same change.
+- **State the hazard in the release notes**, with the exact thing not to do: "do not put these options in a key file read by a released
+  Rust server". A restriction a released peer cannot enforce is a security note, not a footnote.
+- The same input read by two implementations gets shared test vectors, not two hand-written test files.
+
+The same rule applies to any option, config value or CLI flag that narrows what a peer may do: an unknown value is an error at start
+(the host refuses to start, the key is refused, the command exits 2), never ignored.
+
+### 5. Defaults deny; relays and peers are not trusted
+
+Everything from the network is untrusted and bounded, and a default that allows something is a security decision that needs a CHANGELOG
+entry and a README line in the Security model section (what it does NOT protect against). A new default that is more permissive than the
+last release is breaking in the sense of rule "versions" above even when no deployment would notice.
+
+### 6. A change is not done until it is tested against the released peer
+
+- New fields and messages: a test that the old shape still decodes, and that the new sender does not send to a peer without the feature
+  (`test/server-parity.test.mjs`, `test/cross-compat.test.mjs`, `test/operator-proof-compat.test.mjs` are the examples).
+- Anything the Rust side reads from JS-written data, or the other way round: shared vectors, and `npm run test:rust`
+  (`test/rust/*.test.mjs` drives the real `wsh-server` with the JS client).
+- If you change `spec/wsh-v1.yaml`: `npm run codegen`, then the matrix with `npm run matrix`; `npm run codegen:check` and
+  `npm run matrix:check` are both CI gates.
+
+## What this policy does not promise
+
+- No peer older than the previous release of its implementation is tested. The CHANGELOG says what an older one does where it was known.
+- A message that is in the spec is not thereby implemented: see the matrix. A client author should rely on a message only where the
+  matrix shows the host they target names it, and on the field-level behaviour only as far as `test/spec-conformance.test.mjs` and the
+  interop tests cover it.
+- The wire format of a message that no implementation names may still change before one does. A message every implementation names is
+  frozen by the rules above.

@@ -66,7 +66,7 @@ Or via CDN:
 - **MCP bridge** -- discover and invoke remote MCP tools through the control channel
 - **Session recording** -- own JSON schema (asciicast-v2-shaped, not a playable asciicast file -- see note below) recording and playback with seek/pause/resume
 - **Key management** -- IndexedDB storage with OPFS encrypted backup (PBKDF2 + AES-256-GCM)
-- **110 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more
+- **110 message types** -- handshake, channel, gateway, guest sharing, compression negotiation, copilot, policy, authorized-key management, and more. [`spec/message-matrix.md`](spec/message-matrix.md) says, for each, whether the JS host, JS client, Rust host and Rust client implement it (generated from the spec and the source; CI fails when it is stale), and [COMPATIBILITY.md](COMPATIBILITY.md) is the policy for changing the protocol without breaking a released peer
 
 > **Session recording is asciicast-v2-shaped, but not an asciicast file.**
 > The JS `SessionRecorder.toJSON()` export borrows asciicast v2's vocabulary --
