@@ -169,8 +169,14 @@ mod tests {
             .await;
         assert_eq!(fail_code(&wild), Some(4), "{wild:?}");
 
-        // Named, it answers.
-        let named = forwarder(&["localhost"])
+        // A name rule alone does not reveal loopback either.
+        let by_name = forwarder(&["localhost"])
+            .handle_resolve_dns(1, "localhost", "A")
+            .await;
+        assert_eq!(fail_code(&by_name), Some(4), "{by_name:?}");
+
+        // A rule that names the range lets the answer through.
+        let named = forwarder(&["127.0.0.0/8"])
             .handle_resolve_dns(1, "localhost", "A")
             .await;
         match named.payload {
@@ -204,8 +210,13 @@ mod tests {
             .authorized_destination("127.0.0.1", 80)
             .await
             .is_ok());
-        // A name rule: `localhost` resolves to loopback and the admin named it.
-        assert!(forwarder(&["localhost"])
+        // A name rule is not enough: `localhost` resolves to loopback, and only a rule that
+        // names that range or address reaches it.
+        let by_name = forwarder(&["localhost"])
+            .authorized_destination("localhost", 80)
+            .await;
+        assert_eq!(by_name.unwrap_err().0, 4);
+        assert!(forwarder(&["127.0.0.0/8"])
             .authorized_destination("localhost", 80)
             .await
             .is_ok());

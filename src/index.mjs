@@ -102,6 +102,9 @@ export { WshKeyStore } from './keystore.mjs';
 export { WshKnownHosts } from './known-hosts.mjs';
 export { HostKeyError } from './host-key.mjs';
 
+// Typed refusals: a refused login, a failed connection
+export { WshAuthError, WshConnectionError, WSH_ERROR_CODES, classifyAuthRefusal } from './errors.mjs';
+
 // File transfer
 export { WshFileTransfer } from './file-transfer.mjs';
 

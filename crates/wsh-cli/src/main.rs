@@ -127,6 +127,27 @@ struct Cli {
     #[arg(long = "require-channel-binding", global = true)]
     require_channel_binding: bool,
 
+    /// Pin a WebTransport (https://) server to its certificate: the SHA-256 of the certificate, as
+    /// `openssl x509 -fingerprint -sha256 -noout -in cert.pem` prints it (or `wsh-server` prints
+    /// it at start-up with --generate-cert). No certificate authority is involved, so this is how
+    /// a self-signed server is reached. Repeatable (the current and the next certificate of a
+    /// rotation). The certificate must be ECDSA P-256 and valid for at most 14 days. Without this
+    /// flag the server's certificate must chain to the system trust store.
+    #[arg(
+        long = "cert-hash",
+        global = true,
+        value_name = "SHA256",
+        value_parser = parse_cert_hash_arg,
+        action = clap::ArgAction::Append
+    )]
+    cert_hashes: Vec<[u8; 32]>,
+
+    /// DEVELOPMENT ONLY: do not verify a WebTransport server's certificate at all. Anyone on the
+    /// network path can then be the server; a warning is printed on every connection. Not allowed
+    /// with --cert-hash or a password login. Prefer --cert-hash.
+    #[arg(long = "insecure-skip-cert-verification", global = true)]
+    insecure_skip_cert_verification: bool,
+
     /// Reverse host (`wsh reverse`, `wsh agent run`): make every operator prove who it is with its
     /// own key instead of taking the relay's word for it, and refuse one that cannot.
     #[arg(long = "require-operator-proof", global = true)]
@@ -409,6 +430,10 @@ enum CheckCommand {
     },
 }
 
+fn parse_cert_hash_arg(text: &str) -> Result<[u8; 32], String> {
+    wsh_client::transport::webtransport::parse_cert_hash(text).map_err(|e| e.to_string())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -470,6 +495,8 @@ async fn main() {
         },
         sealed: cli.sealed && matches!(cli.command, Some(Command::ReverseConnect { .. })),
         sealed_session: cli.sealed && !matches!(cli.command, Some(Command::ReverseConnect { .. })),
+        cert_hashes: cli.cert_hashes.clone(),
+        insecure_skip_cert_verification: cli.insecure_skip_cert_verification,
     });
 
     if let Some(via) = cli.via.clone() {

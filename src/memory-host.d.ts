@@ -98,6 +98,13 @@ export interface WshMemoryHostOptions {
   targets?: Record<string, import('./host.js').WshTargetOptions>;
   /** With `targets`: an `Open`, `FileOp` or `OpenEndpoint` that names no target is refused (nothing runs on the host itself). */
   requireTarget?: boolean;
+  /**
+   * Which login names this host admits (a RegExp, or a pattern string). Default `/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/`, the shape of an
+   * OS account name. A host that does not map names to OS accounts (a page, a peer named by a base64url identity hash that may start
+   * with a digit or `-`) can admit its own shape, e.g. `/^[A-Za-z0-9_-]{1,64}$/`. Whatever the pattern, a name is 1 to 256 characters
+   * with no control character, no `/` and no `\`, and the pattern may not match the empty name.
+   */
+  usernamePattern?: RegExp | string;
   onLog?: (line: string) => void;
 }
 

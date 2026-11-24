@@ -57,9 +57,21 @@ pub struct ConnectConfig {
     /// Refuse to log in unless the signature is bound to this connection (wsh #119): the host
     /// must offer a binding kind this client can supply, or nothing is signed.
     pub require_channel_binding: bool,
-    /// The SHA-256 of the WebTransport certificate this connection is pinned to, when it is
-    /// pinned to exactly one: the `cert-hash` binding kind.
+    /// The SHA-256 of the WebTransport certificate this connection is pinned to (the JS client's
+    /// `serverCertificateHashes`): the server's certificate must have exactly this hash, and no
+    /// certificate authority is consulted. When the connection is pinned to exactly one
+    /// certificate it is also the `cert-hash` channel-binding kind. The certificate must be an
+    /// ECDSA P-256 one valid for at most 14 days (`wsh-server --generate-cert` makes one).
+    /// `None` and `cert_hashes` empty: the certificate is validated against the system trust store.
     pub cert_hash: Option<[u8; 32]>,
+    /// More certificate hashes to accept, for a rotation (the current and the next certificate),
+    /// pinned together with `cert_hash`. Not a channel binding unless it is the only pin.
+    pub cert_hashes: Vec<[u8; 32]>,
+    /// Do NOT verify the WebTransport server's certificate at all. Development only: anyone on
+    /// the path can be the server, and every connection prints a warning. Contradicts a pin, and
+    /// is refused with a password login (a password cannot be sealed, so it would cross a channel
+    /// whose other end is unverified). `wsh --insecure-skip-cert-verification`.
+    pub insecure_skip_cert_verification: bool,
     /// Seal the whole session end to end (wsh #155): see [`SessionSeal`].
     pub seal_session: SessionSeal,
     /// Ping interval in seconds (0 = disabled).
@@ -83,8 +95,56 @@ impl Default for ConnectConfig {
             known_hosts_path: None,
             require_channel_binding: false,
             cert_hash: None,
+            cert_hashes: Vec::new(),
+            insecure_skip_cert_verification: false,
             ping_interval_secs: 30,
             timeout_secs: 10,
+        }
+    }
+}
+
+impl ConnectConfig {
+    /// How the WebTransport server's certificate is to be checked, or why this configuration is
+    /// refused: the default validates it, pins are used when given, and skipping the check is only
+    /// ever the explicit `insecure_skip_cert_verification`.
+    pub fn cert_policy(&self) -> WshResult<transport::CertPolicy> {
+        let pins: Vec<[u8; 32]> = self
+            .cert_hash
+            .iter()
+            .chain(self.cert_hashes.iter())
+            .copied()
+            .collect();
+        if self.insecure_skip_cert_verification {
+            if !pins.is_empty() {
+                return Err(WshError::Other(
+                    "a certificate hash and --insecure-skip-cert-verification contradict each other: \
+                     pin the certificate, or do not verify it, not both"
+                        .into(),
+                ));
+            }
+            if self.password.is_some() {
+                return Err(WshError::Other(
+                    "a password login is refused with --insecure-skip-cert-verification: a password cannot be \
+                     sealed end to end, so it would be sent to whoever answers the unverified connection. \
+                     Verify the certificate (system roots, or --cert-hash), or log in with a key"
+                        .into(),
+                ));
+            }
+            return Ok(transport::CertPolicy::InsecureSkipVerification);
+        }
+        Ok(if pins.is_empty() {
+            transport::CertPolicy::SystemRoots
+        } else {
+            transport::CertPolicy::Pinned(pins)
+        })
+    }
+
+    /// The certificate hash the login signature is bound to: the one pin, when there is exactly one.
+    pub fn bound_cert_hash(&self) -> Option<[u8; 32]> {
+        let mut all = self.cert_hash.iter().chain(self.cert_hashes.iter());
+        match (all.next(), all.next()) {
+            (Some(h), None) => Some(*h),
+            _ => None,
         }
     }
 }
@@ -456,13 +516,15 @@ impl WshClient {
             None => known_host_label(url)?,
         };
         let timeout = Duration::from_secs(config.timeout_secs);
+        let cert_policy = config.cert_policy()?;
 
         // Auto-select and connect transport within the configured connection timeout.
-        let transport = match time::timeout(timeout, transport::auto_connect(url)).await {
-            Ok(Ok(transport)) => transport,
-            Ok(Err(err)) => return Err(err),
-            Err(_) => return Err(WshError::Timeout),
-        };
+        let transport =
+            match time::timeout(timeout, transport::auto_connect_with(url, &cert_policy)).await {
+                Ok(Ok(transport)) => transport,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Err(WshError::Timeout),
+            };
         let stream_opener = transport.stream_opener();
         let transport = Arc::new(Mutex::new(transport));
 
@@ -1195,7 +1257,7 @@ impl WshClient {
             )));
         }
         let offer = self.rpc_offer().await;
-        if !offer.enabled {
+        if !offer.offered() {
             return Err(WshError::Other(format!(
                 "UNSUPPORTED_PROTOCOL: this host does not advertise \"{}\" channels (cannot open \"{protocol}\")",
                 crate::rpc::RPC_FEATURE
@@ -1206,9 +1268,12 @@ impl WshClient {
                 "UNSUPPORTED_PROTOCOL: this host does not advertise the \"{protocol}\" rpc protocol"
             )));
         }
-        if self.session_sealed() {
+        // The form follows what the host states: `rpc` is a data stream, `rpc-virtual` rides the control plane (wsh #191).
+        let virtual_mode = offer.is_virtual();
+        if !virtual_mode && self.session_sealed() {
+            // A host that states stream-mode rpc on a sealed session would put the channel's bytes where no frame seals them.
             return Err(WshError::Other(
-                "typed rpc channels are not carried on a sealed session".into(),
+                "this host states stream-mode rpc, whose data stream a sealed session cannot seal: refusing to open it".into(),
             ));
         }
         let envelope = Envelope {
@@ -1233,6 +1298,30 @@ impl WshClient {
                 ))
             }
         };
+        if virtual_mode {
+            if ok.data_mode != SessionDataMode::Virtual {
+                self.early.lock().await.release(ok.channel_id);
+                return Err(WshError::Channel(
+                    "the host answered an rpc Open with a data mode other than virtual".into(),
+                ));
+            }
+            // The channel stands in the session table; its SessionData and GatewayCredit go to the channel, and what it
+            // writes leaves as SessionData (sealed with everything else on a sealed session).
+            let stub = Arc::new(WshSession::new_virtual(
+                ok.channel_id,
+                ChannelKind::Rpc,
+                self.control_action_tx.clone(),
+                Vec::new(),
+            ));
+            let channel = crate::rpc::RpcChannel::start_virtual(
+                offer.max_message_bytes,
+                stub.clone(),
+                self.control_action_tx.clone(),
+                self.rpc_credit_sender(ok.channel_id),
+            );
+            self.register_session(&stub, &ok).await;
+            return Ok(channel);
+        }
         let opened = async {
             if ok.data_mode != SessionDataMode::Stream {
                 return Err(WshError::Channel(
@@ -1269,6 +1358,30 @@ impl WshClient {
             offer.max_message_bytes,
             stub,
         ))
+    }
+
+    /// Writes `GatewayCredit` for rpc channel `channel_id` (wsh #191): `bytes` of credit handed back to the host.
+    fn rpc_credit_sender(&self, channel_id: u32) -> Box<dyn Fn(u64) + Send + Sync> {
+        let tx = self.outgoing_tx.clone();
+        Box::new(move |mut left| {
+            while left > 0 {
+                let part = left.min(u64::from(u32::MAX));
+                left -= part;
+                let envelope = Envelope {
+                    msg_type: MsgType::GatewayCredit,
+                    payload: Payload::GatewayCredit(GatewayCreditPayload {
+                        gateway_id: wsh_core::rpc_credit::rpc_credit_id(channel_id),
+                        bytes: part as u32,
+                    }),
+                };
+                if let Ok(frame) = frame_encode(&envelope) {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(frame).await;
+                    });
+                }
+            }
+        })
     }
 
     /// Build the `WshSession` (and its stderr companion) an `OpenOk` describes.
@@ -1992,7 +2105,7 @@ impl WshClient {
                 if let Some(k) = &self.host_key {
                     available.push(("host", k.public_key.to_vec()));
                 }
-                if let Some(h) = &config.cert_hash {
+                if let Some(h) = &config.bound_cert_hash() {
                     available.push(("cert-hash", h.to_vec()));
                 }
                 let (binding, kinds) =
@@ -2599,6 +2712,19 @@ impl WshClient {
                 return;
             }
 
+            // Credit for an rpc channel in virtual data mode (wsh #191) is a GatewayCredit in a number space of its
+            // own (`0x80000000 | channel_id`); it is never the gateway's, and for a channel that is gone it is dropped.
+            if let Payload::GatewayCredit(p) = &envelope.payload {
+                if let Some(channel_id) = wsh_core::rpc_credit::rpc_channel_of_credit(p.gateway_id)
+                {
+                    let session = sessions.lock().await.get(&channel_id).cloned();
+                    if let Some(session) = session {
+                        session.rpc_credit(p.bytes);
+                    }
+                    return;
+                }
+            }
+
             // Gateway traffic for a connection or listener this client opened goes to it. What
             // matches nothing here (a reverse host's own gateway messages) goes on as before.
             if matches!(
@@ -2875,6 +3001,91 @@ impl Drop for WshClient {
         if let Some(h) = self.keepalive_handle.take() {
             h.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod cert_policy_tests {
+    use super::ConnectConfig;
+    use crate::transport::CertPolicy;
+
+    #[test]
+    fn the_default_config_validates_the_certificate() {
+        assert_eq!(
+            ConnectConfig::default().cert_policy().unwrap(),
+            CertPolicy::SystemRoots
+        );
+    }
+
+    #[test]
+    fn pins_from_both_fields_are_pinned_together() {
+        let config = ConnectConfig {
+            cert_hash: Some([1; 32]),
+            cert_hashes: vec![[2; 32]],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.cert_policy().unwrap(),
+            CertPolicy::Pinned(vec![[1; 32], [2; 32]])
+        );
+    }
+
+    #[test]
+    fn the_opt_out_is_explicit_and_cannot_be_mixed_with_a_pin() {
+        let config = ConnectConfig {
+            insecure_skip_cert_verification: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.cert_policy().unwrap(),
+            CertPolicy::InsecureSkipVerification
+        );
+        let both = ConnectConfig {
+            insecure_skip_cert_verification: true,
+            cert_hash: Some([1; 32]),
+            ..Default::default()
+        };
+        assert!(
+            both.cert_policy().is_err(),
+            "pinning and not verifying contradict each other"
+        );
+    }
+
+    #[test]
+    fn a_password_is_never_sent_over_an_unverified_certificate() {
+        let config = ConnectConfig {
+            insecure_skip_cert_verification: true,
+            password: Some("pw".into()),
+            ..Default::default()
+        };
+        let err = config.cert_policy().unwrap_err().to_string();
+        assert!(err.contains("password"), "{err}");
+        // A password with a verified certificate is the ordinary case.
+        let ok = ConnectConfig {
+            password: Some("pw".into()),
+            ..Default::default()
+        };
+        assert!(ok.cert_policy().is_ok());
+    }
+
+    #[test]
+    fn only_a_single_pin_is_a_channel_binding() {
+        let one = ConnectConfig {
+            cert_hash: Some([1; 32]),
+            ..Default::default()
+        };
+        assert_eq!(one.bound_cert_hash(), Some([1; 32]));
+        let two = ConnectConfig {
+            cert_hash: Some([1; 32]),
+            cert_hashes: vec![[2; 32]],
+            ..Default::default()
+        };
+        assert_eq!(two.bound_cert_hash(), None);
+        let only_list = ConnectConfig {
+            cert_hashes: vec![[3; 32]],
+            ..Default::default()
+        };
+        assert_eq!(only_list.bound_cert_hash(), Some([3; 32]));
     }
 }
 

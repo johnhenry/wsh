@@ -14,10 +14,10 @@ describe('browser entry points (#115, #128)', () => {
   it('every exports entry except the Node-only ones is bundled', async () => {
     const pkg = JSON.parse(await readFile(path.join(ROOT, 'package.json'), 'utf8'));
     const bundled = new Set(ENTRY_POINTS.filter((p) => p.entry).map((p) => p.name));
-    // ./server needs Node. ./pipe-relay is a RELAY (it listens on a socket through `ws` and node:http, imported
-    // dynamically in `listen()`): it runs in Node, a browser page is a host or an operator behind it, never the relay.
+    // ./server needs Node. ./pipe-relay IS bundled: its `listen()` (`ws`, `node:http`) is a separate module loaded by name
+    // at call time, so a page can import `pipeUrl`, `newRendezvousId`, `watchPairing` or run `accept()` over sockets it holds.
     // ./mcp-stdio (#127) is the `wsh-mcp` bridge: it reads a key file and speaks stdio, so it is Node-only.
-    const expected = Object.keys(pkg.exports).filter((k) => k !== './server' && k !== './pipe-relay' && k !== './mcp-stdio');
+    const expected = Object.keys(pkg.exports).filter((k) => k !== './server' && k !== './mcp-stdio');
     assert.deepEqual([...bundled].sort(), expected.sort());
     assert.equal(pkg.sideEffects, false);
   });
@@ -69,6 +69,26 @@ describe('browser entry points (#115, #128)', () => {
     assert.equal(replaceReadmeBlock(doc, renderReadmeTable(changed)).startsWith('before\n'), true);
     assert.equal(readmeBlock(replaceReadmeBlock(doc, renderReadmeTable(changed))), renderReadmeTable(changed));
     assert.throws(() => replaceReadmeBlock('no markers', table), /markers/);
+  });
+
+  it('./pipe-relay bundles for the browser without `ws` or a Node built-in, and so does a page that statically imports it with ./memory', async () => {
+    const own = await bundle(ENTRY_POINTS.find((p) => p.name === './pipe-relay'));
+    assert.deepEqual(own.problems, []);
+    assert.deepEqual(own.inputs, ['src/pipe-relay.mjs'], 'only the relay module itself contributes bytes');
+    assert.ok(!/from\s*["']ws["']|require\(["']ws/.test(own.code));
+    // The shape the downstream hit: one bundle with a static import of the pipe relay next to the memory host.
+    const page = await bundle({
+      name: 'memory + pipe-relay',
+      contents: "import { createMemoryHost } from './src/memory-host.mjs'; import { pipeUrl, newRendezvousId, watchPairing, createPipeRelay } from './src/pipe-relay.mjs'; globalThis.x = [createMemoryHost, pipeUrl, newRendezvousId, watchPairing, createPipeRelay];",
+    });
+    assert.deepEqual(page.problems, []);
+  });
+
+  it('the check this guards is real: a relay whose listen() named ws and node:http literally would not bundle', async () => {
+    await assert.rejects(
+      bundle({ name: 'literal', contents: "export async function listen() { const http = await import('node:http'); return http; } globalThis.x = listen;" }),
+      /node:http/,
+    );
   });
 
   it('./host does not import the client', async () => {

@@ -26,7 +26,7 @@
 import { createMemoryHost } from './memory-host.mjs';
 import { resolveHostKey } from './host-backends.mjs';
 import { generateKeyPair } from './auth.mjs';
-import { newRendezvousId, pipeUrl } from './pipe-url.mjs';
+import { pipeUrl } from './pipe-relay.mjs';
 import { webmcpTools, captureWebMcp, createDomPrompt, timersOf, WEBMCP_DEFAULT_LIMITS } from './webmcp.mjs';
 
 export { webmcpTools, captureWebMcp, createDomPrompt, WEBMCP_DEFAULT_LIMITS };
@@ -36,6 +36,21 @@ const RECONNECT_MAX_MS = 30_000;
 const WATCH_MS = 1000;
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+const BASE64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+/** A rendezvous id as the pipe relay wants it (16 random bytes, base64url: 22 characters), from the window's own CSPRNG rather than a global. */
+function randomRendezvousId(cryptoImpl) {
+  if (typeof cryptoImpl?.getRandomValues !== 'function') throw new TypeError('createPageHost: this window has no crypto.getRandomValues for a rendezvous id: give relay: { url, id }');
+  let out = '';
+  let acc = 0;
+  let bits = 0;
+  for (const b of cryptoImpl.getRandomValues(new Uint8Array(16))) {
+    acc = (acc << 8) | b; bits += 8;
+    while (bits >= 6) { bits -= 6; out += BASE64URL[(acc >> bits) & 63]; }
+  }
+  if (bits > 0) out += BASE64URL[(acc << (6 - bits)) & 63];
+  return out;
+}
 
 function readOrigin(window) {
   try { const o = window.location?.origin; return typeof o === 'string' ? o : null; } catch { return null; }
@@ -148,7 +163,7 @@ export async function createPageHost(options = {}) {
 
   const relayOptions = typeof relay === 'string' ? { url: relay } : relay;
   if (!isObj(relayOptions) || typeof relayOptions.url !== 'string') throw new TypeError('createPageHost: relay is required: the ws:// or wss:// URL of a pipe relay (or { url, id })');
-  const rendezvousId = relayOptions.id ?? newRendezvousId(window.crypto);
+  const rendezvousId = relayOptions.id ?? randomRendezvousId(window.crypto);
   const hostUrl = pipeUrl(relayOptions.url, rendezvousId, 'host');
   const operatorUrl = pipeUrl(relayOptions.url, rendezvousId, 'operator');
 

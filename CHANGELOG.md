@@ -24,7 +24,85 @@ hostKeyStore?, onSession, onRefused })`, `webmcpTools({ window, allow, approve, 
   `mcp` channel. **No default changed:** every other `mcp` handler still needs `mcp:*`.
 - **A released peer.** No wire change at all: no message, field or feature string is new. The far side is the `mcp` rpc channel in virtual mode that #191 added, so a released JS client (0.45.0)
   and Rust client (`rust-v0.16.0`) refuse it exactly as they refuse any virtual-mode rpc host (they look for `rpc`); use this release's client or `wsh-mcp --sealed`. `wsh-server` is unchanged.
-- **Bundle:** `@johnhenry/wsh/page` is 79.8 kB gzipped (it contains the memory host); the other entry points grew by about 90 bytes gzip each, from the two small additions to the shared rpc context.
+- **Bundle:** `@johnhenry/wsh/page` is 80.8 kB gzipped (it contains the memory host); the other entry points grew by about 100 bytes gzip each at most, from the two small additions to the shared rpc context.
+
+### rpc channels in virtual data mode, Rust: `wsh mcp --sealed` / `--via` and `wsh-server` with `seal_session` on (#191; Rust)
+
+The Rust halves of the JS change below. **No new wire format**: the feature string `rpc-virtual`, `OpenOk { data_mode: "virtual" }`, `SessionData` and the flagged
+`GatewayCredit` (`gateway_id = 0x80000000 | channel_id`, 262144 bytes per direction) are exactly what the JS side states.
+
+- **Client.** `wsh-client`'s `RpcOffer` reads `rpc-virtual`; `WshClient::open_rpc` chooses the form from what the host states (nothing for callers to change) and the channel
+  keeps credit as the JS `RpcCreditLink` does: a slow reader bounds the sender, an overrun closes the channel, the message cap is enforced from the CBOR header. The
+  refusals of `wsh mcp --sealed` and of rpc on a sealed session are gone: `wsh mcp --sealed` and `wsh --via <pipe relay> mcp` work against a JS host (a page host, a
+  reverse host). The shared accounting is `wsh_core::rpc_credit`.
+- **Server.** With `[server] seal_session = "offer" | "require"` the typed rpc channels (`wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set) are offered, stated
+  `rpc-virtual` instead of `rpc`, riding `SessionData` (inside the seal on a sealed session) with the same credit accounting, and with the per-key capability checks of
+  stream-mode rpc applied identically (`rpc:NAME`, `fs:read` / `fs:write`, file transfer: one code path). The start-up message that withheld rpc is gone. **With
+  `seal_session` off (the default) rpc is stream-mode and unchanged.** Under `offer`, a client that does not seal also gets `rpc-virtual` (plain `SessionData`).
+- **A released peer.** A released JS (0.45.0) or Rust (`rust-v0.16.0`) client looks for `rpc`, which a sealing server does not state: it refuses with
+  `UNSUPPORTED_PROTOCOL` before sending anything (before this change such a server offered no rpc at all, so nothing that worked stops working). A released host never
+  states `rpc-virtual`, so the new client uses streams there. Not covered: WebTransport (never sealed on `wsh-server`; it offers no rpc, as before).
+
+### Host option `usernamePattern` (additive)
+
+`createWshServer`, `createMemoryHost` and `createConnectionFactory` take `usernamePattern` (a `RegExp` or a pattern string): which login names the host admits. **Default unchanged**,
+`^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`. A host that does not map names to OS accounts (a page host, a mesh peer named by a base64url identity hash that may start with a digit or `-`) can
+admit its own shape, for example `/^[A-Za-z0-9_-]{1,64}$/`, and no longer needs to prefix the name. Whatever the pattern, a name is 1 to 256 characters with no control character, no
+`/` or `\`, and is not `.` or `..`, and a pattern that matches the empty name is refused when the host is created.
+
+- **Wire:** none (a name is a string in `Hello.username` as before; the check is the host's). **A released peer:** a released client sends what it always sent; a released host keeps its
+  own default and refuses such a name with `bad username`, so a client that relies on this option needs a host from this release. The Rust `wsh-server` and `createReverseHost` keep the default shape.
+- Tests: `test/username-pattern.test.mjs` (default unchanged and refusing digit-first and dash-first names, a pattern on a Node host and a memory host, the floor under a pattern that
+  matches anything, option validation). The floor was broken once to see its test fail.
+
+### Typed errors for a refused login and a failed connection (additive; JS client)
+
+`connect()` now rejects a refused login with `WshAuthError` and a failed connection with `WshConnectionError`, the way a host-key mismatch is a `HostKeyError`. **Both are `Error`s and the
+messages are unchanged** (`Authentication failed: key not authorized`, `Connection failed across transports (...)`, `Auth handshake timed out ...`), so code that matches the text keeps working.
+
+- `WshAuthError`: `code` (`AUTH_UNAUTHORIZED`, `AUTH_BAD_SIGNATURE`, `AUTH_METHOD_DISABLED`, `AUTH_RATE_LIMITED`, `AUTH_KEY_EXPIRED`, `AUTH_BINDING_REQUIRED`, `AUTH_NOT_SEALED`, `AUTH_BAD_REQUEST`, or `AUTH_FAILED`),
+  `reason` (the host's words, verbatim) and `refusal` (the reason the host reports to its own `onRefused`, or `null`). `WshConnectionError`: `code` `CONNECTION_FAILED` (with `attempts`) or `HANDSHAKE_TIMEOUT`.
+  Also exported: `WSH_ERROR_CODES`, `classifyAuthRefusal(reason)`.
+- **Wire: none.** The `AuthFail` message carries only the host's text, so the client recognises the reasons of the Node host and the Rust `wsh-server` from their wording; a test runs each refusal
+  against a host and checks the client's `refusal` equals what the host reported to `onRefused`. A host that words a refusal differently gives `AUTH_FAILED`, `refusal: null`, and the text in `reason`.
+  Carrying the code on the wire would be a new optional field behind a feature string (a released Rust peer rejects unknown fields); it is not done here.
+- **A released peer:** a released host is unchanged and is what the client reads; a released client is unaffected by a newer host.
+- Tests: `test/client-errors.test.mjs` (each refusal against a memory host with `onRefused`, rate limiting, a real WebSocket, the classification table, an unanswered handshake, no listener).
+  One pattern was removed once to see the tests fail.
+
+### A message a sealed session drops is counted and reported, not written to the console (JS client)
+
+A plain message heard on a sealed session (or before it is sealed), a plain message on a sealed reverse bridge and a bridge frame that does not open used to be dropped with a `console.warn`
+(`[wsh:client] dropping a plaintext message ...`) and no signal to the application. Now **nothing is written to the console**: the client counts them (`client.droppedMessages`, `{ plaintext, unopened }`) and calls
+`client.onDrop({ reason, messageType?, detail? })` (`reason` is `plaintext-on-sealed-session`, `plaintext-before-seal`, `plaintext-on-sealed-bridge` or `unopenable-bridge-frame`). It is not `onError`: the connection carries on,
+and a frame that does not open on a sealed *session* still ends it through `onError` as before. A handler that throws is ignored.
+
+- **Behaviour change:** the console lines are gone. An embedder that read them should read `onDrop` / `droppedMessages`.
+- **Wire: none. A released peer:** unaffected (client-side only).
+- Tests: `test/session-seal-client.test.mjs` (plain messages injected by a relay after the key exchange are counted, reported with their message type, never reach the console, and a throwing handler changes nothing).
+  Not covered by a test: the three sealed-bridge paths (they call the same function).
+
+### Pipe relay: a browser-safe entry, and a "paired" signal for the waiting host (additive; JS)
+
+- **`@johnhenry/wsh/pipe-relay` bundles for a browser.** Its `listen()` (an HTTP server through `ws` and `node:http`) moved to `src/pipe-relay-node.mjs`, which `listen()` loads by name when it is called, so a
+  bundler that follows a static import of the pipe relay no longer needs `ws` or `node:http`/`node:https` (the failure a page that imports `pipeUrl` next to `./memory` hit). **The export is unchanged:** `createPipeRelay().listen()`
+  works as before. `./pipe-relay` is now a bundled browser entry point (`npm run size` lists it, 3.0 kB gzip), and a test bundles it for the browser next to `./memory`.
+- **A host can be told its partner arrived.** `pipeUrl(relay, id, 'host', { notifyPaired: true })` (`?role=host&paired=1`), or `relay.accept(socket, { id, role: 'host', notifyPaired: true })`: the relay sends that host one
+  text frame, `wsh-pipe/1 paired` (`PAIRED_FRAME`), when the operator arrives, before anything the operator said. `watchPairing(socket)` returns `{ socket, paired }`: pass `socket` to `accept()` (the frame is kept out of what
+  the wsh host reads) and await `paired` (rejects if the socket closes first).
+- **Wire / negotiation:** the host opts in with a URL parameter; nothing else changes on the pipe, which is binary both ways. **A released peer:** a released relay ignores `paired=1` and never sends the frame (the host's
+  `paired` then never settles and the connection works as before); a released host never asks, so it is sent nothing; an operator is never sent it, whatever it passes. The Rust `wsh` operator side is unaffected.
+- Tests: `test/pipe-relay-paired.test.mjs` (the frame, its order against early bytes, a host that did not ask, the operator asking, `accept()` directly, `watchPairing` over a real socket, a login through it), the module-graph
+  and bundle tests in `test/pipe-relay.test.mjs` and `test/browser-bundle.test.mjs`. Putting the literal `import('./pipe-relay-node.mjs')` back made the bundle tests fail.
+
+### `@johnhenry/wsh/testing`: the QMux codec primitives, for tests (additive; JS)
+
+A new entry point exports the QMux record and frame codec a test needs to read, change and re-wrap what travels on a connection: `encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, `encodeVarint` / `decodeVarint`, the other frame
+encoders, `FRAME_TYPE`, `QMUX_ERROR_CODE`, `QMuxProtocolError`. **It is marked as not part of the stable API** (the module header, `@experimental` in the types, `QMUX_TESTING_API.stable === false`, the README): it may change or
+disappear in any release and is outside the compatibility policy. The stable entry point (`@johnhenry/wsh`) is unchanged and still does not export them. It is pure JavaScript and is bundled for the browser like the other entries (`npm run size` lists it).
+
+- **Wire: none. A released peer:** not applicable; it re-exports functions the package already contains.
+- Tests: `test/testing-entry.test.mjs` (the exports, that the main entry does not have them, the not-stable markers, a record split across feeds, a frame re-wrapped around altered bytes and an unaltered one re-encoding to the same bytes).
 
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
@@ -44,7 +122,54 @@ An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence o
 - **A released peer.** A released JS client (0.45.0) opens rpc only when the host states `rpc`; a virtual-mode host does not, so it refuses with `UNSUPPORTED_PROTOCOL`
   before sending anything. A released host never states `rpc-virtual`, so this client opens stream-mode rpc there, unchanged; a host with data streams states exactly what
   it did before. A released Rust client (`rust-v0.16.0`) likewise looks for `rpc` and refuses. A released relay (JS or Rust) forwards `SessionData` and `GatewayCredit`
-  as it always has. `wsh-server` does not offer virtual-mode rpc yet, and the Rust `wsh mcp` does not speak it yet (`--sealed` against it is still refused).
+  as it always has. The Rust halves follow in the entry above.
+
+### **Breaking** (Rust client): the Rust client now verifies the server's certificate on WebTransport connections
+
+`wsh` and `wsh-client` now validate the certificate of an `https://` (WebTransport) server against the system trust store. **Who is affected:** anyone who uses the Rust client over
+WebTransport against a server whose certificate is not signed by an authority the system trusts (for example a `wsh-server --generate-cert` certificate). **What to do:** pin the
+certificate with `--cert-hash <sha256>` (below), or point the client at a CA-signed certificate. A `wss://` connection is unchanged: it was already validated.
+
+- **New: `--cert-hash <SHA256>`** (global flag, repeatable) on `wsh`, and `ConnectConfig.cert_hash` / `ConnectConfig.cert_hashes` for the library: the server's certificate must
+  have one of these SHA-256 hashes, no certificate authority involved, with the rules of the JS client's `serverCertificateHashes` (ECDSA P-256 key, validity of at most 14 days;
+  `--generate-cert` makes such a certificate). The value is 64 hex digits, colons allowed, or the whole `SHA256 Fingerprint=...` line `openssl x509 -fingerprint -sha256` prints.
+  `wsh-server` now logs its certificate hash at start-up. With exactly one pin the connection also has the `cert-hash` channel-binding kind (it was available to a library caller
+  before, but nothing checked the certificate it named).
+- **New: `--insecure-skip-cert-verification`** (`ConnectConfig.insecure_skip_cert_verification`), for development only: the certificate is not checked and a warning is printed
+  on every connection. It is refused together with `--cert-hash`, and with a password login (a password login cannot be sealed end to end, so the password would go to whoever
+  answers the unverified connection); a login by key is still covered by `known_hosts` / `--host-key`.
+- `--cert-hash` or the opt-out with a `wss://` URL is an error, not ignored. A target that is tried over WebTransport and then `wss://` applies them to the WebTransport attempt only.
+- **Wire:** none. **A released peer:** nothing is negotiated; a released `wsh-server` and a JS host are unaffected, and a released `wsh` keeps its old behaviour.
+- Tests: `crates/wsh-client` runs a real in-process WebTransport server with a fresh self-signed certificate: refused by default, accepted with its hash, refused with a wrong hash,
+  accepted (with one warning per connection) under the opt-out, and the configuration rules (`cert_policy`) and the hash parser; the CLI's flag handling in `commands/common.rs`.
+  The default was broken once to see its test fail.
+
+### **Breaking** (Rust `wsh-server`): a gateway host-name rule reaches public addresses only, as the Node host's does
+
+In `[gateway] allowed_destinations`, a host-name rule (`"db.internal"`, `"localhost:5432"`) now allows that name only at a **public** address, like `"*"`. Before, a name rule also let
+the name reach a loopback, private, link-local, carrier-grade-NAT, unique-local or unspecified address it resolved to. A literal-address rule (`"127.0.0.1:5432"`) now matches when
+a client asks for that address, not when a name resolves to it; an address range (`"10.0.0.0/8:5432"`) still matches both. The Node host's gateway already worked this way
+(`allowPrivate`, 0.38.0). `ResolveDns` answers are filtered the same way.
+
+- **Who is affected:** a `wsh-server` with `enabled = true` whose `allowed_destinations` lists a host name that is meant to resolve inside the host's network. **What to do:** add the
+  address or range the name resolves to (`"10.1.2.3/32:5432"`, `"127.0.0.1:5432"`); the name rule can stay.
+- **Wire:** none. **A released peer:** nothing is negotiated; a client sees `POLICY_DENIED` for a destination that is no longer allowed.
+- Tests: the rule table in `gateway/policy.rs` (name rules at every kind of non-public address, mixed answers, literal versus range) and `gateway/forwarder.rs`; the rule was
+  broken once to see its tests fail. The Node host's resolved-address policy and its fake-resolver tests (`test/gateway-address-policy.test.mjs`) are unchanged.
+
+### Password hashing helpers for the Node host; `wsh-server hash-password` (additive)
+
+- **New, `@johnhenry/wsh/server`:** `hashPassword(password)`, `verifyPassword(password, stored)` and `passwordVerifier(hashes, { allowLegacySha256, onWarn })`. A password is stored as a
+  PHC string `$scrypt$ln=16,r=8,p=1$<salt>$<hash>` (scrypt from `node:crypto`: memory-hard, 64 MiB by default; a random per-user salt; `timingSafeEqual`; the cost parameters of a stored
+  value are bounded). `passwordVerifier` is an `auth.password` callback over a table, a `Map` or a lookup function: an unknown user costs the same derivation as a wrong password, and an
+  entry that is not one of these hashes is refused with a warning that names the user and never the value. An unsalted `sha256:<hex>` entry is refused, as `wsh-server` refuses it, unless
+  `allowLegacySha256: true`, which verifies it in constant time and warns naming the user. `auth.password` itself is unchanged: any `(username, password) => boolean` still works.
+- **New, Rust `wsh-server`:** `wsh-server hash-password` is a subcommand (the `--hash-password` flag still works). The password is read from standard input, or prompted for without echo (and
+  repeated) at a terminal; it is never an argument. `dialoguer`, already in the dependency tree through `wsh`, is now also a `wsh-server` dependency.
+- A host that lives in a page keeps its own `auth.password` callback: WebCrypto has no scrypt or Argon2, so nothing is added to the browser-safe entry points; the README says what to use there.
+- **Wire:** none. **A released peer:** nothing is negotiated; the Rust server's Argon2id strings and these scrypt strings are not interchangeable and neither side reads the other's.
+- Tests: `test/server-password-hash.test.mjs` (PHC shape and salts, right and wrong passwords, malformed and oversized stored values, the same derivation for an unknown user, the legacy
+  entry refused and allowed, a real login over `createWshServer`), and a clap test that `hash-password` takes no password argument. The unknown-user rule was broken once to see its test fail.
 
 ## 0.45.0 / Rust `rust-v0.16.0`
 
