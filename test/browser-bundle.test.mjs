@@ -6,7 +6,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ENTRY_POINTS, ROOT, bundle } from '../scripts/browser-bundles.mjs';
-import { measure, readBudget, overBudget } from '../scripts/bundle-size.mjs';
+import {
+  measure, readBudget, overBudget, README_FILE, README_START, README_END, readmeBlock, renderReadmeTable, replaceReadmeBlock,
+} from '../scripts/bundle-size.mjs';
 
 describe('browser entry points (#115, #128)', () => {
   it('every exports entry except the Node-only ones is bundled', async () => {
@@ -48,6 +50,25 @@ describe('browser entry points (#115, #128)', () => {
   it('stays within the size budget (gzip, +10%)', async () => {
     const sizes = await measure();
     assert.deepEqual(overBudget(sizes, await readBudget()), []);
+  });
+
+  it('#128: the README states the gzipped size of each browser entry point, as the budget file has it (`npm run size -- --update` rewrites both)', async () => {
+    const budget = await readBudget();
+    const readme = await readFile(README_FILE, 'utf8');
+    assert.equal(readmeBlock(readme), renderReadmeTable(budget), 'the README size table is stale: run `npm run size -- --update`');
+    for (const p of ENTRY_POINTS.filter((x) => x.entry)) assert.ok(readmeBlock(readme).includes(`\`@johnhenry/wsh${p.name === '.' ? '' : p.name.slice(1)}\``), `${p.name} is in the README table`);
+  });
+
+  it('the README table is regenerated from the budget, and a stale one is detected', async () => {
+    const budget = await readBudget();
+    const table = renderReadmeTable(budget);
+    const doc = `before\n${README_START}\n${table}\n${README_END}\nafter\n`;
+    assert.equal(readmeBlock(doc), table);
+    const changed = { ...budget, entries: { ...budget.entries, '.': { ...budget.entries['.'], gzip: budget.entries['.'].gzip + 4096 } } };
+    assert.notEqual(readmeBlock(doc), renderReadmeTable(changed));
+    assert.equal(replaceReadmeBlock(doc, renderReadmeTable(changed)).startsWith('before\n'), true);
+    assert.equal(readmeBlock(replaceReadmeBlock(doc, renderReadmeTable(changed))), renderReadmeTable(changed));
+    assert.throws(() => replaceReadmeBlock('no markers', table), /markers/);
   });
 
   it('./host does not import the client', async () => {
