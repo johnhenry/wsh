@@ -13,7 +13,8 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createPipeRelay } from '@johnhenry/wsh/pipe-relay';
 import { createPageHost, captureWebMcp } from '@johnhenry/wsh/page';
-import { set, on, use, RemoteHandle, NonValue } from '@johnhenry/wsh/objects';
+import { set, on, use, RemoteHandle, NonValue, rootDescription } from '@johnhenry/wsh/objects';
+import { describeRootTypes } from '@johnhenry/wsh/objects-types';
 import {
   WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, exportPrivateKeyPKCS8, fingerprint, mcpClientTransport, cborEncode, MSG,
 } from '@johnhenry/wsh';
@@ -454,6 +455,27 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
     await assert.rejects(wsh.openRpc('mcp'), /not supported|UNSUPPORTED/);
     // And nothing else is: no exec, no files.
     await assert.rejects(wsh.openSession({ type: 'exec', command: 'ls' }));
+  });
+
+  it('typed remotes: the types answer is the root-relative allow-lists and type map of the page host, narrowed by the key (#219)', async () => {
+    const { win } = worldWindow();
+    const expose = { window: { allow: { get: ['document.title', 'app.cart.**'], call: ['app.cart.add'] }, types: { 'document.title': { value: 'string' }, 'app.cart.add': { args: '[item: { sku: string }]', result: '{ count: number }' } } } };
+    const page = await startPage({ window: win, registered: [], authorizedKeys: [aliceLine, `capabilities="objects:window:get" ${bobLine}`], mcp: undefined, host: { mcp: undefined, expose } });
+    // One session at a time: the first key leaves before the second arrives.
+    const describeAs = async (keyPair, username) => {
+      const wsh = new WshClient();
+      await wsh.connect(page.host.operatorUrl, { username, keyPair, transport: 'ws', sealSession: true });
+      try { return await rootDescription((await wsh.openObjects()).window); } finally { await wsh.disconnect(); }
+    };
+    const full = await describeAs(alice, 'alice');
+    assert.deepEqual(full.allow.call, ['window.app.cart.add']);
+    assert.match(describeRootTypes(full), /readonly add: RemoteCall<\[item: \{ sku: string \}\], \{ count: number \}, unknown>/);
+    await until(() => page.host.sessions.length === 0, 'the first session to end');
+    const readOnly = await describeAs(bob, 'bob');
+    assert.deepEqual(readOnly.ops, ['get']);
+    assert.doesNotMatch(describeRootTypes(readOnly).slice(describeRootTypes(readOnly).indexOf('export type')), /RemoteCall|add/);
+    await assert.rejects(createPageHost({ relay: 'ws://127.0.0.1:1', name: 'x', authorizedKeys: ['k'], window: createFakeWindow(), expose: { window: { allow: { get: ['a'] }, types: { b: { value: 'string' } } } } }), /allows that path/);
+    await assert.rejects(createPageHost({ relay: 'ws://127.0.0.1:1', name: 'x', authorizedKeys: ['k'], window: createFakeWindow(), expose: { window: { allow: { get: ['a'] }, types: { a: { value: 'import("x")' } } } } }), /import/);
   });
 
   it('both facilities at once: mcp tools and object access, each its own channel, each with its own capability', async () => {

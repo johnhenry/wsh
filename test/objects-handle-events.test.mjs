@@ -246,8 +246,8 @@ describe('events through a handle: the key, the host\'s statement and an older h
     const [c2, s2] = createDuplexPair();
     createObjectsServer({ roots: { window: makeWorld().win }, allow: ALLOW }).attach(s2);
     closers.push(async () => { c1.close(); s1.close(); c2.close(); s2.close(); });
-    assert.deepEqual((await c1.request('roots', {})).features, ['events', 'callbacks', 'handles', 'handle-events']);
-    assert.deepEqual((await c2.request('roots', {})).features, ['events', 'callbacks']);
+    assert.deepEqual((await c1.request('roots', {})).features, ['events', 'callbacks', 'types', 'handles', 'handle-events']);
+    assert.deepEqual((await c2.request('roots', {})).features, ['events', 'callbacks', 'types']);
   });
 
   it('a host that did not say it supports events through a handle (0.50.0) gets no request: a named error on the client, and nothing is sent', async () => {

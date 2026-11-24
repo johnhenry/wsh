@@ -29,7 +29,7 @@ import {
 export {
   OBJECTS_PROTOCOL, OBJECTS_ERROR, OBJECTS_DEFAULT_LIMITS, NEEDS_LISTING, ObjectsError, NonValue,
   createObjectsServer, createObjectsClient, createDuplexPeer, matchPath, toWire, fromWire,
-  get, set, call, construct, snapshot, describe, on, off, use, release, RemoteHandle, closeObjects,
+  get, set, call, construct, snapshot, describe, on, off, use, release, RemoteHandle, closeObjects, rootDescription,
 } from './objects-core.mjs';
 
 /** Timers for `callTimeoutMs` where the embedder gave none: this module is the Node-or-browser adapter, not the page entry point. */

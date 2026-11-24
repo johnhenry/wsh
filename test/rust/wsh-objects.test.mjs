@@ -165,7 +165,7 @@ describe('wsh --sealed objects: values mode against a page host', () => {
     const roots = await wsh(['roots']);
     assert.equal(roots.code, 0, roots.stderr);
     assert.deepEqual(json(roots).roots, ['window']);
-    assert.deepEqual(json(roots).features.sort(), ['callbacks', 'events'], 'values mode: no handles stated');
+    assert.deepEqual(json(roots).features.sort(), ['callbacks', 'events', 'types'], 'values mode: no handles stated');
     assert.match(roots.stderr, /session sealed end to end/);
 
     assert.equal((await wsh(['get', 'window.app.title'])).stdout, '"Shop"\n');

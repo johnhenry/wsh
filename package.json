@@ -37,6 +37,10 @@
       "types": "./src/objects.d.ts",
       "import": "./src/objects.mjs"
     },
+    "./objects-types": {
+      "types": "./src/objects-types.d.ts",
+      "import": "./src/objects-types.mjs"
+    },
     "./testing": {
       "types": "./src/testing.d.ts",
       "import": "./src/testing.mjs"
@@ -62,7 +66,8 @@
     "./spec/wsh-v1.yaml": "./spec/wsh-v1.yaml"
   },
   "bin": {
-    "wsh-mcp": "./bin/wsh-mcp.mjs"
+    "wsh-mcp": "./bin/wsh-mcp.mjs",
+    "wsh-objects-types": "./bin/wsh-objects-types.mjs"
   },
   "sideEffects": false,
   "types": "./src/index.d.ts",

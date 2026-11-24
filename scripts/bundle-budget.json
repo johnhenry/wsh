@@ -26,12 +26,16 @@
       "gzip": 77790
     },
     "./page": {
-      "raw": 310212,
-      "gzip": 98470
+      "raw": 321768,
+      "gzip": 102581
     },
     "./objects": {
-      "raw": 182437,
-      "gzip": 55857
+      "raw": 193996,
+      "gzip": 59882
+    },
+    "./objects-types": {
+      "raw": 10433,
+      "gzip": 4299
     },
     "./capabilities": {
       "raw": 10845,

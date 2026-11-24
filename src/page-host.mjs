@@ -75,6 +75,7 @@ function exposedRoots(window, expose) {
   const authorizers = new Map();
   const eventFields = {};
   const handles = {};
+  const types = {};
   let limits;
   for (const name of names) {
     const cfg = expose[name];
@@ -97,12 +98,15 @@ function exposedRoots(window, expose) {
         allow[op].push(op === 'on' && entry.startsWith('@') ? `${name}${entry}` : `${name}.${entry}`);
       }
     }
+    // Type texts for the far side's `.d.ts`, with the same relative paths (`'app.cart.add'`, `'app.bus@ready'`, `'@hashchange'` for the root itself): host-authored text, checked by `exposeObjects`.
+    if (cfg.types !== undefined && !isObj(cfg.types)) throw new TypeError(`createPageHost: expose.${name}.types must be an object of paths`);
+    for (const [path, spec] of Object.entries(cfg.types ?? {})) types[path.startsWith('@') ? `${name}${path}` : `${name}.${path}`] = spec;
     for (const [type, fields] of Object.entries(cfg.eventFields ?? {})) eventFields[type] = [...new Set([...(eventFields[type] ?? []), ...(Array.isArray(fields) ? fields : [])])];
     if (cfg.authorize !== undefined) { if (typeof cfg.authorize !== 'function') throw new TypeError(`createPageHost: expose.${name}.authorize must be a function`); authorizers.set(name, cfg.authorize); }
     if (cfg.limits !== undefined) limits = { ...limits, ...cfg.limits };
   }
   const authorize = authorizers.size ? (who, op) => (authorizers.has(op.root) ? authorizers.get(op.root)(who, { ...op, path: op.path }) : true) : undefined;
-  return { roots, allow, authorize, limits, eventFields, handles };
+  return { roots, allow, authorize, limits, eventFields, handles, types };
 }
 
 /**
@@ -265,7 +269,7 @@ export async function createPageHost(options = {}) {
     guard: () => gone() ?? mcp.guard?.() ?? null,
   }) : null;
   const objectsHandler = exposed ? exposeObjects({
-    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, eventFields: exposed.eventFields, handles: exposed.handles, timers,
+    roots: exposed.roots, allow: exposed.allow, authorize: exposed.authorize, limits: exposed.limits, eventFields: exposed.eventFields, handles: exposed.handles, types: exposed.types, timers,
     // Handle ids come from the served window's own CSPRNG.
     random: (n) => window.crypto.getRandomValues(new Uint8Array(n)),
     guard: () => gone(),
