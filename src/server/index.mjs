@@ -25,6 +25,7 @@ import { TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH, CHANNEL_BINDING_KINDS } from '
 export { parseAuthorizedKeys, parseAuthorizedKeyEntries, STREAM_ANNOUNCE, mcpServerAdapter };
 export { createReverseHost } from './reverse-host.mjs';
 export { generateSelfSignedCertificate } from './self-signed.mjs';
+export { hashPassword, verifyPassword, passwordVerifier } from './password.mjs';
 
 /** The TLS exporter of a `wss://` connection as a channel binding (#119); null on a plain socket or a TLS-terminating proxy hop. */
 function tlsChannelBinding(socket) {

@@ -1376,9 +1376,12 @@ offer or compute a binding yet, so against them a client with
 ### Password auth
 
 ```js
+import { createWshServer, hashPassword, passwordVerifier } from '@johnhenry/wsh/server';
+
+const stored = { alice: await hashPassword(process.env.ALICE_PASSWORD) };  // once, offline: keep the strings, not the passwords
 createWshServer({
   auth: {
-    password: async (username, password) => verifyAgainstYourHashes(username, password),
+    password: passwordVerifier(stored),   // or any (username, password) => boolean | Promise<boolean>
     // authorizedKeys / authorize may be given too: both methods are then served.
     rateLimit: { maxFailures: 5, windowMs: 60_000, lockoutMs: 60_000, failureDelayMs: 250 },
   },
@@ -1391,9 +1394,19 @@ The wire already has it (`Hello.auth_method: 'password'` then `Auth{ method:
 that is also its limit: the password travels as plain text inside the
 connection, so serve password logins over `wss://` (TLS-terminating proxy)
 or a link you trust, and pin the host key so it is only ever sent to the right
-host. Use a constant-time comparison against stored hashes in the callback,
-never `===` on plaintext. A host with only `password` refuses key logins and
+host. A host with only `password` refuses key logins and
 vice versa; with neither configured every connection is refused.
+
+**Storing the passwords.** `hashPassword()` / `passwordVerifier()` (Node entry point only, `node:crypto`) store a password as a PHC
+`$scrypt$ln=16,r=8,p=1$<salt>$<hash>` string: scrypt (memory-hard, 64 MiB by default), a random per-user salt, a constant-time
+comparison, and the same derivation for an unknown user as for a wrong password, so neither the answer nor the time says which
+users exist. An old unsalted `sha256:<hex>` entry is refused (with a warning that names the user, never the hash) unless
+`allowLegacySha256: true`, which keeps it working with the warning until it is replaced. The Rust `wsh-server` does the same with
+Argon2id (`wsh-server hash-password`, the password from standard input or a no-echo prompt, never an argument); the two formats are
+not interchangeable. **Not covered:** this protects the stored file, not the wire (the password still travels inside the connection,
+see the Security model); `scrypt` is not available to a host that lives in a page, whose `auth.password` stays a callback and whose
+hash is yours to choose (WebCrypto offers PBKDF2, not scrypt or Argon2; use a high iteration count and a per-user salt); and the
+throttle's counters are per process.
 
 Failures are throttled per peer address (override with `rateLimit.key`, e.g.
 read `x-forwarded-for` from `headers` behind a proxy): each connection gets one
