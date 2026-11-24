@@ -255,8 +255,19 @@ impl RpcSessions {
         };
         let live = self.live.clone();
         tokio::spawn(async move {
-            let ended =
-                channel::run_metered(cfg, Arc::new(handler), in_rx, out_tx, Some(consumed)).await;
+            let overrun = {
+                let link = link.clone();
+                Box::new(move || link.is_closed()) as Box<dyn Fn() -> bool + Send + Sync>
+            };
+            let ended = channel::run_metered(
+                cfg,
+                Arc::new(handler),
+                in_rx,
+                out_tx,
+                Some(consumed),
+                Some(overrun),
+            )
+            .await;
             // Let what was queued reach the wire (bounded: the peer may be gone, or not granting credit).
             let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
             link.close();
@@ -1043,18 +1054,19 @@ mod tests {
         for _ in 0..5 {
             s.on_session_data(ch, filler.clone());
         }
-        let mut closed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
-            else {
-                break;
-            };
-            if matches!(e.payload, Payload::Close(ref c) if c.channel_id == ch) {
-                closed = true;
-                break;
+        // Wait for the event, not for a quiet moment: the host writes whatever answers it had ready, then Exit and Close,
+        // and drops its end of the control stream once it is done (so `recv` returns `None` if Close never comes). How
+        // long that takes depends on the machine; the outer timeout only keeps a broken build from hanging the suite.
+        let closed = tokio::time::timeout(Duration::from_secs(120), async {
+            while let Some(e) = rx.recv().await {
+                if matches!(e.payload, Payload::Close(ref c) if c.channel_id == ch) {
+                    return true;
+                }
             }
-        }
+            false
+        })
+        .await
+        .expect("the channel neither closed nor ended");
         assert!(closed, "the host closes the channel (Exit, then Close)");
     }
 
