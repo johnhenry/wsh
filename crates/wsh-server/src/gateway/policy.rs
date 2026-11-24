@@ -46,6 +46,10 @@ pub struct GatewayPolicy {
     /// Where reverse listeners bind. The client's `bind_addr` is not honoured; it
     /// cannot widen this.
     pub reverse_bind_addr: IpAddr,
+    /// Which ports a client may ask for, and the listener / connection / backlog / idle bounds.
+    pub reverse: super::reverse_policy::ReversePolicy,
+    /// UDP flow count, rates and idle limit.
+    pub udp: super::udp_policy::UdpPolicy,
     /// Unix-domain sockets a client may reach or create (off unless listed).
     pub unix: super::unix_policy::UnixPolicy,
     /// Bytes received from a client for one connection and not yet taken by its origin
@@ -69,6 +73,8 @@ impl Default for GatewayPolicy {
             max_connections: 100,
             enable_reverse_tunnels: false,
             reverse_bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            reverse: super::reverse_policy::ReversePolicy::default(),
+            udp: super::udp_policy::UdpPolicy::default(),
             unix: super::unix_policy::UnixPolicy {
                 max_listeners: super::unix_policy::DEFAULT_MAX_UNIX_LISTENERS,
                 ..Default::default()
@@ -372,11 +378,24 @@ impl GatewayPolicyEnforcer {
     ///
     /// Reverse tunnels must be enabled in the policy (`enable_reverse_tunnels`, off by
     /// default) and the connection limit not reached.
-    pub fn check_listen(&self, _port: u16) -> Result<(), String> {
+    pub fn check_listen(&self, port: u16) -> Result<(), String> {
         if !self.policy.enable_reverse_tunnels {
             return Err("reverse tunnels are disabled".to_string());
         }
+        if !self.policy.reverse.port_allowed(port) {
+            return Err(self.policy.reverse.port_refusal(port));
+        }
         self.check_limit()
+    }
+
+    /// The UDP flow bounds.
+    pub fn udp(&self) -> &super::udp_policy::UdpPolicy {
+        &self.policy.udp
+    }
+
+    /// The reverse-tunnel ports and bounds.
+    pub fn reverse(&self) -> &super::reverse_policy::ReversePolicy {
+        &self.policy.reverse
     }
 
     /// The unix-socket policy.

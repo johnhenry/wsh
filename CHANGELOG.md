@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Rust `wsh-server`: reverse tunnels and UDP flows get the Node host's bounds (#145, part; Rust only; **breaking defaults, read this**)
+
+The two rows of the README capability matrix that said "Rust still needs ... the same bounds" are done. **No wire change, no new feature string, nothing
+changes for a client**; the Rust server now refuses and closes where the Node host (`gateway.reverse`, `gateway.udp`) already did, with the same defaults and the
+same refusal sentences (`ListenFail.reason`, `GatewayFail.message`). `wsh-server` only; a released `wsh` and a JS client see a refusal they already know how to read.
+
+- **BREAKING (defaults), TCP reverse tunnels** (only where `[gateway] enable_reverse_tunnels = true`):
+  - `reverse_ports` (new; default `[0, "1024-65535"]`). A `ListenRequest` for a port below 1024 is now refused with `port 80 is not allowed by the
+    reverse-tunnel policy (ports below 1024 must be listed explicitly by the host operator)`. A deployment that listened on a privileged port must list it
+    (`reverse_ports = [80, 0, "1024-65535"]`); a list REPLACES the default, so name what you want. Entries are integers and `"lo-hi"` ranges; a bad one stops start-up.
+  - `reverse_max_listeners` (4 per client connection; before, only `max_connections` bounded them), `reverse_max_connections_per_listener` (16; the next
+    connection is closed and never announced), `reverse_backlog` (8, now really passed to `listen(2)`; at least 1), and `reverse_idle_secs` (300; before, a quiet
+    tunnel stayed open for ever; `0` keeps that). The idle limit watches a connection the relay is reading; one parked waiting for the client's credit is bounded
+    by the credit window and the caps instead.
+- **BREAKING (defaults), UDP flows (`OpenUdp`) on the reliable control stream:** `udp_max_flows` 16 per client connection (`too many UDP flows (limit N)`,
+  `GatewayFail` code 7), `udp_packets_per_second_per_flow` 500 and `udp_packets_per_second_per_client` 2000 (token buckets over datagrams), and
+  `udp_bytes_per_second_per_client` 4 MiB (payload bytes; this is the amplification bound), all counted in BOTH directions; a datagram over a limit is dropped,
+  as a congested network would. `0` on a rate means no limit. `udp_idle_secs` (60, at least 1) now counts datagrams in either direction (it counted only replies,
+  so a flow the client kept sending on, with no answers, closed at 60 s). A client that pushed more than 2000 datagrams a second through one connection now loses
+  the excess.
+- **Still not in the Rust server (`gateway-datagram`):** UDP as WebTransport datagrams (the `[gateway_id u32 BE][payload]` layout, `maxDatagramSize`, the
+  oversize choice). A client that lists the feature to a Rust server keeps the reliable path, as with every released server. Left in the README matrix.
+- **A released peer:** none of this is negotiated. A released JS client and `wsh` keep working and see the refusals above; a released `wsh-server` keeps the old
+  unbounded behaviour.
+- Tests: `test/rust/wsh-rust-server-reverse.test.mjs` (the Node host's reverse cases against the real binary: the default and a given port list, start-up refusals,
+  the listener cap, the per-listener cap and its slot coming back, the idle limit with and without traffic, `0`, and listeners ending with the client) and
+  `test/rust/wsh-rust-server-udp-bounds.test.mjs` (flows, the three rates, amplification with small queries and big answers, `0`, idle in both directions);
+  unit tests for the policies, the token bucket and the connection wrapper. Every new rule was broken once to see its test fail.
+- Out of scope for the Rust server, listed for #145: named endpoints (`OpenEndpoint`) and execution targets (`ListTargets`) are for hosts without a file system and
+  are not offered by `wsh-server` (they parse and grant nothing, README); `tls-exporter` channel binding needs a TLS terminated by the process itself.
+
 ## 0.44.1
 
 ### The README states the gzipped size of each browser entry point, and CI fails when it is stale (#128, the part that was left; tooling and docs only)
