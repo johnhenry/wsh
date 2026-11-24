@@ -54,11 +54,13 @@ function encodeValue(value, parts) {
     return;
   }
   if (typeof value === 'number') {
-    if (Number.isInteger(value)) {
-      if (value >= 0) {
-        parts.push(encodeHead(MT_UNSIGNED, value));
+    // An integral double within the 64-bit ranges is an integer (exactly: BigInt past 2^53); anything else -- a fraction, NaN,
+    // an infinity, -0, or an integer at or beyond 2^64 in magnitude -- is a float64, so every finite double round-trips.
+    if (Number.isInteger(value) && !Object.is(value, -0) && value >= -TWO_64 && value < TWO_64) {
+      if (Number.isSafeInteger(value)) {
+        parts.push(value >= 0 ? encodeHead(MT_UNSIGNED, value) : encodeHead(MT_NEGATIVE, -1 - value));
       } else {
-        parts.push(encodeHead(MT_NEGATIVE, -1 - value));
+        parts.push(value >= 0 ? encodeHead64(MT_UNSIGNED, BigInt(value)) : encodeHead64(MT_NEGATIVE, -1n - BigInt(value)));
       }
     } else {
       // float64
@@ -102,6 +104,17 @@ function encodeValue(value, parts) {
     return;
   }
   throw new Error(`cborEncode: unsupported type ${typeof value}`);
+}
+
+const TWO_64 = 2 ** 64;
+
+/** An 8-byte head for a value that is beyond the safe-integer range (exact, from a BigInt in 0 .. 2^64-1). */
+function encodeHead64(majorType, big) {
+  const buf = new ArrayBuffer(9);
+  const view = new DataView(buf);
+  view.setUint8(0, (majorType << 5) | 27);
+  view.setBigUint64(1, big);
+  return new Uint8Array(buf);
 }
 
 function encodeHead(majorType, value) {
@@ -159,7 +172,15 @@ function decodeValue(state) {
 
   switch (mt) {
     case MT_UNSIGNED: return decodeUint(state, ai);
-    case MT_NEGATIVE: return -1 - decodeUint(state, ai);
+    case MT_NEGATIVE: {
+      if (ai === 27) {
+        // Past 2^53 `-1 - n` would round twice (n, then the sum): take the nearest double of the exact value once.
+        const view = new DataView(state.data.buffer, state.data.byteOffset + state.offset, 8);
+        state.offset += 8;
+        return Number(-1n - view.getBigUint64(0));
+      }
+      return -1 - decodeUint(state, ai);
+    }
     case MT_BYTES: {
       if (ai === BREAK) return decodeIndefiniteBytes(state);
       const len = decodeUint(state, ai);
@@ -187,7 +208,7 @@ function decodeValue(state) {
       const obj = {};
       for (let i = 0; i < len; i++) {
         const key = decodeValue(state);
-        obj[key] = decodeValue(state);
+        setOwn(obj, key, decodeValue(state));
       }
       return obj;
     }
@@ -260,9 +281,21 @@ function decodeIndefiniteMap(state) {
   const obj = {};
   while (!consumeBreak(state)) {
     const key = decodeValue(state);
-    obj[key] = decodeValue(state);
+    setOwn(obj, key, decodeValue(state));
   }
   return obj;
+}
+
+/**
+ * Set a decoded map entry as plain own data. A key is untrusted wire input: `obj['__proto__'] = value` would run the
+ * prototype setter and change what the object inherits, so that one key is defined as an own property instead (the key is
+ * coerced to a string first, because `obj[['__proto__']]` reaches the same setter). Every other key, `constructor` and
+ * `prototype` included, is an ordinary assignment: it creates an own property and inherits no setter.
+ */
+function setOwn(obj, key, value) {
+  const name = typeof key === 'string' ? key : String(key);
+  if (name === '__proto__') Object.defineProperty(obj, name, { value, writable: true, enumerable: true, configurable: true });
+  else obj[name] = value;
 }
 
 function consumeBreak(state) {

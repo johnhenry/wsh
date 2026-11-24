@@ -256,7 +256,12 @@ function prune(v) {
   if (Array.isArray(v)) return v.map((x) => (x === undefined ? null : prune(x)));
   if (v && typeof v === 'object' && !ArrayBuffer.isView(v) && !(v instanceof ArrayBuffer)) {
     const o = {};
-    for (const k of Object.keys(v)) if (v[k] !== undefined) o[k] = prune(v[k]);
+    for (const k of Object.keys(v)) {
+      if (v[k] === undefined) continue;
+      // An own `__proto__` member is data (it can arrive in a decoded message): copy it as data, never through the setter.
+      if (k === '__proto__') Object.defineProperty(o, k, { value: prune(v[k]), writable: true, enumerable: true, configurable: true });
+      else o[k] = prune(v[k]);
+    }
     return o;
   }
   return v;
