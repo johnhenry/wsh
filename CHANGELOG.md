@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Spec versus implementation: a generated message matrix, and a compatibility policy (#129; documentation and tooling, no wire change)
+
+- **`spec/message-matrix.md`** lists every message of `spec/wsh-v1.yaml` (110) and whether the JS host, JS client, Rust host and Rust client
+  name it (send it or act on it in code that is neither generated nor a test). It is **generated** (`npm run matrix`) from the spec and from the
+  source of each implementation: `MSG.X` or a call of the message's builder in `src/`, `Payload::X` / `MsgType::X` / `XPayload` in `crates/`,
+  comments and `#[cfg(test)]` code removed. `npm run matrix:check` (a CI gate, and `test/message-matrix.test.mjs` in `npm test`) fails when the
+  file is stale, and when a source file is not classified as host, client or shared in `scripts/message-matrix.mjs`. It says that a handler
+  exists, not that every field is honoured. At the time of writing 62 messages are named by all four and one (`AuthMethods`) by none.
+- **`COMPATIBILITY.md`**: what a release may change before 1.0, optional fields on decode, what a released Rust peer (`deny_unknown_fields`)
+  does with a field it does not know and what a released JS peer does (ignores it), feature strings gating anything a released peer would
+  reject or silently ignore, fail-closed parsing of options (the `capabilities=` hazard on released Rust servers), defaults deny.
+- Not done from the issue: a per-message `implemented:` status inside the spec file itself (it would be a hand-kept second source of truth
+  that the generated matrix replaces), and the "ideas" file for messages that are not planned (what is planned is the owner's call; the matrix
+  lists the messages nobody names).
+- No wire change, no feature string, no default changed, no generated file touched.
+
 ### Fix: a sealed reverse bridge no longer drops an operator's first frame that outruns the host's key derivation (#162)
 
 `test/operator-proof.test.mjs` ("injects an Open stamped with the operator's fingerprint ...") failed now and then with
@@ -14,6 +30,8 @@ if the exchange fails). Frames before any `KeyExchange`, for another session or 
 that must be sealed is still dropped; nothing is sent differently, so no wire change, no feature string, no default changed.
 Regression test: a hostile hop that makes the order certain (it delivers the operator's first frame ahead of its ciphertext) fails on 20 of 20
 runs before the fix and passes 20 of 20 after.
+
+## 0.44.0 / Rust `rust-v0.15.0`
 
 ### `wsh-mcp`: a stdio bridge so MCP clients can reach an MCP server behind a wsh host (#127, partial; JS only)
 
