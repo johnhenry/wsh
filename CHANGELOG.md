@@ -26,6 +26,16 @@ connection, with `[gateway] enabled = true` and `udp_datagrams` not `false`**, a
   `udp_oversize`, `udp_datagrams = false`, a WebSocket client, the bounds on the datagram path); unit tests in `wsh-core` (`gateway_datagram`, the same vector as
   `test/gateway-datagram.test.mjs`), `udp_policy` and the gateway session (a fake transport). Each rule was broken once to see its test fail.
 
+### Rust-suite flakes (#162, part; tests only, no change to any released code)
+
+- `test/rust/wsh-rust-server.test.mjs`, "a principal granted access via grantSessionAccess attaches with no token at all": a `SessionGrant` has no acknowledgement
+  (the server answers only an error) and `sendControl` resolves when the frame is written, so the grantee, who connects on another connection that the server serves
+  independently, could attach before the grant was applied ("not authorized to attach to this session"). Reproduced by delaying the grant in the server by 1.5 s; the
+  test now waits for the answer to a request sent after the grant (a connection's control messages are handled in order). The server needed no change: it applies a grant
+  before it handles the next message.
+- `test/rust/wsh-rust-server-forwarding.test.mjs`, "serves many concurrent connections and enforces max_connections", which once hung to the 180 s timeout: not reproduced
+  in about 45 runs (serial, in parallel, throttled). A stalled transfer now fails after 30 s naming the connection and how far it got.
+
 ### Rust `wsh-server`: reverse tunnels and UDP flows get the Node host's bounds (#145, part; Rust only; **breaking defaults, read this**)
 
 The two rows of the README capability matrix that said "Rust still needs ... the same bounds" are done. **No wire change, no new feature string, nothing
