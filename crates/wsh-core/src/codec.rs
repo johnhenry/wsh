@@ -160,6 +160,31 @@ mod tests {
         value: i64,
     }
 
+    /// The bytes the JS encoder (`src/cbor.mjs`) writes at the edges of the 64-bit ranges, and what this decoder reads in them
+    /// (the same vectors are asserted on the JS side in `test/cbor-hardening.test.mjs`).
+    #[test]
+    fn the_js_encoders_integer_and_float_boundaries_decode_to_the_same_numbers() {
+        use ciborium::value::Value;
+        let decode = |hex: &str| -> Value {
+            ciborium::from_reader(hex::decode(hex).unwrap().as_slice()).unwrap()
+        };
+        let int = |v: Value| match v {
+            Value::Integer(i) => i128::from(i),
+            other => panic!("expected an integer, got {other:?}"),
+        };
+        let float = |v: Value| match v {
+            Value::Float(f) => f,
+            other => panic!("expected a float, got {other:?}"),
+        };
+        assert_eq!(int(decode("1b8000000000000000")), 1i128 << 63);
+        assert_eq!(int(decode("3b7fffffffffffffff")), -(1i128 << 63));
+        assert_eq!(int(decode("1bfffffffffffff800")), (1i128 << 64) - 2048);
+        assert_eq!(float(decode("fb43f0000000000000")), 2f64.powi(64));
+        assert_eq!(float(decode("fb444b1ae4d6e2ef50")), 1e21);
+        let neg_zero = float(decode("fb8000000000000000"));
+        assert!(neg_zero == 0.0 && neg_zero.is_sign_negative());
+    }
+
     #[test]
     fn round_trip_single() {
         let msg = TestMsg {
