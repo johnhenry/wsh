@@ -360,6 +360,115 @@ enum Command {
         /// Target host (optional, uses config default)
         host: Option<String>,
     },
+
+    /// Read, call, set and watch the remote objects a host serves (`wsh-objects`), JSON on stdout. Needs
+    /// `--sealed`; `--via RELAY` reaches a page host behind a pipe relay. What the host's allow-lists let this
+    /// key through is all it can do. Text from the host (names, strings, error messages) is never interpreted:
+    /// it is printed as JSON strings with every control character escaped.
+    ///
+    /// Exit status: 0 done; 1 other failure; 2 usage or not sealed; 3 the host refused; 4 not found;
+    /// 5 unsupported (the host does not state the channel or the feature).
+    ///
+    ///   wsh --sealed objects alice@host roots
+    ///   wsh --sealed objects alice@host get window.document.title
+    ///   wsh --sealed objects alice@host call window.app.cart.add '{"sku":"A1"}' 2
+    ///   wsh --sealed objects alice@host watch window.app.bus@ready --count 1
+    Objects {
+        /// Target in [user@]host format, or a ws://, wss:// or https:// URL
+        target: String,
+
+        /// Pin the host: its key fingerprint (64 hex digits) or an `ssh-ed25519 AAAA...` line. The host
+        /// must prove that key, whatever known_hosts says; known_hosts is neither read nor written.
+        #[arg(long = "host-key", value_name = "KEY")]
+        host_key: Option<String>,
+
+        /// To log in, open the channel and wait for each answer, in milliseconds
+        #[arg(long = "timeout", value_name = "MS", default_value_t = 15000, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_ms: u64,
+
+        #[command(subcommand)]
+        op: ObjectsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ObjectsCommand {
+    /// The roots the host lists for this key, and the features it states
+    Roots,
+
+    /// The names under ROOT[.path] that the host's allow-lists could walk to
+    Describe {
+        /// ROOT[.a.b]
+        path: String,
+    },
+
+    /// Read ROOT.a.b: the value as JSON, or its named non-value
+    Get {
+        /// ROOT.a.b
+        path: String,
+    },
+
+    /// Call the method ROOT.a.b with JSON arguments (each argument is one JSON value)
+    Call {
+        /// ROOT.a.method
+        path: String,
+        /// Arguments, each a JSON text
+        #[arg(allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
+
+    /// `new` the constructor ROOT.a.Class with JSON arguments
+    Construct {
+        /// ROOT.a.Class
+        path: String,
+        /// Arguments, each a JSON text
+        #[arg(allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
+
+    /// Assign a JSON value to ROOT.a.b
+    Set {
+        /// ROOT.a.b
+        path: String,
+        /// The value, as JSON
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+
+    /// A bounded deep copy of ROOT.a.b
+    Snapshot {
+        /// ROOT.a.b
+        path: String,
+        /// How deep (the host caps it)
+        #[arg(long)]
+        depth: Option<u32>,
+        /// How many bytes (the host caps it)
+        #[arg(long = "max-bytes")]
+        max_bytes: Option<u64>,
+    },
+
+    /// Listen to the event `event` of the source ROOT.a.b, one JSON line per event:
+    /// {"seq":N,"dropped":N,"dropped_here":N,"data":...} (`dropped`: the host dropped that many before this one;
+    /// `dropped_here`: this side did). Needs the host to state `events`; ends at SIGINT, the host closing, or --count.
+    Watch {
+        /// ROOT.a.b@event
+        spec: String,
+        /// An extra event property the host lists for the type (repeatable)
+        #[arg(long = "field", value_name = "NAME", action = clap::ArgAction::Append)]
+        fields: Vec<String>,
+        /// Exit after this many events
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        count: Option<u64>,
+        /// Events held for the reader before this side drops (and counts) them
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=4096))]
+        capacity: u64,
+    },
+
+    /// One connection, JSON requests on stdin (one per line), one answer line each: how to hold a handle across
+    /// calls. {"op":"call","path":"ROOT.a.f","args":[..]} answers {"ok":true,"result":..}; a handle comes back
+    /// as {"$handle":{"id":"h1",..}} and is used with {"op":"get","handle":"h1","path":"x"} and given back with
+    /// {"op":"release","handle":"h1"}. Ops: roots, get, call, construct, set, describe, snapshot, release.
+    Session,
 }
 
 #[derive(Subcommand)]
@@ -510,7 +619,8 @@ async fn main() {
                 | Command::Ls { .. }
                 | Command::Sftp { .. }
                 | Command::Targets { .. }
-                | Command::Mcp { .. },
+                | Command::Mcp { .. }
+                | Command::Objects { .. },
             ) => true,
             Some(_) => false,
         };
@@ -748,6 +858,61 @@ async fn main() {
                 host_key,
                 reconnect_attempts: if no_reconnect { 0 } else { reconnect_attempts },
                 timeout: std::time::Duration::from_millis(timeout_ms),
+            })
+            .await
+        }
+        Some(Command::Objects {
+            target,
+            host_key,
+            timeout_ms,
+            op,
+        }) => {
+            let host_key = match host_key.as_deref().map(commands::mcp::normalize_host_key) {
+                None => None,
+                Some(Ok(fp)) => Some(fp),
+                Some(Err(e)) => {
+                    eprintln!("wsh objects: {e}");
+                    std::process::exit(2);
+                }
+            };
+            use commands::objects::Op;
+            let op = match op {
+                ObjectsCommand::Roots => Op::Roots,
+                ObjectsCommand::Describe { path } => Op::Describe { path },
+                ObjectsCommand::Get { path } => Op::Get { path },
+                ObjectsCommand::Call { path, args } => Op::Call { path, args },
+                ObjectsCommand::Construct { path, args } => Op::Construct { path, args },
+                ObjectsCommand::Set { path, value } => Op::Set { path, value },
+                ObjectsCommand::Snapshot {
+                    path,
+                    depth,
+                    max_bytes,
+                } => Op::Snapshot {
+                    path,
+                    depth,
+                    max_bytes,
+                },
+                ObjectsCommand::Watch {
+                    spec,
+                    fields,
+                    count,
+                    capacity,
+                } => Op::Watch {
+                    spec,
+                    fields,
+                    count,
+                    capacity: capacity as usize,
+                },
+                ObjectsCommand::Session => Op::Session,
+            };
+            commands::objects::run(commands::objects::Options {
+                target,
+                port,
+                transport: transport.clone(),
+                identity: identity.clone(),
+                host_key,
+                timeout: std::time::Duration::from_millis(timeout_ms),
+                op,
             })
             .await
         }
