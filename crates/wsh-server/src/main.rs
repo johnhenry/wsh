@@ -73,20 +73,43 @@ struct Cli {
     /// and shell history: printf '%s' "$PASSWORD" | wsh-server --hash-password
     #[arg(long)]
     hash_password: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-/// `--hash-password`: stdin in, a PHC string on stdout, a status code out.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Print the Argon2id hash of a password, for `[auth.password_hashes]`. The password is read from
+    /// standard input (first line) or, at a terminal, prompted for without echo; it is never an argument.
+    HashPassword,
+}
+
+/// `hash-password` / `--hash-password`: stdin (or a no-echo prompt at a terminal) in, a PHC string on
+/// stdout, a status code out.
 fn hash_password_from_stdin() -> i32 {
     use std::io::{BufRead as _, IsTerminal as _};
-    if std::io::stdin().is_terminal() {
-        eprintln!("Password (typed text is shown; prefer piping it in):");
-    }
-    let mut line = String::new();
-    if let Err(e) = std::io::stdin().lock().read_line(&mut line) {
-        eprintln!("wsh-server: cannot read the password: {e}");
-        return 1;
-    }
-    let password = line.trim_end_matches(['\n', '\r']);
+    let password = if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        match dialoguer::Password::new()
+            .with_prompt("Password")
+            .with_confirmation("Repeat password", "The passwords differ")
+            .interact()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("wsh-server: cannot read the password: {e}");
+                return 1;
+            }
+        }
+    } else {
+        let mut line = String::new();
+        if let Err(e) = std::io::stdin().lock().read_line(&mut line) {
+            eprintln!("wsh-server: cannot read the password: {e}");
+            return 1;
+        }
+        line.trim_end_matches(['\n', '\r']).to_string()
+    };
+    let password = password.as_str();
     if password.is_empty() {
         eprintln!("wsh-server: refusing to hash an empty password");
         return 1;
@@ -109,7 +132,7 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    if cli.hash_password {
+    if cli.hash_password || matches!(cli.command, Some(Command::HashPassword)) {
         std::process::exit(hash_password_from_stdin());
     }
 
@@ -336,6 +359,18 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_password_is_a_subcommand_and_still_a_flag_and_never_takes_the_password_as_an_argument()
+    {
+        let sub = Cli::try_parse_from(["wsh-server", "hash-password"]).unwrap();
+        assert!(matches!(sub.command, Some(Command::HashPassword)));
+        let flag = Cli::try_parse_from(["wsh-server", "--hash-password"]).unwrap();
+        assert!(flag.hash_password);
+        // A password on the command line would sit in the process list and the shell history.
+        assert!(Cli::try_parse_from(["wsh-server", "hash-password", "hunter2"]).is_err());
+        assert!(Cli::try_parse_from(["wsh-server", "--hash-password", "hunter2"]).is_err());
+    }
 
     /// The generated development certificate has to work as a SERVER
     /// certificate for a TLS client that trusts it: webpki refuses an end

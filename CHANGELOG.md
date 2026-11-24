@@ -22,6 +22,20 @@ An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence o
   it did before. A released Rust client (`rust-v0.16.0`) likewise looks for `rpc` and refuses. A released relay (JS or Rust) forwards `SessionData` and `GatewayCredit`
   as it always has. `wsh-server` does not offer virtual-mode rpc yet, and the Rust `wsh mcp` does not speak it yet (`--sealed` against it is still refused).
 
+### Password hashing helpers for the Node host; `wsh-server hash-password` (additive)
+
+- **New, `@johnhenry/wsh/server`:** `hashPassword(password)`, `verifyPassword(password, stored)` and `passwordVerifier(hashes, { allowLegacySha256, onWarn })`. A password is stored as a
+  PHC string `$scrypt$ln=16,r=8,p=1$<salt>$<hash>` (scrypt from `node:crypto`: memory-hard, 64 MiB by default; a random per-user salt; `timingSafeEqual`; the cost parameters of a stored
+  value are bounded). `passwordVerifier` is an `auth.password` callback over a table, a `Map` or a lookup function: an unknown user costs the same derivation as a wrong password, and an
+  entry that is not one of these hashes is refused with a warning that names the user and never the value. An unsalted `sha256:<hex>` entry is refused, as `wsh-server` refuses it, unless
+  `allowLegacySha256: true`, which verifies it in constant time and warns naming the user. `auth.password` itself is unchanged: any `(username, password) => boolean` still works.
+- **New, Rust `wsh-server`:** `wsh-server hash-password` is a subcommand (the `--hash-password` flag still works). The password is read from standard input, or prompted for without echo (and
+  repeated) at a terminal; it is never an argument. `dialoguer`, already in the dependency tree through `wsh`, is now also a `wsh-server` dependency.
+- A host that lives in a page keeps its own `auth.password` callback: WebCrypto has no scrypt or Argon2, so nothing is added to the browser-safe entry points; the README says what to use there.
+- **Wire:** none. **A released peer:** nothing is negotiated; the Rust server's Argon2id strings and these scrypt strings are not interchangeable and neither side reads the other's.
+- Tests: `test/server-password-hash.test.mjs` (PHC shape and salts, right and wrong passwords, malformed and oversized stored values, the same derivation for an unknown user, the legacy
+  entry refused and allowed, a real login over `createWshServer`), and a clap test that `hash-password` takes no password argument. The unknown-user rule was broken once to see its test fail.
+
 ## 0.45.0 / Rust `rust-v0.16.0`
 
 ### Rust `wsh-server`: UDP flows as WebTransport datagrams, `gateway-datagram` (#124, #145, the last open item of the parity epic; Rust only)
