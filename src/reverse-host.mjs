@@ -20,7 +20,7 @@ import { MSG, reverseAccept, reverseReject, reverseChallenge } from './messages.
 import { MULTI_OPERATOR_FEATURE } from './server/relay.mjs';
 import { E2E_SIGN_FEATURE, E2EResponder } from './e2e-exchange.mjs';
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyOperatorProof } from './operator-proof.mjs';
-import { SealedBridge } from './bridge-seal.mjs';
+import { SealedBridge, BRIDGE_CHANNEL_ID } from './bridge-seal.mjs';
 import { resolveBackends } from './host-backends.mjs';
 import { createConnectionFactory, hostFeatures } from './server/connection.mjs';
 import { validateOnShare } from './shares.mjs';
@@ -266,7 +266,16 @@ export function createReverseHostWith({
       let giveUp = null;
       const who = { fingerprint: from, username: operatorName };
       let unsealedReported = false;
-      const fail = (why) => { onLog(`[reverse] sealed bridge with ${from.slice(0, 12)} failed: ${why}`); notifyRefused('seal-failed', who, why); endBridge(from); };
+      // #162: the operator sends its first frame the moment ITS half of the exchange is done, which can be before this
+      // host has derived its own key (it still decapsulates and combines after the ciphertext arrives). Bridge-level
+      // frames of this bridge's session that arrive in that window are held (bounded), not dropped as "not sealed".
+      let exchanging = false;
+      const early = [];
+      const MAX_EARLY_FRAMES = 16;
+      const openSealed = (frame) => {
+        chain = chain.then(async () => base.receiveMessage(await sealed.open(frame))).catch((e) => onLog(`[reverse] dropped a sealed frame: ${e.message}`));
+      };
+      const fail = (why) => { early.length = 0; onLog(`[reverse] sealed bridge with ${from.slice(0, 12)} failed: ${why}`); notifyRefused('seal-failed', who, why); endBridge(from); };
       if (mustSeal) {
         giveUp = setTimeout(() => { if (!sealed) fail('no key exchange in time'); }, proofTimeoutMs * 2);
         giveUp.unref?.();
@@ -275,18 +284,25 @@ export function createReverseHostWith({
         receiveMessage(msg) {
           if (sealed) {
             if (!sealed.isFrame(msg)) { onLog('[reverse] dropped a plaintext message on a sealed bridge'); return; }
-            chain = chain.then(async () => base.receiveMessage(await sealed.open(msg))).catch((e) => onLog(`[reverse] dropped a sealed frame: ${e.message}`));
+            openSealed(msg);
             return;
           }
           if (msg.type === MSG.KEY_EXCHANGE && msg.session_id === challenge.sessionId) {
+            exchanging = true;
             chain = chain.then(async () => {
               const result = await responder.respond(msg, (reply) => conn.sendRelayControl(reply, to()));
               if (result.key) {
                 sealed = new SealedBridge({ key: result.key, sessionId: challenge.sessionId, role: 'responder' });
                 clearTimeout(giveUp);
                 onLog(`[reverse] bridge to ${from.slice(0, 12)} sealed${result.hybrid ? ' (hybrid)' : ''}`);
+                for (const frame of early.splice(0)) openSealed(frame);
               }
             }).catch((e) => fail(e.message));
+            return;
+          }
+          if (exchanging && msg.type === MSG.ENCRYPTED_FRAME && msg.channel_id === BRIDGE_CHANNEL_ID && msg.session_id === challenge.sessionId) {
+            if (early.length < MAX_EARLY_FRAMES) early.push(msg);
+            else onLog('[reverse] dropped a sealed frame: too many arrived before the key exchange finished');
             return;
           }
           if (mustSeal) {
