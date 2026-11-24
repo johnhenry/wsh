@@ -197,20 +197,33 @@ describe('Rust wsh-server: gateway credit, unix sockets and listeners (the Node 
       const echo = net.createServer((s) => { s.on('data', (d) => s.write(d)); s.on('error', () => {}); });
       await listenUnixSock(echo, `${t}/e.sock`); closers.push(() => new Promise((r) => echo.close(r)));
       const { client } = await setup({ allow: [], unix: { connect: [`${t}/e.sock`] }, maxConnections: 24 });
-      const results = await Promise.all(Array.from({ length: 24 }, async (_, i) => {
+      // This test hung to the 180 s test timeout once on a loaded machine and was not reproduced in about 45 runs, some in parallel and some throttled (issue #162). A
+      // transfer that stalls now fails after 30 s and says which connection and how far it got, so the next occurrence is
+      // diagnosable instead of a silent timeout.
+      const progress = new Array(24).fill('not opened');
+      const transfer = async (i) => {
+        progress[i] = 'opening';
         const d = await client.openUnix(`${t}/e.sock`);
         const w = d.writable.getWriter();
         const msg = crypto.randomBytes(100_000 + i);
         const reader = d.readable.getReader();
+        progress[i] = 'writing';
         const writing = w.write(msg);
         let got = 0; const chunks = [];
-        while (got < msg.length) { const { value, done } = await reader.read(); if (done) break; chunks.push(value); got += value.length; }
+        while (got < msg.length) { const { value, done } = await reader.read(); if (done) break; chunks.push(value); got += value.length; progress[i] = `read ${got} of ${msg.length}`; }
+        progress[i] = `read ${got} of ${msg.length}, waiting for the write to settle`;
         await writing;
         const same = Buffer.concat(chunks).equals(msg);
         if (i < 23) d.destroy(); // one stays open: the cap below counts it
+        progress[i] = 'done';
         return same;
-      }));
-      assert.deepEqual(results, new Array(24).fill(true));
+      };
+      let deadline;
+      const stalled = new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error(`a transfer stalled: ${JSON.stringify(progress.map((p, i) => [i, p]).filter(([, p]) => p !== 'done'))}`)), 30_000); });
+      try {
+        const results = await Promise.race([Promise.all(Array.from({ length: 24 }, (_, i) => transfer(i))), stalled]);
+        assert.deepEqual(results, new Array(24).fill(true));
+      } finally { clearTimeout(deadline); }
     });
 
     it('refuses with GatewayFail 7 beyond the connection limit', async () => {

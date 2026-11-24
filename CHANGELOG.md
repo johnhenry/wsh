@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Rust-suite flakes (#162, part; tests only, no change to any released code)
+
+- `test/rust/wsh-rust-server.test.mjs`, "a principal granted access via grantSessionAccess attaches with no token at all": a `SessionGrant` has no acknowledgement
+  (the server answers only an error) and `sendControl` resolves when the frame is written, so the grantee, who connects on another connection that the server serves
+  independently, could attach before the grant was applied ("not authorized to attach to this session"). Reproduced by delaying the grant in the server by 1.5 s; the
+  test now waits for the answer to a request sent after the grant (a connection's control messages are handled in order). The server needed no change: it applies a grant
+  before it handles the next message.
+- `test/rust/wsh-rust-server-forwarding.test.mjs`, "serves many concurrent connections and enforces max_connections", which once hung to the 180 s timeout: not reproduced
+  in about 45 runs (serial, in parallel, throttled). A stalled transfer now fails after 30 s naming the connection and how far it got.
+
 ### `wsh mcp`: the Rust CLI bridges stdio to the `mcp` rpc channel of a host, on a new rpc client in `wsh-client` (#127, the Rust half; Rust only)
 
 The other half of #127 (the npm `wsh-mcp` shipped in 0.44.0). `wsh mcp [user@]host|URL` lets an MCP client that launches a command use an MCP server
