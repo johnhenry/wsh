@@ -6,16 +6,20 @@
       "gzip": 49551
     },
     "./memory": {
-      "raw": 232312,
-      "gzip": 72246
+      "raw": 232612,
+      "gzip": 72338
     },
     "./host": {
-      "raw": 126661,
-      "gzip": 41650
+      "raw": 126964,
+      "gzip": 41738
     },
     "./reverse": {
-      "raw": 220638,
-      "gzip": 67925
+      "raw": 220944,
+      "gzip": 68028
+    },
+    "./page": {
+      "raw": 259471,
+      "gzip": 81716
     },
     ". (generateKeyPair only)": {
       "raw": 404,
@@ -26,8 +30,8 @@
       "gzip": 40629
     },
     "./host (createConnectionFactory only)": {
-      "raw": 102864,
-      "gzip": 33550
+      "raw": 103167,
+      "gzip": 33644
     }
   }
 }

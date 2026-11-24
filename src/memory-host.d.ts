@@ -22,6 +22,10 @@ export interface WshMemoryRpcContext {
   user: string | null;
   fingerprint: string | null;
   features: string[];
+  /** The capability list of the key this channel serves, or `null` for a key with none (for display: `permits` decides). */
+  capabilities: string[] | null;
+  /** Whether the key's options and capabilities allow a request such as `{ kind: 'mcp-tool', tool }`, asked afresh each call. */
+  permits(request: { kind: string; [field: string]: unknown }, options?: { now?: number }): boolean;
   log(line: string): void;
   [key: string]: unknown;
 }

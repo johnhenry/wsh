@@ -337,7 +337,9 @@ function capabilityRefusal(p, req) {
         // The file rpc has read and write methods on one channel: a key without both is refused it (a client falls back to
         // FileOp and the file channels, which are checked per operation).
         if (proto === 'wsh-fs') r = need('fs:read', has('fs:read')) ?? need('fs:write', has('fs:write'));
-        else if (proto === 'mcp') r = need('mcp:*', caps.some((c) => c.kind === 'mcp' && c.name === '*'));
+        // A handler that narrows by capability itself (`capabilityScoped`, req.scoped) may be opened by a key that names any
+        // tool; every other `mcp` handler would show a `mcp:search` key all of its tools, so it still needs `mcp:*`.
+        else if (proto === 'mcp') r = req.scoped ? need('mcp:<tool>', has('mcp')) : need('mcp:*', caps.some((c) => c.kind === 'mcp' && c.name === '*'));
         else r = need(`rpc:${proto}`, caps.some((c) => c.kind === 'rpc' && c.name === proto));
       } else r = need(req.channel, false);
       return r ?? target();

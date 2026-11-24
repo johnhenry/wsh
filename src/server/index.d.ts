@@ -525,11 +525,22 @@ export interface WshRpcContext {
   /** The exact `ServerHello.features` this connection received. */
   features: string[];
   hostFingerprint: string | null;
+  /** The capability list of the key this channel serves (`capabilities="..."` in its `authorized_keys` line, or what `authorize` granted), or `null` for a key with none. For display: `permits` decides. */
+  capabilities: string[] | null;
+  /**
+   * Whether the key's options and capabilities allow a request such as `{ kind: 'mcp-tool', tool: 'search' }`, asked afresh each call (an
+   * `expires` is honoured; `now` is epoch seconds). Nothing is reported to `onRefused`. A handler that narrows by capability this way
+   * sets `capabilityScoped = true` on itself, so that a key which names tools (`mcp:search`) but not `mcp:*` may open the `mcp` channel.
+   */
+  permits(request: { kind: string; [field: string]: unknown }, options?: { now?: number }): boolean;
   log(line: string): void;
 }
 
-/** Runs once per opened channel; register methods on `channel`. Inbound messages wait until the returned promise settles. */
-export type WshRpcHandler = (channel: RpcChannel, ctx: WshRpcContext) => void | Promise<void>;
+/**
+ * Runs once per opened channel; register methods on `channel`. Inbound messages wait until the returned promise settles. A handler for
+ * `mcp` that filters by `ctx.permits` itself may carry `capabilityScoped: true`.
+ */
+export type WshRpcHandler = ((channel: RpcChannel, ctx: WshRpcContext) => void | Promise<void>) & { capabilityScoped?: boolean };
 
 /**
  * Expose an MCP `Server` (`@modelcontextprotocol/sdk`) over an rpc channel: `rpc: { mcp: mcpServerAdapter(server) }`.

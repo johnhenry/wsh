@@ -216,6 +216,13 @@ export function createConnectionFactory(cfg) {
     const keyRefusal = (req) => refusalOf(req, false);
     /** Whether this request would be allowed, without saying anything about it (what a discovery answer lists). */
     const keyAllows = (req) => refusalOf(req, true) === null;
+    /**
+     * What an rpc handler is told of the key it serves (additive): the capability list of the key (`null` for a key with none), and
+     * `permits(request, { now })`, whether the key's options and capabilities allow a request such as `{ kind: 'mcp-tool', tool }`,
+     * asked afresh each time (an expiry is honoured), without a refusal being reported. `permits` is the authority; the list is for display.
+     */
+    const keyCapabilities = () => { for (const p of permissionSets()) if (Array.isArray(p.capabilities)) return p.capabilities.slice(); return null; };
+    const permits = (req, { now } = {}) => permissionSets().every((perms) => !checkKeyRequest(perms, req, { now }));
     /** The reply that refuses a gateway message the key's capabilities do not cover (`GatewayFail` / `ListenFail`), or null. */
     function gatewayRefusal(m) {
       let req; let listener = false;
@@ -852,7 +859,8 @@ export function createConnectionFactory(cfg) {
           if (target !== undefined) return send(openFail({ reason: 'rpc channels do not take a target' }));
           if (requireTarget) return send(openFail({ reason: 'a target is required' }));
           {
-            const refusal = keyRefusal({ kind: 'open', channel: 'rpc', protocol: typeof m.command === 'string' ? m.command : '' });
+            const protocol = typeof m.command === 'string' ? m.command : '';
+            const refusal = keyRefusal({ kind: 'open', channel: 'rpc', protocol, scoped: cfg.rpc?.protocols.get(protocol)?.capabilityScoped === true });
             if (refusal) return send(openFail({ reason: refusal.reason }));
           }
           return openRpc(m);
@@ -1157,6 +1165,7 @@ export function createConnectionFactory(cfg) {
           const ctx = {
             protocol, channelId, user: state.username, fingerprint: state.fingerprint, remote,
             features: state.features ?? [], hostFingerprint: state.hostFingerprint,
+            capabilities: keyCapabilities(), permits,
             log: (line) => log(`rpc ${protocol} channel ${channelId}: ${line}`),
           };
           // Inbound messages wait until the handler (possibly async) has registered its methods.
@@ -1200,6 +1209,7 @@ export function createConnectionFactory(cfg) {
       const ctx = {
         protocol, channelId, user: state.username, fingerprint: state.fingerprint, remote,
         features: state.features ?? [], hostFingerprint: state.hostFingerprint,
+        capabilities: keyCapabilities(), permits,
         log: (line) => log(`rpc ${protocol} channel ${channelId}: ${line}`),
       };
       // Inbound messages wait until the handler (possibly async) has registered its methods; the handler starts only after

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### `@johnhenry/wsh/page`: a page's WebMCP tools served as MCP behind a pipe relay (#190; JS)
+
+A web page can now be a wsh host for **the tools it has registered with WebMCP**, and an MCP client (`wsh-mcp --sealed`, or `client.openRpc('mcp')` with `mcpClientTransport`) can list
+and call them. New entry point `@johnhenry/wsh/page`: `createPageHost({ window, relay, name, authorizedKeys, mcp: { allow, approve, tools? }, indicator?, unattended?, hostKey?,
+hostKeyStore?, onSession, onRefused })`, `webmcpTools({ window, allow, approve, tools? })` (an rpc handler for `mcp`, usable in any host) and `captureWebMcp(window)`.
+
+- **Key login only, a sealed session required, nothing else offered:** no anonymous mode, no password login, no exec, no file access, no object access (that is a later step of #190).
+  The window is passed in and is the only realm touched (a test greps the entry point for ambient globals); passing it exposes nothing by itself.
+- **Three sources of tools:** an explicit list (the same definitions given to `registerTool`); a capture shim installed before the application's code, wrapping `registerTool` on
+  `document.modelContext` and the older `navigator.modelContext`, honouring abort signals and `unregister()`, and providing a minimal `modelContext` where the browser has none; and
+  the browser's own `getTools()` / `executeTool()` where it has them (the current draft's; feature-detected, tested against a fake only).
+- **Mapping to MCP:** `tools/list` (name, title, description, schemas, annotations; what MCP lacks in `_meta`), `tools/call` to `execute(input, { signal })` with MCP cancel aborting the signal, structured
+  results plus a text rendering, a thrown error as `isError` with the message and never a stack, `notifications/tools/list_changed`. Results are labelled untrusted.
+- **Bounds, refused by name:** `maxTools`, `maxSchemaBytes`, `maxInputBytes`, `maxResultBytes`, `maxInflight`, `maxCallsPerMinute` (and `callTimeoutMs`).
+- **Safety the browser would have supplied:** an allow-list by tool name (nothing allowed by default); `approve: 'never' | 'consequential' | 'always'` (default `'consequential'`: anything not marked
+  `readOnlyHint`) asking the person at the page through `prompt(call, who)`, with an accessible default dialog; a visible indicator with the key's fingerprint and a Stop control (`revoke`);
+  `indicator: false` only with `unattended: true`; the host closes, telling the operator why, when the window leaves its origin or closes; a host key per page load, or one kept through an injected `hostKeyStore`.
+- **Per-key narrowing, and an additive change to every JS host's rpc context:** `capabilities="mcp:TOOL"` limits a key to those tools. To allow it, an rpc handler's `ctx` now has `capabilities`
+  (the key's list or `null`) and `permits(request)`; a handler that filters by `permits` sets `capabilityScoped = true`, and only then may a key holding `mcp:TOOL` but not `mcp:*` open the
+  `mcp` channel. **No default changed:** every other `mcp` handler still needs `mcp:*`.
+- **A released peer.** No wire change at all: no message, field or feature string is new. The far side is the `mcp` rpc channel in virtual mode that #191 added, so a released JS client (0.45.0)
+  and Rust client (`rust-v0.16.0`) refuse it exactly as they refuse any virtual-mode rpc host (they look for `rpc`); use this release's client or `wsh-mcp --sealed`. `wsh-server` is unchanged.
+- **Bundle:** `@johnhenry/wsh/page` is 79.8 kB gzipped (it contains the memory host); the other entry points grew by about 90 bytes gzip each, from the two small additions to the shared rpc context.
+
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
 An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside

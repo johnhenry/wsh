@@ -29,6 +29,10 @@
       "types": "./src/reverse-host.d.ts",
       "import": "./src/reverse-host.mjs"
     },
+    "./page": {
+      "types": "./src/page-host.d.ts",
+      "import": "./src/page-host.mjs"
+    },
     "./mcp-stdio": {
       "types": "./src/mcp-stdio.d.ts",
       "import": "./src/mcp-stdio.mjs"
