@@ -1195,7 +1195,7 @@ impl WshClient {
             )));
         }
         let offer = self.rpc_offer().await;
-        if !offer.enabled {
+        if !offer.offered() {
             return Err(WshError::Other(format!(
                 "UNSUPPORTED_PROTOCOL: this host does not advertise \"{}\" channels (cannot open \"{protocol}\")",
                 crate::rpc::RPC_FEATURE
@@ -1206,9 +1206,12 @@ impl WshClient {
                 "UNSUPPORTED_PROTOCOL: this host does not advertise the \"{protocol}\" rpc protocol"
             )));
         }
-        if self.session_sealed() {
+        // The form follows what the host states: `rpc` is a data stream, `rpc-virtual` rides the control plane (wsh #191).
+        let virtual_mode = offer.is_virtual();
+        if !virtual_mode && self.session_sealed() {
+            // A host that states stream-mode rpc on a sealed session would put the channel's bytes where no frame seals them.
             return Err(WshError::Other(
-                "typed rpc channels are not carried on a sealed session".into(),
+                "this host states stream-mode rpc, whose data stream a sealed session cannot seal: refusing to open it".into(),
             ));
         }
         let envelope = Envelope {
@@ -1233,6 +1236,30 @@ impl WshClient {
                 ))
             }
         };
+        if virtual_mode {
+            if ok.data_mode != SessionDataMode::Virtual {
+                self.early.lock().await.release(ok.channel_id);
+                return Err(WshError::Channel(
+                    "the host answered an rpc Open with a data mode other than virtual".into(),
+                ));
+            }
+            // The channel stands in the session table; its SessionData and GatewayCredit go to the channel, and what it
+            // writes leaves as SessionData (sealed with everything else on a sealed session).
+            let stub = Arc::new(WshSession::new_virtual(
+                ok.channel_id,
+                ChannelKind::Rpc,
+                self.control_action_tx.clone(),
+                Vec::new(),
+            ));
+            let channel = crate::rpc::RpcChannel::start_virtual(
+                offer.max_message_bytes,
+                stub.clone(),
+                self.control_action_tx.clone(),
+                self.rpc_credit_sender(ok.channel_id),
+            );
+            self.register_session(&stub, &ok).await;
+            return Ok(channel);
+        }
         let opened = async {
             if ok.data_mode != SessionDataMode::Stream {
                 return Err(WshError::Channel(
@@ -1269,6 +1296,30 @@ impl WshClient {
             offer.max_message_bytes,
             stub,
         ))
+    }
+
+    /// Writes `GatewayCredit` for rpc channel `channel_id` (wsh #191): `bytes` of credit handed back to the host.
+    fn rpc_credit_sender(&self, channel_id: u32) -> Box<dyn Fn(u64) + Send + Sync> {
+        let tx = self.outgoing_tx.clone();
+        Box::new(move |mut left| {
+            while left > 0 {
+                let part = left.min(u64::from(u32::MAX));
+                left -= part;
+                let envelope = Envelope {
+                    msg_type: MsgType::GatewayCredit,
+                    payload: Payload::GatewayCredit(GatewayCreditPayload {
+                        gateway_id: wsh_core::rpc_credit::rpc_credit_id(channel_id),
+                        bytes: part as u32,
+                    }),
+                };
+                if let Ok(frame) = frame_encode(&envelope) {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(frame).await;
+                    });
+                }
+            }
+        })
     }
 
     /// Build the `WshSession` (and its stderr companion) an `OpenOk` describes.
@@ -2597,6 +2648,19 @@ impl WshClient {
                     }
                 }
                 return;
+            }
+
+            // Credit for an rpc channel in virtual data mode (wsh #191) is a GatewayCredit in a number space of its
+            // own (`0x80000000 | channel_id`); it is never the gateway's, and for a channel that is gone it is dropped.
+            if let Payload::GatewayCredit(p) = &envelope.payload {
+                if let Some(channel_id) = wsh_core::rpc_credit::rpc_channel_of_credit(p.gateway_id)
+                {
+                    let session = sessions.lock().await.get(&channel_id).cloned();
+                    if let Some(session) = session {
+                        session.rpc_credit(p.bytes);
+                    }
+                    return;
+                }
             }
 
             // Gateway traffic for a connection or listener this client opened goes to it. What

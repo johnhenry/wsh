@@ -1,11 +1,15 @@
-//! Per-connection glue: binds `rpc` channels to client-opened QMux streams.
+//! Per-connection glue: binds `rpc` channels to client-opened QMux streams, or (virtual data mode) to `SessionData`.
 //!
 //! The flow mirrors an exec channel on the JS server. `Open { kind: "rpc" }` is
 //! answered `OpenOk` (`data_mode: stream`); the client then opens one QMux
 //! stream per channel, and streams bind to channels in `OpenOk` order. The
 //! stream carries a CBOR sequence of JSON-RPC messages (see [`super::channel`]).
+//!
+//! With `seal_session` on (wsh #191) the connection is sealed and its bytes are frames, not streams: the same
+//! CBOR sequence then rides `SessionData` (inside `EncryptedFrame`), answered `OpenOk` with `data_mode: virtual`,
+//! and metered by `GatewayCredit` credit ([`wsh_core::rpc_credit`]) because the control plane has no flow control.
 
-use super::channel::{self, ChannelConfig, Ended, Input};
+use super::channel::{self, ChannelConfig, Consumed, Ended, Input};
 use super::protocols::{HostInfo, Protocol};
 use super::{valid_protocol_name, RpcSettings, WSH_FS, WSH_HOST};
 use std::collections::{HashMap, VecDeque};
@@ -15,10 +19,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use wsh_core::messages::{
-    ClosePayload, Envelope, ExitPayload, MsgType, OpenFailPayload, OpenOkPayload, Payload,
-    SessionDataMode,
+    ClosePayload, Envelope, ExitPayload, GatewayCreditPayload, MsgType, OpenFailPayload,
+    OpenOkPayload, Payload, SessionDataMode, SessionDataPayload,
 };
 use wsh_core::qmux_connection::QMuxConnection;
+use wsh_core::rpc_credit::{rpc_credit_id, CreditLink};
 
 /// Channels per connection (the JS server's `MAX_CHANNELS`).
 const MAX_RPC_CHANNELS: usize = 64;
@@ -87,6 +92,11 @@ struct Pending {
 enum Channel {
     Pending,
     Bound(mpsc::UnboundedSender<Input>),
+    /// Virtual data mode: no stream; the credit link meters the bytes in both directions.
+    Virtual {
+        tx: mpsc::UnboundedSender<Input>,
+        link: Arc<CreditLink>,
+    },
 }
 
 /// All rpc channels of one connection.
@@ -139,11 +149,198 @@ impl RpcSessions {
         mut alloc_channel_id: impl FnMut() -> u32,
         allow_fs: bool,
     ) -> Envelope {
+        let handler = match self.resolve(protocol, allow_fs) {
+            Ok(h) => h,
+            Err(refusal) => return refusal,
+        };
+        let channel_id = alloc_channel_id();
+        self.live.fetch_add(1, Ordering::Relaxed);
+        self.channels.insert(channel_id, Channel::Pending);
+        self.pending.push_back(Pending {
+            channel_id,
+            protocol: handler,
+            cancelled: false,
+        });
+        debug!(channel_id, protocol, "rpc channel opened");
+        open_ok(channel_id)
+    }
+
+    /// Whether this server states its rpc channels in virtual data mode (`rpc-virtual`): they ride `SessionData`
+    /// instead of client-opened data streams, so [`open_virtual`](Self::open_virtual) opens them.
+    pub fn is_virtual(&self) -> bool {
+        self.settings.as_ref().is_some_and(|s| s.virtual_data)
+    }
+
+    /// Handle `Open { kind: "rpc", command: protocol }` in virtual data mode (wsh #191): the channel starts at once and
+    /// everything it sends leaves as `SessionData` on `control` (and so inside the session's seal, when it has one),
+    /// metered by credit; what it receives arrives through [`on_session_data`](Self::on_session_data) and
+    /// [`on_credit`](Self::on_credit).
+    ///
+    /// The same checks as [`open`](Self::open): the protocol, the channel limit, and `allow_fs` (what the key's
+    /// capabilities allow of `wsh-fs`; the caller has already applied `rpc:<protocol>`).
+    pub fn open_virtual(
+        &mut self,
+        protocol: &str,
+        mut alloc_channel_id: impl FnMut() -> u32,
+        allow_fs: bool,
+        control: mpsc::Sender<Envelope>,
+    ) -> Envelope {
         let Some(settings) = self.settings.clone() else {
             return open_fail("UNSUPPORTED_PROTOCOL: rpc is not enabled on this server");
         };
+        let handler = match self.resolve(protocol, allow_fs) {
+            Ok(h) => h,
+            Err(refusal) => return refusal,
+        };
+        let channel_id = alloc_channel_id();
+        self.live.fetch_add(1, Ordering::Relaxed);
+        let link = Arc::new(CreditLink::new());
+        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(32);
+        self.channels.insert(
+            channel_id,
+            Channel::Virtual {
+                tx: in_tx,
+                link: link.clone(),
+            },
+        );
+
+        // What the channel writes leaves as SessionData, a chunk at a time, each waiting for credit.
+        let writer = {
+            let (link, control) = (link.clone(), control.clone());
+            tokio::spawn(async move {
+                while let Some(bytes) = out_rx.recv().await {
+                    let mut rest = &bytes[..];
+                    while !rest.is_empty() {
+                        let Ok(n) = link.reserve(rest.len()).await else {
+                            return;
+                        };
+                        let chunk = Envelope {
+                            msg_type: MsgType::SessionData,
+                            payload: Payload::SessionData(SessionDataPayload {
+                                channel_id,
+                                data: rest[..n].to_vec(),
+                            }),
+                        };
+                        if control.send(chunk).await.is_err() {
+                            return;
+                        }
+                        rest = &rest[n..];
+                    }
+                }
+            })
+        };
+        // What it takes in is credit handed back to the client.
+        let consumed: Consumed = {
+            let (link, control) = (link.clone(), control.clone());
+            Box::new(move |n| {
+                if let Some(give) = link.consumed(n) {
+                    let credit = Envelope {
+                        msg_type: MsgType::GatewayCredit,
+                        payload: Payload::GatewayCredit(GatewayCreditPayload {
+                            gateway_id: rpc_credit_id(channel_id),
+                            bytes: u32::try_from(give).unwrap_or(u32::MAX),
+                        }),
+                    };
+                    let control = control.clone();
+                    tokio::spawn(async move {
+                        let _ = control.send(credit).await;
+                    });
+                }
+            })
+        };
+        let cfg = ChannelConfig {
+            max_message_bytes: settings.max_message_bytes,
+            max_inflight: settings.max_inflight,
+        };
+        let live = self.live.clone();
+        tokio::spawn(async move {
+            let ended =
+                channel::run_metered(cfg, Arc::new(handler), in_rx, out_tx, Some(consumed)).await;
+            // Let what was queued reach the wire (bounded: the peer may be gone, or not granting credit).
+            let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+            link.close();
+            match &ended {
+                Ended::HostClosed(why) => {
+                    debug!(channel_id, why = %why, "rpc channel (virtual) closed by host")
+                }
+                other => debug!(channel_id, ?other, "rpc channel (virtual) ended"),
+            }
+            // The host ended it (a protocol error, or the peer overran its credit): tell the client the channel is over.
+            if matches!(ended, Ended::HostClosed(_) | Ended::StreamEnd) {
+                let _ = control
+                    .send(Envelope {
+                        msg_type: MsgType::Exit,
+                        payload: Payload::Exit(ExitPayload {
+                            channel_id,
+                            code: 0,
+                        }),
+                    })
+                    .await;
+                let _ = control
+                    .send(Envelope {
+                        msg_type: MsgType::Close,
+                        payload: Payload::Close(ClosePayload { channel_id }),
+                    })
+                    .await;
+            }
+            live.fetch_sub(1, Ordering::Relaxed);
+        });
+        debug!(channel_id, protocol, "rpc channel opened (virtual)");
+        Envelope {
+            msg_type: MsgType::OpenOk,
+            payload: Payload::OpenOk(OpenOkPayload {
+                channel_id,
+                stream_ids: vec![],
+                data_mode: SessionDataMode::Virtual,
+                capabilities: vec![],
+                session_id: None,
+                token: None,
+                stderr_channel_id: None,
+            }),
+        }
+    }
+
+    /// `SessionData` for a virtual-mode rpc channel: true if the channel is one (the caller must not treat the message
+    /// as session input). A peer that sends more than the credit it was given has the channel closed.
+    pub fn on_session_data(&self, channel_id: u32, data: Vec<u8>) -> bool {
+        let Some(Channel::Virtual { tx, link }) = self.channels.get(&channel_id) else {
+            return false;
+        };
+        if data.is_empty() {
+            return true;
+        }
+        if link.receive(data.len()) {
+            let _ = tx.send(Input::Data(data));
+        } else {
+            debug!(
+                channel_id,
+                "rpc channel: the peer sent more than its credit"
+            );
+            // The writer may be waiting on credit this peer will never grant, with the channel waiting on the writer:
+            // release it, so the channel gets to the `Violation` and closes.
+            link.close();
+            let _ = tx.send(Input::Violation);
+        }
+        true
+    }
+
+    /// `GatewayCredit` for a virtual-mode rpc channel (`gateway_id` flagged): the peer took `bytes` in.
+    pub fn on_credit(&self, channel_id: u32, bytes: u32) {
+        if let Some(Channel::Virtual { link, .. }) = self.channels.get(&channel_id) {
+            link.grant(u64::from(bytes));
+        }
+    }
+
+    /// The handler for `protocol`, or the `OpenFail` to answer with.
+    fn resolve(&self, protocol: &str, allow_fs: bool) -> Result<Protocol, Envelope> {
+        let Some(settings) = self.settings.clone() else {
+            return Err(open_fail(
+                "UNSUPPORTED_PROTOCOL: rpc is not enabled on this server",
+            ));
+        };
         if self.live.load(Ordering::Relaxed) >= MAX_RPC_CHANNELS {
-            return open_fail("too many open channels");
+            return Err(open_fail("too many open channels"));
         }
         let handler = if !valid_protocol_name(protocol) {
             None
@@ -158,27 +355,17 @@ impl RpcSessions {
         } else if protocol == WSH_FS {
             match &settings.fs {
                 Some(fs) if allow_fs => Some(Protocol::Fs(fs.clone())),
-                Some(_) => return open_fail("file transfer not permitted for this key"),
+                Some(_) => return Err(open_fail("file transfer not permitted for this key")),
                 None => None,
             }
         } else {
             None
         };
-        let Some(handler) = handler else {
-            return open_fail(format!(
+        handler.ok_or_else(|| {
+            open_fail(format!(
                 "UNSUPPORTED_PROTOCOL: protocol \"{protocol}\" is not supported by this server"
-            ));
-        };
-        let channel_id = alloc_channel_id();
-        self.live.fetch_add(1, Ordering::Relaxed);
-        self.channels.insert(channel_id, Channel::Pending);
-        self.pending.push_back(Pending {
-            channel_id,
-            protocol: handler,
-            cancelled: false,
-        });
-        debug!(channel_id, protocol, "rpc channel opened");
-        open_ok(channel_id)
+            ))
+        })
     }
 
     /// A client-opened QMux stream appeared: bind it to the oldest unbound channel.
@@ -307,6 +494,11 @@ impl RpcSessions {
                 self.streams.retain(|_, c| *c != channel_id);
                 true
             }
+            Some(Channel::Virtual { tx, link }) => {
+                link.close();
+                let _ = tx.send(Input::Kill);
+                true
+            }
             Some(Channel::Pending) => {
                 if let Some(p) = self.pending.iter_mut().find(|p| p.channel_id == channel_id) {
                     p.cancelled = true;
@@ -366,6 +558,7 @@ mod tests {
                 super::super::fs::FileAccess::new(std::path::Path::new("/tmp"), false, 1024)
                     .unwrap()
             }),
+            virtual_data: false,
         })
     }
 
@@ -706,5 +899,171 @@ mod tests {
             super::super::get(super::super::get(&r, "error").unwrap(), "code"),
             Some(&super::super::int(super::super::code::METHOD_NOT_FOUND))
         );
+    }
+
+    // ── virtual data mode (wsh #191) ──────────────────────────────────────
+
+    fn virtual_settings(fs: bool) -> Arc<RpcSettings> {
+        let mut s = (*settings(fs)).clone();
+        s.virtual_data = true;
+        Arc::new(s)
+    }
+
+    /// `host.ping` padded to about `n` bytes, so a stream of them is a stream of bytes to meter.
+    fn padded_request(id: i64, n: usize) -> Vec<u8> {
+        enc(&Value::Map(vec![
+            (super::super::text("jsonrpc"), super::super::text("2.0")),
+            (super::super::text("id"), super::super::int(id)),
+            (
+                super::super::text("method"),
+                super::super::text("host.ping"),
+            ),
+            (
+                super::super::text("params"),
+                Value::Map(vec![(
+                    super::super::text("pad"),
+                    super::super::text(&"p".repeat(n)),
+                )]),
+            ),
+        ]))
+    }
+
+    /// An open virtual channel and what the host wrote to the control stream.
+    async fn open_virtual_channel(
+        protocol: &str,
+        allow_fs: bool,
+    ) -> (RpcSessions, u32, mpsc::Receiver<Envelope>) {
+        let mut s = RpcSessions::new(Some(virtual_settings(true)), vec!["rpc-virtual".into()]);
+        let (control, rx) = mpsc::channel(1024);
+        let ok = s.open_virtual(protocol, || 5, allow_fs, control);
+        let Payload::OpenOk(p) = ok.payload else {
+            panic!("expected OpenOk, got {ok:?}")
+        };
+        assert_eq!(p.data_mode, SessionDataMode::Virtual);
+        assert!(p.stream_ids.is_empty());
+        (s, p.channel_id, rx)
+    }
+
+    async fn next_data(rx: &mut mpsc::Receiver<Envelope>) -> Vec<u8> {
+        let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the host wrote nothing")
+            .expect("control closed");
+        match e.payload {
+            Payload::SessionData(d) => d.data,
+            other => panic!("expected SessionData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sealed_server_states_rpc_virtual_instead_of_rpc() {
+        let f = virtual_settings(true).features();
+        assert_eq!(f[0], "rpc-virtual");
+        assert!(!f.contains(&"rpc".to_string()));
+        assert!(f.contains(&"rpc-protocol:wsh-host".to_string()));
+        assert!(f.contains(&"rpc-protocol:wsh-fs".to_string()));
+        assert!(f.iter().any(|x| x.starts_with("rpc-max-message:")));
+        assert_eq!(
+            settings(true).features()[0],
+            "rpc",
+            "unsealed: stream mode, unchanged"
+        );
+        assert!(RpcSessions::new(Some(virtual_settings(false)), vec![]).is_virtual());
+        assert!(!RpcSessions::new(Some(settings(false)), vec![]).is_virtual());
+    }
+
+    #[tokio::test]
+    async fn a_virtual_channel_answers_requests_as_session_data() {
+        let (s, ch, mut rx) = open_virtual_channel("wsh-host", true).await;
+        assert!(s.on_session_data(ch, request(1, "host.ping")));
+        let bytes = next_data(&mut rx).await;
+        let mut dec = super::super::seq::CborSequenceDecoder::new(1 << 20);
+        let r = dec.feed(&bytes).unwrap().remove(0);
+        assert!(super::super::get(&r, "result").is_some());
+        // SessionData for a channel that is not an rpc channel is not ours
+        assert!(!s.on_session_data(ch + 1, request(1, "host.ping")));
+    }
+
+    #[tokio::test]
+    async fn the_same_checks_apply_in_virtual_mode() {
+        let mut s = RpcSessions::new(Some(virtual_settings(true)), vec![]);
+        let (control, _rx) = mpsc::channel(8);
+        // wsh-fs needs the file-transfer scope of the key
+        assert_eq!(
+            reason(&s.open_virtual("wsh-fs", || 1, false, control.clone())),
+            "file transfer not permitted for this key"
+        );
+        assert!(reason(&s.open_virtual("mcp", || 1, true, control.clone()))
+            .starts_with("UNSUPPORTED_PROTOCOL: protocol \"mcp\""));
+        assert!(matches!(
+            s.open_virtual("wsh-fs", || 2, true, control.clone())
+                .payload,
+            Payload::OpenOk(_)
+        ));
+        let mut off = RpcSessions::new(None, vec![]);
+        assert_eq!(
+            reason(&off.open_virtual("wsh-host", || 1, true, control)),
+            "UNSUPPORTED_PROTOCOL: rpc is not enabled on this server"
+        );
+    }
+
+    #[tokio::test]
+    async fn credit_is_returned_as_the_channel_takes_requests_in() {
+        let (s, ch, mut rx) = open_virtual_channel("wsh-host", true).await;
+        // 40 requests of ~4 KiB are over half a window (128 KiB): credit comes back
+        for i in 0..40 {
+            assert!(s.on_session_data(ch, padded_request(i, 4000)));
+        }
+        let mut credited = 0u64;
+        let mut answers = 0;
+        while credited < 128 * 1024 {
+            let e = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no credit came back")
+                .unwrap();
+            match e.payload {
+                Payload::GatewayCredit(c) => {
+                    assert_eq!(c.gateway_id, 0x8000_0000 | ch);
+                    credited += u64::from(c.bytes);
+                }
+                Payload::SessionData(_) => answers += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(credited >= 128 * 1024 && answers > 0);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_overruns_its_credit_has_the_channel_closed() {
+        let (s, ch, mut rx) = open_virtual_channel("wsh-host", true).await;
+        // 5 x 64 KiB is over the 256 KiB window the client was given. The filler is a run of one-character strings, each
+        // answered with an error the client never makes room for: the channel is stuck on its way out, and the overrun
+        // still closes it.
+        let filler = vec![0x61u8; 64 * 1024];
+        for _ in 0..5 {
+            s.on_session_data(ch, filler.clone());
+        }
+        let mut closed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            else {
+                break;
+            };
+            if matches!(e.payload, Payload::Close(ref c) if c.channel_id == ch) {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the host closes the channel (Exit, then Close)");
+    }
+
+    #[tokio::test]
+    async fn the_client_closing_ends_a_virtual_channel_and_it_is_forgotten() {
+        let (mut s, ch, _rx) = open_virtual_channel("wsh-host", true).await;
+        assert!(s.owns_channel(ch));
+        assert!(s.on_close(ch));
+        assert!(!s.on_session_data(ch, request(1, "host.ping")));
+        s.on_credit(ch, 10); // for a channel that is gone: ignored
     }
 }

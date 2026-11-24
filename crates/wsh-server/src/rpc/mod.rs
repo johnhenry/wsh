@@ -57,6 +57,9 @@ pub struct RpcSettings {
     pub max_inflight: usize,
     /// `wsh-fs` is offered only when a file root is configured.
     pub fs: Option<fs::FileAccess>,
+    /// The connection is (or may be) sealed (`seal_session` on), so its bytes are frames and not client-opened data
+    /// streams: the channels are stated `rpc-virtual` instead of `rpc` and ride `SessionData`, metered by credit (wsh #191).
+    pub virtual_data: bool,
 }
 
 impl RpcSettings {
@@ -71,7 +74,13 @@ impl RpcSettings {
 
     /// The `ServerHello.features` entries for rpc.
     pub fn features(&self) -> Vec<String> {
-        let mut f = vec![RPC_FEATURE.to_string()];
+        // One form per connection: a peer that only knows `rpc` never opens a channel it cannot carry.
+        let mut f = vec![if self.virtual_data {
+            wsh_core::rpc_credit::RPC_VIRTUAL_FEATURE
+        } else {
+            RPC_FEATURE
+        }
+        .to_string()];
         f.extend(
             self.protocols()
                 .iter()
