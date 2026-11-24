@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.44.1
 
 ### The README states the gzipped size of each browser entry point, and CI fails when it is stale (#128, the part that was left; tooling and docs only)
 
