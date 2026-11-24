@@ -25,6 +25,7 @@
  */
 
 import { callerIdentity } from './key-names.mjs';
+import { buildMcpTools } from './objects-mcp.mjs';
 
 export const OBJECTS_PROTOCOL = 'wsh-objects';
 
@@ -368,7 +369,7 @@ function isPromiseLike(v) {
  * @param {() => number} [options.now]
  */
 export function createObjectsServer(options = {}) {
-  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, handles = {}, random = null, now = () => Date.now() } = options;
+  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, handles = {}, random = null, mcp, now = () => Date.now() } = options;
   if (mode === 'handles') throw new TypeError("exposeObjects: handles are chosen per root, not for the host: use handles: { window: {} } (and nodes: true on a root that may hand out nodes)");
   if (mode !== 'values') throw new TypeError("exposeObjects: mode must be 'values' (handles are chosen per root with handles: { ROOT: {} })");
   if (typeof allow === 'string') throw new TypeError('exposeObjects: allow must be { get, call, set, on }: a wide-open string is not accepted, and the allow-lists apply to handles too');
@@ -438,6 +439,19 @@ export function createObjectsServer(options = {}) {
     if (gone) throw refuse('gone', `refused: ${gone}`);
     // 0. what the caller's key may do on this root, if the transport says (`ctx.permit(root, op)`, asked afresh: an expiry holds at call time)
     permitted(ctx, root, kind === 'get' && !terminal ? 'walk' : kind === 'construct' ? 'call' : kind === 'describe' || kind === 'snapshot' ? 'get' : kind);
+    staticCheck(kind, root, segs, { terminal, type, callbacks });
+    if (terminal && authorize) {
+      let ok = false;
+      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.'), ...(type !== undefined ? { type } : {}), ...(callbacks ? { callbacks } : {}) })) === true; } catch { ok = false; }
+      if (!ok) throw refuse('authorize', `refused: ${kind} of ${segs.join('.')} was not authorized`, { path: segs.join('.'), op: kind });
+    }
+  }
+
+  /**
+   * The part of `check` that needs nothing of the caller: the allow-lists and the names that need listing. It is what makes an MCP tool for a path possible when the host is
+   * configured (the path must pass it for its operation), and it is the same code every call passes.
+   */
+  function staticCheck(kind, root, segs, { terminal, type, callbacks = 0 }) {
     const rel = segs.slice(1).map(bareName);
     const own = lists[kind === 'construct' ? 'call' : kind === 'describe' || kind === 'snapshot' ? 'get' : kind];
     // 1. the allow-list: the operation's own list for the operation itself, any list for walking toward something
@@ -454,11 +468,6 @@ export function createObjectsServer(options = {}) {
       if (!containsSequence(rel, seq)) continue;
       const listed = terminal ? own.some((p) => matchPath(p, segs) && patternNames(p, seq)) : every.some((p) => prefixPath(p, segs) && patternNames(p, seq));
       if (!listed) throw refuse('needs-listing', `refused: "${rel.join('.')}" is refused until an allow-list entry names ${seq.join('.')} (a wildcard does not)`, { path: segs.join('.') });
-    }
-    if (terminal && authorize) {
-      let ok = false;
-      try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.'), ...(type !== undefined ? { type } : {}), ...(callbacks ? { callbacks } : {}) })) === true; } catch { ok = false; }
-      if (!ok) throw refuse('authorize', `refused: ${kind} of ${segs.join('.')} was not authorized`, { path: segs.join('.'), op: kind });
     }
   }
 
@@ -910,7 +919,32 @@ export function createObjectsServer(options = {}) {
     return { limits, handleCount: () => session.handles.size, callbackCount: () => session.callbacks.size, deadCallbackCalls: () => session.deadCalls };
   }
 
-  return { attach, limits: Object.freeze({ ...limits }), rootNames: rootNames.slice() };
+  /**
+   * One `get` or `call` of a named path (`path` starts with the root: `['window', 'app', 'cart', 'add']`), through the same checks as an objects call: the key's grants
+   * (`permit(root, op)`), the allow-lists, the names that need listing, `authorize` and the window guard. No session: nothing here makes a handle or takes a callback, and the
+   * answer is the wire value (`{ v }`, or a named non-value `{ u }`). `args` are plain data, copied and bounded like the arguments of a call. This is what an MCP tool runs.
+   * @param {{ kind: 'get' | 'call', path: string[], args?: unknown[] }} request
+   * @param {{ who?: object, permit?: (root: string, op: string) => boolean, signal?: AbortSignal }} [ctx]
+   */
+  async function invoke({ kind, path, args = [] } = {}, { who, permit, signal } = {}) {
+    if (kind !== 'get' && kind !== 'call') throw invalid('invoke: kind must be get or call');
+    if (!Array.isArray(path) || path.length < 2 || !path.every((s) => typeof s === 'string')) throw invalid('invoke: path must be a root and at least one member');
+    if (!Array.isArray(args)) throw invalid('invoke: args must be an array');
+    const root = requireRoot({ root: path[0] });
+    const last = path.length - 2;
+    const ops = path.slice(1).map((key, i) => (kind === 'call' && i === last ? { call: key, args } : { get: key }));
+    return resolve({ root, ops }, { who: callerIdentity(who) ?? undefined, permit, signal, maxBytes: limits.maxValueBytes });
+  }
+
+  // The MCP face (#219): tools for named allow-listed paths, built from the host's `mcp: { tools }`. Empty unless the host wrote it.
+  const mcpTools = buildMcpTools({
+    mcp,
+    rootNames,
+    allows: (kind, root, segs) => staticCheck(kind, root, segs, { terminal: true }),
+    invoke,
+  });
+
+  return { attach, invoke, limits: Object.freeze({ ...limits }), rootNames: rootNames.slice(), mcpTools, mcpToolNames: mcpTools.map((t) => t.name) };
 }
 
 // ── A bare duplex as a peer ─────────────────────────────────────────────────────────────────────────────────────────

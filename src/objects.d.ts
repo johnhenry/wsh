@@ -133,6 +133,8 @@ export interface ObjectsServerOptions {
   limits?: Partial<ObjectsLimits>;
   /** Extra event fields a subscriber may ask for, by event type (`'*'`: any type): property names read from the event and copied as plain data (a node is left out). */
   eventFields?: Record<string, string[]>;
+  /** An MCP face for named paths, off unless written: `{ tools: [{ name, description, call: 'window.app.cart.add', inputSchema }, { name, description, get: 'window.document.title' }] }`. */
+  mcp?: { tools: ObjectsMcpTool[] };
   /** Why nothing may be served any more (the window left), else null. */
   guard?: () => string | null;
   /** For `callTimeoutMs`. */
@@ -155,9 +157,48 @@ export interface ObjectsPeer {
 export function createObjectsServer(options: ObjectsServerOptions): {
   /** `who`: the identity of every call unless the peer gives one per call (`ctx.who`); one that names two keys, or is not an identity, throws a `TypeError` here. */
   attach(peer: Pick<ObjectsPeer, 'onRequest' | 'maxMessageBytes'>, options?: { who?: ObjectsIdentity }): { limits: ObjectsLimits };
+  /**
+   * One `get` or `call` of a named path (`path` starts with the root), through the same checks as an objects call (the key's grants as `permit(root, op)`, the allow-lists,
+   * the names that need listing, `authorize`, the window guard). No session, so no handle and no callback; resolves with the wire value (`{ v }`, or a named non-value `{ u }`).
+   */
+  invoke(request: { kind: 'get' | 'call'; path: string[]; args?: unknown[] }, ctx?: { who?: ObjectsIdentity; permit?: (root: string, op: string) => boolean; signal?: AbortSignal }): Promise<{ v: unknown } | { u: string; type?: string; text?: string }>;
   readonly limits: Readonly<ObjectsLimits>;
   readonly rootNames: string[];
+  /** The tools the host named in `mcp: { tools }` (none unless written), as definitions for `webmcpTools({ tools })`. */
+  readonly mcpTools: ObjectsMcpToolDefinition[];
+  readonly mcpToolNames: string[];
 };
+
+/**
+ * One path made into an MCP tool (#219). Nothing is a tool by being allowed: the host writes each one. Exactly one of `call` (a method, as the objects client would call it) and `get`
+ * (a value) names the path, a literal one that the allow-lists name for that operation. `inputSchema` is a small subset of JSON Schema (an unsupported keyword is refused when the host is made)
+ * that the far side's arguments are checked against before the person is asked and before the page runs anything; with none, the tool takes no arguments.
+ */
+export interface ObjectsMcpTool {
+  /** 1-128 characters of letters, digits, `_`, `-` and `.`. */
+  name: string;
+  title?: string;
+  /** What the far side reads to decide when to call it: written by the host. */
+  description: string;
+  /** A method path from a root, qualified (`'window.app.cart.add'`) in `exposeObjects`; relative to the root (`'app.cart.add'`) in `createPageHost({ expose })`. */
+  call?: string;
+  /** A value path, as for `call`. Read-only by default. */
+  get?: string;
+  inputSchema?: Record<string, unknown>;
+  /** For a call: `'object'` (the validated input is the one argument) or the property names to pass, in order. Default: `'object'` when the schema lists properties, else none. */
+  args?: 'object' | string[];
+  /** Default: a get is read-only and a call is not. A tool not marked read-only asks the person at the page first (the WebMCP bridge's approval). */
+  readOnly?: boolean;
+}
+/** A tool as `webmcpTools({ tools })` takes it (what `exposeObjects` builds from an `ObjectsMcpTool`). */
+export interface ObjectsMcpToolDefinition {
+  name: string;
+  title?: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations: { readOnlyHint: boolean };
+  execute(input: Record<string, any>, options?: { signal?: AbortSignal; who?: ObjectsIdentity; permits?: (request: { kind: string; [k: string]: unknown }) => boolean }): Promise<unknown>;
+}
 
 /**
  * A peer over `send(message)` and `receive(message)`: the same protocol over any duplex that is not wsh. `who` is who is on the far side, as an
@@ -182,6 +223,9 @@ export interface ObjectsHandler {
   closeSessions(reason: string, fingerprint?: string): Promise<number>;
   readonly rootNames: string[];
   readonly limits: Readonly<ObjectsLimits>;
+  /** The MCP face (#219): the tools named in `mcp: { tools }`, for `webmcpTools({ window, tools: handler.mcpTools, allow: handler.mcpToolNames })`. Empty unless written. */
+  readonly mcpTools: ObjectsMcpToolDefinition[];
+  readonly mcpToolNames: string[];
 }
 export function exposeObjects(options: ObjectsServerOptions): ObjectsHandler;
 

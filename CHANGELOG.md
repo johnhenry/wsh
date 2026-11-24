@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### An MCP face for allow-listed object paths (#219; JS)
+
+**Wire: nothing new.** The tools are served on the existing `mcp` rpc channel (or `serveMcpOverDuplex`) with its existing methods; no message type, field, channel or feature string was added, so any released MCP-speaking peer (npm 0.49.0 and 0.50.0, the Rust CLI's `wsh --sealed --via ... mcp`) lists and calls them like any other tool. Rust has no `wsh-objects` host.
+
+- **`exposeObjects({ mcp: { tools } })`** (and `createPageHost({ expose: { ROOT: { mcp: { tools } } } })`, paths relative to the root) makes **exactly the paths it names** into MCP tools, each a host-authored `name`, `description` and JSON Schema: a **call** of one method, or a read-only **get** of one value. Nothing is a tool by being allowed; a path the allow-lists do not name for that operation, a wildcard, a path through a call result and a name that needs listing are refused when the host is created. The handler carries `mcpTools` / `mcpToolNames` for `webmcpTools({ tools, allow })`; a page host merges them with the page's WebMCP tools in one handler.
+- **The same approval, bounds and label as the WebMCP bridge** (it is the same handler): a tool not marked read-only (a call, by default) asks the person at the page; the input, result, schema, in-flight and per-minute bounds; results are labelled untrusted page content; a page function that throws is an error result without a stack.
+- **Arguments are validated before the person is asked and before the page runs anything**, against a small bounded subset of JSON Schema (`src/objects-schema.mjs`: `type`, `enum`, `const`, `properties`, `required`, `additionalProperties`, `items`, `minItems`, `maxItems`, `minLength`, `maxLength`, `minimum`, `maximum`, `anyOf`). A schema with any other keyword (`$ref`, `pattern`, `oneOf`, ...) is refused when the host is created, so what is advertised is what is checked. Arguments and results are plain data only; there is no handle, event or callback through MCP.
+- **Two notations, both required.** A key lists and calls a tool only if it holds `mcp:TOOL` (or `mcp:*`) **and** the operation on the root (`objects:ROOT[:call|:get]`); the `objects:` grant is asked again when the tool runs, with the allow-list, `authorize` and the window guard (`createObjectsServer(...).invoke`, new, runs one `get` or `call` through exactly the checks of an objects call). A key with `mcp:TOOL` and no `objects:` entry sees no tool.
+- **Internals.** `webmcpTools` honours a host-only part of a tool definition (`INTERNAL_TOOL`: who is calling and the key's grants for `execute`, an argument check before the approval, and a per-key availability hook) only for the definitions the host passes in `tools`, never for a tool the page registers itself (a test forges it from a page tool and it is ignored).
+
 ## 0.50.0
 
 npm only (since `rust-v0.17.1` the only change under `crates/` is the unit test of the capability vectors added in 0.49.0, no binary changes, no `rust-v` tag; the note below in `spec/wsh-v1.yaml` is a comment that generates no code change). **Wire: nothing new.**

@@ -1,7 +1,7 @@
 import type { RpcChannel } from './index.js';
 import type { WshRpcContext } from './server/index.js';
 import type { WshOnRefused } from './host.js';
-import type { ObjectsAllow, ObjectsWho, ObjectsOperation, ObjectsLimits } from './objects.js';
+import type { ObjectsAllow, ObjectsWho, ObjectsOperation, ObjectsLimits, ObjectsMcpTool } from './objects.js';
 
 export { exposeObjects } from './objects.js';
 
@@ -211,7 +211,7 @@ export interface WshPageHostOptions {
    * `'document.title'`, `'app.**'`; nothing allowed by default). A root named `window` is the window that was passed; another name needs `object`.
    * `mode: 'handles'` is this root's own opt-in to handles (`nodes: true` a second, for nodes and the window graph). See `@johnhenry/wsh/objects`.
    */
-  expose?: Record<string, { mode?: 'values' | 'handles'; nodes?: boolean; wideEntries?: boolean; allow?: ObjectsAllow; authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>; limits?: Partial<ObjectsLimits>; object?: object; eventFields?: Record<string, string[]> }>;
+  expose?: Record<string, { mode?: 'values' | 'handles'; nodes?: boolean; wideEntries?: boolean; allow?: ObjectsAllow; authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>; limits?: Partial<ObjectsLimits>; object?: object; eventFields?: Record<string, string[]>; /** An MCP face for named paths of this root (paths relative to it), served on the `mcp` channel beside the WebMCP tools: nothing is a tool by being allowed. */ mcp?: { tools: ObjectsMcpTool[] } }>;
   /** `true` (default): the badge in `window.document`. Callbacks: for a context with no document, or your own UI. `false` needs `unattended: true`. */
   indicator?: boolean | WshPageIndicatorCallbacks;
   /** Nobody is in front of this window. Allows `indicator: false` and a window with no document; what needs approval is then denied unless `mcp.prompt` answers. */
