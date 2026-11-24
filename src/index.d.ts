@@ -1838,6 +1838,46 @@ export interface WshHostKey {
 export type WshHostKeyErrorCode =
   | 'HOST_KEY_MISSING' | 'HOST_KEY_INVALID' | 'HOST_KEY_MISMATCH' | 'HOST_KEY_UNKNOWN' | 'HOST_KEY_REJECTED';
 
+/** Stable `code` values of `WshAuthError` and `WshConnectionError`. */
+export const WSH_ERROR_CODES: Readonly<{
+  AUTH_FAILED: 'AUTH_FAILED';
+  AUTH_UNAUTHORIZED: 'AUTH_UNAUTHORIZED';
+  AUTH_BAD_SIGNATURE: 'AUTH_BAD_SIGNATURE';
+  AUTH_METHOD_DISABLED: 'AUTH_METHOD_DISABLED';
+  AUTH_RATE_LIMITED: 'AUTH_RATE_LIMITED';
+  AUTH_KEY_EXPIRED: 'AUTH_KEY_EXPIRED';
+  AUTH_BINDING_REQUIRED: 'AUTH_BINDING_REQUIRED';
+  AUTH_NOT_SEALED: 'AUTH_NOT_SEALED';
+  AUTH_BAD_REQUEST: 'AUTH_BAD_REQUEST';
+  CONNECTION_FAILED: 'CONNECTION_FAILED';
+  HANDSHAKE_TIMEOUT: 'HANDSHAKE_TIMEOUT';
+}>;
+export type WshAuthErrorCode = Exclude<keyof typeof WSH_ERROR_CODES, 'CONNECTION_FAILED' | 'HANDSHAKE_TIMEOUT'>;
+
+/**
+ * Thrown by `connect()` when the host refuses the login. The message is `Authentication failed: <reason>`, as it always was.
+ * `refusal` is the reason the host reports to its own `onRefused` (`REFUSAL_REASONS` of `@johnhenry/wsh/host`), recognised from the
+ * wording of the hosts this package ships (the wire carries the text only); `null` for a host that words it otherwise.
+ */
+export class WshAuthError extends Error {
+  constructor(reason: string, message?: string);
+  readonly code: WshAuthErrorCode;
+  /** What the host said, verbatim. */
+  readonly reason: string;
+  readonly refusal: 'unauthorized' | 'bad-signature' | 'method-disabled' | 'rate-limited' | 'key-expired' | 'binding-required' | 'not-sealed' | 'bad-request' | null;
+}
+
+/** Thrown by `connect()` when no transport could be opened (`CONNECTION_FAILED`, with `attempts`) or the host did not answer a login step in time (`HANDSHAKE_TIMEOUT`). */
+export class WshConnectionError extends Error {
+  constructor(code: 'CONNECTION_FAILED' | 'HANDSHAKE_TIMEOUT', message: string, details?: { attempts?: string[]; cause?: unknown });
+  readonly code: 'CONNECTION_FAILED' | 'HANDSHAKE_TIMEOUT';
+  /** One line per transport tried. */
+  readonly attempts?: string[];
+}
+
+/** Map an `AuthFail` reason to the stable code and `onRefused` reason (`AUTH_FAILED` / `null` when it is not recognised). */
+export function classifyAuthRefusal(reason: unknown): { code: WshAuthErrorCode; refusal: WshAuthError['refusal'] };
+
 /** Thrown by `connect()` when the host key fails the caller's policy. No credential has been sent. */
 export class HostKeyError extends Error {
   constructor(code: WshHostKeyErrorCode, message: string, details?: { expected?: string; actual?: string });
