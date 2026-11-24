@@ -1,7 +1,7 @@
 // test/rust/wsh-rust-server-udp-bounds.test.mjs -- #145: the Rust `wsh-server`'s UDP flows (`OpenUdp`) are bounded the way the Node
 // host's are (test/gateway-datagram.test.mjs, the parts that do not need WebTransport): flows per client, datagrams per second
 // per flow and per client, payload bytes per second per client (both directions), and an idle limit counted in both directions.
-// Over the reliable control stream (wss://): the Rust server does not offer `gateway-datagram` yet (README capability matrix).
+// Over the reliable control stream (wss://). The same bounds over WebTransport datagrams: wsh-rust-server-udp-datagrams.test.mjs.
 //
 // Drives the real binary (cargo build -p wsh-server, WSH_SERVER_BIN) with this repo's JS client, against a UDP echo on
 // loopback. Every server runs with HOME in a scratch directory.

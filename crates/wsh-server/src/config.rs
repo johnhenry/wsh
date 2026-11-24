@@ -336,6 +336,21 @@ pub struct GatewaySection {
     /// Default: `60`.
     #[serde(default = "default_udp_idle_secs")]
     pub udp_idle_secs: u64,
+    /// Offer `gateway-datagram` on WebTransport connections: when the client lists it too, the
+    /// payloads of its UDP flows travel as WebTransport datagrams (`[gateway_id u32 BE][payload]`)
+    /// instead of `GatewayData` on the control stream. `false` keeps every flow on the control
+    /// stream. Has no effect over WebSocket, which has no datagrams.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub udp_datagrams: bool,
+    /// A UDP payload that does not fit one WebTransport datagram (the transport's maximum minus the
+    /// 4-byte flow id): `"reliable"` sends it on the control stream (ordered, retransmitted, metered
+    /// by credit), `"drop"` drops it as a path over its MTU would.
+    ///
+    /// Default: `"reliable"`.
+    #[serde(default = "default_udp_oversize")]
+    pub udp_oversize: String,
     /// Unix-domain sockets in THIS machine's file system a client may connect to
     /// (`OpenUnix`, `wsh -L ...:/remote.sock`). Needs `enabled = true`. Each entry is an
     /// absolute path, exact (`"/var/run/docker.sock"`) or a directory prefix with a trailing
@@ -401,6 +416,8 @@ impl Default for GatewaySection {
             udp_packets_per_second_per_client: default_udp_packets_per_second_per_client(),
             udp_bytes_per_second_per_client: default_udp_bytes_per_second_per_client(),
             udp_idle_secs: default_udp_idle_secs(),
+            udp_datagrams: true,
+            udp_oversize: default_udp_oversize(),
             unix_connect: Vec::new(),
             unix_listen: Vec::new(),
             unix_replace_stale: false,
@@ -413,6 +430,9 @@ impl Default for GatewaySection {
 
 fn default_unix_max_listeners() -> usize {
     crate::gateway::unix_policy::DEFAULT_MAX_UNIX_LISTENERS
+}
+fn default_udp_oversize() -> String {
+    "reliable".to_string()
 }
 fn default_udp_max_flows() -> usize {
     crate::gateway::udp_policy::DEFAULT_MAX_FLOWS
@@ -716,7 +736,12 @@ impl ServerConfig {
             file_config.gateway.udp_bytes_per_second_per_client,
             file_config.gateway.udp_idle_secs,
         )
-        .map_err(wsh_core::WshError::Other)?;
+        .map_err(wsh_core::WshError::Other)?
+        .with_datagrams(
+            file_config.gateway.udp_datagrams,
+            crate::gateway::udp_policy::Oversize::parse(&file_config.gateway.udp_oversize)
+                .map_err(wsh_core::WshError::Other)?,
+        );
         let gateway_unix = crate::gateway::unix_policy::UnixPolicy::new(
             file_config.gateway.unix_connect.clone(),
             file_config.gateway.unix_listen.clone(),
