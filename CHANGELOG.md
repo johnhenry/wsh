@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fix: the last messages of a connection are delivered before its close is reported (JS client and `WebSocketTransport`)
+
+When the socket closed right behind the last messages of a connection, the close could be handled before those messages had been dispatched: a transport dispatches inbound control messages one per turn, a sealed frame is opened asynchronously, and the socket's
+close is a separate event, so the close overtook what was still waiting. What the host said last (the reason it was ending the session, the exit of a command) could be lost, and a caller waiting for it waited forever. `WebSocketTransport` now reports the close
+after the messages that arrived before it (`SerialQueue` gained `busy` and `idle()`), and `WshClient` handles the close after the sealed frames that had already arrived have been opened and delivered. No wire change; nothing else about closing is different.
+
+### CI: a hung test now costs minutes and names itself
+
+`npm test` runs `scripts/run-tests.mjs`: the same `node --test` per file as before, with each file announced when it starts and ends, a per-test timeout (2 minutes) that fails the test by name, and a per-file limit (5 minutes) that kills the file and fails the run naming it.
+The CI and publish gates also run it under `timeout 1200`; the CodeQL and dependency-review jobs got `timeout-minutes`. (`npm test -- test/x.test.mjs` runs one file.)
+
 ## 0.46.0 / Rust `rust-v0.17.0`
 
 ### Breaking defaults (read these before upgrading; the entries below say who is affected and what to do)

@@ -73,10 +73,22 @@ export class SerialQueue {
     this.#handler = handler;
   }
 
+  #loop = Promise.resolve();
+
   /** @param {*} item */
   push(item) {
     this.#items.push(item);
-    this.#drain();
+    if (!this.#draining) this.#loop = this.#drain();
+  }
+
+  /** Whether anything pushed is still waiting for, or being given to, the handler. */
+  get busy() {
+    return this.#draining || this.#items.length > 0;
+  }
+
+  /** Resolves once everything pushed so far has been dispatched (immediately when nothing is). */
+  idle() {
+    return this.#loop;
   }
 
   /** Discard any queued-but-not-yet-dispatched items (e.g. on reconnect). */

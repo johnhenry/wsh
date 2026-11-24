@@ -19,8 +19,11 @@ jobs:
       # executed in CI. See #42. No committed lockfile, so no npm cache.
       install-command: npm install --no-save --include=optional
       node-cache: ""
+      # `npm test` bounds every test file (scripts/run-tests.mjs names a file that hangs), and `timeout` bounds the whole step:
+      # the suite takes about two minutes, so a run that is still going after 20 is a hang and fails in minutes, not hours.
+      # (A job that calls a reusable workflow cannot take `timeout-minutes` itself.)
       gate-commands: |
-        npm test
+        timeout 1200 npm test
         npm run typecheck
         npm run examples
         npm run size

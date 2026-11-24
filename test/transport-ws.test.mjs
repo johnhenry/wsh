@@ -437,6 +437,28 @@ describe('WebSocketTransport (QMux)', { skip: !transportWsMod && 'transport-ws.m
     }
   });
 
+  it('control messages that arrived before the socket closed are all dispatched before onClose (the close does not overtake them)', async () => {
+    const restore = installFakeWebSocket();
+    let transport;
+    try {
+      ({ transport } = await connectedTransport());
+      const ws = FakeWebSocket.instances[0];
+      const events = [];
+      // Messages are dispatched one per turn, so a close reported right away would overtake the ones still waiting.
+      transport.onControl = (msg) => { events.push(`msg ${msg.seq}`); };
+      transport.onClose = () => events.push('close');
+
+      const batch = new Uint8Array([...frameEncode({ type: 10, seq: 1 }), ...frameEncode({ type: 10, seq: 2 }), ...frameEncode({ type: 10, seq: 3 })]);
+      ws.simulateMessage(encodeRecord(encodeStream({ streamId: 0, offset: 0, data: batch, fin: false })));
+      ws.simulateServerClose(1000, 'right behind the last message');
+      await nextTick(3);
+
+      assert.deepEqual(events, ['msg 1', 'msg 2', 'msg 3', 'close']);
+    } finally {
+      restore();
+    }
+  });
+
   it('a peer CONNECTION_CLOSE frame also tears the transport down gracefully', async () => {
     const restore = installFakeWebSocket();
     let transport;

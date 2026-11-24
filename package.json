@@ -91,7 +91,7 @@
     "@modelcontextprotocol/sdk": "^1.17.0"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node scripts/run-tests.mjs",
     "test:rust": "node --test --test-timeout=180000 test/rust/*.test.mjs",
     "test:browser": "playwright test --config test/browser/playwright.config.mjs",
     "size": "node scripts/bundle-size.mjs",
