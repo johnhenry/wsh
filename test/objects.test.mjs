@@ -354,7 +354,7 @@ describe('always refused, in every list', () => {
     }
     assert.throws(() => createObjectsServer({ roots, allow: { get: 'window.**' } }), /array of path patterns/);
     assert.throws(() => createObjectsServer({ roots, allow: { post: [] } }), /not an operation/);
-    assert.throws(() => createObjectsServer({ roots, allow: 'everything-i-understand-this-is-remote-control' }), /not built/);
+    assert.throws(() => createObjectsServer({ roots, allow: 'everything-i-understand-this-is-remote-control' }), /not accepted/);
   });
 });
 
@@ -540,7 +540,7 @@ describe('limits are refused by name', () => {
     it(`${transportName}: the limits themselves are checked`, () => {
       assert.throws(() => createObjectsServer({ roots: { window: {} }, limits: { maxOps: 0 } }), /positive integer/);
       assert.throws(() => createObjectsServer({ roots: { window: {} }, limits: { nope: 1 } }), /unknown limit/);
-      assert.throws(() => createObjectsServer({ roots: { window: {} }, mode: 'handles' }), /'handles' is not built/);
+      assert.throws(() => createObjectsServer({ roots: { window: {} }, mode: 'handles' }), /per root/);
       assert.throws(() => createObjectsServer({ roots: { window: {} }, mode: 'other' }), /must be 'values'/);
       assert.throws(() => createObjectsServer({ roots: { window: {} }, authorize: 'yes' }), /authorize must be a function/);
     });
@@ -670,7 +670,7 @@ describe('over wsh: the capability, client.openObjects(), and the wire', () => {
 
   it('exposeObjects without roots, and mode handles, are refused with a sentence', () => {
     assert.throws(() => exposeObjects({}), /roots must be an object/);
-    assert.throws(() => exposeObjects({ roots: { window: {} }, mode: 'handles' }), /not built/);
+    assert.throws(() => exposeObjects({ roots: { window: {} }, mode: 'handles' }), /per root/);
   });
 
   it('closeSessions tells the caller why and ends the channel', async () => {

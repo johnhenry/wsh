@@ -1,5 +1,5 @@
 /** Type-only fixture: `@johnhenry/wsh/objects` (#190), values mode: the host handler, the lazy references, the helpers. */
-import { exposeObjects, createObjectsServer, createObjectsClient, createDuplexPeer, get, set, call, construct, snapshot, describe, on, off, closeObjects, NonValue, ObjectsError, OBJECTS_DEFAULT_LIMITS, type ObjectsHandler } from '@johnhenry/wsh/objects';
+import { exposeObjects, createObjectsServer, createObjectsClient, createDuplexPeer, get, set, call, construct, snapshot, describe, on, off, use, release, RemoteHandle, closeObjects, NonValue, ObjectsError, OBJECTS_DEFAULT_LIMITS, type ObjectsHandler } from '@johnhenry/wsh/objects';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { createPageHost } from '@johnhenry/wsh/page';
 import { WshClient } from '@johnhenry/wsh';
@@ -9,6 +9,7 @@ declare const win: Window;
 const handler: ObjectsHandler = exposeObjects({
   roots: { window: win },
   mode: 'values',
+  handles: { window: { nodes: false } },
   allow: { get: ['window.document.title', 'window.app.**'], call: ['window.app.**'], set: [] },
   authorize: (who, op) => who.username === 'alice' && op.kind !== 'set' && op.path.length > 0,
   limits: { maxOps: 16, maxValueBytes: 65536 },
@@ -30,6 +31,8 @@ async function farSide(client: WshClient): Promise<void> {
   void [title, n, r, state, shape.keys[0]?.key, then];
   const stop = await on(page.window.app.bus, 'ready', (data, { type, seq, dropped }) => { void [data, type, seq, dropped]; }, { fields: ['detail'], onError: (e) => { void e; } });
   await off(stop);
+  const cart = await page.window.app.cart;
+  if (cart instanceof RemoteHandle) { void [cart.kind, cart.type, cart.preview?.keys]; await use(cart).add({ sku: 'A1' }); await release(cart); }
   await closeObjects(page);
 }
 void exposeObjects({ roots: { window: win }, allow: { on: ['window.app.bus@ready'] }, eventFields: { hashchange: ['newURL'] }, limits: { maxSubscriptions: 4, maxEventsPerSecond: 5 } });
@@ -42,5 +45,5 @@ void [farSide, createObjectsClient(peer), new ObjectsError(-32003, 'x', { reason
 // The page host: object access beside the MCP bridge, paths relative to the root.
 void createPageHost({
   window: win, relay: 'wss://relay.example/pipe', name: 'tab', authorizedKeys: ['ssh-ed25519 AAAA'],
-  expose: { window: { mode: 'values', allow: { get: ['document.title', 'app.**'], call: ['app.**'] }, limits: { maxOps: 8 } } },
+  expose: { window: { mode: 'handles', nodes: false, allow: { get: ['document.title', 'app.**'], call: ['app.**'] }, limits: { maxOps: 8, maxHandles: 8 } } },
 });

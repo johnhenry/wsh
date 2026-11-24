@@ -653,8 +653,8 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/reverse` (whole entry point) | 220.0 kB | 68.0 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
 | `@johnhenry/wsh/testing` (whole entry point) | 7.9 kB | 2.6 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 285.3 kB | 90.2 kB |
-| `@johnhenry/wsh/objects` (whole entry point) | 165.7 kB | 50.8 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 289.7 kB | 91.7 kB |
+| `@johnhenry/wsh/objects` (whole entry point) | 170.4 kB | 52.2 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 135.9 kB | 40.8 kB |
 | `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 102.9 kB | 33.6 kB |
@@ -780,7 +780,7 @@ earlier load will not match and trust-on-first-use gives no continuity. To keep 
 ### Remote objects: `@johnhenry/wsh/objects` (#190)
 
 `wsh-objects` is an rpc protocol that reaches an object graph by path: a page's `window`, a worker's `self`, any object a host names as a **root**. It is `values` mode:
-only plain cloneable values ever cross (there are no handles and no callbacks yet; `mode: 'handles'` is refused with a sentence saying it is not built; events are delivered as copies, see below).
+only plain cloneable values ever cross (on a root that has not opted in to [handles](#handles) there are no handles and no callbacks; events are delivered as copies, see below).
 Nothing is reachable but the named roots, and nothing in them is allowed until an allow-list says so.
 
 ```js
@@ -845,7 +845,38 @@ does the same). Bounds, by name: `maxSubscriptions` 16 per channel (refused), `m
 is **dropped and counted** (the rate and the queue are checked before anything of the event is read or copied, so a dropped event costs a counter), and the next one delivered says how many were lost before it (`dropped`). Events leave as notifications whose write waits for the channel's credit, so a slow reader fills the bounded
 queue and then loses events, counted, instead of growing the page's memory. Every listener is taken out of the page's sources when the channel ends: the operator leaves, Stop, a navigation, a revoke. An error in the far
 side's listener goes to its `onError` and stays there; the host's listener only copies and queues and cannot throw into the page's dispatch. Callbacks as arguments of a call are **not offered** (a function cannot be
-sent: it is refused where it is written); the design in #190 describes them as handles, which is the next step.
+sent: it is refused where it is written); callbacks are not built yet (see [Handles](#handles)).
+
+#### Handles
+
+A root can opt in to **handles**: `exposeObjects({ roots, handles: { window: {} }, ... })`, or `createPageHost({ expose: { window: { mode: 'handles', allow } } })`. Values stays the default, and the opt-in is per root.
+On such a root a function or an object that is not plain data (a class instance with state, a `Map`) comes back as an opaque `RemoteHandle` instead of a named non-value, and `use(handle)` makes a reference that stands on it:
+
+```js
+const cart = await win.app.cart;             // a RemoteHandle { type: 'Cart' } (what a plain value or a named non-value would have been)
+await use(cart).add({ sku: 'A1' });          // the same object across calls; one request per chain, as ever
+await use(cart).items.length;
+await release(cart);                         // gives its place back; everything is released when the channel ends
+```
+
+- **The path-bound model.** A handle stands at the **path that produced it**: one got by `get window.app.cart` behaves as `window.app.cart`; one returned by calling `window.app.makeCounter` behaves as `window.app.makeCounter()`
+  (the notation values mode uses for results), and its members as `window.app.makeCounter().inc`. Every operation through it is judged by the allow-lists for that path extended by the member, exactly as if the path were written out.
+  **A handle never widens what a path grants**: if only `window.app.cart.add` may be called, `use(cart).items` is refused. Allow-list entries can name such paths (`call: ['window.app.makeCounter', 'window.app.makeCounter().inc']`).
+  The always-refused names stay refused through a handle, and so do the entries that must name their path (`fetch`, cookies, storage, ...).
+- **A handle is opaque and local.** Its id is 128 random bits (from `crypto.getRandomValues`; the page host uses the served window's). It is meaningful only on the channel that produced it, for the key that holds that channel: another
+  channel, another key, a reconnect, or a guess finds nothing (`no such handle`). Nothing of it is enumerable on the far side; it is not thenable, and it cannot be sent as an argument.
+- **Nodes and the window graph.** A DOM node, a window or a document is **not** handed out as a handle (it stays a named non-value) unless the root sets its own opt-in, `nodes: true`, which is control of the page. Even then the members that
+  lead back up to the graph (`ownerDocument`, `defaultView`, `parentNode`, `parentElement`, `getRootNode`, `contentWindow`, `contentDocument`, `self`, `window`, `top`, `parent`, `frames`, `opener`, `globalThis`) stay refused
+  until an allow-list entry names them; a wildcard does not.
+- **A bounded table.** `maxHandles` (64) per channel, **refused by name on overflow, never evicted**; `release(handle)` is explicit; all of them go when the channel ends (the operator leaving, Stop, a navigation, a revoke). A far side's
+  garbage-collection hints would be advisory only; none is used.
+- **Previews.** `handle.preview` (a bounded list of up to 8 member names) is present only if a `get` entry names the handle's path; otherwise a handle says its type and nothing more. `describe(use(handle))` lists only members the allow-lists could walk to.
+- **Capabilities.** `objects:ROOT[:OP]` apply unchanged: an operation through a handle is the same `get`, `call`, `set` of the producing path (a key with `objects:window:get` can read through a handle and cannot call through it).
+- **What a handle is not.** The host's real object stays in the page: calling a method runs the page's code with the caller's plain-data arguments, as for any `call`; a handle to an object with a powerful method is as powerful as that method's entry in `call`. A handle is
+  a reference to something already reachable by a path, so it cannot reach more than the path's own entries; but a wide entry (`window.app.**`) covers every member of every object under it. Events are not offered through a handle, and callbacks are not built.
+
+**The indicator is best effort.** The page host shows a visible element while a session is connected, puts it back if the page removes it, and has a Stop button. Page code can always remove or cover a DOM element, and a tool or a
+function the caller may call runs with the page's authority. What holds is **Stop and revoke** (they close the channel from the page's own code, whatever is on screen) and **the key's capabilities and the host's allow-lists**.
 
 **Threat model of `values` mode.** An allow-list of paths means what it says **only because nothing but cloneable values crosses**: a result can never be walked somewhere else, so what a session can
 reach is exactly the paths the lists name (and, below a `get`, the plain data inside that value). That holds up to what the named paths themselves do:
@@ -862,9 +893,9 @@ reach is exactly the paths the lists name (and, below a `get`, the plain data in
   written by third parties.
 - A sealed session, a key login and a visible indicator (the page host) are what keep a relay and an unknown caller out; `authorize` is where an embedder asks the person.
 
-Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 50.8 kB gzipped (it contains the client), and
-the page entry point is 90.2 kB with it; no other entry point changed. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
-Not built yet (later steps of #190): handles for what cannot be cloned, callbacks as arguments, typed remotes (`Remote<T>`), an MCP face for the allow-listed paths, and a dial-out form.
+Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 52.2 kB gzipped (it contains the client), and
+the page entry point is 91.7 kB with it; no other entry point changed. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
+Not built yet (later steps of #190): callbacks as arguments, typed remotes (`Remote<T>`), an MCP face for the allow-listed paths, and a dial-out form.
 
 ### WebTransport listener
 
@@ -2401,7 +2432,7 @@ out explicitly below rather than left to be discovered.
   already in it; a fresh host key per page load means no pin outlives it unless `hostKeyStore` is given) are stated in
   [A page as a host](#a-page-as-a-host-johnhenrywshpage-190).
 - **`wsh-objects` (`@johnhenry/wsh/objects`, #190) lets a key read, call and set the paths an allow-list names on the roots a host names, and nothing else.** An allow-list of paths means what it says
-  only because nothing but cloneable values crosses (no handles in `values` mode); what it cannot make safe is stated in
+  only because nothing but cloneable values crosses (no handles in `values` mode; on a root that opted in to [handles](#handles), a handle is judged by the path that produced it and never widens it, and nodes need their own opt-in); what it cannot make safe is stated in
   [Remote objects](#remote-objects-johnhenrywshobjects-190): a getter or a setter on an allowed path runs, a called function does whatever it does with the page's authority, a wide pattern means its width, and a
   few paths (`document.cookie`, storage, `fetch`, ...) need an entry that names them. Object access is off on every host unless `exposeObjects` or `createPageHost({ expose })` is written, and `rpc:wsh-objects` is the key capability that gates it.
 - **`wsh-mcp` runs as a client with your key (#127).** It reads a private key file you point it at (no passphrase support: protect the

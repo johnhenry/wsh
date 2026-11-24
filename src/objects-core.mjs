@@ -62,6 +62,8 @@ export const OBJECTS_DEFAULT_LIMITS = Object.freeze({
   maxKeys: 200,
   /** Requests accepted per second, per attached peer. */
   maxRequestsPerSecond: 50,
+  /** Handles per channel (on roots that opted in): more are refused, nothing is evicted. */
+  maxHandles: 64,
   /** Event subscriptions per channel. */
   maxSubscriptions: 16,
   /** Events delivered per second, per subscription; the rest are dropped and counted. */
@@ -91,6 +93,9 @@ export const NEEDS_LISTING = Object.freeze([
 ]);
 
 const KEY_MAX = 256;
+const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+/** On a root with handles: members that lead from a node back up to the document or window graph. Refused until an allow-list entry names them, nodes opt-in or not. */
+const GRAPH_MEMBERS = Object.freeze(['ownerDocument', 'defaultView', 'parentNode', 'parentElement', 'getRootNode', 'contentWindow', 'contentDocument', 'self', 'window', 'top', 'parent', 'frames', 'opener', 'globalThis']);
 const EVENT_TYPE_RE = /^[A-Za-z0-9_$:.-]{1,128}$/;
 
 function checkKey(key) {
@@ -345,10 +350,10 @@ function isPromiseLike(v) {
  * @param {() => number} [options.now]
  */
 export function createObjectsServer(options = {}) {
-  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, now = () => Date.now() } = options;
-  if (mode === 'handles') throw new TypeError("exposeObjects: mode 'handles' is not built: only 'values' exists (handles and callbacks are a later step of #190)");
-  if (mode !== 'values') throw new TypeError("exposeObjects: mode must be 'values'");
-  if (typeof allow === 'string') throw new TypeError('exposeObjects: allow must be { get, call, set } (the wide-open form belongs to mode handles, which is not built)');
+  const { roots, mode = 'values', allow = {}, authorize, limits: limitOptions = {}, guard, timers = null, eventFields = {}, handles = {}, random = null, now = () => Date.now() } = options;
+  if (mode === 'handles') throw new TypeError("exposeObjects: handles are chosen per root, not for the host: use handles: { window: {} } (and nodes: true on a root that may hand out nodes)");
+  if (mode !== 'values') throw new TypeError("exposeObjects: mode must be 'values' (handles are chosen per root with handles: { ROOT: {} })");
+  if (typeof allow === 'string') throw new TypeError('exposeObjects: allow must be { get, call, set, on }: a wide-open string is not accepted, and the allow-lists apply to handles too');
   if (!allow || typeof allow !== 'object' || Array.isArray(allow)) throw new TypeError('exposeObjects: allow must be { get, call, set }');
   for (const k of Object.keys(allow)) if (!['get', 'call', 'set', 'on'].includes(k)) throw new TypeError(`exposeObjects: allow.${k} is not an operation (get, call, set, on)`);
   // The extra fields of an event a subscriber may ask for, by event type (`'*'`: any type): names of properties read from the event, copied as plain data.
@@ -365,6 +370,16 @@ export function createObjectsServer(options = {}) {
     if (roots[name] === null || (typeof roots[name] !== 'object' && typeof roots[name] !== 'function')) throw new TypeError(`exposeObjects: root "${name}" must be an object`);
   }
   if (authorize !== undefined && typeof authorize !== 'function') throw new TypeError('exposeObjects: authorize must be a function (who, op) => boolean');
+  // Handles: per root, explicit. `nodes: true` is the root's own opt-in to hand out DOM nodes, windows and documents: control of the page.
+  if (!handles || typeof handles !== 'object' || Array.isArray(handles)) throw new TypeError('exposeObjects: handles must be { ROOT: { nodes? } }');
+  const handleRoots = new Map();
+  for (const [name, cfg] of Object.entries(handles)) {
+    if (!rootNames.includes(name)) throw new TypeError(`exposeObjects: handles names ${JSON.stringify(name)}, which is no such root`);
+    if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) throw new TypeError(`exposeObjects: handles.${name} must be an object ({ nodes?: boolean })`);
+    if (cfg.nodes !== undefined && typeof cfg.nodes !== 'boolean') throw new TypeError(`exposeObjects: handles.${name}.nodes must be true or false`);
+    handleRoots.set(name, { nodes: cfg.nodes === true });
+  }
+  if (handleRoots.size && typeof random !== 'function') throw new TypeError('exposeObjects: handles need a random source (random: (n) => Uint8Array of n random bytes, from crypto.getRandomValues)');
   const limits = { ...OBJECTS_DEFAULT_LIMITS };
   for (const [k, v] of Object.entries(limitOptions)) {
     if (!(k in OBJECTS_DEFAULT_LIMITS)) throw new TypeError(`exposeObjects: unknown limit ${JSON.stringify(k)} (${Object.keys(OBJECTS_DEFAULT_LIMITS).join(', ')})`);
@@ -406,7 +421,8 @@ export function createObjectsServer(options = {}) {
       throw refuse('not-allowed', `refused: ${segs.join('.')} is not on the way to anything the allow-list names`, { path: segs.join('.') });
     }
     // 2. what a wildcard does not cover: the operation itself needs an entry that names it; walking toward one needs only that some entry that names it goes that way
-    for (const seq of NEEDS_LISTING) {
+    // On a root with handles, the members that lead back up to the document or window graph need naming as well.
+    for (const seq of handleRoots.has(root) ? [...NEEDS_LISTING, ...GRAPH_MEMBERS.map((n) => [n])] : NEEDS_LISTING) {
       if (!containsSequence(rel, seq)) continue;
       const listed = terminal ? own.some((p) => matchPath(p, segs) && patternNames(p, seq)) : every.some((p) => prefixPath(p, segs) && patternNames(p, seq));
       if (!listed) throw refuse('needs-listing', `refused: "${rel.join('.')}" is refused until an allow-list entry names ${seq.join('.')} (a wildcard does not)`, { path: segs.join('.') });
@@ -453,12 +469,13 @@ export function createObjectsServer(options = {}) {
   }
 
   async function resolve(params, ctx) {
-    const root = requireRoot(params);
+    const start = startOf(params, ctx);
+    const { root } = start;
     const ops = params.ops;
     if (!Array.isArray(ops)) throw invalid('ops must be an array');
     if (ops.length > limits.maxOps) throw limitError('maxOps', limits.maxOps, `${ops.length} operations in one request`);
-    let cur = roots[root];
-    let segs = [root];
+    let cur = start.cur;
+    let segs = start.segs;
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       const last = i === ops.length - 1;
@@ -492,7 +509,68 @@ export function createObjectsServer(options = {}) {
       } catch (e) { throw wrapThrown(e, next.join('.')); }
       segs = [...segs, `${key}()`];
     }
-    return toWire(cur, { maxDepth: limits.maxDepth, maxBytes: ctx.maxBytes ?? limits.maxValueBytes });
+    return finishValue(cur, root, segs, ctx);
+  }
+
+  // ── Handles ───────────────────────────────────────────────────────────────────────────────────────────────────────
+  // On a root that opted in (`handles: { ROOT: { nodes? } }`), a function or an object that is not plain data comes back as an opaque handle instead of a
+  // named non-value. A handle stands at the PATH that produced it (`a.b` for a get, `a.f()` for a call), and every operation through it is judged by the
+  // allow-lists for that path extended by the member: it never widens what the path grants. The table is per channel, bounded, never evicts.
+
+  /** Prototype-chain names of what reaches the document or window graph. */
+  const GRAPH_CLASSES = new Set(['Node', 'Window', 'WorkerGlobalScope', 'Document']);
+  function reachesGraph(value) {
+    try {
+      let proto = Object.getPrototypeOf(value);
+      for (let hops = 0; proto && hops < 16; hops++, proto = Object.getPrototypeOf(proto)) {
+        const d = Object.getOwnPropertyDescriptor(proto, 'constructor');
+        const name = d && 'value' in d && typeof d.value === 'function' ? Object.getOwnPropertyDescriptor(d.value, 'name')?.value : undefined;
+        if (GRAPH_CLASSES.has(name)) return true;
+      }
+      const tag = Object.prototype.toString.call(value);
+      return tag === '[object Window]' || tag === '[object global]' || tag === '[object Document]' || tag === '[object HTMLDocument]';
+    } catch { return true; }
+  }
+
+  function finishValue(cur, root, segs, ctx) {
+    const wire = toWire(cur, { maxDepth: limits.maxDepth, maxBytes: ctx.maxBytes ?? limits.maxValueBytes });
+    const mode = handleRoots.get(root);
+    if (!mode || !('u' in wire) || (wire.u !== 'function' && wire.u !== 'object') || !ctx.session) return wire;
+    if (wire.u === 'object' && reachesGraph(cur) && !mode.nodes) return wire; // a node, a window, a document: named, not a handle, without the root's own opt-in
+    if (wire.u === 'function' && reachesGraph(cur) && !mode.nodes) return wire;
+    const { session } = ctx;
+    if (session.handles.size >= limits.maxHandles) throw limitError('maxHandles', limits.maxHandles, 'too many handles on this channel: release some (nothing is evicted)');
+    const id = newHandleId();
+    session.handles.set(id, { root, segs: segs.slice(), value: cur });
+    return { h: id, kind: wire.u, ...(wire.type ? { type: wire.type } : {}), ...previewOf(cur, root, segs, ctx) };
+  }
+
+  function newHandleId() {
+    const bytes = random(16);
+    let out = '';
+    let acc = 0;
+    let bits = 0;
+    for (const b of bytes) { acc = (acc << 8) | b; bits += 8; while (bits >= 6) { bits -= 6; out += B64URL[(acc >> bits) & 63]; } }
+    if (bits > 0) out += B64URL[(acc << (6 - bits)) & 63];
+    return out;
+  }
+
+  /** A preview is what a `get` on the same path could reveal: the names of a few own members, and only where the get-list names the path. */
+  function previewOf(value, root, segs, ctx) {
+    if (!lists.get.some((p) => matchPath(p, segs))) return {};
+    if (typeof ctx.permit === 'function' && ctx.permit(root, 'get') !== true) return {};
+    const rel = segs.slice(1).map(bareName);
+    for (const seq of [...NEEDS_LISTING, ...GRAPH_MEMBERS.map((n) => [n])]) if (containsSequence(rel, seq) && !lists.get.some((p) => matchPath(p, segs) && patternNames(p, seq))) return {};
+    try {
+      const keys = Object.keys(value).filter((k) => !ALWAYS_REFUSED.has(k) && !k.includes('.') && k.length <= 64).slice(0, 8);
+      return { preview: { keys } };
+    } catch { return {}; }
+  }
+
+  async function releaseHandle(params, ctx) {
+    const { session } = ctx;
+    if (typeof params.handle !== 'string' || !session.handles.delete(params.handle)) throw invalid('no such handle (it was released, belongs to another session, or never existed)');
+    return { ok: true };
   }
 
   function requireRoot(params) {
@@ -502,12 +580,26 @@ export function createObjectsServer(options = {}) {
     return root;
   }
 
-  /** Walk `path` (an array of keys) as traversal only; the holder and its path. */
-  async function walk(root, path, ctx) {
+  /**
+   * Where a request starts: a root, or a handle of this channel (`params.handle`), which stands at the path that produced it. A handle is looked
+   * up in THIS channel's table by its id: another channel, another key, or a made-up id finds nothing.
+   */
+  function startOf(params, ctx) {
+    if (params === null || typeof params !== 'object') throw invalid('params must be an object');
+    if (params.handle === undefined) { const root = requireRoot(params); return { root, cur: roots[root], segs: [root] }; }
+    const rec = typeof params.handle === 'string' ? ctx.session?.handles.get(params.handle) : undefined;
+    if (!rec) throw invalid('no such handle (it was released, belongs to another session, or never existed)');
+    // The root's mode is checked again, and the key's permission for that root is asked afresh by `check` on every step.
+    return { root: rec.root, cur: rec.value, segs: rec.segs.slice() };
+  }
+
+  /** Walk `path` (an array of keys) as traversal only, from where the request starts; the holder and its path. */
+  async function walk(start, path, ctx) {
+    const root = start.root;
     if (!Array.isArray(path)) throw invalid('path must be an array');
     if (path.length > limits.maxOps) throw limitError('maxOps', limits.maxOps, `a path of ${path.length} segments`);
-    let cur = roots[root];
-    let segs = [root];
+    let cur = start.cur;
+    let segs = start.segs;
     for (const raw of path) {
       const key = checkKey(raw);
       if (typeof cur === 'function' && FUNCTION_REFLECTION.has(key)) throw refuse('always-refused', `refused: "${key}" of a function re-aims it and is never reachable`);
@@ -520,10 +612,11 @@ export function createObjectsServer(options = {}) {
   }
 
   async function setValue(params, ctx) {
-    const root = requireRoot(params);
+    const start = startOf(params, ctx);
+    const { root } = start;
     const path = params.path;
     if (!Array.isArray(path) || path.length === 0) throw invalid('set needs a path of at least one segment');
-    const { cur: parent, segs } = await walk(root, path.slice(0, -1), ctx);
+    const { cur: parent, segs } = await walk(start, path.slice(0, -1), ctx);
     const key = checkKey(path[path.length - 1]);
     const target = [...segs, key];
     await check('set', root, target, ctx, { terminal: true });
@@ -542,8 +635,9 @@ export function createObjectsServer(options = {}) {
   }
 
   async function describe(params, ctx) {
-    const root = requireRoot(params);
-    const { cur, segs } = await walk(root, params.path ?? [], ctx);
+    const start = startOf(params, ctx);
+    const { root } = start;
+    const { cur, segs } = await walk(start, params.path ?? [], ctx);
     await check('describe', root, segs, ctx, { terminal: false });
     if (cur === null || (typeof cur !== 'object' && typeof cur !== 'function')) return { type: kindOf(cur), keys: [] };
     const keys = [];
@@ -569,8 +663,9 @@ export function createObjectsServer(options = {}) {
   }
 
   async function snapshot(params, ctx) {
-    const root = requireRoot(params);
-    const { cur, segs } = await walk(root, params.path ?? [], ctx);
+    const start = startOf(params, ctx);
+    const { root } = start;
+    const { cur, segs } = await walk(start, params.path ?? [], ctx);
     await check('snapshot', root, segs, ctx, { terminal: true });
     const depth = params.depth === undefined ? limits.maxDepth : Number.isSafeInteger(params.depth) && params.depth >= 0 ? Math.min(params.depth, limits.maxDepth) : (() => { throw invalid('depth must be a whole number'); })();
     const ceiling = ctx.maxBytes ?? limits.maxValueBytes;
@@ -652,7 +747,7 @@ export function createObjectsServer(options = {}) {
     const offered = [...(eventFields[type] ?? []), ...(eventFields['*'] ?? [])];
     for (const f of asked) if (!offered.includes(f)) throw refuse('not-allowed', `refused: the field "${f}" of ${type} events is not offered by this host`, { field: f, type });
     if (session.subs.size >= limits.maxSubscriptions) throw limitError('maxSubscriptions', limits.maxSubscriptions, 'too many event subscriptions on this channel');
-    const { cur: source, segs } = await walk(root, params.path ?? [], ctx);
+    const { cur: source, segs } = await walk({ root, cur: roots[root], segs: [root] }, params.path ?? [], ctx);
     await check('on', root, segs, ctx, { terminal: true, type });
     const kind = sourceMethods(source);
     if (!kind) throw new ObjectsError(OBJECTS_ERROR.FAILED, `${segs.join('.')} is not an event source (it needs addEventListener, or on and off)`, { reason: 'not-an-event-source' });
@@ -679,7 +774,7 @@ export function createObjectsServer(options = {}) {
   /** Register the protocol's methods on a peer. `who` is the identity of every call unless the transport gives one per call. */
   function attach(peer, { who } = {}) {
     if (typeof peer?.onRequest !== 'function') throw new TypeError('attach: the peer needs onRequest(method, handler)');
-    const session = { peer, subs: new Map(), queue: [], pumping: false, closed: false };
+    const session = { peer, subs: new Map(), queue: [], pumping: false, closed: false, handles: new Map() };
     // The end of the channel (the peer left, Stop, a navigation, a revoke) takes every listener out of the page's sources.
     const prior = peer.onClose;
     peer.onClose = (reason) => {
@@ -687,6 +782,7 @@ export function createObjectsServer(options = {}) {
       for (const sub of session.subs.values()) removeSub(sub);
       session.subs.clear();
       session.queue = [];
+      session.handles.clear(); // the end of the channel (leaving, Stop, navigation, revoke) releases every handle
       try { prior?.(reason); } catch { /* ignore */ }
     };
     const stamps = [];
@@ -709,7 +805,8 @@ export function createObjectsServer(options = {}) {
     method('snapshot', snapshot);
     method('subscribe', subscribe);
     method('unsubscribe', unsubscribe);
-    return { limits };
+    method('release', releaseHandle);
+    return { limits, handleCount: () => session.handles.size };
   }
 
   return { attach, limits: Object.freeze({ ...limits }), rootNames: rootNames.slice() };
@@ -805,10 +902,29 @@ export class NonValue {
   toString() { return `[remote ${this.kind}${this.type ? ` ${this.type}` : ''}${this.text ? `: ${this.text}` : ''}]`; }
 }
 
-const decodeResult = (res) => {
+const decodeResult = (res, session) => {
+  if (res && typeof res === 'object' && typeof res.h === 'string' && session) return new RemoteHandle(session, res);
   if (res && typeof res === 'object' && 'u' in res) return res.u === 'undefined' ? undefined : new NonValue(res);
   return res?.v;
 };
+
+const HANDLE_ID = new WeakMap();
+
+/**
+ * What a value that cannot be cloned arrives as on a root that opted in to handles: an opaque token. Nothing of it is enumerable (the id is not
+ * there to copy), it is not thenable, and it is not an argument. `use(handle)` makes a reference that stands on it; `release(handle)` gives its place back.
+ */
+export class RemoteHandle {
+  constructor(session, wire) {
+    HANDLE_ID.set(this, { session, id: wire.h });
+    Object.defineProperty(this, 'kind', { value: wire.kind, enumerable: false });
+    Object.defineProperty(this, 'type', { value: wire.type, enumerable: false });
+    Object.defineProperty(this, 'preview', { value: wire.preview, enumerable: false });
+    Object.freeze(this);
+  }
+
+  toString() { return `[remote handle${this.type ? ` ${this.type}` : ''}]`; }
+}
 
 function asObjectsError(e, session) {
   if (e instanceof ObjectsError) return e;
@@ -828,6 +944,7 @@ function plainArgs(args) {
   let visits = 0;
   const walk = (v, depth) => {
     if (typeof v === 'function') throw new TypeError('a function or a remote reference cannot be sent as an argument: only plain data crosses (a reference is a path: await it to get its value first)');
+    if (v instanceof RemoteHandle) throw new TypeError('a handle cannot be sent as an argument: it means something only on its own session, and only plain data crosses');
     if (v === null || typeof v !== 'object' || depth > 8 || ++visits > 2000) return;
     if (ArrayBuffer.isView(v)) return;
     for (const k of Object.keys(v)) walk(v[k], depth + 1);
@@ -836,8 +953,11 @@ function plainArgs(args) {
   return args;
 }
 
-function makeRef(session, root, ops) {
-  const state = { session, root, ops };
+/** What a request names as its start: the handle this reference stands on, or its root. */
+const target = (state) => (state.handle !== undefined ? { handle: state.handle } : { root: state.root });
+
+function makeRef(session, root, ops, handle) {
+  const state = { session, root, ops, handle };
   const readOnly = (what) => () => { throw new TypeError(what); };
   const handler = {
     get(_target, key) {
@@ -847,7 +967,7 @@ function makeRef(session, root, ops) {
         // `await ref` sends the whole chain in ONE request. A remote property really named "then" is reached with get(ref, 'then').
         return (onFulfilled, onRejected) => send(state).then(onFulfilled, onRejected);
       }
-      return makeRef(session, root, [...ops, { get: key }]);
+      return makeRef(session, root, [...ops, { get: key }], handle);
     },
     set(_t, key) { throw new TypeError(`cannot assign to ${String(key)} of a remote reference with "=": assignment cannot be awaited or report a refusal. Use await set(ref, ${JSON.stringify(String(key))}, value)`); },
     defineProperty: readOnly('a remote reference cannot be defined on: use set(ref, key, value)'),
@@ -856,12 +976,12 @@ function makeRef(session, root, ops) {
     apply(_t, _this, args) {
       const last = ops[ops.length - 1];
       if (!last || !('get' in last)) throw new TypeError('only a method reached by name can be called (win.app.cart.add(x)); call a path, not a result');
-      return makeRef(session, root, [...ops.slice(0, -1), { call: last.get, args: plainArgs(args) }]);
+      return makeRef(session, root, [...ops.slice(0, -1), { call: last.get, args: plainArgs(args) }], handle);
     },
     construct(_t, args) {
       const last = ops[ops.length - 1];
       if (!last || !('get' in last)) throw new TypeError('only a constructor reached by name can be constructed (new win.app.Cart())');
-      return makeRef(session, root, [...ops.slice(0, -1), { construct: last.get, args: plainArgs(args) }]);
+      return makeRef(session, root, [...ops.slice(0, -1), { construct: last.get, args: plainArgs(args) }], handle);
     },
   };
   // A function as the target so the proxy can be called and constructed.
@@ -869,9 +989,9 @@ function makeRef(session, root, ops) {
 }
 
 async function send(state, { signal } = {}) {
-  const { session, root, ops } = state;
+  const { session, ops } = state;
   try {
-    return decodeResult(await session.peer.request('resolve', { root, ops }, { signal, ...(session.timeoutMs ? { timeoutMs: session.timeoutMs } : {}) }));
+    return decodeResult(await session.peer.request('resolve', { ...target(state), ops }, { signal, ...(session.timeoutMs ? { timeoutMs: session.timeoutMs } : {}) }), session);
   } catch (e) { throw asObjectsError(e, session); }
 }
 
@@ -896,7 +1016,7 @@ export function get(ref, ...keys) {
 export async function set(ref, key, value) {
   const { state, keys } = pathOf(ref, 'set');
   plainArgs([value]);
-  try { await state.session.peer.request('set', { root: state.root, path: [...keys, String(key)], value }); } catch (e) { throw asObjectsError(e, state.session); }
+  try { await state.session.peer.request('set', { ...target(state), path: [...keys, String(key)], value }); } catch (e) { throw asObjectsError(e, state.session); }
 }
 
 /** Call a method reached by name with these (plain-data) arguments: `await call(win.app.cart.add, { sku: 'A1' })`; for a method named `then`, `call(ref, ...)`. */
@@ -919,7 +1039,7 @@ export function construct(ref, ...args) {
 export async function snapshot(ref, { depth, maxBytes, signal } = {}) {
   const { state, keys } = pathOf(ref, 'snapshot');
   try {
-    return decodeResult(await state.session.peer.request('snapshot', { root: state.root, path: keys, ...(depth !== undefined ? { depth } : {}), ...(maxBytes !== undefined ? { maxBytes } : {}) }, { signal }));
+    return decodeResult(await state.session.peer.request('snapshot', { ...target(state), path: keys, ...(depth !== undefined ? { depth } : {}), ...(maxBytes !== undefined ? { maxBytes } : {}) }, { signal }));
   } catch (e) { throw asObjectsError(e, state.session); }
 }
 
@@ -932,6 +1052,7 @@ export async function on(ref, type, listener, { fields, onError } = {}) {
   const { state, keys } = pathOf(ref, 'on');
   if (typeof listener !== 'function') throw new TypeError('on needs a listener function: listener(data, { type, seq, dropped })');
   const { session } = state;
+  if (state.handle !== undefined) throw new TypeError('events are not offered through a handle: name the source by its path');
   const id = session.nextSub++;
   // Registered before the request: an event can follow the answer at once.
   session.subs.set(id, { listener, onError, type });
@@ -953,7 +1074,7 @@ export async function off(unsubscribe) {
 /** The shape of an object, for a REPL or completion: `{ type, keys: [{ key, type, own }] }`. Only names the allow-list could walk to are told. */
 export async function describe(ref, { signal } = {}) {
   const { state, keys } = pathOf(ref, 'describe');
-  try { return await state.session.peer.request('describe', { root: state.root, path: keys }, { signal }); } catch (e) { throw asObjectsError(e, state.session); }
+  try { return await state.session.peer.request('describe', { ...target(state), path: keys }, { signal }); } catch (e) { throw asObjectsError(e, state.session); }
 }
 
 /**
@@ -983,6 +1104,22 @@ export async function createObjectsClient(peer, { timeoutMs } = {}) {
 }
 
 /** End the connection behind what `openObjects()` returned. */
+/** A reference that stands on a handle: `await use(handle).items.length`. Its path is the one that produced the handle, extended by what you name. */
+export function use(handle) {
+  const rec = handle instanceof RemoteHandle ? HANDLE_ID.get(handle) : undefined;
+  if (!rec) throw new TypeError('use needs a handle (what awaiting a reference returns on a root that opted in to handles)');
+  return makeRef(rec.session, null, [], rec.id);
+}
+
+/** Give a handle's place back. Releasing a released handle does nothing. Everything is released when the channel ends. */
+export async function release(handle) {
+  const rec = handle instanceof RemoteHandle ? HANDLE_ID.get(handle) : undefined;
+  if (!rec) throw new TypeError('release needs a handle');
+  if (rec.released) return;
+  rec.released = true;
+  try { await rec.session.peer.request('release', { handle: rec.id }); } catch (e) { throw asObjectsError(e, rec.session); }
+}
+
 export async function closeObjects(page) {
   const session = page?.[SESSION];
   if (!session) throw new TypeError('closeObjects: expected what openObjects() returned');

@@ -256,6 +256,9 @@ window.h.pageApp = () => {
     state: { user: 'alice', flags: { beta: true } },
     secret: 'planted-app-secret',
   };
+  // An object that cannot be cloned (a class instance with state), for handles.
+  class Account { constructor() { this.balance = 10; } deposit(n) { this.balance += n; return this.balance; } }
+  window.app.account = new Account();
 };
 window.h.pageHostInfo = () => ({ sessions: pageHostHandle.sessions.map((s) => s.fingerprint), closed: pageHostHandle.closed, closedReason: pageHostHandle.closedReason, cart: window.__cart, ran: window.__ran.map((r) => r.name) });
 window.h.stopPageHost = () => pageHostHandle?.close();

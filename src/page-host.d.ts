@@ -165,9 +165,9 @@ export interface WshPageHostOptions {
   /**
    * Object access (`wsh-objects`, `values` mode), off unless written: named roots, each with its allow-lists by operation (paths RELATIVE to the root:
    * `'document.title'`, `'app.**'`; nothing allowed by default). A root named `window` is the window that was passed; another name needs `object`.
-   * `mode: 'handles'` is refused: not built. See `@johnhenry/wsh/objects`.
+   * `mode: 'handles'` is this root's own opt-in to handles (`nodes: true` a second, for nodes and the window graph). See `@johnhenry/wsh/objects`.
    */
-  expose?: Record<string, { mode?: 'values'; allow?: ObjectsAllow; authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>; limits?: Partial<ObjectsLimits>; object?: object; eventFields?: Record<string, string[]> }>;
+  expose?: Record<string, { mode?: 'values' | 'handles'; nodes?: boolean; allow?: ObjectsAllow; authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>; limits?: Partial<ObjectsLimits>; object?: object; eventFields?: Record<string, string[]> }>;
   /** `true` (default): the badge in `window.document`. Callbacks: for a context with no document, or your own UI. `false` needs `unattended: true`. */
   indicator?: boolean | WshPageIndicatorCallbacks;
   /** Nobody is in front of this window. Allows `indicator: false` and a window with no document; what needs approval is then denied unless `mcp.prompt` answers. */

@@ -28,11 +28,14 @@ import {
 export {
   OBJECTS_PROTOCOL, OBJECTS_ERROR, OBJECTS_DEFAULT_LIMITS, NEEDS_LISTING, ObjectsError, NonValue,
   createObjectsServer, createObjectsClient, createDuplexPeer, matchPath, toWire, fromWire,
-  get, set, call, construct, snapshot, describe, on, off, closeObjects,
+  get, set, call, construct, snapshot, describe, on, off, use, release, RemoteHandle, closeObjects,
 } from './objects-core.mjs';
 
 /** Timers for `callTimeoutMs` where the embedder gave none: this module is the Node-or-browser adapter, not the page entry point. */
 const defaultTimers = { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (id) => clearTimeout(id) };
+
+/** The platform's CSPRNG for handle ids, where the embedder gave none (the page host gives its window's). */
+const defaultRandom = (n) => globalThis.crypto.getRandomValues(new Uint8Array(n));
 
 /** An `RpcChannel` as the core's `Peer`: refusals become `RpcError`s with their reason, so the far side hears the sentence and the rule. */
 function channelPeer(channel, host = {}) {
@@ -64,7 +67,7 @@ function channelPeer(channel, host = {}) {
  * @param {object} [options.limits] - `maxOps`, `maxArgs`, `maxDepth`, `maxValueBytes`, `maxKeys`, `maxRequestsPerSecond`, `callTimeoutMs`
  */
 export function exposeObjects(options = {}) {
-  const server = createObjectsServer({ timers: defaultTimers, ...options });
+  const server = createObjectsServer({ timers: defaultTimers, random: defaultRandom, ...options });
   const sessions = new Set();
   const handler = (channel, ctx = {}) => {
     const who = { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null };

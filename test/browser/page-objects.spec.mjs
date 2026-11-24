@@ -3,7 +3,7 @@
 import { test, expect } from './fixtures.mjs';
 import { startPipe } from './nodes.mjs';
 import { WshClient, WebSocketTransport, generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
-import { set, snapshot, describe, on, NonValue } from '@johnhenry/wsh/objects';
+import { set, snapshot, describe, on, use, release, RemoteHandle, NonValue } from '@johnhenry/wsh/objects';
 
 test.describe('a page host: object access (values mode) over a sealed relayed session', () => {
   let pipe; let alice; let aliceLine;
@@ -88,6 +88,48 @@ test.describe('a page host: object access (values mode) over a sealed relayed se
       await page.evaluate(() => { window.location.hash = '#after'; });
       await new Promise((r) => setTimeout(r, 200));
       expect(got.length).toBe(1);
+    } finally { await wsh.disconnect(); }
+  });
+
+  test('handles: an app object that cannot be cloned is a handle used across calls (path-bound); a DOM node is refused; release; Stop ends them all', async ({ page }) => {
+    const expose = { window: { mode: 'handles', allow: { get: ['app.account', 'app.account.balance', 'document.body', 'document.title'], call: ['app.account.deposit'] }, limits: { maxHandles: 2 } } };
+    const { wsh, remote } = await start(page, expose);
+    try {
+      const account = await remote.app.account;
+      expect(account).toBeInstanceOf(RemoteHandle);
+      expect(account.type).toBe('Account');
+      expect(await use(account).deposit(5)).toBe(15);
+      expect(await use(account).deposit(1)).toBe(16);
+      expect(await use(account).balance).toBe(16);
+      expect(await page.evaluate(() => window.app.account.balance)).toBe(16);
+      // The handle stands at window.app.account: members the lists do not name are refused, and the refused names stay refused.
+      await expect(Promise.resolve(use(account).secret)).rejects.toMatchObject({ reason: 'not-allowed' });
+      await expect(Promise.resolve(use(account).constructor)).rejects.toMatchObject({ reason: 'always-refused' });
+      // A DOM node of the real document is not a handle without nodes: true.
+      const body = await remote.document.body;
+      expect(body).toBeInstanceOf(NonValue);
+      expect(body.type).toBe('HTMLBodyElement');
+      // Release gives the place back; a released handle is gone.
+      await release(account);
+      await expect(Promise.resolve(use(account).deposit(1))).rejects.toThrow(/no such handle/);
+      expect(await page.evaluate(() => window.app.account.balance)).toBe(16);
+      const again = await remote.app.account;
+      expect(again).toBeInstanceOf(RemoteHandle);
+      await page.locator('[data-wsh-page="indicator"]').getByRole('button', { name: /Stop/ }).click();
+      await expect(Promise.resolve(use(again).deposit(1))).rejects.toThrow();
+      expect(await page.evaluate(() => window.app.account.balance)).toBe(16);
+    } finally { await wsh.disconnect(); }
+  });
+
+  test('handles with nodes: true: a real node is a handle, and ownerDocument and defaultView stay refused until an entry names them', async ({ page }) => {
+    const expose = { window: { mode: 'handles', nodes: true, allow: { get: ['document.body', 'document.body.tagName'], call: [] } } };
+    const { wsh, remote } = await start(page, expose);
+    try {
+      const body = await remote.document.body;
+      expect(body).toBeInstanceOf(RemoteHandle);
+      expect(body.type).toBe('HTMLBodyElement');
+      expect(await use(body).tagName).toBe('BODY');
+      for (const member of ['ownerDocument', 'parentNode', 'getRootNode']) await expect(Promise.resolve(use(body)[member])).rejects.toMatchObject({ reason: expect.stringMatching(/needs-listing|not-allowed/) });
     } finally { await wsh.disconnect(); }
   });
 

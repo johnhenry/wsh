@@ -18,6 +18,22 @@ export class ObjectsError extends Error {
 }
 
 /** What a remote value that cannot be cloned arrives as: named, never a handle. `kind`: `function`, `symbol`, `bigint`, `number` (too large for the wire), `Date`, `RegExp`, `Error`, `object`. */
+/**
+ * What a value that cannot be cloned arrives as on a root that opted in to handles: an opaque token, nothing of it enumerable, not thenable, not an argument.
+ * It stands at the path that produced it: `use(handle)` makes a reference that continues that path; `release(handle)` gives its place back.
+ */
+export class RemoteHandle {
+  readonly kind: 'function' | 'object';
+  /** The class name, or a function's name. */
+  readonly type?: string;
+  /** Up to 8 member names, only if a `get` entry names the handle's path. */
+  readonly preview?: { keys: string[] };
+}
+/** A reference that stands on a handle: `await use(handle).items.length`. Judged by the producing path extended by what you name. */
+export function use(handle: RemoteHandle): any;
+/** Give a handle's place back (releasing a released handle does nothing). */
+export function release(handle: RemoteHandle): Promise<void>;
+
 export class NonValue {
   constructor(wire: { u: string; type?: string; text?: string });
   readonly kind: string;
@@ -52,6 +68,8 @@ export interface ObjectsLimits {
   maxEventBytes: number;
   /** Events waiting for the transport's credit, per channel; more are dropped and counted. Default 100. */
   maxQueuedEvents: number;
+  /** Handles per channel on roots that opted in; more are refused by name, nothing is evicted. Default 64. */
+  maxHandles: number;
 }
 export const OBJECTS_DEFAULT_LIMITS: Readonly<ObjectsLimits>;
 
@@ -82,8 +100,15 @@ export interface ObjectsOperation {
 export interface ObjectsServerOptions {
   /** The named roots: all that is reachable. */
   roots: Record<string, object>;
-  /** `'values'` is the only mode: `'handles'` is refused (not built). */
+  /** `'values'` (the default). Handles are chosen per root with `handles`, not here. */
   mode?: 'values';
+  /**
+   * Roots that opt in to handles: a value that cannot be cloned comes back as an opaque `RemoteHandle`, judged by the path that produced it. `nodes: true` is a
+   * second opt-in, for DOM nodes, windows and documents (control of the page). Needs `random`.
+   */
+  handles?: Record<string, { nodes?: boolean }>;
+  /** The random source for handle ids: `(n) => bytes` from `crypto.getRandomValues`. `exposeObjects` defaults to the platform's, the page host to its window's. */
+  random?: (n: number) => Uint8Array;
   allow?: ObjectsAllow;
   /** Asked for every operation the allow-list let through; anything but `true` (a throw included) refuses. */
   authorize?: (who: ObjectsWho, op: ObjectsOperation) => boolean | Promise<boolean>;
