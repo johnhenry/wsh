@@ -20,6 +20,19 @@
 
 ## 0.44.0 / Rust `rust-v0.15.0`
 
+### Fix: a sealed reverse bridge no longer drops an operator's first frame that outruns the host's key derivation (#162)
+
+`test/operator-proof.test.mjs` ("injects an Open stamped with the operator's fingerprint ...") failed now and then with
+`Timed out waiting for session open response` (1 of 20 on macOS, once on Linux CI). The cause was in `createReverseHost`, not the test:
+the operator seals its first message the moment ITS half of the key exchange is done, and when the operator encapsulates (which side
+does depends on the two ephemeral keys) the host still has to decapsulate the ML-KEM ciphertext and combine the secrets. A first frame
+that reached the host in that window found no key yet and was dropped as "not sealed", so the `Open` was never answered. The host now holds
+bridge-level frames of the bridge's session that arrive after the key exchange began (at most 16, opened in order once the key exists, discarded
+if the exchange fails). Frames before any `KeyExchange`, for another session or in excess are still dropped; a plaintext message on a bridge
+that must be sealed is still dropped; nothing is sent differently, so no wire change, no feature string, no default changed.
+Regression test: a hostile hop that makes the order certain (it delivers the operator's first frame ahead of its ciphertext) fails on 20 of 20
+runs before the fix and passes 20 of 20 after.
+
 ### `wsh-mcp`: a stdio bridge so MCP clients can reach an MCP server behind a wsh host (#127, partial; JS only)
 
 An MCP client that launches a command and speaks MCP over stdio can now use the tools of a server behind a Node host or a memory host. The
