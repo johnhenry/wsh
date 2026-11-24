@@ -16,6 +16,7 @@ Usage: wsh-mcp [options] [user@]<url>
   -l, --user NAME         login name (default: the user@ part of the URL, else $WSH_USER, $USER, or the OS user)
   -i, --identity FILE     Ed25519 private key (default: ~/.wsh/keys/default.pem, the key \`wsh keygen\` makes)
       --channel NAME      the rpc channel to open (default: mcp)
+      --sealed            seal the whole session end to end and refuse a host that cannot (a host behind a relay, a page); key login only
       --host-key KEY      pin the host: a hex fingerprint, or an ssh-ed25519 line (default: not pinned, with a warning)
       --no-reconnect      exit when the connection is lost instead of reconnecting
       --reconnect-attempts N   attempts before giving up (default: 5, from 500 ms, doubling)
@@ -44,6 +45,7 @@ try {
       user: { type: 'string', short: 'l' },
       identity: { type: 'string', short: 'i' },
       channel: { type: 'string' },
+      sealed: { type: 'boolean' },
       'host-key': { type: 'string' },
       'no-reconnect': { type: 'boolean' },
       'reconnect-attempts': { type: 'string' },
@@ -81,7 +83,7 @@ try {
   const signer = await loadIdentity(values.identity ?? defaultIdentityPath());
   for (const sig of ['SIGINT', 'SIGTERM']) process.once(sig, () => { void handle.close?.(); });
   exitCode = await runMcpStdioBridge({
-    url, username, signer, channel: values.channel, expectHostKey: values['host-key'], timeoutMs,
+    url, username, signer, channel: values.channel, expectHostKey: values['host-key'], sealSession: values.sealed ? true : undefined, timeoutMs,
     reconnect: values['no-reconnect'] ? false : (attempts === undefined ? undefined : { attempts }),
     signalHandle: handle,
   });

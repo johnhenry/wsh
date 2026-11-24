@@ -1,6 +1,6 @@
 /** Type-only fixture for the typed RPC channel API (wsh #85), as documented in the README. */
 import {
-  WshClient, RpcChannel, RpcError, RPC_FEATURE, RPC_ERROR, rpcProtocolFeature, mcpClientTransport, parseRpcFeatures,
+  WshClient, RpcChannel, RpcError, RPC_FEATURE, RPC_VIRTUAL_FEATURE, RPC_CREDIT_WINDOW, rpcVirtualOffered, RPC_ERROR, rpcProtocolFeature, mcpClientTransport, parseRpcFeatures,
   type RpcContext, type RpcRequestPromise,
 } from '@johnhenry/wsh';
 import { createWshServer, mcpServerAdapter, type WshRpcHandler } from '@johnhenry/wsh/server';
@@ -23,7 +23,7 @@ async function client(wsh: WshClient) {
   const session = await wsh.openSession({ type: 'rpc', protocol: 'wsh-host' });
   void session.channelId;
   wsh.preferRpcFiles = false;
-  void [RPC_FEATURE, rpcProtocolFeature('mcp'), parseRpcFeatures(wsh.features).protocols];
+  void [RPC_FEATURE, RPC_VIRTUAL_FEATURE, RPC_CREDIT_WINDOW, rpcVirtualOffered(wsh.features), rpcProtocolFeature('mcp'), parseRpcFeatures(wsh.features).protocols];
   void mcpClientTransport(rpc).onmessage;
 }
 

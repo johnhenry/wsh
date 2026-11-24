@@ -121,6 +121,26 @@ describe('wsh-mcp: an MCP client reaches an MCP server behind a wsh host (#127)'
     return client;
   }
 
+  it('--sealed reaches a host that serves no data streams and requires a sealed session (#191), and refuses one that cannot seal', async () => {
+    const host = createMemoryHost({
+      auth: { authorizedKeys: `${await exportPublicKeySSH(keyPair.publicKey)}` }, hostKey: true, dataStreams: false, sealSession: 'require',
+      rpc: { mcp: mcpServerAdapter(() => makeMcpServer()) },
+    });
+    const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    await new Promise((r) => wss.once('listening', r));
+    wss.on('connection', (ws) => { host.accept(ws).catch(() => {}); });
+    cleanups.push(async () => { for (const c of wss.clients) c.terminate(); await new Promise((r) => wss.close(r)); await host.close(); });
+    const url = `ws://127.0.0.1:${wss.address().port}`;
+    const client = await viaSdkClient(['--identity', identity, '--user', 'alice', '--sealed', url]);
+    assert.deepEqual((await client.listTools()).tools.map((t) => t.name), ['echo', 'wait']);
+    assert.equal((await client.callTool({ name: 'echo', arguments: { text: 'sealed' } })).content[0].text, 'echo: sealed');
+    await client.close();
+    const { url: plain } = await nodeHost();
+    const b = bridge(['--identity', identity, '--user', 'alice', '--sealed', '--no-reconnect', plain]);
+    assert.equal((await b.exited).code, 2);
+    assert.match(b.stderr(), /e2e-session/);
+  });
+
   it('an MCP client configured with the command lists and calls the tools of a server behind a Node host', async () => {
     const { url } = await nodeHost();
     const client = await viaSdkClient(['--identity', identity, '--user', 'alice', url]);

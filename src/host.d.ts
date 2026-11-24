@@ -129,7 +129,7 @@ export interface WshConnectionPipe {
   closeTransport?(): void;
   /**
    * Serve the connection without client-opened QMux streams: exec output rides `SessionData` (`data_mode: 'virtual'`) and
-   * `stream-announce` / `rpc` are not offered. Default `true`. Needed for a peer that cannot open streams (#132).
+   * `stream-announce` is not offered, and rpc is stated as `rpc-virtual` (#191). Default `true`. Needed for a peer that cannot open streams (#132).
    */
   dataStreams?: boolean;
 }

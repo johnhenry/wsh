@@ -81,6 +81,8 @@ const errorResponse = (id, code, message) => ({ jsonrpc: '2.0', id, error: { cod
  * @param {{ publicKey: Uint8Array, sign(data: Uint8Array): Promise<Uint8Array> }} options.signer - see `loadIdentity`
  * @param {string} [options.channel='mcp'] - the rpc protocol to open
  * @param {string | Uint8Array} [options.expectHostKey] - pin the host key (hex fingerprint, raw key or `ssh-ed25519` line)
+ * @param {boolean | 'auto'} [options.sealSession] - the client's `sealSession` (#155): `true` seals the whole session end to end and
+ *   refuses a host that cannot (the `--sealed` flag); needs a key login. Omitted: the client's default (`'auto'`).
  * @param {false | { attempts?: number, delayMs?: number, maxDelayMs?: number }} [options.reconnect] - default 5 attempts from 500 ms, doubling
  * @param {number} [options.timeoutMs=15000] - to log in and to open the channel
  * @param {number} [options.maxLineBytes=8388608] - longest message accepted from the client
@@ -93,7 +95,7 @@ const errorResponse = (id, code, message) => ({ jsonrpc: '2.0', id, error: { cod
  * @returns {Promise<number>}
  */
 export async function runMcpStdioBridge({
-  url, username, signer, channel = 'mcp', expectHostKey, reconnect, timeoutMs = 15_000, maxLineBytes = 8 * 1024 * 1024, maxQueued = 200,
+  url, username, signer, channel = 'mcp', expectHostKey, sealSession, reconnect, timeoutMs = 15_000, maxLineBytes = 8 * 1024 * 1024, maxQueued = 200,
   input = process.stdin, output = process.stdout, errorOutput = process.stderr, clientFactory = () => new WshClient(), signalHandle = null,
 }) {
   if (typeof url !== 'string' || !url) throw new McpBridgeError('a host URL is required');
@@ -124,7 +126,7 @@ export async function runMcpStdioBridge({
   async function open() {
     const client = clientFactory();
     try {
-      await client.connect(url, { username, signer, timeout: timeoutMs, ...(expectHostKey ? { expectHostKey } : {}) });
+      await client.connect(url, { username, signer, timeout: timeoutMs, ...(expectHostKey ? { expectHostKey } : {}), ...(sealSession !== undefined ? { sealSession } : {}) });
     } catch (e) {
       throw new McpBridgeError(`cannot connect to ${url}: ${e?.message ?? e}`, { code: /Authentication failed|not authorized|host key/i.test(String(e?.message)) ? 'auth' : 'connect', cause: e });
     }

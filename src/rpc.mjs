@@ -23,6 +23,13 @@ import { cborEncode, cborDecode } from './cbor.mjs';
 
 /** ServerHello feature: the host serves `rpc` sessions. */
 export const RPC_FEATURE = 'rpc';
+/**
+ * ServerHello (or `ReverseAccept`) feature: the host serves `rpc` channels in virtual data mode -- the CBOR sequence rides
+ * `SessionData` (inside `EncryptedFrame` on a sealed session), metered by credit (`src/rpc-virtual.mjs`). A host states
+ * this INSTEAD of `rpc` on a connection that has no client-opened data streams, so a peer that only knows stream-mode rpc
+ * (it looks for `rpc`) never opens one it cannot carry.
+ */
+export const RPC_VIRTUAL_FEATURE = 'rpc-virtual';
 /** ServerHello feature prefix: one `rpc-protocol:<name>` per supported protocol. */
 export const RPC_PROTOCOL_PREFIX = 'rpc-protocol:';
 /** ServerHello feature prefix: `rpc-max-message:<bytes>`, the largest single message the host accepts. */
@@ -53,6 +60,7 @@ export const RPC_ERROR = Object.freeze({
  * Read the rpc advertisement out of `ServerHello.features`.
  * @param {string[]} [features]
  * @returns {{ enabled: boolean, protocols: string[], maxMessageBytes: number }}
+ *   `enabled`: stream-mode rpc (`rpc`). Virtual-mode rpc (`rpc-virtual`) is not counted here: ask `rpcVirtualOffered`.
  */
 export function parseRpcFeatures(features = []) {
   const protocols = [];
@@ -69,6 +77,9 @@ export function parseRpcFeatures(features = []) {
   }
   return { enabled, protocols, maxMessageBytes };
 }
+
+/** Does this feature list offer rpc in virtual data mode (`rpc-virtual`)? @param {string[]} [features] */
+export const rpcVirtualOffered = (features = []) => features.includes(RPC_VIRTUAL_FEATURE);
 
 // ── Errors ────────────────────────────────────────────────────────────
 
@@ -278,6 +289,8 @@ export class RpcChannel {
   #closing = null;
   #held = false;
   #heldItems = [];
+  #heldBytes = 0;
+  #onConsumed;
 
   /** Called once when the channel ends, with the reason. */
   onClose = null;
@@ -289,9 +302,13 @@ export class RpcChannel {
    * @param {number} [opts.maxMessageBytes=1048576]
    * @param {number} [opts.timeoutMs] - default per-request timeout (none when omitted)
    * @param {number} [opts.maxInflight=64] - concurrent inbound requests before `-32002`
+   * @param {(bytes: number) => void} [opts.onConsumed] - for a metered transport (virtual-mode rpc): called with the number of
+   *   received bytes this channel has taken in and dispatched, so the transport can hand the sender credit for them. Bytes
+   *   of messages queued behind `hold()` are not reported until `release()`.
    */
-  constructor({ write, close, maxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, timeoutMs, maxInflight = 64 } = {}) {
+  constructor({ write, close, maxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, timeoutMs, maxInflight = 64, onConsumed } = {}) {
     if (typeof write !== 'function') throw new TypeError('RpcChannel: write(bytes) is required');
+    this.#onConsumed = typeof onConsumed === 'function' ? onConsumed : null;
     this.#write = write;
     this.#closeFn = close ?? (() => {});
     this.#max = maxMessageBytes;
@@ -358,6 +375,14 @@ export class RpcChannel {
     for (const item of this.#heldItems.splice(0)) {
       if (this.#closed) return;
       this.#dispatch(item);
+    }
+    this.#consumed(this.#heldBytes);
+    this.#heldBytes = 0;
+  }
+
+  #consumed(n) {
+    if (n > 0 && this.#onConsumed) {
+      try { this.#onConsumed(n); } catch { /* the transport's problem */ }
     }
   }
 
@@ -495,6 +520,8 @@ export class RpcChannel {
       if (this.#held) this.#heldItems.push(item);
       else this.#dispatch(item);
     }
+    if (this.#held) this.#heldBytes += bytes.length;
+    else this.#consumed(bytes.length);
   }
 
   #dispatch(m) {

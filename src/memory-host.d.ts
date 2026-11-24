@@ -42,7 +42,7 @@ export interface WshMemoryHostOptions {
   hostKey?: WshHostKeyOption;
   /**
    * Offer client-opened QMux data streams (default `true`). `false` serves exec output as `SessionData` instead and
-   * offers neither `stream-announce` nor `rpc`: needed for a peer that cannot open streams, the released Rust client over
+   * offers no `stream-announce`, and states rpc as `rpc-virtual` (rpc rides the control plane, #191) instead of `rpc`: needed for a peer that cannot open streams, the released Rust client over
    * WebSocket (#132). Released clients state nothing a host could choose on, so this is an option, not a negotiation;
    * `accept(socket, { dataStreams })` overrides it for one connection.
    */

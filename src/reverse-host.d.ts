@@ -15,6 +15,10 @@ export interface WshBrowserReverseHostOptions extends Omit<WshReverseHostOptions
   /** An object of file operations, not a root path. */
   fs?: WshFileBackend;
   mcp?: WshServerMcpOptions;
+  /** Typed rpc channels (#191): one handler per protocol, served to the bridged operator in virtual data mode and stated as `rpc-virtual` in `ReverseAccept.features` (so it needs `reportFeatures`). Handler functions only. */
+  rpc?: Record<string, ((channel: import('./index.js').RpcChannel, ctx: import('./server/index.js').WshRpcContext) => void | Promise<void>) | false | null | undefined>;
+  rpcMaxMessageBytes?: number;
+  rpcMaxInflight?: number;
 }
 
 /**

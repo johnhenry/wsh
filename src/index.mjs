@@ -115,5 +115,7 @@ export { WshMcpBridge } from './mcp-bridge.mjs';
 export {
   RpcChannel, RpcError, CborSequenceDecoder, RPC_ERROR, RPC_FEATURE, RPC_PROTOCOL_PREFIX, RPC_MAX_MESSAGE_PREFIX,
   RPC_DEFAULT_MAX_MESSAGE, RPC_PROTOCOL_NAME_RE, rpcProtocolFeature, parseRpcFeatures,
+  RPC_VIRTUAL_FEATURE, rpcVirtualOffered,
 } from './rpc.mjs';
+export { RPC_CREDIT_WINDOW } from './rpc-virtual.mjs';
 export { RpcMcpTransport, mcpClientTransport, mcpServerTransport } from './rpc-mcp.mjs';

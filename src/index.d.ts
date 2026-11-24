@@ -258,6 +258,16 @@ export const TARGETS_FEATURE: 'targets';
 
 /** ServerHello feature: the host serves `rpc` sessions (`openSession({ type: 'rpc', protocol })`). */
 export const RPC_FEATURE: 'rpc';
+/**
+ * ServerHello (or `ReverseAccept`) feature (#191): the host serves rpc channels in virtual data mode (the CBOR sequence rides
+ * `SessionData`, inside `EncryptedFrame` on a sealed session, metered by credit). A host states this INSTEAD of `rpc` on a
+ * connection with no client-opened data streams. `openRpc` picks the form from what the host states.
+ */
+export const RPC_VIRTUAL_FEATURE: 'rpc-virtual';
+/** Does this feature list offer rpc in virtual data mode? */
+export function rpcVirtualOffered(features?: string[]): boolean;
+/** Credit, in bytes, each direction of a virtual-mode rpc channel starts with (a protocol constant). */
+export const RPC_CREDIT_WINDOW: 262144;
 /** ServerHello feature prefix: one `rpc-protocol:<name>` per protocol the host serves. */
 export const RPC_PROTOCOL_PREFIX: 'rpc-protocol:';
 /** ServerHello feature prefix: `rpc-max-message:<bytes>`. */
@@ -338,6 +348,8 @@ export interface RpcChannelOptions {
   maxMessageBytes?: number;
   timeoutMs?: number;
   maxInflight?: number;
+  /** For a metered transport (virtual-mode rpc): called with the received bytes taken in and dispatched, so credit can be returned. */
+  onConsumed?: (bytes: number) => void;
 }
 
 /**

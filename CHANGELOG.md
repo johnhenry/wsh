@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
+
+An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside
+`EncryptedFrame` on a sealed session -- where there are no client-opened data streams. So a sealed session carries rpc (`wsh-mcp --sealed`), and a host behind a relay
+(`createReverseHost({ rpc })`, a page host over a pipe relay, a memory host with `dataStreams: false`) can offer `mcp`, `wsh-fs`-style and custom protocols.
+
+- **Wire.** One new feature string, `rpc-virtual`, stated by a host **instead of** `rpc` on a connection without client-opened streams (in `ServerHello.features`, or
+  `ReverseAccept.features` behind a relay), with the unchanged `rpc-protocol:<name>` and `rpc-max-message:<n>`. `OpenOk` answers `data_mode: "virtual"`. Flow control is
+  per direction, 262144 bytes of credit to start, returned in bytes as the receiver takes data in; the credit message is the existing `GatewayCredit` with `gateway_id`
+  = `0x80000000 | channel_id` (a number space no gateway id has), so no new message type exists for a relay to drop. A peer that overruns its credit has the channel
+  closed; a message over `rpc-max-message` is refused from its CBOR header, before it is assembled. No default changed: a host serves rpc in virtual mode only when it was
+  given `rpc`.
+- **API.** `createReverseHost({ rpc, rpcMaxMessageBytes, rpcMaxInflight })` (browser-safe and `@johnhenry/wsh/server`'s, which also takes the `wsh-host` / `wsh-fs`
+  built-ins); `client.openRpc()` chooses the form from what the host states; `wsh-mcp --sealed` and `runMcpStdioBridge({ sealSession })`; `RPC_VIRTUAL_FEATURE`,
+  `rpcVirtualOffered()`, `RPC_CREDIT_WINDOW`; `RpcChannel` option `onConsumed`.
+- **A released peer.** A released JS client (0.45.0) opens rpc only when the host states `rpc`; a virtual-mode host does not, so it refuses with `UNSUPPORTED_PROTOCOL`
+  before sending anything. A released host never states `rpc-virtual`, so this client opens stream-mode rpc there, unchanged; a host with data streams states exactly what
+  it did before. A released Rust client (`rust-v0.16.0`) likewise looks for `rpc` and refuses. A released relay (JS or Rust) forwards `SessionData` and `GatewayCredit`
+  as it always has. `wsh-server` does not offer virtual-mode rpc yet, and the Rust `wsh mcp` does not speak it yet (`--sealed` against it is still refused).
+
 ## 0.45.0 / Rust `rust-v0.16.0`
 
 ### Rust `wsh-server`: UDP flows as WebTransport datagrams, `gateway-datagram` (#124, #145, the last open item of the parity epic; Rust only)
