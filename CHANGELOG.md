@@ -1,8 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.50.0
 
-npm only. **Wire: nothing new.** A released JS peer (0.48.0) and a released Rust peer are ordinary peers of a session over a duplex; nothing in them changes.
+npm only (since `rust-v0.17.1` the only change under `crates/` is the unit test of the capability vectors added in 0.49.0, no binary changes, no `rust-v` tag; the note below in `spec/wsh-v1.yaml` is a comment that generates no code change). **Wire: nothing new.**
+
+### A rpc handler that authorizes for itself (#220; JS)
+
+`handler.authorizesItself = true` on an rpc handler (an `mcp` handler of an adapter, say) says it asks the host's own `permits` for every call. A host then opens its channel for any key that the key's options and expiry let in, **without demanding `mcp:*` (or `rpc:NAME`, or a named tool) of the key's capability list**; the handler's own checks decide. A handler without the flag is checked as before (`mcp:*`, or a named tool for a `capabilityScoped` one), and `restrict` without `permit-mcp` and an expired key still refuse first. `spec/capabilities.md` lists the request field `authorizesItself`.
+
+### Documentation
+
+`spec/wsh-v1.yaml` records, as a known inconsistency, that `GatewayFail` code `5` is "gateway disabled" on the Rust `wsh-server` and a timeout on the Node gateway and in netway (and names 6 and 7); behaviour is unchanged (tracked in an issue). The bundle budget and the README size table were rewritten by `npm run size -- --update`.
+
+A released JS peer (0.49.0 or 0.48.0) and a released Rust peer are ordinary peers of a session over a duplex; nothing in them changes.
 
 ### wsh over a caller-supplied duplex: `@johnhenry/wsh/duplex` (#220; JS)
 
