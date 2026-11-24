@@ -15,19 +15,24 @@
 //! and an address that is loopback, link-local, private (RFC 1918), unique-local
 //! (`fc00::/7`), carrier-grade NAT (`100.64.0.0/10`), unspecified or multicast is
 //! refused *after the name has been resolved* -- whatever rule matched the name --
-//! unless a rule names that host or address specifically. The wildcard `"*"` therefore
-//! means "any public destination", never "this machine's network".
+//! unless a rule names that address or range. The wildcard `"*"` and a host name
+//! rule therefore mean "that destination, at a public address", never "this
+//! machine's network": a name is not trusted to resolve to the same kind of place
+//! twice. The Node host's gateway applies the same rule (`allowPrivate`).
 //!
 //! # Rules
 //!
 //! | Rule                 | Matches                                                          |
 //! |----------------------|------------------------------------------------------------------|
 //! | `"*"`                | Any host and port whose address is not restricted (above).       |
-//! | `"example.com"`      | That hostname on any port. Names a restricted address it resolves to. |
-//! | `"example.com:443"`  | That hostname and port.                                          |
+//! | `"example.com"`      | That hostname on any port, at a public address.                  |
+//! | `"example.com:443"`  | That hostname and port, at a public address.                     |
 //! | `"10.0.0.0/8"`       | Any address in the range, any port. Names the range.             |
 //! | `"10.0.0.0/8:5432"`  | Addresses in the range, that port. (IPv6 ranges: `fd00::/8`, no port.) |
-//! | `"127.0.0.1:5432"`   | A literal address (and optionally port). Names it.               |
+//! | `"127.0.0.1:5432"`   | A literal address (and optionally port), when a client asks for that address. |
+//!
+//! To let a NAME reach an internal address, name the address or its range
+//! (`"10.1.2.3/32:5432"`); the name rule alone does not.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -363,7 +368,18 @@ impl GatewayPolicyEnforcer {
                         host: h,
                         ip: rip,
                         port: rp,
-                    } => port_matches(*rp, port) && (h == &host || *rip == Some(ip)),
+                    } => {
+                        port_matches(*rp, port)
+                            && match rip {
+                                // A literal address names that address, when it is the one requested.
+                                Some(literal) => {
+                                    host.parse::<IpAddr>().ok() == Some(*literal) && *literal == ip
+                                }
+                                // A host name names the host, never the internal network behind it:
+                                // what the name resolves to must be a public address.
+                                None => h == &host && !restricted,
+                            }
+                    }
                     Rule::Cidr {
                         network,
                         prefix,
@@ -588,28 +604,85 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_that_names_a_restricted_host_or_address_allows_it() {
+    fn a_rule_that_names_a_restricted_address_allows_it_and_a_name_rule_does_not() {
         let p = policy(&[
             "localhost:5432",
             "10.1.2.3",
             "192.168.0.0/16:443",
             "db.internal",
         ]);
-        assert!(allowed(&p, "localhost", 5432, &["127.0.0.1"]));
-        assert!(!allowed(&p, "localhost", 22, &["127.0.0.1"]), "other port");
+        assert!(
+            !allowed(&p, "localhost", 5432, &["127.0.0.1"]),
+            "a name rule does not reach loopback: name the address (`127.0.0.1:5432`)"
+        );
         assert!(
             !allowed(&p, "127.0.0.1", 5432, &["127.0.0.1"]),
             "the rule names the host `localhost`, not the address"
+        );
+        let literal = policy(&["127.0.0.1:5432"]);
+        assert!(allowed(&literal, "127.0.0.1", 5432, &["127.0.0.1"]));
+        assert!(
+            !allowed(&literal, "127.0.0.1", 22, &["127.0.0.1"]),
+            "other port"
         );
         assert!(allowed(&p, "10.1.2.3", 1, &["10.1.2.3"]));
         assert!(!allowed(&p, "10.1.2.4", 1, &["10.1.2.4"]));
         assert!(allowed(&p, "192.168.7.7", 443, &["192.168.7.7"]));
         assert!(!allowed(&p, "192.168.7.7", 80, &["192.168.7.7"]));
         assert!(
-            allowed(&p, "db.internal", 1, &["10.9.9.9"]),
-            "a name the admin listed may resolve inside"
+            !allowed(&p, "db.internal", 1, &["10.9.9.9"]),
+            "a host NAME rule never reaches a restricted address, whatever the name resolves to"
         );
         assert!(!allowed(&p, "other.internal", 1, &["10.9.9.9"]));
+    }
+
+    #[test]
+    fn a_host_name_rule_only_reaches_public_addresses() {
+        let p = policy(&["partner.example.com"]);
+        assert!(allowed(&p, "partner.example.com", 443, &["93.184.216.34"]));
+        for addr in [
+            "127.0.0.1",
+            "::1",
+            "10.0.0.5",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+        ] {
+            assert!(
+                !allowed(&p, "partner.example.com", 443, &[addr]),
+                "{addr} must not be reachable through a name rule"
+            );
+        }
+        // A mixed answer keeps only the public address, and a changed answer is judged afresh.
+        assert_eq!(
+            p.authorize_addrs(
+                "partner.example.com",
+                Some(443),
+                &[ip("10.0.0.5"), ip("93.184.216.34"), ip("127.0.0.1")]
+            ),
+            vec![ip("93.184.216.34")]
+        );
+        assert!(p
+            .authorize_addrs("partner.example.com", Some(443), &[ip("127.0.0.1")])
+            .is_empty());
+    }
+
+    #[test]
+    fn a_literal_address_rule_names_that_address_only_when_it_is_requested_by_address() {
+        let p = policy(&["10.1.2.3"]);
+        assert!(allowed(&p, "10.1.2.3", 80, &["10.1.2.3"]));
+        assert!(
+            !allowed(&p, "some.name.example", 80, &["10.1.2.3"]),
+            "a name that resolves to the address is not the address the rule named"
+        );
+        // An address range is how a name is allowed to resolve inside.
+        let range = policy(&["10.1.2.3/32"]);
+        assert!(allowed(&range, "some.name.example", 80, &["10.1.2.3"]));
     }
 
     #[test]

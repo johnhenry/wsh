@@ -2237,9 +2237,10 @@ position. From the Rust release after `rust-v0.6.0` the server's defaults are:
   lists some. `"*"` means any *public* destination: an address that is loopback,
   link-local (including `169.254.169.254`), private (RFC 1918), unique-local
   (`fc00::/7`), carrier-grade NAT (`100.64.0.0/10`), unspecified or multicast is
-  refused **after the name is resolved**, whichever rule matched the name, unless
-  a rule names that host (`"db.internal:5432"`) or address/range
-  (`"10.1.0.0/16:5432"`, `"127.0.0.1:8080"`). The server connects to the address it
+  refused **after the name is resolved**, whichever rule matched the name (a host
+  name rule included), unless a rule names that address or range
+  (`"10.1.0.0/16:5432"`, `"127.0.0.1:8080"`; a literal address is matched when a
+  client asks for that address, a range also when a name resolves into it). The server connects to the address it
   checked, so a name cannot pass the check as one address and connect as another.
   `ResolveDns` follows the same rule and does not return internal answers.
 - **Reverse listeners are off** (`enable_reverse_tunnels = false`) and, when on,
@@ -2257,10 +2258,13 @@ position. From the Rust release after `rust-v0.6.0` the server's defaults are:
 
 What this does **not** protect against:
 
-- **A rule you write is trusted.** A hostname rule (`"db.internal"`) allows that name
-  to resolve to anything, including a restricted address; only the wildcard is
-  held to public addresses. An address range or literal address rule allows
-  exactly what it says.
+- **A rule you write is trusted, as far as it says.** A hostname rule
+  (`"partner.example.com"`) allows that name at a public address only, as the wildcard
+  does: a name whose DNS answers an internal address is refused, so a name is not
+  how the internal network is reached. An address range or literal address rule
+  allows exactly what it says, so write `"10.1.2.3/32:5432"` to let `db.internal`
+  resolve to that one address. It does not protect against a public address that
+  forwards to something internal (a proxy, or a service you allow that fetches URLs).
 - **It is not per-key.** Every authorized key gets the same gateway. A key that
   should not have it should not be in `authorized_keys`.
 - **There is no bandwidth or request-rate limit** beyond `max_connections`
