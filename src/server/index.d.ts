@@ -529,6 +529,13 @@ export interface WshServerOptions {
   targets?: Record<string, Omit<import('../host.js').WshTargetOptions, 'exec' | 'fs'> & { exec?: true | WshServerExecOptions | WshExecRunner; fs?: WshServerFsOptions | import('../host.js').WshFileBackend }>;
   /** With `targets`: an `Open`, `FileOp` or `OpenEndpoint` that names no target is refused, so nothing runs on the host itself (`rpc` channels too). Does not cover the gateway, MCP or `Attach`. */
   requireTarget?: boolean;
+  /**
+   * Which login names this host admits (a RegExp, or a pattern string). Default `/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/`, the shape of an
+   * OS account name, because a name reaches `exec` environments and file paths. A host that does not map names to OS accounts can
+   * admit its own shape, e.g. `/^[A-Za-z0-9_-]{1,64}$/` for base64url identity hashes. Whatever the pattern, a name is 1 to 256
+   * characters with no control character, no `/` and no `\`, and the pattern may not match the empty name.
+   */
+  usernamePattern?: RegExp | string;
   onLog?: (line: string) => void;
 }
 

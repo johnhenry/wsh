@@ -19,6 +19,18 @@ The Rust halves of the JS change below. **No new wire format**: the feature stri
   `UNSUPPORTED_PROTOCOL` before sending anything (before this change such a server offered no rpc at all, so nothing that worked stops working). A released host never
   states `rpc-virtual`, so the new client uses streams there. Not covered: WebTransport (never sealed on `wsh-server`; it offers no rpc, as before).
 
+### Host option `usernamePattern` (additive)
+
+`createWshServer`, `createMemoryHost` and `createConnectionFactory` take `usernamePattern` (a `RegExp` or a pattern string): which login names the host admits. **Default unchanged**,
+`^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`. A host that does not map names to OS accounts (a page host, a mesh peer named by a base64url identity hash that may start with a digit or `-`) can
+admit its own shape, for example `/^[A-Za-z0-9_-]{1,64}$/`, and no longer needs to prefix the name. Whatever the pattern, a name is 1 to 256 characters with no control character, no
+`/` or `\`, and is not `.` or `..`, and a pattern that matches the empty name is refused when the host is created.
+
+- **Wire:** none (a name is a string in `Hello.username` as before; the check is the host's). **A released peer:** a released client sends what it always sent; a released host keeps its
+  own default and refuses such a name with `bad username`, so a client that relies on this option needs a host from this release. The Rust `wsh-server` and `createReverseHost` keep the default shape.
+- Tests: `test/username-pattern.test.mjs` (default unchanged and refusing digit-first and dash-first names, a pattern on a Node host and a memory host, the floor under a pattern that
+  matches anything, option validation). The floor was broken once to see its test fail.
+
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
 An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside

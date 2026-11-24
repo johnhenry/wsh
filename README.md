@@ -229,6 +229,14 @@ restricted host with no shell. `fs.root` confines every path: `..`, absolute
 paths and symlinks pointing out of it are refused -- for `write` and `rename`
 (both paths) exactly as for `read`.
 
+**Login names (`usernamePattern`).** A host admits only names of an OS account's shape, `^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`, because a name reaches
+`exec` environments, file paths and logs. A host that does not map names to accounts (a page, or a mesh peer named by a base64url identity
+hash, which may start with a digit or `-`) says what it admits: `createWshServer({ usernamePattern: /^[A-Za-z0-9_-]{1,64}$/ })`, also on
+`createMemoryHost` and `createConnectionFactory`. Off unless given. **Not loosened by any pattern:** a name is 1 to 256 characters with no control
+character, no `/` or `\`, and is not `.` or `..`, and a pattern that matches the empty name is refused at start. The pattern is the embedder's
+decision: whatever `exec`, `fs` or `authorize` do with the name is theirs to keep safe, and a wider pattern widens what they must handle
+(`createReverseHost` and the Rust `wsh-server` keep the default shape).
+
 **Client environment (`clientEnv`).** A client may ask for environment
 variables with `openSession({ env })`. Since 0.36 the host accepts only
 `TERM`, `COLORTERM`, `LANG`, `LANGUAGE` and `LC_*` by default (the shape of
