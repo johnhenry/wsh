@@ -483,7 +483,7 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
     const asked = [];
     const expose = { window: { allow: { get: ['document.title', 'app.cart.**'], call: ['app.cart.add'] }, mcp: { tools: [
       { name: 'cart_add', description: 'Add a product to the cart', call: 'app.cart.add', inputSchema: { type: 'object', properties: { sku: { type: 'string' } }, required: ['sku'], additionalProperties: false } },
-      { name: 'page_title', description: 'The page title', get: 'document.title' },
+      { name: 'page_title', description: 'The page title', get: 'document.title', readOnly: true },
     ] } } };
     const page = await startPage({
       window: win, host: { expose }, mcp: { prompt: async (call) => { asked.push(call.name); return true; } },

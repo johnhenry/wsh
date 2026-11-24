@@ -20,7 +20,7 @@ test.describe('a page host: an MCP face for allow-listed paths over a sealed rel
       allow: { get: ['document.title', 'app.cart.**', 'app.secret'], call: ['app.cart.add', 'app.cart.clearAll'] },
       mcp: { tools: [
         { name: 'cart_add', description: 'Add a product to the cart', call: 'app.cart.add', inputSchema: { type: 'object', properties: { sku: { type: 'string', minLength: 1 }, qty: { type: 'integer', minimum: 1 } }, required: ['sku'], additionalProperties: false } },
-        { name: 'page_title', description: 'The title of the page', get: 'document.title' },
+        { name: 'page_title', description: 'The title of the page', get: 'document.title', readOnly: true },
       ] },
     },
   };

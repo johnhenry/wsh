@@ -241,7 +241,7 @@ export interface ObjectsMcpTool {
   inputSchema?: Record<string, unknown>;
   /** For a call: `'object'` (the validated input is the one argument) or the property names to pass, in order. Default: `'object'` when the schema lists properties, else none. */
   args?: 'object' | string[];
-  /** Default: a get is read-only and a call is not. A tool not marked read-only asks the person at the page first (the WebMCP bridge's approval). */
+  /** `true` marks the tool read-only; with nothing said, neither a get nor a call is (a getter can have effects). A tool not marked read-only asks the person at the page first (the WebMCP bridge's approval). */
   readOnly?: boolean;
 }
 /** A tool as `webmcpTools({ tools })` takes it (what `exposeObjects` builds from an `ObjectsMcpTool`). */

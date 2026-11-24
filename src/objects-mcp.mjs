@@ -70,7 +70,8 @@ export function buildMcpTools({ mcp, rootNames, allows, invoke }) {
     try { allows(kind, segs[0], segs); } catch (e) { throw fail(`${String(e?.message ?? e)} (a tool never widens the allow-list: list the path there, then name it here)`); }
 
     if (spec.readOnly !== undefined && typeof spec.readOnly !== 'boolean') throw fail('readOnly must be true or false');
-    const readOnly = spec.readOnly ?? (kind === 'get');
+    // Read-only only when the host says so, for a get as for a call: a getter can have effects, and the mark skips the person's approval.
+    const readOnly = spec.readOnly === true;
     const schema = spec.inputSchema ?? { type: 'object', properties: {}, additionalProperties: false };
     if (!isObj(schema) || (schema.type !== undefined && schema.type !== 'object')) throw fail('inputSchema must describe an object');
     let compiled;
