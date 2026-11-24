@@ -425,6 +425,29 @@ export class WshClient {
   onError = null;
 
   /**
+   * Called when the client hears a message a sealed session or sealed bridge does not accept and drops it: a plain message
+   * where only sealed frames are heard (a relay in the middle can write any plain message), or a bridge frame that does not
+   * open. Not an error of the connection (the session carries on), so not `onError`; also counted in `droppedMessages`.
+   * Nothing is written to the console. A handler that throws is ignored.
+   * @type {((drop: { reason: 'plaintext-on-sealed-session' | 'plaintext-before-seal' | 'plaintext-on-sealed-bridge' | 'unopenable-bridge-frame', messageType?: number, detail?: string }) => void) | null}
+   */
+  onDrop = null;
+
+  #droppedPlaintext = 0;
+  #droppedUnopened = 0;
+
+  /** How many messages this client has dropped because a sealed session or bridge did not accept them. */
+  get droppedMessages() {
+    return { plaintext: this.#droppedPlaintext, unopened: this.#droppedUnopened };
+  }
+
+  /** @param {{ reason: string, messageType?: number, detail?: string }} drop */
+  #countDrop(drop) {
+    if (drop.reason === 'unopenable-bridge-frame') this.#droppedUnopened++; else this.#droppedPlaintext++;
+    try { this.onDrop?.(drop); } catch { /* a handler's bug does not decide what the client does */ }
+  }
+
+  /**
    * Called when a reverse-connect request arrives (reverse mode only).
    * @type {function(object): void|null}
    */
@@ -3016,7 +3039,7 @@ export class WshClient {
     if (!seal || msg.type === MSG.PING || msg.type === MSG.PONG) { this.#handleControl(msg); return; }
     if (seal.bridge) {
       if (!seal.bridge.isFrame(msg)) {
-        console.warn(`[wsh:client] dropping a plaintext message (type ${msg.type}) on a sealed session`);
+        this.#countDrop({ reason: 'plaintext-on-sealed-session', messageType: msg.type });
         return;
       }
       seal.bridge.open(msg).then(
@@ -3026,7 +3049,7 @@ export class WshClient {
       return;
     }
     if (msg.type === MSG.KEY_EXCHANGE && msg.session_id === seal.sessionId) { this.#handleControl(msg); return; }
-    console.warn(`[wsh:client] dropping a plaintext message (type ${msg.type}) before the session is sealed`);
+    this.#countDrop({ reason: 'plaintext-before-seal', messageType: msg.type });
   }
 
   #sealedFrameFailed(seal, err) {
@@ -3206,12 +3229,12 @@ export class WshClient {
         if (sealState.bridge?.isFrame(inner)) {
           sealState.bridge.open(inner)
             .then((opened) => this.#handleControl(opened, msg.from_fingerprint))
-            .catch((err) => console.warn('[wsh:client] dropping a sealed frame:', err.message));
+            .catch((err) => this.#countDrop({ reason: 'unopenable-bridge-frame', detail: err.message }));
           return;
         }
         const setup = !sealState.bridge && inner.type === MSG.KEY_EXCHANGE && inner.session_id === sealState.sessionId;
         if (!setup) {
-          console.warn('[wsh:client] dropping a plaintext message on a sealed bridge');
+          this.#countDrop({ reason: 'plaintext-on-sealed-bridge', messageType: inner.type });
           return;
         }
       }

@@ -252,6 +252,37 @@ describe('a hostile relay cannot work with a sealed session', () => {
     assert.equal(await echo(c, 'still up'), 'still up');
   });
 
+  it('a plain message heard on a sealed session is counted and reported to onDrop, never written to the console', async () => {
+    const s = await setup({ sealSession: 'offer' });
+    const c = await login(s, { sealSession: true });
+    assert.deepEqual(c.droppedMessages, { plaintext: 0, unopened: 0 });
+    const drops = [];
+    c.onDrop = (d) => drops.push(d);
+    const written = [];
+    const real = { warn: console.warn, error: console.error };
+    console.warn = (...a) => written.push(a.join(' '));
+    console.error = (...a) => written.push(a.join(' '));
+    try {
+      assert.equal(await echo(c, 'hi'), 'hi');
+      s.relay.context().injectToClient({ type: MSG.SHUTDOWN, reason: 'injected by the relay' });
+      s.relay.context().injectToClient({ type: MSG.ERROR, code: 9, message: 'injected by the relay' });
+      await until(() => c.droppedMessages.plaintext === 2, 'both injected messages to be counted');
+      assert.equal(await echo(c, 'still up'), 'still up');
+    } finally { Object.assign(console, real); }
+    assert.deepEqual(c.droppedMessages, { plaintext: 2, unopened: 0 });
+    assert.deepEqual(drops.map((d) => [d.reason, d.messageType]), [['plaintext-on-sealed-session', MSG.SHUTDOWN], ['plaintext-on-sealed-session', MSG.ERROR]]);
+    assert.deepEqual(written.filter((l) => /wsh:client/.test(l)), [], 'nothing on the console by default');
+  });
+
+  it('a throwing onDrop handler does not change what the client does', async () => {
+    const s = await setup({ sealSession: 'offer' });
+    const c = await login(s, { sealSession: true });
+    c.onDrop = () => { throw new Error('handler bug'); };
+    s.relay.context().injectToClient({ type: MSG.SHUTDOWN, reason: 'injected by the relay' });
+    await until(() => c.droppedMessages.plaintext === 1, 'the drop to be counted');
+    assert.equal(await echo(c, 'still up'), 'still up');
+  });
+
   it('a plain message injected toward the host after the key exchange is not heard', async () => {
     const s = await setup({ sealSession: 'offer' });
     const c = await login(s, { sealSession: true });

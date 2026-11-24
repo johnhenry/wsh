@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### A message a sealed session drops is counted and reported, not written to the console (JS client)
+
+A plain message heard on a sealed session (or before it is sealed), a plain message on a sealed reverse bridge and a bridge frame that does not open used to be dropped with a `console.warn`
+(`[wsh:client] dropping a plaintext message ...`) and no signal to the application. Now **nothing is written to the console**: the client counts them (`client.droppedMessages`, `{ plaintext, unopened }`) and calls
+`client.onDrop({ reason, messageType?, detail? })` (`reason` is `plaintext-on-sealed-session`, `plaintext-before-seal`, `plaintext-on-sealed-bridge` or `unopenable-bridge-frame`). It is not `onError`: the connection carries on,
+and a frame that does not open on a sealed *session* still ends it through `onError` as before. A handler that throws is ignored.
+
+- **Behaviour change:** the console lines are gone. An embedder that read them should read `onDrop` / `droppedMessages`.
+- **Wire: none. A released peer:** unaffected (client-side only).
+- Tests: `test/session-seal-client.test.mjs` (plain messages injected by a relay after the key exchange are counted, reported with their message type, never reach the console, and a throwing handler changes nothing).
+  Not covered by a test: the three sealed-bridge paths (they call the same function).
+
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
 An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside

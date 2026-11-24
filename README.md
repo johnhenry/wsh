@@ -1002,7 +1002,7 @@ a host that does not offer `e2e-session`, one that proved no host key, or a pass
 sent, with a sentence; `false` never seals. `client.sessionSealed` says whether it is. The exchange is bound to the host key the
 host PROVED on this connection: it authenticates that key, not whose it is, so pin the host as well (`expectHostKey` /
 `knownHosts`), or a relay that presents its own host key and terminates the exchange is the host to this client. Once sealed, a
-plain message from the host is dropped, a frame that does not open ends the connection (`onError`, then `onClose`), `openStream()`
+plain message from the host is dropped (counted in `client.droppedMessages`, and reported to `client.onDrop({ reason, messageType })`; nothing is written to the console), a frame that does not open ends the connection (`onError`, then `onClose`), `openStream()`
 is refused and datagrams are neither sent nor heard (UDP uses the reliable path). `'auto'` is not a guarantee, for the reason above;
 `true` is.
 

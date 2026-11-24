@@ -2259,6 +2259,20 @@ export class WshClient {
   /** Called on connection-level errors. */
   onError: ((err: Error) => void) | null;
 
+  /**
+   * Called when a sealed session or bridge drops a message it does not accept (a plain message where only sealed frames are
+   * heard, or a bridge frame that does not open). The connection carries on, so this is not `onError`; the drops are also
+   * counted in `droppedMessages`. Nothing is written to the console.
+   */
+  onDrop: ((drop: {
+    reason: 'plaintext-on-sealed-session' | 'plaintext-before-seal' | 'plaintext-on-sealed-bridge' | 'unopenable-bridge-frame';
+    messageType?: number;
+    detail?: string;
+  }) => void) | null;
+
+  /** How many messages a sealed session or bridge has dropped: plain ones, and bridge frames that did not open. */
+  readonly droppedMessages: { plaintext: number; unopened: number };
+
   /** Called when a reverse-connect request arrives (reverse mode only). */
   onReverseConnect: ((msg: WshMessage) => void) | null;
 
