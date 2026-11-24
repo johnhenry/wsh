@@ -592,7 +592,9 @@ export function createConnectionFactory(cfg) {
         state.channelBinding = boundKinds;
         let allowed = false;
         try {
-          allowed = await cfg.authorize({ username: state.username, fingerprint: fp, publicKey: m.public_key });
+          // `sealRequired`: this host serves nothing until the session is sealed (after login), so a login here is not yet a session
+          // that can do anything; `cfg.onSealed` says when it is.
+          allowed = await cfg.authorize({ username: state.username, fingerprint: fp, publicKey: m.public_key, ...(sealRequired ? { sealRequired: true } : {}) });
         } catch (e) { log(`authorize threw: ${e.message}`); }
         if (!allowed) return refuse('key not authorized', 'unauthorized', claimed);
         // `authorize` may answer with a capability set (`{ permissions }` from `buildAuthorizer`): it narrows what the key's own options allow.
@@ -638,6 +640,7 @@ export function createConnectionFactory(cfg) {
           if (result.key) {
             sealed.bridge = new SealedBridge({ key: result.key, sessionId: state.sessionId, role: 'responder', scope: 'session' });
             log(`session sealed${result.hybrid ? ' (hybrid)' : ''}`);
+            try { cfg.onSealed?.({ username: state.username, fingerprint: state.fingerprint }); } catch (e) { log(`onSealed threw: ${e.message}`); }
           }
         } catch (e) { log(`sealed session refused: ${e.message}`); reportRefused('seal-failed', `key exchange failed: ${e.message}`); shutdown('sealed session key exchange failed'); }
         return undefined;

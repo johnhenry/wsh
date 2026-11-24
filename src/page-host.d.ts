@@ -144,6 +144,17 @@ export interface WebMcpHandler {
 /** The page's WebMCP tools as MCP, an rpc handler for the `mcp` protocol. */
 export function webmcpTools(options: WebMcpToolsOptions): WebMcpHandler;
 
+/**
+ * The page host's badge as its own function: a row per connected key with its fingerprint and a Stop button. BEST EFFORT: page code can
+ * remove or cover a DOM element; Stop, revoke and the key's capabilities are the controls that hold.
+ */
+export function createPageIndicator(window: WshPageWindow, options: { name: string }): {
+  show(who: { fingerprint: string | null }, stop: () => unknown): void;
+  hide(who: { fingerprint: string | null }): void;
+  ensure(): void;
+  destroy(): void;
+};
+
 /** A JSON-RPC 2.0 message as an object: what the far side of `serveMcpOverDuplex` speaks (plain MCP). */
 export type McpMessage = { jsonrpc: '2.0'; id?: string | number; method?: string; params?: object; result?: unknown; error?: { code: number; message: string; data?: unknown } };
 

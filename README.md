@@ -1611,6 +1611,8 @@ An MCP client configuration:
 { "mcpServers": { "remote": { "command": "wsh-mcp", "args": ["--identity", "/home/me/.wsh/keys/default.pem", "--host-key", "<fingerprint>", "wss://host.example:4422"] } } }
 ```
 
+**Dialling a host behind a pipe relay (a pod's services host, a page host).** Both CLIs dial the operator side of a [pipe relay](#a-pipe-relay-johnhenrywshpipe-relay-118) directly. `wsh-mcp` takes the relay URL as its URL, since that is a `ws://` / `wss://` URL: `wsh-mcp --sealed --host-key <host fingerprint> --identity KEY wss://relay.example/r/<rendezvous id>` (the URL must end in `/r/<22-128 base64url characters>` and must not be the `?role=host` one). The Rust `wsh` has a flag for it: `wsh --sealed --via wss://relay.example/r/<id> mcp user@host` (and `wsh --via wss://relay.example/r/<id> user@host [command...]`), where `user@host` stays the identity the host key is recorded under. A host behind a relay that is a page or a mesh peer serves sealed sessions only, so pass `--sealed` and pin `--host-key`.
+
 stdout carries MCP messages only (one JSON-RPC message per line); every diagnostic goes to stderr. Exit status: `0` the client closed
 its side, `1` the host was lost for good, `2` it could not start -- no connection, a refused login or host key, or **a host that offers
 no such channel** (the error lists the channels it does offer and how to serve one). After a dropped connection it reconnects (5
