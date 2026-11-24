@@ -62,7 +62,14 @@ class QMuxStreamAdapter {
   constructor(qs) {
     this.id = qs.id;
 
+    // `controller.error()` throws away what is queued, so a connection that ends right behind a stream's last bytes would
+    // take them with it. The failure is held until the reader has taken what had arrived (`pull` runs when the queue is
+    // empty), and delivered then.
+    let destroyedWith = null;
     this.readable = new ReadableStream({
+      pull: (controller) => {
+        if (destroyedWith) { try { controller.error(destroyedWith); } catch { /* already settled */ } }
+      },
       start: (controller) => {
         qs.onData = (data) => {
           try { controller.enqueue(data); } catch { /* controller already closed/errored */ }
@@ -74,7 +81,10 @@ class QMuxStreamAdapter {
           try { controller.error(new Error(`Stream ${qs.id} was reset by peer (error code ${errorCode})`)); } catch { /* already settled */ }
         };
         qs.onDestroy = (err) => {
-          try { controller.error(err); } catch { /* already settled */ }
+          destroyedWith = err;
+          if (controller.desiredSize === null || controller.desiredSize > 0) {
+            try { controller.error(err); } catch { /* already settled */ }
+          }
         };
       },
       cancel: () => {

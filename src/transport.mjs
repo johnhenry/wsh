@@ -706,19 +706,23 @@ export class WebTransportTransport extends WshTransport {
    * @param {WebTransport} wt
    */
   #monitorClosed(wt) {
+    // What the control stream had delivered before the session ended is dispatched (one message per turn) before the close
+    // is reported: the end of the session is a separate event, and reporting it at once would overtake the last messages.
+    // The reader ends with the session, so this wait is bounded by it.
+    const afterControl = () => this.#controlReaderDone?.catch(() => {}) ?? Promise.resolve();
     wt.closed
-      .then(() => {
+      .then(() => afterControl().then(() => {
         if (this.state !== 'closed') {
           this._setState('closed');
           this._emitClose();
         }
-      })
-      .catch((err) => {
+      }))
+      .catch((err) => afterControl().then(() => {
         if (this.state !== 'closed') {
           this._setState('closed');
           this._emitError(err);
           this._emitClose();
         }
-      });
+      }));
   }
 }

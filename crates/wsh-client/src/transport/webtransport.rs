@@ -13,6 +13,30 @@ use wsh_core::codec::FrameDecoder;
 use wsh_core::error::{WshError, WshResult};
 use wsh_core::transport::{ByteStream, IdentifiedStream, TransportSession};
 
+/// The frames of the control stream: bytes in, whole frames out one at a time. A single read can complete several frames,
+/// so the ones not yet handed on are kept (taking only the first of what a read decoded would drop the rest).
+struct ControlFrames {
+    decoder: FrameDecoder,
+    ready: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl ControlFrames {
+    fn new() -> Self {
+        Self {
+            decoder: FrameDecoder::new(),
+            ready: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.ready.extend(self.decoder.feed_raw(bytes));
+    }
+
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        self.ready.pop_front()
+    }
+}
+
 /// A WebTransport bidirectional stream wrapped as a `ByteStream`.
 struct WebTransportStream {
     send: SendStream,
@@ -62,7 +86,7 @@ pub struct WebTransportSession {
     connection: Connection,
     control_send: SendStream,
     control_recv: RecvStream,
-    decoder: FrameDecoder,
+    decoder: ControlFrames,
     next_stream_id: u32,
     connected: bool,
 }
@@ -197,7 +221,7 @@ impl WebTransportSession {
             connection,
             control_send,
             control_recv,
-            decoder: FrameDecoder::new(),
+            decoder: ControlFrames::new(),
             next_stream_id: 1,
             connected: true,
         })
@@ -248,17 +272,14 @@ impl TransportSession for WebTransportSession {
 
     async fn recv_control(&mut self) -> WshResult<Vec<u8>> {
         loop {
-            if let Some(frame) = self.decoder.feed_raw(&[]).into_iter().next() {
+            // Frames already read, whole, come first -- also after the stream has ended.
+            if let Some(frame) = self.decoder.pop() {
                 return Ok(frame);
             }
 
             let mut buf = vec![0u8; 8192];
             match self.control_recv.read(&mut buf).await {
-                Ok(Some(n)) => {
-                    if let Some(frame) = self.decoder.feed_raw(&buf[..n]).into_iter().next() {
-                        return Ok(frame);
-                    }
-                }
+                Ok(Some(n)) => self.decoder.push(&buf[..n]),
                 Ok(None) => {
                     self.connected = false;
                     return Err(WshError::Transport("control stream closed".into()));
@@ -454,6 +475,41 @@ mod tests {
         assert!(text.contains("--insecure-skip-cert-verification"));
         assert!(text.contains("not verified"));
         assert!(text.contains("127.0.0.1:4433"));
+    }
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// One read of the control stream can carry several frames (a ServerHello and the Challenge behind it): every one is
+    /// handed on, in order, and none is lost.
+    #[test]
+    fn several_frames_in_one_read_are_all_delivered_in_order() {
+        let mut frames = ControlFrames::new();
+        let mut chunk = framed(b"one");
+        chunk.extend(framed(b"two"));
+        chunk.extend(framed(b"three"));
+        frames.push(&chunk);
+        assert_eq!(frames.pop().as_deref(), Some(&b"one"[..]));
+        assert_eq!(frames.pop().as_deref(), Some(&b"two"[..]));
+        assert_eq!(frames.pop().as_deref(), Some(&b"three"[..]));
+        assert_eq!(frames.pop(), None);
+    }
+
+    #[test]
+    fn a_frame_split_across_reads_is_delivered_once_complete_and_frames_after_it_are_kept() {
+        let mut frames = ControlFrames::new();
+        let whole = framed(b"split-frame");
+        frames.push(&whole[..6]);
+        assert_eq!(frames.pop(), None);
+        let mut rest = whole[6..].to_vec();
+        rest.extend(framed(b"next"));
+        frames.push(&rest);
+        assert_eq!(frames.pop().as_deref(), Some(&b"split-frame"[..]));
+        assert_eq!(frames.pop().as_deref(), Some(&b"next"[..]));
+        assert_eq!(frames.pop(), None);
     }
 
     #[test]

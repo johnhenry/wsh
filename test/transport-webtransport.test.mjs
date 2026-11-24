@@ -208,6 +208,40 @@ describe('WebTransportTransport passes options to the WebTransport constructor',
   });
 });
 
+describe('WebTransportTransport: what arrived before the session closed is delivered before the close is reported', () => {
+  it('control messages already read from the control stream reach onControl ahead of onClose', async () => {
+    let controlController;
+    let closeSession;
+    class Controlled extends FakeWebTransport {
+      constructor(url, options) {
+        super(url, options);
+        this.closed = new Promise((resolve) => { closeSession = resolve; });
+      }
+
+      createBidirectionalStream() {
+        return Promise.resolve({
+          readable: new ReadableStream({ start(c) { controlController = c; } }),
+          writable: new WritableStream(),
+        });
+      }
+    }
+    globalThis.WebTransport = Controlled;
+    const { frameEncode } = await import('../src/cbor.mjs');
+    const t = new WebTransportTransport();
+    const events = [];
+    t.onControl = (m) => events.push(`msg ${m.seq}`);
+    await t.connect('https://example.test:4433/wsh');
+    const batch = new Uint8Array([...frameEncode({ type: 10, seq: 1 }), ...frameEncode({ type: 10, seq: 2 }), ...frameEncode({ type: 10, seq: 3 })]);
+    // The last messages and the end of the session in the same turn, as a host that says goodbye and closes produces.
+    const closed = new Promise((resolve) => { t.onClose = () => { events.push('close'); resolve(); }; });
+    controlController.enqueue(batch);
+    controlController.close();
+    closeSession();
+    await closed;
+    assert.deepEqual(events, ['msg 1', 'msg 2', 'msg 3', 'close']);
+  });
+});
+
 describe('WebTransportTransport when the session never becomes ready', () => {
   it('rejects connect() without leaving `closed`\'s rejection unhandled (fatal in Node)', async () => {
     class NeverReady extends FakeWebTransport {

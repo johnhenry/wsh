@@ -27,8 +27,24 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { retu
 
 /** A stand-in for node-pty: a child process on pipes. */
 const children = new Set();
+/** How many output bytes each fake process has written, and who waits for a count: lets a test wait for the process's output, not for time. */
+const produced = new WeakMap();
+function outputBytes(child, n) {
+  const st = produced.get(child);
+  if (st.bytes >= n) return Promise.resolve();
+  return new Promise((resolve) => st.waiters.push({ n, resolve }));
+}
 function fakeSpawn(file, args, o) {
   const child = spawn(file, args, { env: o.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const st = { bytes: 0, waiters: [] };
+  produced.set(child, st);
+  const count = (d) => {
+    st.bytes += d.length;
+    // Resolve on the next turn, after every other listener of this chunk (the host's) has run.
+    for (const w of st.waiters.filter((x) => st.bytes >= x.n)) { st.waiters.splice(st.waiters.indexOf(w), 1); setImmediate(w.resolve); }
+  };
+  child.stdout.on('data', count);
+  child.stderr.on('data', count);
   children.add(child);
   child.on('close', () => children.delete(child));
   child.stdin.on('error', () => {});
@@ -241,7 +257,8 @@ describe('server sessions: attach / resume / detach', () => {
     const { sessionId, resumeToken } = s1;
     const lastSeq = s1.seq;
     await drop(c1);
-    await sleep(600);
+    // All 206 bytes (6 + 20 lines of 10) must have been produced, and read by the host, before the resume asks.
+    await outputBytes([...children].at(-1), 206);
 
     const c2 = await connect(url);
     await assert.rejects(() => c2.resumeSession(sessionId, resumeToken, { lastSeq }), /Failed to resume: output gap: .*starts at seq 142.*last_seq is 6/);

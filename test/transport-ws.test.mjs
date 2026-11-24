@@ -459,6 +459,34 @@ describe('WebSocketTransport (QMux)', { skip: !transportWsMod && 'transport-ws.m
     }
   });
 
+  it('bytes that reached a stream before the socket closed are still readable, and the read after them fails', async () => {
+    const restore = installFakeWebSocket();
+    let transport;
+    try {
+      ({ transport } = await connectedTransport());
+      const ws = FakeWebSocket.instances[0];
+      const { readable, id } = await transport.openStream();
+      // Two chunks nobody has read yet, then the close of the connection.
+      ws.simulateMessage(encodeRecord(encodeStream({ streamId: id, offset: 0, data: new Uint8Array([1, 2]), fin: false })));
+      ws.simulateMessage(encodeRecord(encodeStream({ streamId: id, offset: 2, data: new Uint8Array([3]), fin: false })));
+      ws.simulateServerClose(1000, 'the host went away after its last output');
+      const reader = readable.getReader();
+      const got = [];
+      let failure = null;
+      for (;;) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) break;
+          got.push(...value);
+        } catch (e) { failure = e; break; }
+      }
+      assert.deepEqual(got, [1, 2, 3], 'what had arrived was delivered');
+      assert.ok(failure, 'the stream still ends with the failure of the connection');
+    } finally {
+      restore();
+    }
+  });
+
   it('a peer CONNECTION_CLOSE frame also tears the transport down gracefully', async () => {
     const restore = installFakeWebSocket();
     let transport;

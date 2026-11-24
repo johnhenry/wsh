@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.46.1 / Rust `rust-v0.17.1`
+
+### Fixes only: no new option, feature string or wire message, and no default changed. A released peer needs nothing.
+
+### Fix: the Rust client over WebTransport lost control frames that arrived together (Rust)
+
+`wsh` and `wsh-client` read the control stream of a WebTransport connection and handed on only the first frame of each read, dropping the rest of the frames that read had completed (for example the `ServerHello` and the `Challenge` behind it, or a reply and
+the message after it). Every frame a read completes is now kept and delivered in order, including after the stream has ended. A `wss://` connection read frames correctly and is unchanged.
+
+### Fix: what a peer sent before its connection closed is delivered before the close, on every JS transport and host (JS)
+
+The same ordering as the entry below, in the places that had it too:
+- **`WebTransportTransport`:** the end of the session was reported while control messages already read were still waiting to be dispatched; it now waits for them.
+- **A stream that had received bytes when the WebSocket closed** lost them: the stream was failed at once, which discards what is queued. The failure now reaches the reader after the bytes that had arrived (`WebSocketTransport` streams).
+- **`bindSocket`** (what `server.accept(socket)` and `host.accept(socket)` run): the socket's close marked the connection closed before the messages already received had been handled, so a peer's last messages (a final write, the end of its input) were dropped. The close now joins the chain behind them.
+
+### Tests: three timing-sensitive tests wait on the event instead of the clock
+
+`pipe-relay` "pairs a host and an operator…" (its relay gave up on a waiting half after 400 ms, which a slow machine exceeded; it has its own relay now and waits on the messages and a ping's pong), `server-sessions` "a ring overflow is reported as a gap by Resume"
+(it assumed the process had written everything 600 ms after the drop; it waits for the bytes) and `gateway-udp` "counts against maxConnections…" (the short idle limit could free the slot before the second open arrived; the cap and the idle limit are checked separately). Tests only.
 
 ### Fix: the last messages of a connection are delivered before its close is reported (JS client and `WebSocketTransport`)
 
