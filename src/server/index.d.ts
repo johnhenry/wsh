@@ -412,6 +412,23 @@ export interface WshSelfSignedCertificate {
 /** A dependency-free self-signed ECDSA P-256 certificate fit for WebTransport's `serverCertificateHashes`. */
 export function generateSelfSignedCertificate(opts?: { hosts?: string[]; validityDays?: number; now?: Date }): WshSelfSignedCertificate;
 
+/**
+ * Hash a password for `passwordVerifier`: scrypt (`node:crypto`), a random per-user salt, a PHC string
+ * (`$scrypt$ln=16,r=8,p=1$<salt>$<hash>`). The default cost is 64 MiB; `ln` is log2 of N (10 to 22, and at most 256 MiB in all).
+ */
+export function hashPassword(password: string, opts?: { ln?: number; r?: number; p?: number }): Promise<string>;
+/** Does `password` match a `hashPassword` value? False for anything else (never throws on the stored value); compared in constant time. */
+export function verifyPassword(password: string, stored: string): Promise<boolean>;
+/**
+ * An `auth.password` callback over stored `hashPassword` values: an unknown user costs the same derivation as a wrong password,
+ * and an entry that is not a `hashPassword` value is refused with `onWarn` naming the user (default `console.warn`; never the
+ * stored value). An old unsalted `sha256:<hex>` entry is refused unless `allowLegacySha256` is set.
+ */
+export function passwordVerifier(
+  hashes: Record<string, string> | Map<string, string> | ((username: string) => string | undefined | Promise<string | undefined>),
+  opts?: { allowLegacySha256?: boolean; onWarn?: (message: string) => void },
+): (username: string, password: string) => Promise<boolean>;
+
 export interface WshServerOptions {
   /** Bind address (default `127.0.0.1`). */
   host?: string;
@@ -512,6 +529,13 @@ export interface WshServerOptions {
   targets?: Record<string, Omit<import('../host.js').WshTargetOptions, 'exec' | 'fs'> & { exec?: true | WshServerExecOptions | WshExecRunner; fs?: WshServerFsOptions | import('../host.js').WshFileBackend }>;
   /** With `targets`: an `Open`, `FileOp` or `OpenEndpoint` that names no target is refused, so nothing runs on the host itself (`rpc` channels too). Does not cover the gateway, MCP or `Attach`. */
   requireTarget?: boolean;
+  /**
+   * Which login names this host admits (a RegExp, or a pattern string). Default `/^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/`, the shape of an
+   * OS account name, because a name reaches `exec` environments and file paths. A host that does not map names to OS accounts can
+   * admit its own shape, e.g. `/^[A-Za-z0-9_-]{1,64}$/` for base64url identity hashes. Whatever the pattern, a name is 1 to 256
+   * characters with no control character, no `/` and no `\`, and the pattern may not match the empty name.
+   */
+  usernamePattern?: RegExp | string;
   onLog?: (line: string) => void;
 }
 

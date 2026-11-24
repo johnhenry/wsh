@@ -31,6 +31,7 @@
 import { WshClient } from './client.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
 import { createConnectionFactory } from './server/connection.mjs';
+import { resolveUsernamePattern } from './server/username.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
 import { resolveBackends, resolveHostKey, createRpcTable } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
@@ -179,7 +180,8 @@ function createRegistry(sessions, log) {
  * @param {(line: string) => void} [options.onLog]
  */
 export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
-  onShare, onRefused, targets, requireTarget } = {}) {
+  onShare, onRefused, targets, requireTarget, usernamePattern } = {}) {
+  resolveUsernamePattern(usernamePattern, 'createMemoryHost');
   validateOnShare(onShare, 'createMemoryHost');
   validateOnRefused(onRefused, 'createMemoryHost');
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
@@ -216,7 +218,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
     methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused,
-    targets: targetTable, requireTarget: mustHaveTarget,
+    targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
   }));
   ready.catch(() => {});

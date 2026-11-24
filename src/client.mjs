@@ -60,6 +60,10 @@ import {
   HostKeyError, newHostKeyNonce, hostKeyProofMessage, findHostKeyAdvert,
   HOST_KEY_NONCE_PREFIX,
 } from './host-key.mjs';
+import { WshAuthError, WshConnectionError } from './errors.mjs';
+
+/** The error of a login step the host did not answer in time (same message as ever, now with a code). */
+const handshakeTimeout = (message) => new WshConnectionError('HANDSHAKE_TIMEOUT', message);
 import { verify as verifySignature, exportPublicKeySSH, parseSSHPublicKey, extractRawFromSSHWire } from './auth.mjs';
 
 // ── Client states ─────────────────────────────────────────────────────
@@ -425,6 +429,29 @@ export class WshClient {
   onError = null;
 
   /**
+   * Called when the client hears a message a sealed session or sealed bridge does not accept and drops it: a plain message
+   * where only sealed frames are heard (a relay in the middle can write any plain message), or a bridge frame that does not
+   * open. Not an error of the connection (the session carries on), so not `onError`; also counted in `droppedMessages`.
+   * Nothing is written to the console. A handler that throws is ignored.
+   * @type {((drop: { reason: 'plaintext-on-sealed-session' | 'plaintext-before-seal' | 'plaintext-on-sealed-bridge' | 'unopenable-bridge-frame', messageType?: number, detail?: string }) => void) | null}
+   */
+  onDrop = null;
+
+  #droppedPlaintext = 0;
+  #droppedUnopened = 0;
+
+  /** How many messages this client has dropped because a sealed session or bridge did not accept them. */
+  get droppedMessages() {
+    return { plaintext: this.#droppedPlaintext, unopened: this.#droppedUnopened };
+  }
+
+  /** @param {{ reason: string, messageType?: number, detail?: string }} drop */
+  #countDrop(drop) {
+    if (drop.reason === 'unopenable-bridge-frame') this.#droppedUnopened++; else this.#droppedPlaintext++;
+    try { this.onDrop?.(drop); } catch { /* a handler's bug does not decide what the client does */ }
+  }
+
+  /**
    * Called when a reverse-connect request arrives (reverse mode only).
    * @type {function(object): void|null}
    */
@@ -688,11 +715,11 @@ export class WshClient {
       const firstResponse = await this.#waitForMessage(
         [MSG.SERVER_HELLO, MSG.CHALLENGE, MSG.AUTH_FAIL],
         timeout,
-        'Auth handshake timed out waiting for server response'
+        handshakeTimeout('Auth handshake timed out waiting for server response')
       );
 
       if (firstResponse.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${firstResponse.reason || 'unknown'}`);
+        throw new WshAuthError(firstResponse.reason || 'unknown');
       }
 
       let tempSessionId = null;
@@ -709,7 +736,7 @@ export class WshClient {
         // Challenge right behind ServerHello, and a message nobody is waiting
         // for yet is dropped.
         const challengeWait = authMethod === AUTH_METHOD.PUBKEY
-          ? this.#waitForMessage([MSG.CHALLENGE, MSG.AUTH_OK], timeout, 'Auth handshake timed out waiting for challenge')
+          ? this.#waitForMessage([MSG.CHALLENGE, MSG.AUTH_OK], timeout, handshakeTimeout('Auth handshake timed out waiting for challenge'))
           : null;
         challengeWait?.catch(() => {});
         await this.#verifyHostKey(firstResponse, hostCtx);
@@ -791,11 +818,11 @@ export class WshClient {
       const authResult = await this.#waitForMessage(
         [MSG.AUTH_OK, MSG.AUTH_FAIL],
         timeout,
-        'Auth handshake timed out waiting for auth result'
+        handshakeTimeout('Auth handshake timed out waiting for auth result')
       );
 
       if (authResult.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${authResult.reason || 'rejected'}`);
+        throw new WshAuthError(authResult.reason || 'rejected');
       }
 
       this.#sessionId = authResult.session_id || tempSessionId;
@@ -2734,7 +2761,7 @@ export class WshClient {
       }
     }
 
-    throw new Error(`Connection failed across transports (${errors.join('; ')})`);
+    throw new WshConnectionError('CONNECTION_FAILED', `Connection failed across transports (${errors.join('; ')})`, { attempts: errors });
   }
 
   /**
@@ -3016,7 +3043,7 @@ export class WshClient {
     if (!seal || msg.type === MSG.PING || msg.type === MSG.PONG) { this.#handleControl(msg); return; }
     if (seal.bridge) {
       if (!seal.bridge.isFrame(msg)) {
-        console.warn(`[wsh:client] dropping a plaintext message (type ${msg.type}) on a sealed session`);
+        this.#countDrop({ reason: 'plaintext-on-sealed-session', messageType: msg.type });
         return;
       }
       seal.bridge.open(msg).then(
@@ -3026,7 +3053,7 @@ export class WshClient {
       return;
     }
     if (msg.type === MSG.KEY_EXCHANGE && msg.session_id === seal.sessionId) { this.#handleControl(msg); return; }
-    console.warn(`[wsh:client] dropping a plaintext message (type ${msg.type}) before the session is sealed`);
+    this.#countDrop({ reason: 'plaintext-before-seal', messageType: msg.type });
   }
 
   #sealedFrameFailed(seal, err) {
@@ -3072,11 +3099,11 @@ export class WshClient {
       const firstResponse = await this.#waitForMessage(
         [MSG.SERVER_HELLO, MSG.CHALLENGE, MSG.AUTH_FAIL],
         timeout,
-        'Auth handshake timed out'
+        handshakeTimeout('Auth handshake timed out')
       );
 
       if (firstResponse.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${firstResponse.reason || 'unknown'}`);
+        throw new WshAuthError(firstResponse.reason || 'unknown');
       }
 
       let tempSessionId = null;
@@ -3146,7 +3173,7 @@ export class WshClient {
       );
 
       if (authResult.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${authResult.reason || 'rejected'}`);
+        throw new WshAuthError(authResult.reason || 'rejected');
       }
 
       this.#sessionId = authResult.session_id || tempSessionId;
@@ -3206,12 +3233,12 @@ export class WshClient {
         if (sealState.bridge?.isFrame(inner)) {
           sealState.bridge.open(inner)
             .then((opened) => this.#handleControl(opened, msg.from_fingerprint))
-            .catch((err) => console.warn('[wsh:client] dropping a sealed frame:', err.message));
+            .catch((err) => this.#countDrop({ reason: 'unopenable-bridge-frame', detail: err.message }));
           return;
         }
         const setup = !sealState.bridge && inner.type === MSG.KEY_EXCHANGE && inner.session_id === sealState.sessionId;
         if (!setup) {
-          console.warn('[wsh:client] dropping a plaintext message on a sealed bridge');
+          this.#countDrop({ reason: 'plaintext-on-sealed-bridge', messageType: inner.type });
           return;
         }
       }
@@ -3567,7 +3594,7 @@ export class WshClient {
         // Remove this waiter.
         this.#removeWaiter(key, waiter);
         signal?.removeEventListener('abort', onAbort);
-        reject(new Error(timeoutMessage));
+        reject(timeoutMessage instanceof Error ? timeoutMessage : new Error(timeoutMessage));
       }, timeout);
       const onAbort = () => {
         clearTimeout(timer);

@@ -40,6 +40,8 @@ libc = "0.2"
 time = { version = "0.3", features = ["std"] }
 argon2 = "0.5"
 subtle = "2"
+# The no-echo prompt of `wsh-server hash-password` (already in the tree through wsh-cli).
+dialoguer = "0.11"
 
 [dev-dependencies]
 tokio = { workspace = true }
