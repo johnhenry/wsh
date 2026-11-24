@@ -37,6 +37,7 @@ import {
   detach as detachMsg,
   sessionListRequest as sessionListRequestMsg,
   listTargets as listTargetsMsg,
+  gatewayCredit as gatewayCreditMsg,
   sessionGrant as sessionGrantMsg, sessionRevoke as sessionRevokeMsg,
   isRelayForwardable,
 } from './messages.mjs';
@@ -49,9 +50,10 @@ import { WshSession } from './session.mjs';
 import { GatewayConnections } from './gateway-client.mjs';
 import { GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from './gateway-datagram.mjs';
+import { RpcCreditLink, rpcCreditId, rpcChannelOfCredit } from './rpc-virtual.mjs';
 import { cborDecode, cborEncode } from './cbor.mjs';
 import {
-  RpcChannel, RpcError, RPC_ERROR, RPC_FEATURE, RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE,
+  RpcChannel, RpcError, RPC_ERROR, RPC_FEATURE, RPC_VIRTUAL_FEATURE, RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE,
   rpcProtocolFeature, parseRpcFeatures,
 } from './rpc.mjs';
 import {
@@ -313,6 +315,9 @@ export class WshClient {
 
   /** @type {Map<number, WshSession>} Active sessions keyed by channel ID. */
   #sessions = new Map();
+
+  /** @type {Map<number, RpcCreditLink>} The credit link of each rpc channel in virtual data mode (#191), by channel ID. */
+  #rpcLinks = new Map();
 
   /**
    * In-flight attachSession()/resumeSession() calls awaiting the Presence
@@ -657,7 +662,7 @@ export class WshClient {
     this.#sealState = null;
     this.#sessionSeal = null;
     this.#peerProof = null;
-    this.#sessions.clear();
+    this.#sessions.clear(); this.#rpcLinks.clear();
     this.#channelCounter = 0;
     this.#waiters.clear();
     this.#sessionId = null;
@@ -889,7 +894,7 @@ export class WshClient {
     if (typeof protocol !== 'string' || !RPC_PROTOCOL_NAME_RE.test(protocol)) {
       throw new RpcError(RPC_ERROR.INVALID_PARAMS, 'openSession({ type: "rpc" }) needs a protocol name', undefined, 'INVALID_PROTOCOL');
     }
-    if (!this.hasFeature(RPC_FEATURE)) {
+    if (!this.hasFeature(RPC_FEATURE) && !this.hasFeature(RPC_VIRTUAL_FEATURE)) {
       throw new RpcError(RPC_ERROR.UNSUPPORTED_PROTOCOL, `UNSUPPORTED_PROTOCOL: this host does not advertise "${RPC_FEATURE}" channels (cannot open "${protocol}")`, undefined, 'UNSUPPORTED_PROTOCOL');
     }
     if (!this.hasFeature(rpcProtocolFeature(protocol))) {
@@ -909,11 +914,32 @@ export class WshClient {
    */
   async openRpc(protocol, { timeoutMs, openTimeout = DEFAULT_OPEN_TIMEOUT } = {}) {
     this.#assertAuthenticated('openRpc');
-    const { maxMessageBytes } = parseRpcFeatures(this.#serverFeatures);
+    // The limit is the host's own: behind a relay it is what the host reported in `ReverseAccept`, not the relay's.
+    const { maxMessageBytes } = parseRpcFeatures(this.#bridgedFeatures ?? this.#serverFeatures);
+    // The mode follows what the host states: `rpc` is a data stream, `rpc-virtual` rides the control plane (#191).
+    const virtual = !this.hasFeature(RPC_FEATURE) && this.hasFeature(RPC_VIRTUAL_FEATURE);
     let channel = null;
     const session = await this.openSession({
       type: 'rpc', protocol, timeout: openTimeout,
       attach: (s) => {
+        if (virtual) {
+          const link = new RpcCreditLink({
+            sendData: (bytes) => s.write(bytes),
+            sendCredit: (n) => this.sendRelayControl(gatewayCreditMsg({ gatewayId: rpcCreditId(s.channelId), bytes: n })),
+            onViolation: () => { void channel?.close('credit-violation'); },
+          });
+          this.#rpcLinks.set(s.channelId, link);
+          channel = new RpcChannel({
+            maxMessageBytes: maxMessageBytes ?? RPC_DEFAULT_MAX_MESSAGE,
+            timeoutMs,
+            write: (bytes) => link.write(bytes),
+            close: async () => { link.close(); await s.close(); },
+            onConsumed: (n) => link.consumed(n),
+          });
+          s.onData = (bytes) => { if (link.receive(bytes.length)) channel.feed(bytes); };
+          s.onClose = (err) => { link.close(); this.#rpcLinks.delete(s.channelId); channel.handleClose(err ? 'stream-error' : 'channel-closed'); };
+          return;
+        }
         channel = new RpcChannel({
           maxMessageBytes: maxMessageBytes ?? RPC_DEFAULT_MAX_MESSAGE,
           timeoutMs,
@@ -1166,7 +1192,7 @@ export class WshClient {
       closePromises.push(session.close().catch(() => {}));
     }
     await Promise.allSettled(closePromises);
-    this.#sessions.clear();
+    this.#sessions.clear(); this.#rpcLinks.clear();
 
     // Close the transport.
     if (this.#transport) {
@@ -3332,6 +3358,12 @@ export class WshClient {
       }
     }
 
+    // Credit for an rpc channel in virtual data mode (#191) is a GatewayCredit in a number space of its own.
+    if (type === MSG.GATEWAY_CREDIT && rpcChannelOfCredit(msg.gateway_id) !== undefined) {
+      this.#rpcLinks.get(rpcChannelOfCredit(msg.gateway_id))?.grant(msg.bytes);
+      return;
+    }
+
     // Route gateway messages (0x70–0x7f) to the gateway handler.
     if (type >= 0x70 && type <= 0x7f) {
       // Connections opened through openUnix()/openEndpoint()/openTcp()/listenUnix() own their ids.
@@ -3500,7 +3532,7 @@ export class WshClient {
     for (const session of this.#sessions.values()) {
       session._handleControlMessage({ type: MSG.CLOSE });
     }
-    this.#sessions.clear();
+    this.#sessions.clear(); this.#rpcLinks.clear();
 
     try {
       this.onClose?.();

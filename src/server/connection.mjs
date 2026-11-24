@@ -19,7 +19,7 @@ import {
   MSG, serverHello, challenge, authOk, authFail, openOk, openFail, sessionData,
   exit as exitMsg, close as closeMsg, encryptedFrame as encryptedFrameMsg, pong, fileResult, fileChunk, mcpTools, mcpResult,
   presence as presenceMsg, error as errorMsg, sessionList, detachOk, detachFail, reversePeers, reverseReject,
-  targetList as targetListMsg, gatewayFail, listenFail,
+  targetList as targetListMsg, gatewayFail, listenFail, gatewayCredit,
 } from '../messages.gen.mjs';
 import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
@@ -27,7 +27,8 @@ import {
 import { FILE_CHUNK_BYTES, MAX_ATTACHMENTS } from './constants.mjs';
 import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE, TARGETS_FEATURE } from '../features.mjs';
 import { TARGET_NAME_RE } from '../host-backends.mjs';
-import { RpcChannel, RPC_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
+import { RpcChannel, RPC_FEATURE, RPC_VIRTUAL_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
+import { RpcCreditLink, rpcChannelOfCredit, rpcCreditId } from '../rpc-virtual.mjs';
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
@@ -48,7 +49,7 @@ export { SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE };
 /**
  * The features a host built from `cfg` advertises (`ServerHello.features`, minus the host-key proof).
  * Over a relay bridge (`dataStreams: false`) there are no client-opened streams, so the
- * stream-based ones (`stream-announce`, `rpc`) are not offered; a reverse host reports this
+ * `stream-announce` is not offered and rpc is stated as `rpc-virtual` (#191) instead of `rpc`; a reverse host reports this
  * list to the operator in `ReverseAccept.features`.
  */
 export function hostFeatures(cfg, { dataStreams = true } = {}) {
@@ -74,8 +75,10 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   if (cfg.e2e && !dataStreams) features.push(E2E_FEATURE, ...(cfg.e2e.signKey ? [E2E_SIGN_FEATURE] : []));
   // A sealed session (#155) needs the host's identity to sign its half, and no client-opened streams (their bytes are not frames).
   if (cfg.sealSession && cfg.hostKey && !dataStreams) features.push(SESSION_SEAL_FEATURE, ...(cfg.sealSession === 'require' ? [SESSION_SEAL_REQUIRED_FEATURE] : []));
-  if (cfg.rpc && dataStreams && cfg.rpc.protocols.size) {
-    features.push(RPC_FEATURE, ...[...cfg.rpc.protocols.keys()].map(rpcProtocolFeature), RPC_MAX_MESSAGE_PREFIX + cfg.rpc.maxMessageBytes);
+  // rpc (#85) rides a client-opened data stream; where there is none (a relay bridge, a sealed session) it rides the control
+  // plane (#191). A host states one form per connection: a peer that only knows `rpc` never opens a channel it cannot carry.
+  if (cfg.rpc && cfg.rpc.protocols.size) {
+    features.push(dataStreams ? RPC_FEATURE : RPC_VIRTUAL_FEATURE, ...[...cfg.rpc.protocols.keys()].map(rpcProtocolFeature), RPC_MAX_MESSAGE_PREFIX + cfg.rpc.maxMessageBytes);
   }
   return features;
 }
@@ -392,6 +395,11 @@ export function createConnectionFactory(cfg) {
         m = inner;
       }
       if (await handleRelay(m)) return;
+      // Credit for a virtual-mode rpc channel (#191) is a GatewayCredit in a number space of its own; it is never the gateway's.
+      if (m.type === MSG.GATEWAY_CREDIT && rpcChannelOfCredit(m.gateway_id) !== undefined) {
+        channels.get(rpcChannelOfCredit(m.gateway_id))?.credit?.(m.bytes);
+        return;
+      }
       if (gateway) {
         // What the key's capabilities allow of the gateway (#122), before the gateway's own policy is asked.
         const refusal = gatewayRefusal(m);
@@ -1119,10 +1127,11 @@ export function createConnectionFactory(cfg) {
       const rpc = cfg.rpc;
       const protocol = typeof m.command === 'string' ? m.command : '';
       const handler = rpc?.protocols.get(protocol);
-      if (!rpc || !dataStreams || !handler) {
-        const why = !rpc || !dataStreams ? 'rpc is not enabled on this server' : `protocol "${protocol}" is not supported by this server`;
+      if (!rpc || !handler) {
+        const why = !rpc ? 'rpc is not enabled on this server' : `protocol "${protocol}" is not supported by this server`;
         return send(openFail({ reason: `UNSUPPORTED_PROTOCOL: ${why}` }));
       }
+      if (!dataStreams) return openRpcVirtual(m, protocol, handler, rpc);
       const channelId = ++state.nextChannel;
       let chan = null;
       let stream = null;
@@ -1164,6 +1173,46 @@ export function createConnectionFactory(cfg) {
       pendingStreams.push(channelId);
       await send(openOk({ channelId, dataMode: 'stream', capabilities: [] }));
       log(`rpc channel ${channelId}: ${protocol}`);
+    }
+
+    // An rpc channel in virtual data mode (#191): the same CBOR sequence of JSON-RPC messages, carried as SessionData (and so
+    // inside EncryptedFrame on a sealed session) and metered by credit, because the control plane has no flow control of its own.
+    async function openRpcVirtual(m, protocol, handler, rpc) {
+      const channelId = ++state.nextChannel;
+      let chan = null;
+      const link = new RpcCreditLink({
+        sendData: (bytes) => send(sessionData({ channelId, data: bytes })),
+        sendCredit: (n) => send(gatewayCredit({ gatewayId: rpcCreditId(channelId), bytes: n })),
+        onViolation: (why) => { log(`rpc ${protocol} channel ${channelId}: ${why}; closing it`); void chan?.close('credit-violation'); },
+      });
+      chan = new RpcChannel({
+        maxMessageBytes: rpc.maxMessageBytes,
+        maxInflight: rpc.maxInflight,
+        write: (bytes) => link.write(bytes),
+        onConsumed: (n) => link.consumed(n),
+        close: async () => { link.close(); await finishChannel(channelId, 0); },
+      });
+      channels.set(channelId, {
+        kill: () => { channels.delete(channelId); link.close(); chan.handleClose('peer-closed'); },
+        input: (d) => { if (d?.length && link.receive(d.length)) chan.feed(d); },
+        credit: (n) => link.grant(n),
+      });
+      const ctx = {
+        protocol, channelId, user: state.username, fingerprint: state.fingerprint, remote,
+        features: state.features ?? [], hostFingerprint: state.hostFingerprint,
+        log: (line) => log(`rpc ${protocol} channel ${channelId}: ${line}`),
+      };
+      // Inbound messages wait until the handler (possibly async) has registered its methods; the handler starts only after
+      // OpenOk is on its way, so nothing it sends can reach a client that does not have the channel yet.
+      chan.hold();
+      await send(openOk({ channelId, dataMode: 'virtual', capabilities: [] }));
+      log(`rpc channel ${channelId}: ${protocol} (virtual)`);
+      let ready;
+      try { ready = Promise.resolve(handler(chan, ctx)); } catch (e) { ready = Promise.reject(e); }
+      ready.then(() => chan.release(), (e) => {
+        log(`rpc ${protocol} channel ${channelId}: handler failed: ${e?.message ?? e}`);
+        void chan.close('handler-error');
+      });
     }
 
     async function openPty(m, b, target) {

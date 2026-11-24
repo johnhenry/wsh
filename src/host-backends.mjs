@@ -8,6 +8,7 @@ import { normalizePty } from './server/pty.mjs';
 import { createMcpHost } from './server/mcp.mjs';
 import { normalizeEndpoints } from './server/gateway-core.mjs';
 import { DEFAULT_MAX_FILE_BYTES } from './server/constants.mjs';
+import { RPC_PROTOCOL_NAME_RE } from './rpc.mjs';
 import { generateKeyPair, resolveSigner, fingerprint, exportPublicKeySSH, importPublicKeyRaw } from './auth.mjs';
 
 /** The operations a file backend must have (`openRange` is optional: only the `wsh-fs` rpc built-in, which needs Node, reads it). */
@@ -50,6 +51,28 @@ export function normalizeFileBackend(fs, who = 'fs') {
   };
   if (fs.openRange) files.openRange = (...a) => fs.openRange(...a);
   return files;
+}
+
+/**
+ * Validate an `rpc` option into the table the connection handler reads: `{ protocols, maxMessageBytes, maxInflight }`
+ * (`createRpcHost` in `server/rpc.mjs` is this plus the Node-only built-ins). Handlers only: `wsh-host` and `wsh-fs` need Node.
+ * @param {Record<string, Function | false | null | undefined>} rpc
+ * @param {number} maxMessageBytes
+ * @param {number} maxInflight
+ * @param {string} [who] - the host's name in error messages
+ */
+export function createRpcTable(rpc, maxMessageBytes, maxInflight, who = 'createMemoryHost') {
+  if (!rpc || typeof rpc !== 'object' || Array.isArray(rpc)) throw new TypeError(`${who}: rpc must be an object of { [protocol]: handler }`);
+  if (!(maxMessageBytes >= 256)) throw new TypeError(`${who}: rpcMaxMessageBytes must be at least 256`);
+  if (!Number.isSafeInteger(maxInflight) || maxInflight < 1) throw new TypeError(`${who}: rpcMaxInflight must be a positive integer`);
+  const protocols = new Map();
+  for (const [name, handler] of Object.entries(rpc)) {
+    if (handler === undefined || handler === false || handler === null) continue;
+    if (!RPC_PROTOCOL_NAME_RE.test(name)) throw new TypeError(`${who}: rpc protocol name ${JSON.stringify(name)} is not allowed (letters, digits, ".", "_", "-")`);
+    if (typeof handler !== 'function') throw new TypeError(`${who}: rpc[${JSON.stringify(name)}] needs a handler function (channel, ctx) => void (the wsh-host / wsh-fs built-ins need Node; use @johnhenry/wsh/server)`);
+    protocols.set(name, handler);
+  }
+  return { protocols, maxMessageBytes, maxInflight };
 }
 
 /** A target's name: what a client puts in `Open.target`. */

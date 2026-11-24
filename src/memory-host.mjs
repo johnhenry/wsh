@@ -32,11 +32,11 @@ import { WshClient } from './client.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
 import { createConnectionFactory } from './server/connection.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
-import { resolveBackends, resolveHostKey } from './host-backends.mjs';
+import { resolveBackends, resolveHostKey, createRpcTable } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
 import { normalizeEndpointGateway, createEndpointGatewaySession } from './server/gateway-core.mjs';
 import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
-import { RPC_PROTOCOL_NAME_RE, RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
+import { RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
 import { validateOnShare } from './shares.mjs';
 import { validateOnRefused } from './refusal.mjs';
@@ -105,21 +105,6 @@ export function createSocketPair() {
   return [a, b];
 }
 
-/** Validate the `rpc` option into the table the connection handler reads (`createRpcHost` in `server/rpc.mjs` minus the Node-only built-ins). */
-function createRpcTable(rpc, maxMessageBytes, maxInflight) {
-  if (typeof rpc !== 'object' || Array.isArray(rpc)) throw new TypeError('createMemoryHost: rpc must be an object of { [protocol]: handler }');
-  if (!(maxMessageBytes >= 256)) throw new TypeError('createMemoryHost: rpcMaxMessageBytes must be at least 256');
-  if (!Number.isSafeInteger(maxInflight) || maxInflight < 1) throw new TypeError('createMemoryHost: rpcMaxInflight must be a positive integer');
-  const protocols = new Map();
-  for (const [name, handler] of Object.entries(rpc)) {
-    if (handler === undefined || handler === false || handler === null) continue;
-    if (!RPC_PROTOCOL_NAME_RE.test(name)) throw new TypeError(`createMemoryHost: rpc protocol name ${JSON.stringify(name)} is not allowed (letters, digits, ".", "_", "-")`);
-    if (typeof handler !== 'function') throw new TypeError(`createMemoryHost: rpc[${JSON.stringify(name)}] needs a handler function (channel, ctx) => void (the wsh-host / wsh-fs built-ins need Node; use @johnhenry/wsh/server)`);
-    protocols.set(name, handler);
-  }
-  return { protocols, maxMessageBytes, maxInflight };
-}
-
 function createRegistry(sessions, log) {
   const o = sessions === true ? {} : sessions;
   if (typeof o !== 'object' || Array.isArray(o)) throw new TypeError('createMemoryHost: sessions must be true or { detachTtlMs, maxDetached, ringBytes }');
@@ -153,7 +138,7 @@ function createRegistry(sessions, log) {
  *   `{ publicKey, sign(data) }`, or `true` for a fresh non-extractable key.
  * @param {boolean} [options.dataStreams=true] - Offer client-opened QMux data streams for exec output (`stream-announce`,
  *   rpc). Set `false` for a peer that cannot open them -- the released Rust client over WebSocket -- so exec output rides
- *   `SessionData` instead (and `rpc` is not offered). The released clients state nothing in their `Hello` that a host could
+ *   `SessionData` instead (and rpc is stated as `rpc-virtual`, #191). The released clients state nothing in their `Hello` that a host could
  *   key an automatic choice on, so this is an option; `accept(socket, { dataStreams })` overrides it per connection.
  * @param {{ tools?: object[] | object, client?: object, authorize?: Function, maxConcurrent?: number, timeoutMs?: number }} [options.mcp]
  * @param {Record<string, Function>} [options.extensions] - Handlers for application-defined messages, as for `createWshServer`.
@@ -211,7 +196,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   }
   if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createMemoryHost: extensions must be an object of handlers');
   if (typeof dataStreams !== 'boolean') throw new TypeError('createMemoryHost: dataStreams must be true or false');
-  const rpcHost = rpc === undefined || rpc === null ? null : createRpcTable(rpc, rpcMaxMessageBytes, rpcMaxInflight);
+  const rpcHost = rpc === undefined || rpc === null ? null : createRpcTable(rpc, rpcMaxMessageBytes, rpcMaxInflight, 'createMemoryHost');
   const registry = sessions === undefined || sessions === null || sessions === false ? null : createRegistry(sessions, onLog);
   const { execRunner, execOptions, pty: ptyBackend, files, mcp: mcpHost, targets: targetTable, requireTarget: mustHaveTarget } = resolveBackends({ exec, pty, fs, mcp, targets, requireTarget });
   const hostKeyReady = hostKey === undefined || hostKey === null || hostKey === false ? Promise.resolve(null) : resolveHostKey(hostKey, 'createMemoryHost: hostKey');

@@ -755,7 +755,8 @@ export class WshSession {
           break;
         }
         if (msg.data && msg.data.byteLength > 0) {
-          this.#virtualBackend?.pushData(msg.data);
+          // An rpc channel is read through `onData` only (its credit window bounds what is in flight): nothing is queued for read().
+          if (this.kind !== 'rpc') this.#virtualBackend?.pushData(msg.data);
           try {
             this.#seq += msg.data.byteLength;
             this.onData?.(msg.data);

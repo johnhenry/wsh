@@ -1453,6 +1453,15 @@ messages:
         it in ServerHello.features; otherwise neither sends it and GatewayData
         is unmetered as before (the host then bounds its buffering with
         byte caps instead and closes a connection that exceeds them).
+
+        The same message meters an rpc channel in virtual data mode (feature
+        "rpc-virtual": the channel's CBOR sequence rides SessionData, and
+        EncryptedFrame on a sealed session). Its credit has a number space of
+        its own: `gateway_id` is 0x80000000 OR the rpc channel's channel_id,
+        a flag no gateway id carries. Each direction starts with 262144 bytes
+        and is topped up as the receiver takes the bytes in; a peer that sends
+        more than it was granted has the channel closed. It is sent only on a
+        connection where the host stated "rpc-virtual".
       fields:
         gateway_id:
           type: u32

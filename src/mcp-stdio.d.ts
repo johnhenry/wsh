@@ -28,6 +28,8 @@ export interface McpStdioBridgeOptions {
   channel?: string;
   /** Pin the host: a hex fingerprint, a raw key or an `ssh-ed25519` line. */
   expectHostKey?: string | Uint8Array;
+  /** `true` seals the whole session end to end and refuses a host that cannot (key login only); the `--sealed` flag. Default: the client's `'auto'`. */
+  sealSession?: boolean | 'auto';
   /** After a lost connection: attempts (default 5), first delay in ms (500, doubling) and the longest delay (10000); `false` to exit instead. */
   reconnect?: false | { attempts?: number; delayMs?: number; maxDelayMs?: number };
   /** To log in and to open the channel, ms. Default 15000. */

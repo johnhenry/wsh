@@ -21,7 +21,8 @@ import { MULTI_OPERATOR_FEATURE } from './server/relay.mjs';
 import { E2E_SIGN_FEATURE, E2EResponder } from './e2e-exchange.mjs';
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyOperatorProof } from './operator-proof.mjs';
 import { SealedBridge, BRIDGE_CHANNEL_ID } from './bridge-seal.mjs';
-import { resolveBackends } from './host-backends.mjs';
+import { resolveBackends, createRpcTable } from './host-backends.mjs';
+import { RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { createConnectionFactory, hostFeatures } from './server/connection.mjs';
 import { validateOnShare } from './shares.mjs';
 import { refusalNotifier, validateOnRefused } from './refusal.mjs';
@@ -40,6 +41,12 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {object} [options.pty]
  * @param {object} [options.fs]
  * @param {object} [options.mcp]
+ * @param {Record<string, Function | false | null>} [options.rpc] - Typed rpc channels (wsh #85, #191): `{ [protocol]: (channel, ctx) => void }`,
+ *   served to the bridged operator in virtual data mode (the CBOR sequence rides `SessionData`, inside `EncryptedFrame` when the
+ *   bridge is sealed), advertised as `rpc-virtual`, `rpc-protocol:<name>` and `rpc-max-message:<n>` in `ReverseAccept.features`
+ *   (so it needs `reportFeatures`, the default). `@johnhenry/wsh/server`'s also takes the `wsh-host` and `wsh-fs` built-ins.
+ * @param {number} [options.rpcMaxMessageBytes=1048576]
+ * @param {number} [options.rpcMaxInflight=64]
  * @param {boolean} [options.reconnect=true] - Dial again (with backoff) after the relay connection ends. A relay ends it when a bridge does.
  * @param {object} [options.connect] - Extra options for the relay connection (`expectHostKey`, `knownHosts`, ...).
  * @param {string} [options.peerType='host']
@@ -78,7 +85,9 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost(options = {}) {
-  return createReverseHostWith(options, resolveBackends(options));
+  const rpc = options.rpc === undefined || options.rpc === null ? null
+    : createRpcTable(options.rpc, options.rpcMaxMessageBytes ?? RPC_DEFAULT_MAX_MESSAGE, options.rpcMaxInflight ?? 64, 'createReverseHost');
+  return createReverseHostWith(options, { ...resolveBackends(options), rpc });
 }
 
 /**
@@ -98,6 +107,7 @@ export function createReverseHostWith({
   if (requireOperatorProof && e2e === false) throw new TypeError('createReverseHost: requireOperatorProof seals the bridge, which needs e2e (do not set e2e: false)');
   if (requireOperatorProof && !reportFeatures) throw new TypeError('createReverseHost: requireOperatorProof needs reportFeatures (the operator learns "e2e-sealed" from ReverseAccept.features)');
   if (backends.targets) throw new TypeError('createReverseHost: targets are not supported by a reverse host (a bridged operator reaches the one machine behind it); use createWshServer or createMemoryHost');
+  if (backends.rpc?.protocols.size && !reportFeatures) throw new TypeError('createReverseHost: rpc needs reportFeatures (the operator learns "rpc-virtual" and the protocols from ReverseAccept.features)');
   if (!url) throw new TypeError('createReverseHost: url is required');
   if (!username) throw new TypeError('createReverseHost: username is required');
   if (!keyPair) throw new TypeError('createReverseHost: keyPair is required (the relay keys peers by fingerprint)');
@@ -121,12 +131,12 @@ export function createReverseHostWith({
   });
   /** Features for `ReverseAccept` on this relay connection. */
   const bridgeFeatures = (c, e2eConfig, manyOperators) => [
-    ...hostFeatures({ mcp: backends.mcp, files: backends.files, e2e: e2eConfig, onShare }, { dataStreams: false }),
+    ...hostFeatures({ mcp: backends.mcp, files: backends.files, e2e: e2eConfig, onShare, rpc: backends.rpc ?? null }, { dataStreams: false }),
     ...(manyOperators ? [MULTI_OPERATOR_FEATURE] : []),
   ];
   const factory = createConnectionFactory({
     authorize: async () => false, methods: { pubkey: false, password: null }, hostKey: null, rateLimit: null,
-    execRunner: backends.execRunner, execOptions: backends.execOptions, pty: backends.pty, files: backends.files, mcp: backends.mcp,
+    execRunner: backends.execRunner, execOptions: backends.execOptions, pty: backends.pty, files: backends.files, mcp: backends.mcp, rpc: backends.rpc ?? null,
     sessions: null, relay: null, e2e: null, bindTimeoutMs: 3000, log: (l) => onLog(`[reverse] ${l}`), onShare,
   });
 

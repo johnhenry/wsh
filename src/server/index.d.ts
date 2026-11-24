@@ -663,6 +663,10 @@ export interface WshReverseHostOptions {
   pty?: WshServerPtyOptions;
   fs?: WshServerFsOptions;
   mcp?: WshServerMcpOptions;
+  /** Typed rpc channels (#191), as for `createWshServer` (the `wsh-host` and `wsh-fs` built-ins included), served to the bridged operator in virtual data mode and stated as `rpc-virtual` in `ReverseAccept.features` (so it needs `reportFeatures`). */
+  rpc?: Record<string, true | WshServerFsOptions | WshRpcHandler | false | null | undefined>;
+  rpcMaxMessageBytes?: number;
+  rpcMaxInflight?: number;
   /** Dial again, with backoff, after the relay connection ends -- which a relay does when a bridge does (default true). */
   reconnect?: boolean;
   /** Extra options for the relay connection (`expectHostKey`, `knownHosts`, `trustOnFirstUse`, ...). */
