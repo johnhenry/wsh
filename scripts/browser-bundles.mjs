@@ -27,6 +27,7 @@ export const ENTRY_POINTS = [
   { name: './host', entry: 'src/host.mjs' },
   { name: './reverse', entry: 'src/reverse-host.mjs' },
   { name: './pipe-relay', entry: 'src/pipe-relay.mjs' },
+  { name: './testing', entry: 'src/testing.mjs' },
   { name: '. (generateKeyPair only)', contents: "import { generateKeyPair } from './src/index.mjs'; globalThis.x = generateKeyPair;" },
   { name: '. (WshClient only)', contents: "import { WshClient } from './src/index.mjs'; globalThis.x = WshClient;" },
   { name: './host (createConnectionFactory only)', contents: "import { createConnectionFactory } from './src/host.mjs'; globalThis.x = createConnectionFactory;" },

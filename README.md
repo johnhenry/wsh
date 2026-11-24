@@ -617,6 +617,7 @@ bundler drop what you do not use.
 | `@johnhenry/wsh/memory` | `createMemoryHost()`, a host in this realm (above) |
 | `@johnhenry/wsh/host` | the pieces under it, for your own transport: `createConnectionFactory(config)` -- the connection handler `createWshServer`, `createMemoryHost` and `createReverseHost` all run -- plus `bindSocket(socket, ready, { dataStreams })`, `resolveBackends()`, `resolveHostKey()`, `buildAuthorizer()` and `authMethods()`. It does not import the client |
 | `@johnhenry/wsh/reverse` | `createReverseHost()` for a page or Worker: dial out to a relay and serve the operator it bridges. The same function `@johnhenry/wsh/server` exports, minus `exec: true` and `fs: { root }` |
+| `@johnhenry/wsh/testing` | the QMux record and frame codec (`encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, the varint and the other frame encoders), for a test that reads, alters and re-wraps what travels on a connection. **Experimental: not part of the stable API**; it may change or disappear in any release |
 | `@johnhenry/wsh/server` | Node only |
 
 ```js
@@ -645,6 +646,7 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/host` (whole entry point) | 123.7 kB | 40.7 kB |
 | `@johnhenry/wsh/reverse` (whole entry point) | 215.5 kB | 66.3 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
+| `@johnhenry/wsh/testing` (whole entry point) | 7.9 kB | 2.6 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 133.2 kB | 39.7 kB |
 | `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 100.5 kB | 32.8 kB |

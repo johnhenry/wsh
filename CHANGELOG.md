@@ -71,6 +71,15 @@ and a frame that does not open on a sealed *session* still ends it through `onEr
 - Tests: `test/pipe-relay-paired.test.mjs` (the frame, its order against early bytes, a host that did not ask, the operator asking, `accept()` directly, `watchPairing` over a real socket, a login through it), the module-graph
   and bundle tests in `test/pipe-relay.test.mjs` and `test/browser-bundle.test.mjs`. Putting the literal `import('./pipe-relay-node.mjs')` back made the bundle tests fail.
 
+### `@johnhenry/wsh/testing`: the QMux codec primitives, for tests (additive; JS)
+
+A new entry point exports the QMux record and frame codec a test needs to read, change and re-wrap what travels on a connection: `encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, `encodeVarint` / `decodeVarint`, the other frame
+encoders, `FRAME_TYPE`, `QMUX_ERROR_CODE`, `QMuxProtocolError`. **It is marked as not part of the stable API** (the module header, `@experimental` in the types, `QMUX_TESTING_API.stable === false`, the README): it may change or
+disappear in any release and is outside the compatibility policy. The stable entry point (`@johnhenry/wsh`) is unchanged and still does not export them. It is pure JavaScript and is bundled for the browser like the other entries (`npm run size` lists it).
+
+- **Wire: none. A released peer:** not applicable; it re-exports functions the package already contains.
+- Tests: `test/testing-entry.test.mjs` (the exports, that the main entry does not have them, the not-stable markers, a record split across feeds, a frame re-wrapped around altered bytes and an unaltered one re-encoding to the same bytes).
+
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
 An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside
