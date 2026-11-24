@@ -644,6 +644,7 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/memory` (whole entry point) | 226.9 kB | 70.6 kB |
 | `@johnhenry/wsh/host` (whole entry point) | 123.7 kB | 40.7 kB |
 | `@johnhenry/wsh/reverse` (whole entry point) | 215.5 kB | 66.3 kB |
+| `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 133.2 kB | 39.7 kB |
 | `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 100.5 kB | 32.8 kB |
@@ -1067,6 +1068,27 @@ await client.connect(pipeUrl('wss://relay.example', id), { username, keyPair, ex
 ```
 
 The module imports nothing that can execute code or read files (a test walks its module graph); it does not parse wsh.
+**Browser and Node halves.** `@johnhenry/wsh/pipe-relay` itself is browser-safe -- `pipeUrl`, `newRendezvousId`, `watchPairing` and a relay's
+`accept()` over sockets you hold bundle for a page (the bundle test covers it, next to `./memory`). `listen()` (an HTTP server through the optional
+`ws` package) is a second module, `pipe-relay-node.mjs`, loaded when you call it, so a bundler never follows it. `createPipeRelay().listen()` works as it did.
+
+**Knowing a host was paired.** A host that has dialled and is waiting cannot otherwise tell when its operator arrived. Dial with
+`pipeUrl(relay, id, 'host', { notifyPaired: true })` (`?role=host&paired=1`; with your own HTTP server, `relay.accept(socket, { id, role: 'host', notifyPaired: true })`),
+wrap the socket, and await the promise:
+
+```js
+const ws = new WebSocket(pipeUrl('wss://relay.example', id, 'host', { notifyPaired: true }));
+await new Promise((r) => ws.addEventListener('open', r, { once: true }));
+const { socket, paired } = watchPairing(ws);                   // before anything else is attached
+await server.accept(socket);                                   // the wsh host never sees the signal frame
+await paired;                                                  // the operator is here (rejects if the socket closes first)
+```
+
+The relay sends the host ONE text frame, `wsh-pipe/1 paired`, when the operator arrives and before anything the operator said; everything else on a pipe is
+binary, so it cannot be mistaken for wsh bytes. It is opt-in per host and costs nothing otherwise: a relay older than this ignores `paired=1` and never sends it (then
+`paired` never settles and the connection works as before, so bound the wait with your own timer if you need to know), and a host that did not ask is sent nothing.
+It tells the host the operator is there, not who it is: the handshake still decides that.
+
 Bounds, all with defaults: `maxWaiting`, `rendezvousTimeoutMs`, `idleTimeoutMs`, `maxLifetimeMs`, `maxBytes`,
 `maxMessageBytes`, `earlyBytes`, `highWaterBytes` (a receiver that is not draining pauses the sender; a socket that
 cannot pause is closed). **Trust difference:** relay mode has the relay vouch for the operator; a pipe relay vouches
