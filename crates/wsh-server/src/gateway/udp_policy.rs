@@ -127,8 +127,15 @@ mod tests {
     #[test]
     fn a_bucket_allows_its_burst_then_refuses_and_a_zero_rate_never_refuses() {
         let b = TokenBucket::new(40, 16.0); // burst max(10, 16) = 16
+        let started = Instant::now();
         let admitted = (0..100).filter(|_| b.take(1)).count();
-        assert!((16..=17).contains(&admitted), "{admitted}");
+        // Never more than the burst plus what the refill can have added over the time the loop took
+        // (a loaded machine can stall the loop), and at least the burst.
+        let most = 16.0 + 40.0 * started.elapsed().as_secs_f64();
+        assert!(
+            admitted >= 16 && (admitted as f64) <= most + 1.0,
+            "{admitted} admitted, at most {most}"
+        );
         let unlimited = TokenBucket::new(0, 16.0);
         assert!((0..10_000).all(|_| unlimited.take(1_000_000)));
     }

@@ -112,23 +112,62 @@ describe('Rust wsh-server: UDP flows are bounded as on the Node host (#145)', ()
     await until(async () => { try { (await client.openUdp('127.0.0.1', port)); return true; } catch { return false; } }, 'a slot frees when a flow closes');
   });
 
+  // What a token bucket guarantees whatever the scheduling: over T seconds since it was made it admits at most burst + rate * T
+  // datagrams. An echoed datagram costs two (the one sent and the one that comes back), so received * 2 <= burst + rate * T.
+  // These tests assert that ceiling, computed from the measured wall time, and NOT a floor: a fast sender drains the whole burst
+  // with its own datagrams before any answer is back, so an exact or minimum count depends on how slow the machine is (CI saw 0).
+  // That the limit lets traffic through at all is asserted by a sender paced well inside the rate, which never runs dry.
+  const ceiling = (burst, rate, startedAt) => (burst + rate * ((Date.now() - startedAt) / 1000)) / 2 + 1;
+
+  /** `count` datagrams of 50 bytes, one every `everyMs`, and how many are echoed back. */
+  async function paced(flow, count, everyMs) {
+    const w = flow.writable.getWriter(); const r = flow.readable.getReader();
+    let received = 0;
+    const pump = (async () => { for (;;) { const { done } = await r.read(); if (done) return; received += 1; } })().catch(() => {});
+    for (let i = 0; i < count; i++) { await w.write(new Uint8Array(50).fill(9)); await sleep(everyMs); }
+    await until(() => received >= count, `${count} echoes`, 5000).catch(() => {});
+    flow.destroy();
+    await Promise.race([pump, sleep(200)]);
+    return received;
+  }
+
   it('rate-limits a flow: a burst beyond udp_packets_per_second_per_flow is dropped, not queued', async () => {
     const port = await echoServer();
+    const t0 = Date.now();
     const { client } = await setup(port, 'udp_packets_per_second_per_flow = 20\n');
     const flow = await client.openUdp('127.0.0.1', port);
     const { received } = await blast(flow, 200, 50, 1000);
-    // burst max(20/4, 16) = 16 tokens, both directions drawing on the same bucket: well under 200, well over 0
-    assert.ok(received >= 1 && received <= 40, `${received} echoed of 200`);
+    // burst max(20/4, 16) = 16 tokens, both directions drawing on the same bucket
+    assert.ok(received <= ceiling(16, 20, t0), `${received} echoed of 200, at most ${ceiling(16, 20, t0)} allowed`);
+  });
+
+  it('a flow sending inside udp_packets_per_second_per_flow is not limited', async () => {
+    const port = await echoServer();
+    const { client } = await setup(port, 'udp_packets_per_second_per_flow = 20\n');
+    const flow = await client.openUdp('127.0.0.1', port);
+    // 10 datagrams, 2 tokens each: 20 tokens in about a second against a burst of 16 and a refill of 20 a second, so never dry
+    assert.equal(await paced(flow, 10, 100), 10);
   });
 
   it('rate-limits a client over all its flows: udp_packets_per_second_per_client', async () => {
     const port = await echoServer();
+    const t0 = Date.now();
     const { client } = await setup(port, 'udp_packets_per_second_per_client = 20\n');
     const a = await client.openUdp('127.0.0.1', port);
     const b = await client.openUdp('127.0.0.1', port);
     const [ra, rb] = await Promise.all([blast(a, 100, 50, 1000), blast(b, 100, 50, 1000)]);
-    // burst max(5, 32) = 32 tokens shared by both flows and both directions: far fewer than the 200 sent
-    assert.ok(ra.received + rb.received >= 1 && ra.received + rb.received <= 60, `${ra.received + rb.received} echoed of 200`);
+    // burst max(5, 32) = 32 tokens shared by both flows and both directions
+    assert.ok(ra.received + rb.received <= ceiling(32, 20, t0), `${ra.received + rb.received} echoed of 200, at most ${ceiling(32, 20, t0)} allowed`);
+  });
+
+  it('two flows paced inside udp_packets_per_second_per_client together are not limited', async () => {
+    const port = await echoServer();
+    const { client } = await setup(port, 'udp_packets_per_second_per_client = 20\n');
+    const a = await client.openUdp('127.0.0.1', port);
+    const b = await client.openUdp('127.0.0.1', port);
+    // 2 x 6 datagrams, 2 tokens each: 24 tokens against a burst of 32, whatever the refill: never dry
+    const [ra, rb] = await Promise.all([paced(a, 6, 100), paced(b, 6, 100)]);
+    assert.equal(ra + rb, 12);
   });
 
   it('bounds the payload bytes per second per client (the amplification bound): small queries, big answers', async () => {
@@ -137,6 +176,7 @@ describe('Rust wsh-server: UDP flows are bounded as on the Node host (#145)', ()
     await new Promise((r) => amp.bind(0, '127.0.0.1', r));
     amp.on('message', (_m, ri) => amp.send(Buffer.alloc(8000, 7), ri.port, ri.address));
     const port = amp.address().port;
+    const t0 = Date.now();
     const { client } = await setup(port, 'udp_bytes_per_second_per_client = 40000\nudp_packets_per_second_per_client = 0\nudp_packets_per_second_per_flow = 0\n');
     const flow = await client.openUdp('127.0.0.1', port);
     const w = flow.writable.getWriter(); const r = flow.readable.getReader();
@@ -145,8 +185,11 @@ describe('Rust wsh-server: UDP flows are bounded as on the Node host (#145)', ()
     for (let i = 0; i < 40; i++) { await w.write(new Uint8Array(10)); await sleep(25); }
     await sleep(500);
     flow.destroy(); await Promise.race([pump, sleep(200)]);
-    // the burst is max(10000, 65536) bytes, then 40000 a second for about a second and a half: about 125 kB of the 320 kB offered
-    assert.ok(bytes >= 8000 && bytes <= 200_000, `${bytes} bytes of 320000 offered reached the client`);
+    // The burst is max(10000, 65536) bytes and the refill 40000 a second; the 10-byte queries draw on the same bucket. Whatever
+    // the scheduling, no more than burst + rate * T bytes can have been admitted over T seconds; and the first answer, which
+    // finds the burst full, always passes.
+    const allowed = 65536 + 40000 * ((Date.now() - t0) / 1000);
+    assert.ok(bytes >= 8000 && bytes <= allowed, `${bytes} bytes of 320000 offered reached the client, at most ${allowed} allowed`);
   });
 
   it('zero means no limit: nothing is dropped', async () => {
