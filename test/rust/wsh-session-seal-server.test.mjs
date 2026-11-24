@@ -182,11 +182,12 @@ describe('seal_session = "offer"', () => {
     assert.ok(Buffer.concat(got).equals(payload));
   });
 
-  it('typed rpc channels are not offered while sealing is (their data streams are not frames), and a plain client sees no rpc feature', async () => {
+  it('typed rpc channels are offered in virtual data mode while sealing is (#191): `rpc-virtual`, never `rpc` (test/rust/wsh-rpc-virtual.test.mjs drives them)', async () => {
     const s = await startServer({ seal: 'offer' });
     const c = await login(s, undefined, { sealSession: false });
-    assert.ok(![...c.serverFeatures].some((f) => f.startsWith('rpc')), c.serverFeatures.join(','));
-    assert.match(s.logs(), /typed rpc channels .* are not offered/);
+    assert.ok(c.serverFeatures.includes('rpc-virtual'), c.serverFeatures.join(','));
+    assert.ok(!c.serverFeatures.includes('rpc'), 'a client that only knows stream-mode rpc is never offered one it cannot carry');
+    assert.doesNotMatch(s.logs(), /typed rpc channels .* are not offered/);
   });
 
   it('a flipped bit in a frame toward the server closes the session; nothing is delivered', async () => {

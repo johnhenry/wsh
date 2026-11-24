@@ -14,6 +14,8 @@
 //!   JSON-RPC error (-32603, the client may retry) and holds what the client sends meanwhile (at most
 //!   200 messages; a request past that is answered with an error);
 //! - a host that offers no such channel is a clear error that lists the channels it does offer;
+//! - it follows what the host states: stream-mode rpc (`rpc`), or rpc in virtual data mode (`rpc-virtual`, wsh #191),
+//!   which is what a sealed session (`--sealed`) and a host behind a pipe relay (`--via`) carry;
 //! - exit status: 0 the client closed its side, 1 the host was lost for good, 2 it could not start.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -242,7 +244,7 @@ async fn open(opts: &Options, resolved: &ResolvedTarget) -> Result<Conn, Failure
     if !offer.serves(&opts.channel) {
         let url = redact(&resolved.url);
         let _ = client.disconnect().await;
-        let offered = if offer.enabled && !offer.protocols.is_empty() {
+        let offered = if offer.offered() && !offer.protocols.is_empty() {
             format!(" (it offers: {})", offer.protocols.join(", "))
         } else {
             " (it offers no rpc channels)".to_string()

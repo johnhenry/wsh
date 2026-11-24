@@ -26,6 +26,8 @@ pub enum Input {
     Reset,
     /// The peer closed the channel (a `Close` control message).
     Kill,
+    /// A channel in virtual data mode (wsh #191): the peer sent more than the credit it was given.
+    Violation,
 }
 
 /// Why [`run`] returned.
@@ -320,8 +322,25 @@ impl Engine {
 pub async fn run(
     cfg: ChannelConfig,
     protocol: Arc<Protocol>,
+    input: mpsc::UnboundedReceiver<Input>,
+    out: mpsc::Sender<Vec<u8>>,
+) -> Ended {
+    run_metered(cfg, protocol, input, out, None).await
+}
+
+/// Called with the number of received bytes the channel has taken in and dispatched, so a metered transport (an rpc
+/// channel in virtual data mode) can hand the peer credit for them.
+pub type Consumed = Box<dyn Fn(usize) + Send + Sync>;
+
+/// [`run`] for a transport that meters its bytes: `consumed` is told, after each `Input::Data` has been decoded and its
+/// messages dispatched, how many bytes that was. Dispatching waits for room to answer (`out` is bounded), so a peer that
+/// does not read what it is sent gets no credit back, and so cannot make this end read any more.
+pub async fn run_metered(
+    cfg: ChannelConfig,
+    protocol: Arc<Protocol>,
     mut input: mpsc::UnboundedReceiver<Input>,
     out: mpsc::Sender<Vec<u8>>,
+    consumed: Option<Consumed>,
 ) -> Ended {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel();
     let mut engine = Engine {
@@ -340,10 +359,14 @@ pub async fn run(
                 Some(Input::Kill) => break Ended::PeerKilled,
                 Some(Input::Reset) => break Ended::StreamReset,
                 Some(Input::End) => break Ended::StreamEnd,
+                Some(Input::Violation) => break Ended::HostClosed("credit-violation".to_string()),
                 Some(Input::Data(bytes)) => match decoder.feed(&bytes) {
                     Ok(items) => {
                         for item in items {
                             engine.dispatch(item).await;
+                        }
+                        if let Some(consumed) = &consumed {
+                            consumed(bytes.len());
                         }
                     }
                     Err(e) => {

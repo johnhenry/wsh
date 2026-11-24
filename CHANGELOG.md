@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### rpc channels in virtual data mode, Rust: `wsh mcp --sealed` / `--via` and `wsh-server` with `seal_session` on (#191; Rust)
+
+The Rust halves of the JS change below. **No new wire format**: the feature string `rpc-virtual`, `OpenOk { data_mode: "virtual" }`, `SessionData` and the flagged
+`GatewayCredit` (`gateway_id = 0x80000000 | channel_id`, 262144 bytes per direction) are exactly what the JS side states.
+
+- **Client.** `wsh-client`'s `RpcOffer` reads `rpc-virtual`; `WshClient::open_rpc` chooses the form from what the host states (nothing for callers to change) and the channel
+  keeps credit as the JS `RpcCreditLink` does: a slow reader bounds the sender, an overrun closes the channel, the message cap is enforced from the CBOR header. The
+  refusals of `wsh mcp --sealed` and of rpc on a sealed session are gone: `wsh mcp --sealed` and `wsh --via <pipe relay> mcp` work against a JS host (a page host, a
+  reverse host). The shared accounting is `wsh_core::rpc_credit`.
+- **Server.** With `[server] seal_session = "offer" | "require"` the typed rpc channels (`wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set) are offered, stated
+  `rpc-virtual` instead of `rpc`, riding `SessionData` (inside the seal on a sealed session) with the same credit accounting, and with the per-key capability checks of
+  stream-mode rpc applied identically (`rpc:NAME`, `fs:read` / `fs:write`, file transfer: one code path). The start-up message that withheld rpc is gone. **With
+  `seal_session` off (the default) rpc is stream-mode and unchanged.** Under `offer`, a client that does not seal also gets `rpc-virtual` (plain `SessionData`).
+- **A released peer.** A released JS (0.45.0) or Rust (`rust-v0.16.0`) client looks for `rpc`, which a sealing server does not state: it refuses with
+  `UNSUPPORTED_PROTOCOL` before sending anything (before this change such a server offered no rpc at all, so nothing that worked stops working). A released host never
+  states `rpc-virtual`, so the new client uses streams there. Not covered: WebTransport (never sealed on `wsh-server`; it offers no rpc, as before).
+
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
 An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside
@@ -20,7 +37,7 @@ An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence o
 - **A released peer.** A released JS client (0.45.0) opens rpc only when the host states `rpc`; a virtual-mode host does not, so it refuses with `UNSUPPORTED_PROTOCOL`
   before sending anything. A released host never states `rpc-virtual`, so this client opens stream-mode rpc there, unchanged; a host with data streams states exactly what
   it did before. A released Rust client (`rust-v0.16.0`) likewise looks for `rpc` and refuses. A released relay (JS or Rust) forwards `SessionData` and `GatewayCredit`
-  as it always has. `wsh-server` does not offer virtual-mode rpc yet, and the Rust `wsh mcp` does not speak it yet (`--sealed` against it is still refused).
+  as it always has. The Rust halves follow in the entry above.
 
 ## 0.45.0 / Rust `rust-v0.16.0`
 
