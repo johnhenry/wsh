@@ -1322,6 +1322,12 @@ client.onHostKey = (hk) => confirm(`Trust ${hk.fingerprint}?`);   // or per call
   a `code` (`HOST_KEY_MISSING | _INVALID | _MISMATCH | _UNKNOWN | _REJECTED`),
   thrown **before any credential -- signature or password -- is sent**.
 - `WshClient.exec()` and `connectReverse()` accept the same options.
+- **A refused login is a `WshAuthError`, a failed connection a `WshConnectionError`** (both `Error`s, with the same message as ever). `WshAuthError` has
+  `code` (`AUTH_UNAUTHORIZED | _BAD_SIGNATURE | _METHOD_DISABLED | _RATE_LIMITED | _KEY_EXPIRED | _BINDING_REQUIRED | _NOT_SEALED | _BAD_REQUEST`, else
+  `AUTH_FAILED`), `reason` (what the host said) and `refusal`, the reason the host reported to its own `onRefused`. The wire carries only the host's
+  words, so `refusal` is recognised from the wording of the Node host and the Rust `wsh-server` (a test keeps the table in step with the Node host's
+  `onRefused` codes); a host that words it otherwise gives `AUTH_FAILED` and `refusal: null`, with the text in `reason`. `WshConnectionError` has `code`
+  `CONNECTION_FAILED` (no transport opened; `attempts` lists each) or `HANDSHAKE_TIMEOUT`.
 - `WshKnownHosts` defaults to `localStorage`, which in Node is not a persistent file store: for a real TOFU file pass `new WshKnownHosts({ storage })` with a `getItem`/`setItem`/`removeItem` object you back with a file.
 - Wire shape: the spec's `ServerHello.host_fingerprint` is populated, and
   because a bare fingerprint proves nothing (anyone can repeat it) the key and

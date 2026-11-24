@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Typed errors for a refused login and a failed connection (additive; JS client)
+
+`connect()` now rejects a refused login with `WshAuthError` and a failed connection with `WshConnectionError`, the way a host-key mismatch is a `HostKeyError`. **Both are `Error`s and the
+messages are unchanged** (`Authentication failed: key not authorized`, `Connection failed across transports (...)`, `Auth handshake timed out ...`), so code that matches the text keeps working.
+
+- `WshAuthError`: `code` (`AUTH_UNAUTHORIZED`, `AUTH_BAD_SIGNATURE`, `AUTH_METHOD_DISABLED`, `AUTH_RATE_LIMITED`, `AUTH_KEY_EXPIRED`, `AUTH_BINDING_REQUIRED`, `AUTH_NOT_SEALED`, `AUTH_BAD_REQUEST`, or `AUTH_FAILED`),
+  `reason` (the host's words, verbatim) and `refusal` (the reason the host reports to its own `onRefused`, or `null`). `WshConnectionError`: `code` `CONNECTION_FAILED` (with `attempts`) or `HANDSHAKE_TIMEOUT`.
+  Also exported: `WSH_ERROR_CODES`, `classifyAuthRefusal(reason)`.
+- **Wire: none.** The `AuthFail` message carries only the host's text, so the client recognises the reasons of the Node host and the Rust `wsh-server` from their wording; a test runs each refusal
+  against a host and checks the client's `refusal` equals what the host reported to `onRefused`. A host that words a refusal differently gives `AUTH_FAILED`, `refusal: null`, and the text in `reason`.
+  Carrying the code on the wire would be a new optional field behind a feature string (a released Rust peer rejects unknown fields); it is not done here.
+- **A released peer:** a released host is unchanged and is what the client reads; a released client is unaffected by a newer host.
+- Tests: `test/client-errors.test.mjs` (each refusal against a memory host with `onRefused`, rate limiting, a real WebSocket, the classification table, an unanswered handshake, no listener).
+  One pattern was removed once to see the tests fail.
+
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
 An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside

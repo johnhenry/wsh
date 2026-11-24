@@ -60,6 +60,10 @@ import {
   HostKeyError, newHostKeyNonce, hostKeyProofMessage, findHostKeyAdvert,
   HOST_KEY_NONCE_PREFIX,
 } from './host-key.mjs';
+import { WshAuthError, WshConnectionError } from './errors.mjs';
+
+/** The error of a login step the host did not answer in time (same message as ever, now with a code). */
+const handshakeTimeout = (message) => new WshConnectionError('HANDSHAKE_TIMEOUT', message);
 import { verify as verifySignature, exportPublicKeySSH, parseSSHPublicKey, extractRawFromSSHWire } from './auth.mjs';
 
 // ── Client states ─────────────────────────────────────────────────────
@@ -688,11 +692,11 @@ export class WshClient {
       const firstResponse = await this.#waitForMessage(
         [MSG.SERVER_HELLO, MSG.CHALLENGE, MSG.AUTH_FAIL],
         timeout,
-        'Auth handshake timed out waiting for server response'
+        handshakeTimeout('Auth handshake timed out waiting for server response')
       );
 
       if (firstResponse.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${firstResponse.reason || 'unknown'}`);
+        throw new WshAuthError(firstResponse.reason || 'unknown');
       }
 
       let tempSessionId = null;
@@ -709,7 +713,7 @@ export class WshClient {
         // Challenge right behind ServerHello, and a message nobody is waiting
         // for yet is dropped.
         const challengeWait = authMethod === AUTH_METHOD.PUBKEY
-          ? this.#waitForMessage([MSG.CHALLENGE, MSG.AUTH_OK], timeout, 'Auth handshake timed out waiting for challenge')
+          ? this.#waitForMessage([MSG.CHALLENGE, MSG.AUTH_OK], timeout, handshakeTimeout('Auth handshake timed out waiting for challenge'))
           : null;
         challengeWait?.catch(() => {});
         await this.#verifyHostKey(firstResponse, hostCtx);
@@ -791,11 +795,11 @@ export class WshClient {
       const authResult = await this.#waitForMessage(
         [MSG.AUTH_OK, MSG.AUTH_FAIL],
         timeout,
-        'Auth handshake timed out waiting for auth result'
+        handshakeTimeout('Auth handshake timed out waiting for auth result')
       );
 
       if (authResult.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${authResult.reason || 'rejected'}`);
+        throw new WshAuthError(authResult.reason || 'rejected');
       }
 
       this.#sessionId = authResult.session_id || tempSessionId;
@@ -2734,7 +2738,7 @@ export class WshClient {
       }
     }
 
-    throw new Error(`Connection failed across transports (${errors.join('; ')})`);
+    throw new WshConnectionError('CONNECTION_FAILED', `Connection failed across transports (${errors.join('; ')})`, { attempts: errors });
   }
 
   /**
@@ -3072,11 +3076,11 @@ export class WshClient {
       const firstResponse = await this.#waitForMessage(
         [MSG.SERVER_HELLO, MSG.CHALLENGE, MSG.AUTH_FAIL],
         timeout,
-        'Auth handshake timed out'
+        handshakeTimeout('Auth handshake timed out')
       );
 
       if (firstResponse.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${firstResponse.reason || 'unknown'}`);
+        throw new WshAuthError(firstResponse.reason || 'unknown');
       }
 
       let tempSessionId = null;
@@ -3146,7 +3150,7 @@ export class WshClient {
       );
 
       if (authResult.type === MSG.AUTH_FAIL) {
-        throw new Error(`Authentication failed: ${authResult.reason || 'rejected'}`);
+        throw new WshAuthError(authResult.reason || 'rejected');
       }
 
       this.#sessionId = authResult.session_id || tempSessionId;
@@ -3567,7 +3571,7 @@ export class WshClient {
         // Remove this waiter.
         this.#removeWaiter(key, waiter);
         signal?.removeEventListener('abort', onAbort);
-        reject(new Error(timeoutMessage));
+        reject(timeoutMessage instanceof Error ? timeoutMessage : new Error(timeoutMessage));
       }, timeout);
       const onAbort = () => {
         clearTimeout(timer);
