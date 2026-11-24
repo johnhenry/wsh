@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.45.0 / Rust `rust-v0.16.0`
 
 ### Rust `wsh-server`: UDP flows as WebTransport datagrams, `gateway-datagram` (#124, #145, the last open item of the parity epic; Rust only)
 
