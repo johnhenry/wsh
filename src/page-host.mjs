@@ -32,8 +32,9 @@ import { pipeUrl } from './pipe-relay.mjs';
 import { webmcpTools, captureWebMcp, createDomPrompt, timersOf, WEBMCP_DEFAULT_LIMITS } from './webmcp.mjs';
 import { exposeObjects } from './objects.mjs';
 import { OBJECTS_PROTOCOL } from './objects-core.mjs';
+import { serveMcpOverDuplex } from './mcp-duplex.mjs';
 
-export { webmcpTools, captureWebMcp, createDomPrompt, WEBMCP_DEFAULT_LIMITS, exposeObjects };
+export { webmcpTools, captureWebMcp, createDomPrompt, WEBMCP_DEFAULT_LIMITS, exposeObjects, serveMcpOverDuplex };
 
 const RECONNECT_START_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;

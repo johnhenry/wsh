@@ -20,6 +20,7 @@
  */
 
 import { RpcError } from './rpc.mjs';
+import { callerIdentity } from './key-names.mjs';
 import { WshClient } from './client.mjs';
 import {
   OBJECTS_PROTOCOL, ObjectsError, createObjectsServer, createObjectsClient,
@@ -70,7 +71,9 @@ export function exposeObjects(options = {}) {
   const server = createObjectsServer({ timers: defaultTimers, random: defaultRandom, ...options });
   const sessions = new Set();
   const handler = (channel, ctx = {}) => {
-    const who = { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null };
+    // A wsh caller is its key, `{ username, fingerprint }`. A handler called by an adapter that is not wsh (a mesh channel) is given the
+    // caller as `ctx.who` (`{ username, fingerprint?, podId? }`), and it is that identity that `authorize` and `closeSessions` see.
+    const who = callerIdentity(ctx.who ?? { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null });
     server.attach(channelPeer(channel, ctx), { who });
     const session = { channel, who };
     sessions.add(session);

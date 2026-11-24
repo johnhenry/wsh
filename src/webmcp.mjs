@@ -21,6 +21,7 @@
  */
 
 import { RpcError, RPC_ERROR } from './rpc.mjs';
+import { callerIdentity } from './key-names.mjs';
 
 const TOOL_NAME_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 const APPROVE_MODES = new Set(['never', 'consequential', 'always']);
@@ -464,7 +465,8 @@ export function webmcpTools(options = {}) {
   };
 
   function handler(channel, ctx = {}) {
-    const who = { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null };
+    // A wsh caller is its key, `{ username, fingerprint }`; a transport that is not wsh (`serveMcpOverDuplex`) gives `ctx.who`, which may carry a `podId`.
+    const who = callerIdentity(ctx.who ?? { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null });
     const permits = typeof ctx.permits === 'function' ? ctx.permits : null;
     const session = { channel, who, inflight: new Map(), starts: [], approvals: Promise.resolve(), unsubscribe: null, listed: null, closed: false };
     sessions.add(session);

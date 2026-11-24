@@ -93,7 +93,8 @@ export interface WebMcpCall {
   consequential: boolean;
   readOnly: boolean;
 }
-export interface WebMcpWho { username: string | null; fingerprint: string | null }
+/** Who is calling: `{ username, fingerprint }` over wsh; a transport that is not wsh may add `podId`, and then `fingerprint` is the hex hash of the same key. */
+export interface WebMcpWho { username: string | null; fingerprint: string | null; podId?: string }
 /** Answers `true` to allow the call; anything else denies. `signal` aborts when the call is cancelled or the session ends. */
 export type WebMcpPrompt = (call: WebMcpCall, who: WebMcpWho, extra: { signal: AbortSignal }) => boolean | Promise<boolean>;
 
@@ -132,7 +133,7 @@ export interface WebMcpToolsOptions {
 /** The `mcp` rpc handler for `createMemoryHost({ rpc: { mcp } })`, `createReverseHost` and so on. It declares itself `capabilityScoped`. */
 export interface WebMcpHandler {
   /** It needs from the host's rpc context only who is calling and `permits` (a host that gives no `permits` serves every allowed tool). */
-  (channel: RpcChannel, ctx?: { user?: string | null; fingerprint?: string | null; permits?: (request: { kind: string; [field: string]: unknown }) => boolean }): void;
+  (channel: RpcChannel, ctx?: { user?: string | null; fingerprint?: string | null; who?: { username?: string | null; fingerprint?: string | null; podId?: string | null }; permits?: (request: { kind: string; [field: string]: unknown }) => boolean }): void;
   capabilityScoped: true;
   /** Tell every session (or those of one key) why, then end it. Resolves with how many were ended. */
   closeSessions(reason: string, fingerprint?: string): Promise<number>;
@@ -142,6 +143,38 @@ export interface WebMcpHandler {
 
 /** The page's WebMCP tools as MCP, an rpc handler for the `mcp` protocol. */
 export function webmcpTools(options: WebMcpToolsOptions): WebMcpHandler;
+
+/** A JSON-RPC 2.0 message as an object: what the far side of `serveMcpOverDuplex` speaks (plain MCP). */
+export type McpMessage = { jsonrpc: '2.0'; id?: string | number; method?: string; params?: object; result?: unknown; error?: { code: number; message: string; data?: unknown } };
+
+export interface ServeMcpOverDuplexOptions {
+  /** Writes a message to the far side. A throw or rejection ends the session. */
+  send(message: McpMessage): void | Promise<void>;
+  /** Who is on the far side, as the transport knows it. `fingerprint` and `podId` agree (one is derived from the other). */
+  who?: { username?: string | null; fingerprint?: string | null; podId?: string | null };
+  /** The far side's grants, asked afresh for each tool (`{ kind: 'mcp-tool', tool }`); `@johnhenry/wsh/capabilities`' `permits` fits. */
+  permits?: (request: { kind: string; [field: string]: unknown }) => boolean;
+  /** Default 1048576. The largest message, JSON-encoded, in either direction. */
+  maxMessageBytes?: number;
+  /** Default 64. Requests of the far side being answered at once, of any kind. */
+  maxInflight?: number;
+}
+
+export interface McpDuplexSession {
+  /** Hand over one message from the far side. Never throws. */
+  receive(message: unknown): void;
+  /** End the session: running calls are aborted, the handler's watchers removed. */
+  close(reason?: string): void;
+  readonly closed: boolean;
+  readonly who: { username: string | null; fingerprint: string | null; podId?: string } | undefined;
+}
+
+/**
+ * Serve the handler of `webmcpTools` (or any rpc handler of the `mcp` protocol) over any duplex: `send` and `receive` of plain MCP
+ * JSON-RPC 2.0 messages. The handler's bounds, approval hook and untrusted labelling are unchanged; the seam adds the size of a message,
+ * the requests running at once and one answer per id.
+ */
+export function serveMcpOverDuplex(handler: (channel: any, ctx?: any) => void, options: ServeMcpOverDuplexOptions): McpDuplexSession;
 
 /** The default `prompt`: an accessible modal dialog in `window.document` (a key's fingerprint, the tool, the input as text; Deny has focus; Escape and a timeout deny). */
 export function createDomPrompt(window: WshPageWindow, options?: { timeoutMs?: number; timers?: WshPageTimers }): WebMcpPrompt;
