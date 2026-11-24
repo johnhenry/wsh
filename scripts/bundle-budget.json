@@ -41,6 +41,10 @@
       "raw": 16026,
       "gzip": 5848
     },
+    "./duplex": {
+      "raw": 143418,
+      "gzip": 43392
+    },
     "./testing (encodeRecord only)": {
       "raw": 1887,
       "gzip": 938

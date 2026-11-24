@@ -164,7 +164,7 @@ export function createConnectionFactory(cfg) {
    *    `dataStreams: false` means there are no client-opened streams to bind, so exec output rides SessionData.
    *    `e2e` overrides `cfg.e2e` for this connection.
    */
-  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride, channelBinding = null, datagrams = null }) {
+  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride, channelBinding = null, datagrams = null, sealSession: sealOverride }) {
     const cid = ++counter;
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
@@ -260,8 +260,13 @@ export function createConnectionFactory(cfg) {
 
     // A sealed session (#155): after login, a signed KeyExchange for this connection's session id seals everything
     // that follows (control messages, gateway and endpoint data included) as EncryptedFrames on channel 0.
-    const sealOn = !!cfg.sealSession && !!cfg.hostKey && !dataStreams;
-    const sealRequired = sealOn && cfg.sealSession === 'require';
+    // `sealSession: 'require'` in the options of this connection may only STRENGTHEN the host's setting (a transport that cannot vouch for itself,
+    // a duplex someone else carries, asks for it); a host that cannot seal (no host key, or client-opened data streams) then cannot serve it at all.
+    if (sealOverride !== undefined && sealOverride !== 'require') throw new TypeError("attach: sealSession can only be 'require' for one connection");
+    if (sealOverride === 'require' && (!cfg.hostKey || dataStreams)) throw new Error('this connection must be sealed, and this host cannot seal it (it needs a host key and dataStreams: false)');
+    const sealMode = sealOverride === 'require' ? 'require' : cfg.sealSession;
+    const sealOn = !!sealMode && !!cfg.hostKey && !dataStreams;
+    const sealRequired = sealOn && sealMode === 'require';
     /** @type {{ bridge: SealedBridge | null, responder: E2EResponder | null }} */
     const sealed = { bridge: null, responder: null };
 
@@ -520,11 +525,11 @@ export function createConnectionFactory(cfg) {
         } else {
           return refuse(`unsupported auth method ${JSON.stringify(method)}`, 'bad-request', { username: user });
         }
-        if (cfg.sealSession === 'require' && cfg.hostKey && !dataStreams && method !== 'pubkey') return refuse('this host requires a sealed session, which needs a key login', 'not-sealed', { username: user });
+        if (sealRequired && method !== 'pubkey') return refuse('this host requires a sealed session, which needs a key login', 'not-sealed', { username: user });
         state.username = user;
         state.method = method;
         gateway?.setPeerFeatures(m.features);
-        const features = hostFeatures(cfg, { dataStreams });
+        const features = hostFeatures(sealMode === cfg.sealSession ? cfg : { ...cfg, sealSession: sealMode }, { dataStreams });
         // UDP over datagrams only where this transport has them and the gateway serves (and allows) UDP.
         if (datagrams && cfg.gateway?.tcp && cfg.gateway.udp?.datagrams) features.push(GATEWAY_DATAGRAM_FEATURE);
         let hostFingerprint;

@@ -45,7 +45,7 @@ export const FILES = {
       'src/key-options.mjs', 'src/operator-proof.mjs', 'src/rpc.mjs', 'src/rpc-virtual.mjs', 'src/rpc-mcp.mjs', 'src/stream-frame.mjs', 'src/virtual-session.mjs',
     ],
     ignored: ['src/index.mjs', 'src/testing.mjs', 'src/errors.mjs', 'src/messages.mjs', 'src/messages.gen.mjs', 'src/cbor.mjs', 'src/mlkem.mjs', 'src/pipe-relay.mjs', 'src/pipe-relay-node.mjs', 'src/objects.mjs', 'src/objects-core.mjs', 'src/page-host.mjs', 'src/webmcp.mjs', 'src/qmux.mjs', 'src/qmux-connection.mjs',
-      'src/capabilities.mjs', 'src/identity.mjs', 'src/key-names.mjs', 'src/gateway-errors.mjs', 'src/mcp-duplex.mjs', 'src/testing-doubles.mjs'],
+      'src/capabilities.mjs', 'src/identity.mjs', 'src/key-names.mjs', 'src/gateway-errors.mjs', 'src/mcp-duplex.mjs', 'src/testing-doubles.mjs', 'src/duplex.mjs'],
   },
   rust: {
     host: ['crates/wsh-server/src/'],

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+npm only. **Wire: nothing new.** A released JS peer (0.48.0) and a released Rust peer are ordinary peers of a session over a duplex; nothing in them changes.
+
+### wsh over a caller-supplied duplex: `@johnhenry/wsh/duplex` (#220; JS)
+
+`serveWshOverDuplex(host, { send })`, `connectWshOverDuplex({ send }, credentials)` and `createDuplexSocket({ send })` run a whole wsh session (login, host-key proof, sealed session, channels) over a duplex of messages another library provides (a mesh channel, a `MessagePort`), so a browser with no relay can be reached by hopping through a mesh peer and a pod can reach a wsh host without a relay. The design, what the duplex must guarantee (reliable, in order, a known maximum message size, backpressure by a returned promise, one connection per duplex) and what a hop can and cannot do is `spec/duplex-binding.md` (shipped in the package).
+
+- **Sealed by default.** The host serves a duplex only sealed, whatever its own `sealSession`; the client seals or fails and binds its login to the host key (`requireChannelBinding: ['host']`); there is no TLS binding on this transport, and the host-key proof plus the sealed session carry the authentication. `allowUnsealed: true` lifts it, said out loud. A client must name the host key it expects (`expectHostKey`, `knownHosts`, or `trustOnFirstUse: true`); a password login is refused unless unsealed is allowed.
+- **A connection may now be required to seal:** `host.accept(socket, { sealSession: 'require' })` / `bindSocket` (internally `attach({ sealSession: 'require' })`). It can only strengthen the host's setting; a host with no host key, or one that gave the connection data streams, refuses to attach it (fail closed) instead of serving it unsealed.
+- Bounded: messages are cut to `maxMessageBytes` (default 64 KiB) and a larger incoming one ends the link; what waits for `send`, or for a listener, is bounded by `maxBufferedBytes` (4 MiB); a `send` that throws ends the link.
+- Tested over an in-memory duplex with a hostile middle that reads, changes, drops and repeats messages: it reads nothing after login, an altered message delivers nothing altered and runs nothing, a repeated one does not run twice, a middle that answers as the host is refused by a client that named the key, and a plain client over the duplex is served nothing.
+
 ## 0.49.0
 
 npm only (the Rust crates changed only in a unit test of the capability vectors; no binary changes, no `rust-v` tag). **Wire: nothing new.** No message, field or feature string was added; a 0.48.0 peer and a released Rust peer (`rust-v0.17.1`) interoperate unchanged. Everything below is exports, one specification with its vectors, and seams in the object and MCP layers (#220, the wsh side of making wsh and browsermesh a pair; wsh still has no dependency on browsermesh).

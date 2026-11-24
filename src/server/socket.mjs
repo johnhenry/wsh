@@ -35,10 +35,12 @@ async function toBytes(data) {
  * @param {{ remote?: { address?: string, headers?: object }, dataStreams?: boolean }} [options] - what the host knows about the peer
  *   (`address` keys the password-failure throttle; the default key is shared by every socket without one).
  *   `dataStreams: false` serves this connection without client-opened data streams (exec output rides SessionData), for a
- *   client that cannot open them (the Rust client over WebSocket, #132).
+ *   client that cannot open them (the Rust client over WebSocket, #132). `sealSession: 'require'` makes THIS connection serve nothing
+ *   until it is sealed, whatever the host's own setting (it can only strengthen it; a host with no host key, or with data streams, refuses to
+ *   attach it: `ready` rejects). It is what `@johnhenry/wsh/duplex` asks of a transport it cannot vouch for.
  * @returns {Promise<{ close(): void }>} resolves once the connection is attached; `close()` drops it
  */
-export function bindSocket(socket, ready, { remote = {}, dataStreams } = {}) {
+export function bindSocket(socket, ready, { remote = {}, dataStreams, sealSession } = {}) {
   if (!socket || typeof socket.send !== 'function' || typeof socket.close !== 'function') {
     throw new TypeError('accept: socket must be a WebSocket-like duplex with send() and close()');
   }
@@ -74,6 +76,7 @@ export function bindSocket(socket, ready, { remote = {}, dataStreams } = {}) {
       send: write,
       remote: { address: remote.address, headers: remote.headers ?? {} },
       dataStreams,
+      ...(sealSession !== undefined ? { sealSession } : {}),
       closeTransport: () => { try { socket.close(1000); } catch { /* already closed */ } },
     });
   });
