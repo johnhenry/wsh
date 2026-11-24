@@ -99,24 +99,43 @@ describe('pipe relay: rendezvous and copying', () => {
   });
 
   it('pairs a host and an operator and copies both ways, including what was said before the partner came', async () => {
-    const id = newRendezvousId();
-    const op = dial(id, 'operator');
-    await op.open;
-    op.ws.send(Buffer.from('early-from-operator'));
-    await sleep(50);
-    const host = dial(id, 'host');
-    await host.open;
-    host.ws.send(Buffer.from('from-host'));
-    await sleep(100);
-    assert.deepEqual(host.got.map(String), ['early-from-operator']);
-    assert.deepEqual(op.got.map(String), ['from-host']);
-    op.ws.send(Buffer.from('more'));
-    await sleep(50);
-    assert.deepEqual(host.got.map(String), ['early-from-operator', 'more']);
-    assert.equal(relay.stats().pipes >= 1, true);
-    op.ws.close(1000);
-    await sleep(100);
-    assert.equal(host.closed?.code, 1000, 'the other end follows');
+    // Its own relay: the shared one gives up on a waiting half after 400 ms (a test below depends on that), which a slow
+    // machine can exceed between the operator's dial and the host's.
+    const own = createPipeRelay();
+    const { port: ownPort } = await own.listen();
+    const ownUrl = `ws://127.0.0.1:${ownPort}`;
+    const dialOwn = (id, role) => {
+      const ws = new WsClient(pipeUrl(ownUrl, id, role));
+      sockets.push(ws);
+      const got = []; let closed = null; const waiters = [];
+      ws.on('message', (d) => { got.push(Buffer.from(d)); for (const w of waiters.splice(0)) w(); });
+      ws.on('close', (code) => { closed = { code }; });
+      ws.on('error', () => {});
+      /** Resolves once at least `n` messages have arrived (the event, not a delay). */
+      const heard = async (n) => { while (got.length < n) await new Promise((r) => waiters.push(r)); };
+      return { ws, got, heard, get closed() { return closed; }, open: new Promise((r) => ws.once('open', r)), whenClosed: new Promise((r) => ws.once('close', r)) };
+    };
+    try {
+      const id = newRendezvousId();
+      const op = dialOwn(id, 'operator');
+      await op.open;
+      op.ws.send(Buffer.from('early-from-operator'));
+      // A pong comes back only after the relay has read everything sent before the ping on this socket.
+      await new Promise((resolve) => { op.ws.once('pong', resolve); op.ws.ping(); });
+      const host = dialOwn(id, 'host');
+      await host.open;
+      host.ws.send(Buffer.from('from-host'));
+      await Promise.all([host.heard(1), op.heard(1)]);
+      assert.deepEqual(host.got.map(String), ['early-from-operator']);
+      assert.deepEqual(op.got.map(String), ['from-host']);
+      op.ws.send(Buffer.from('more'));
+      await host.heard(2);
+      assert.deepEqual(host.got.map(String), ['early-from-operator', 'more']);
+      assert.equal(own.stats().pipes, 1);
+      op.ws.close(1000);
+      await host.whenClosed;
+      assert.equal(host.closed?.code, 1000, 'the other end follows');
+    } finally { await own.close(); }
   });
 
   it('refuses a bad id, a bad role, and a second half with the same role', async () => {

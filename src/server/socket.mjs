@@ -77,8 +77,16 @@ export function bindSocket(socket, ready, { remote = {}, dataStreams } = {}) {
       closeTransport: () => { try { socket.close(1000); } catch { /* already closed */ } },
     });
   });
-  const drop = () => { if (closed) return; closed = true; chain = chain.then(() => conn?.close()).catch(() => {}); };
+  // The close joins the chain behind the messages that were received before it: each message is handled asynchronously, and
+  // marking the connection closed at once would drop the peer's last messages (its final write, the end of its input).
+  let closing = false;
+  const drop = () => {
+    if (closing) return;
+    closing = true;
+    chain = chain.then(() => { closed = true; return conn?.close(); }).catch(() => {});
+  };
   listen('message', (data) => {
+    if (closing) return;
     chain = chain.then(async () => {
       if (closed || !conn) return;
       const bytes = await toBytes(data);

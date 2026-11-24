@@ -68,14 +68,18 @@ describe('OpenUdp on the Node host', () => {
 
   it('counts against maxConnections, closes idle flows, and closes when the client does', async () => {
     const port = await echo();
-    const { client, inbox } = await fx.setup({ allow: [`127.0.0.1:${port}`], maxConnections: 1, udpIdleMs: 150 });
+    // The cap, with no idle limit that could free the slot while the second open is on its way (a loaded machine takes longer than a short one).
+    const capped = await fx.setup({ allow: [`127.0.0.1:${port}`], maxConnections: 1 });
+    const first = await capped.client.openUdp('127.0.0.1', port);
+    await assert.rejects(capped.client.openUdp('127.0.0.1', port), (e) => e.code === 7);
+    first.destroy();
+    await first.closed;
+    // The idle limit: a flow nobody writes to is closed by the host, and its slot is free again.
+    const { client } = await fx.setup({ allow: [`127.0.0.1:${port}`], maxConnections: 1, udpIdleMs: 150 });
     const d = await client.openUdp('127.0.0.1', port);
-    await assert.rejects(client.openUdp('127.0.0.1', port), (e) => e.code === 7);
-    await Promise.race([d.closed, sleep(2000).then(() => assert.fail('idle flow was not closed'))]);
-    // the slot is free again
+    await d.closed;
     const d2 = await client.openUdp('127.0.0.1', port);
     d2.destroy();
-    void inbox;
   });
 
   it('drops datagrams a stalled client cannot take instead of buffering them', async () => {
