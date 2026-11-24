@@ -1251,6 +1251,20 @@ impl WshClient {
     /// `rpc-protocol:<name>` in its `ServerHello.features`): an older host would not know the kind.
     /// Needs a transport that can open data streams (WebSocket, WebTransport).
     pub async fn open_rpc(&self, protocol: &str) -> WshResult<crate::rpc::RpcChannel> {
+        self.open_rpc_with(protocol, false).await
+    }
+
+    /// [`open_rpc`](Self::open_rpc) for a protocol whose messages carry byte strings (`wsh-objects`): the channel's
+    /// messages are read and written as CBOR values (`send_values` / `recv_values`) instead of JSON.
+    pub async fn open_rpc_values(&self, protocol: &str) -> WshResult<crate::rpc::RpcChannel> {
+        self.open_rpc_with(protocol, true).await
+    }
+
+    async fn open_rpc_with(
+        &self,
+        protocol: &str,
+        values: bool,
+    ) -> WshResult<crate::rpc::RpcChannel> {
         if !crate::rpc::valid_protocol_name(protocol) {
             return Err(WshError::Other(format!(
                 "{protocol:?} is not a valid rpc protocol name"
@@ -1318,6 +1332,7 @@ impl WshClient {
                 stub.clone(),
                 self.control_action_tx.clone(),
                 self.rpc_credit_sender(ok.channel_id),
+                values,
             );
             self.register_session(&stub, &ok).await;
             return Ok(channel);
@@ -1357,6 +1372,7 @@ impl WshClient {
             stream.stream,
             offer.max_message_bytes,
             stub,
+            values,
         ))
     }
 

@@ -21,7 +21,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use wsh_core::error::{WshError, WshResult};
-use wsh_core::rpc_codec::{encode_message, CborSequenceDecoder};
+use wsh_core::rpc_codec::{
+    encode_cbor, encode_message, to_json, Cbor, CborSequenceDecoder, RpcCodecError,
+};
 use wsh_core::rpc_credit::CreditLink;
 use wsh_core::transport::ByteStream;
 
@@ -111,8 +113,29 @@ enum Command {
     Close,
 }
 
+/// A received message: JSON on a channel opened the ordinary way, the CBOR value as it came on a channel opened
+/// for values (`open_rpc_values`), where a byte string is allowed.
+enum Message {
+    Json(Value),
+    Cbor(Cbor),
+}
+
+/// The messages a chunk completed, in the form the channel carries.
+fn shape(values: bool, items: Vec<Cbor>) -> Result<Vec<Message>, RpcCodecError> {
+    items
+        .into_iter()
+        .map(|c| {
+            if values {
+                Ok(Message::Cbor(c))
+            } else {
+                to_json(c).map(Message::Json)
+            }
+        })
+        .collect()
+}
+
 /// A received message and the bytes of it the host's credit is still to be returned for (virtual mode).
-type Item = (WshResult<Value>, usize);
+type Item = (WshResult<Message>, usize);
 
 enum Incoming {
     Bounded(mpsc::Receiver<Item>),
@@ -149,6 +172,8 @@ pub(crate) struct VirtualInbound {
     closed: Arc<AtomicBool>,
     channel_id: u32,
     control: mpsc::Sender<ControlAction>,
+    /// Messages are carried as CBOR values (bytes allowed) rather than JSON.
+    values: bool,
     /// Hands the host `n` bytes of credit back (a `GatewayCredit`).
     send_credit: Box<dyn Fn(u64) + Send + Sync>,
 }
@@ -181,7 +206,11 @@ impl VirtualInbound {
         {
             let mut s = self.inner.lock().expect("rpc inbound lock");
             let before = s.decoder.pending();
-            let messages = match s.decoder.feed(bytes) {
+            let messages = match s
+                .decoder
+                .feed_values(bytes)
+                .and_then(|items| shape(self.values, items))
+            {
                 Ok(m) => m,
                 Err(e) => {
                     drop(s);
@@ -284,6 +313,7 @@ impl RpcChannel {
         stream: Box<dyn ByteStream>,
         max_message_bytes: usize,
         stub: Arc<WshSession>,
+        values: bool,
     ) -> Self {
         let (commands, command_rx) = mpsc::channel(64);
         let (incoming_tx, incoming) = mpsc::channel(256);
@@ -294,6 +324,7 @@ impl RpcChannel {
             incoming_tx,
             max_message_bytes,
             closed.clone(),
+            values,
         ));
         Self {
             writer: Writer::Stream(commands),
@@ -311,6 +342,7 @@ impl RpcChannel {
         stub: Arc<WshSession>,
         control: mpsc::Sender<ControlAction>,
         send_credit: Box<dyn Fn(u64) + Send + Sync>,
+        values: bool,
     ) -> Self {
         let link = Arc::new(CreditLink::new());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -327,6 +359,7 @@ impl RpcChannel {
             closed: closed.clone(),
             channel_id: stub.channel_id(),
             control,
+            values,
             send_credit,
         });
         stub.set_rpc_inbound(inbound.clone());
@@ -357,6 +390,16 @@ impl RpcChannel {
     /// is written (the host would close the channel on it).
     pub async fn send(&self, message: &Value) -> WshResult<()> {
         let bytes = encode_message(message).map_err(|e| WshError::Other(e.to_string()))?;
+        self.send_encoded(bytes).await
+    }
+
+    /// [`send`](Self::send) for a message that is a CBOR value (it may hold byte strings).
+    pub async fn send_values(&self, message: &Cbor) -> WshResult<()> {
+        let bytes = encode_cbor(message).map_err(|e| WshError::Other(e.to_string()))?;
+        self.send_encoded(bytes).await
+    }
+
+    async fn send_encoded(&self, bytes: Vec<u8>) -> WshResult<()> {
         if bytes.len() > self.max_message_bytes {
             return Err(WshError::Other(format!(
                 "message of {} bytes exceeds the {} byte rpc message limit",
@@ -394,6 +437,28 @@ impl RpcChannel {
     /// been read; `Some(Err(..))` once, last, when the stream could not be decoded or failed (or, on a
     /// channel in virtual data mode, when the host sent more than the credit it was given).
     pub async fn recv(&self) -> Option<WshResult<Value>> {
+        Some(match self.next().await? {
+            Ok(Message::Json(v)) => Ok(v),
+            Ok(Message::Cbor(c)) => {
+                to_json(c).map_err(|e| WshError::Other(format!("rpc stream: {e}")))
+            }
+            Err(e) => Err(e),
+        })
+    }
+
+    /// [`recv`](Self::recv) as the CBOR value that arrived: a byte string stays one on a channel opened with
+    /// `open_rpc_values`; on any other channel it is what `recv` would have given, as CBOR.
+    pub async fn recv_values(&self) -> Option<WshResult<Cbor>> {
+        Some(match self.next().await? {
+            Ok(Message::Cbor(c)) => Ok(c),
+            Ok(Message::Json(v)) => {
+                Cbor::serialized(&v).map_err(|e| WshError::Other(format!("rpc stream: {e}")))
+            }
+            Err(e) => Err(e),
+        })
+    }
+
+    async fn next(&self) -> Option<WshResult<Message>> {
         let (message, owed) = self.incoming.lock().await.recv().await?;
         // Taking a message in is what hands the host credit for its bytes back.
         if let (Writer::Virtual { inbound, .. }, Ok(_)) = (&self.writer, &message) {
@@ -443,6 +508,7 @@ async fn pump(
     incoming: mpsc::Sender<Item>,
     max_message_bytes: usize,
     closed: Arc<AtomicBool>,
+    values: bool,
 ) {
     let mut decoder = CborSequenceDecoder::new(max_message_bytes);
     let mut buf = vec![0u8; 16 * 1024];
@@ -465,7 +531,10 @@ async fn pump(
             },
             read = stream.read(&mut buf) => match read {
                 Ok(0) => break,
-                Ok(n) => match decoder.feed(&buf[..n]) {
+                Ok(n) => match decoder
+                    .feed_values(&buf[..n])
+                    .and_then(|items| shape(values, items))
+                {
                     Ok(messages) => {
                         for message in messages {
                             if incoming.send((Ok(message), 0)).await.is_err() {
@@ -488,6 +557,43 @@ async fn pump(
         }
     }
     closed.store(true, Ordering::Relaxed);
+}
+
+/// A channel in virtual data mode with nothing behind it, for the tests of what is built on a channel: the
+/// test plays the host by writing what it sends to `inbound` and reading what the client wrote from `actions`.
+#[cfg(test)]
+pub(crate) struct TestChannel {
+    pub channel: RpcChannel,
+    pub inbound: Arc<VirtualInbound>,
+    pub actions: mpsc::Receiver<ControlAction>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_channel(max_message_bytes: usize, values: bool) -> TestChannel {
+    use wsh_core::messages::ChannelKind;
+    let (control_tx, actions) = mpsc::channel(4096);
+    let stub = Arc::new(WshSession::new_virtual(
+        7,
+        ChannelKind::Rpc,
+        control_tx.clone(),
+        Vec::new(),
+    ));
+    let channel = RpcChannel::start_virtual(
+        max_message_bytes,
+        stub,
+        control_tx,
+        Box::new(|_| {}),
+        values,
+    );
+    let inbound = match &channel.writer {
+        Writer::Virtual { inbound, .. } => inbound.clone(),
+        Writer::Stream(_) => unreachable!(),
+    };
+    TestChannel {
+        channel,
+        inbound,
+        actions,
+    }
 }
 
 #[cfg(test)]
@@ -595,6 +701,7 @@ mod tests {
             Box::new(move |n| {
                 counter.fetch_add(n, Ordering::SeqCst);
             }),
+            false,
         );
         let inbound = match &channel.writer {
             Writer::Virtual { inbound, .. } => inbound.clone(),

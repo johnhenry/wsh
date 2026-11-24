@@ -8,7 +8,7 @@
 //! error. This is the bound that matters to a client: a host cannot make it buffer more than `max`
 //! bytes towards one item.
 
-use ciborium::value::Value as Cbor;
+pub use ciborium::value::Value as Cbor;
 use serde_json::Value as Json;
 
 /// JSON-RPC's parse error, which a malformed stream is reported as.
@@ -186,8 +186,22 @@ impl CborSequenceDecoder {
         self.buf.len()
     }
 
-    /// Feed bytes; returns every message completed so far. On error the buffer is dropped.
+    /// Feed bytes; returns every message completed so far as JSON (a byte string is an error: JSON has none).
+    /// On error the buffer is dropped.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Json>, RpcCodecError> {
+        self.feed_values(chunk)?
+            .into_iter()
+            .map(to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                self.buf.clear();
+                e
+            })
+    }
+
+    /// Like [`feed`](Self::feed), but the messages are CBOR values as they are: a byte string stays a byte string
+    /// (the `wsh-objects` protocol carries bytes natively). The same bounds hold.
+    pub fn feed_values(&mut self, chunk: &[u8]) -> Result<Vec<Cbor>, RpcCodecError> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         let mut off = 0usize;
@@ -211,7 +225,7 @@ impl CborSequenceDecoder {
                         code: PARSE,
                         message: format!("malformed cbor: {e}"),
                     })?;
-                out.push(to_json(item)?);
+                out.push(item);
                 off = end;
             }
             Ok(())
@@ -239,7 +253,18 @@ pub fn encode_message(message: &Json) -> Result<Vec<u8>, RpcCodecError> {
     Ok(out)
 }
 
-fn to_json(v: Cbor) -> Result<Json, RpcCodecError> {
+/// One CBOR value as the data item that goes on the stream.
+pub fn encode_cbor(message: &Cbor) -> Result<Vec<u8>, RpcCodecError> {
+    let mut out = Vec::new();
+    ciborium::into_writer(message, &mut out).map_err(|e| RpcCodecError {
+        code: PARSE,
+        message: format!("cannot encode the message: {e}"),
+    })?;
+    Ok(out)
+}
+
+/// A decoded message as JSON; a byte string, and a map key that is not text, cannot be.
+pub fn to_json(v: Cbor) -> Result<Json, RpcCodecError> {
     Ok(match v {
         Cbor::Null => Json::Null,
         Cbor::Bool(b) => Json::Bool(b),
@@ -347,6 +372,31 @@ mod tests {
     fn a_byte_string_is_refused_not_guessed_at() {
         let mut d = CborSequenceDecoder::new(64);
         assert_eq!(d.feed(&[0x41, 0x07]).unwrap_err().code, PARSE);
+    }
+
+    #[test]
+    fn values_keep_a_byte_string_that_json_cannot() {
+        let mut d = CborSequenceDecoder::new(64);
+        // h'0107', then a map {"b": h'ff'}
+        let items = d
+            .feed_values(&[0x42, 0x01, 0x07, 0xa1, 0x61, b'b', 0x41, 0xff])
+            .unwrap();
+        assert_eq!(items[0], Cbor::Bytes(vec![1, 7]));
+        assert_eq!(
+            items[1],
+            Cbor::Map(vec![(Cbor::Text("b".into()), Cbor::Bytes(vec![0xff]))])
+        );
+        assert_eq!(
+            encode_cbor(&items[0]).unwrap(),
+            vec![0x42, 0x01, 0x07],
+            "and it goes back as it came"
+        );
+        // the bound holds all the same
+        let mut small = CborSequenceDecoder::new(4);
+        assert_eq!(
+            small.feed_values(&[0x45, 1, 2, 3, 4, 5]).unwrap_err().code,
+            INVALID_REQUEST
+        );
     }
 
     #[test]
