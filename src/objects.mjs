@@ -35,10 +35,12 @@ export {
 const defaultTimers = { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (id) => clearTimeout(id) };
 
 /** An `RpcChannel` as the core's `Peer`: refusals become `RpcError`s with their reason, so the far side hears the sentence and the rule. */
-function channelPeer(channel) {
+function channelPeer(channel, host = {}) {
+  // What the key of this channel may do on a root: `objects:ROOT[:OP]` capabilities, through the host's `permits`, asked afresh for each operation.
+  const permit = typeof host.permits === 'function' ? (root, op) => host.permits({ kind: 'objects', root, op }) : undefined;
   return {
     onRequest: (method, handler) => channel.onRequest(method, async (params, ctx) => {
-      try { return await handler(params, ctx); } catch (e) {
+      try { return await handler(params, permit ? { ...ctx, permit } : ctx); } catch (e) {
         if (e instanceof ObjectsError) throw new RpcError(e.code, e.message, e.data);
         throw e;
       }
@@ -62,7 +64,7 @@ export function exposeObjects(options = {}) {
   const sessions = new Set();
   const handler = (channel, ctx = {}) => {
     const who = { username: ctx.user ?? null, fingerprint: ctx.fingerprint ?? null };
-    server.attach(channelPeer(channel), { who });
+    server.attach(channelPeer(channel, ctx), { who });
     const session = { channel, who };
     sessions.add(session);
     const prior = channel.onClose;
@@ -77,6 +79,8 @@ export function exposeObjects(options = {}) {
     }));
     return targets.length;
   };
+  // This handler narrows by the key's capabilities itself (`objects:ROOT[:OP]`), so a key that names roots may open the channel without `rpc:wsh-objects`.
+  handler.capabilityScoped = true;
   handler.rootNames = server.rootNames;
   handler.limits = server.limits;
   return handler;

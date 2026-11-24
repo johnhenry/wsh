@@ -469,6 +469,27 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
     await assert.rejects(wsh.openRpc('mcp'), /capability/);
   });
 
+  it('objects:window:get limits a key on a page host to reading, and objects:store to the other root', async () => {
+    const { win, calls } = worldWindow();
+    const store = { n: 1 };
+    const both = { ...EXPOSE, store: { object: store, allow: { get: ['n'] } } };
+    const page = await startPage({ window: win, registered: [], authorizedKeys: [`capabilities="objects:window:get" ${aliceLine}`, `capabilities="objects:store" ${bobLine}`], mcp: undefined, host: { mcp: undefined, expose: both } });
+    const a = new WshClient(); closers.push(() => a.disconnect());
+    await a.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const ra = await a.openObjects();
+    assert.deepEqual(Object.keys(ra), ['window']);
+    assert.equal(await ra.window.document.title, 'Shop');
+    await assert.rejects(Promise.resolve(ra.window.app.cart.add({ sku: 'x' })), (e) => e.reason === 'not-permitted');
+    assert.deepEqual(calls, []);
+    await a.disconnect();
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+    const b = new WshClient(); closers.push(() => b.disconnect());
+    await b.connect(page.host.operatorUrl, { username: 'bob', keyPair: bob, transport: 'ws', sealSession: true });
+    const rb = await b.openObjects();
+    assert.deepEqual(Object.keys(rb), ['store']);
+    assert.equal(await rb.store.n, 1);
+  });
+
   it('a key with mcp capabilities only cannot open object access', async () => {
     const { win } = worldWindow();
     const page = await startPage({ window: win, authorizedKeys: [`capabilities="mcp:*" ${aliceLine}`], host: { expose: EXPOSE } });

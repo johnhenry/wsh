@@ -360,9 +360,12 @@ export function createObjectsServer(options = {}) {
   const every = [...lists.get, ...lists.call, ...lists.set];
 
   /** The checks every operation passes, in order. `terminal` ones need the operation's own list; the rest need only to walk toward something allowed. */
-  async function check(kind, root, segs, who, { terminal }) {
+  async function check(kind, root, segs, ctx, { terminal }) {
+    const who = ctx.who;
     const gone = guard?.();
     if (gone) throw refuse('gone', `refused: ${gone}`);
+    // 0. what the caller's key may do on this root, if the transport says (`ctx.permit(root, op)`, asked afresh: an expiry holds at call time)
+    permitted(ctx, root, kind === 'get' && !terminal ? 'walk' : kind === 'construct' ? 'call' : kind === 'describe' || kind === 'snapshot' ? 'get' : kind);
     const rel = segs.slice(1).map(bareName);
     const own = lists[kind === 'construct' ? 'call' : kind === 'describe' || kind === 'snapshot' ? 'get' : kind];
     // 1. the allow-list: the operation's own list for the operation itself, any list for walking toward something
@@ -382,6 +385,11 @@ export function createObjectsServer(options = {}) {
       try { ok = (await authorize(who ?? {}, { kind, root, path: segs.slice(1), text: segs.join('.') })) === true; } catch { ok = false; }
       if (!ok) throw refuse('authorize', `refused: ${kind} of ${segs.join('.')} was not authorized`, { path: segs.join('.'), op: kind });
     }
+  }
+
+  function permitted(ctx, root, op) {
+    if (typeof ctx.permit !== 'function' || ctx.permit(root, op) === true) return;
+    throw refuse('not-permitted', `refused: this key's capabilities do not allow ${op === 'walk' ? 'reading' : op} on ${root}`, { root, op });
   }
 
   const readKey = (holder, key) => {
@@ -431,14 +439,14 @@ export function createObjectsServer(options = {}) {
       const next = [...segs, key];
       if (kind === 'get') {
         if (typeof cur === 'function' && FUNCTION_REFLECTION.has(key)) throw refuse('always-refused', `refused: "${key}" of a function re-aims it and is never reachable`);
-        await check('get', root, next, ctx.who, { terminal: last });
+        await check('get', root, next, ctx, { terminal: last });
         try { cur = readKey(cur, key); } catch (e) { throw wrapThrown(e, `reading ${next.join('.')}`); }
         segs = next;
         continue;
       }
       // call / construct
       if (kind === 'call' && typeof cur === 'function' && FUNCTION_REFLECTION.has(key)) throw refuse('always-refused', `refused: "${key}" of a function re-aims it and is never reachable`);
-      await check(kind, root, next, ctx.who, { terminal: true });
+      await check(kind, root, next, ctx, { terminal: true });
       const args = op.args === undefined ? [] : op.args;
       if (!Array.isArray(args)) throw invalid('args must be an array');
       if (args.length > limits.maxArgs) throw limitError('maxArgs', limits.maxArgs, `${args.length} arguments`);
@@ -464,7 +472,7 @@ export function createObjectsServer(options = {}) {
   }
 
   /** Walk `path` (an array of keys) as traversal only; the holder and its path. */
-  async function walk(root, path, who) {
+  async function walk(root, path, ctx) {
     if (!Array.isArray(path)) throw invalid('path must be an array');
     if (path.length > limits.maxOps) throw limitError('maxOps', limits.maxOps, `a path of ${path.length} segments`);
     let cur = roots[root];
@@ -473,7 +481,7 @@ export function createObjectsServer(options = {}) {
       const key = checkKey(raw);
       if (typeof cur === 'function' && FUNCTION_REFLECTION.has(key)) throw refuse('always-refused', `refused: "${key}" of a function re-aims it and is never reachable`);
       const next = [...segs, key];
-      await check('get', root, next, who, { terminal: false });
+      await check('get', root, next, ctx, { terminal: false });
       try { cur = readKey(cur, key); } catch (e) { throw wrapThrown(e, `reading ${next.join('.')}`); }
       segs = next;
     }
@@ -484,10 +492,10 @@ export function createObjectsServer(options = {}) {
     const root = requireRoot(params);
     const path = params.path;
     if (!Array.isArray(path) || path.length === 0) throw invalid('set needs a path of at least one segment');
-    const { cur: parent, segs } = await walk(root, path.slice(0, -1), ctx.who);
+    const { cur: parent, segs } = await walk(root, path.slice(0, -1), ctx);
     const key = checkKey(path[path.length - 1]);
     const target = [...segs, key];
-    await check('set', root, target, ctx.who, { terminal: true });
+    await check('set', root, target, ctx, { terminal: true });
     if (parent === null || (typeof parent !== 'object' && typeof parent !== 'function')) throw new ObjectsError(OBJECTS_ERROR.FAILED, `cannot set "${key}" on ${segs.join('.')}: it is not an object`, { reason: 'bad-path' });
     const value = fromWire(params.value, limits);
     let ok;
@@ -504,8 +512,8 @@ export function createObjectsServer(options = {}) {
 
   async function describe(params, ctx) {
     const root = requireRoot(params);
-    const { cur, segs } = await walk(root, params.path ?? [], ctx.who);
-    await check('describe', root, segs, ctx.who, { terminal: false });
+    const { cur, segs } = await walk(root, params.path ?? [], ctx);
+    await check('describe', root, segs, ctx, { terminal: false });
     if (cur === null || (typeof cur !== 'object' && typeof cur !== 'function')) return { type: kindOf(cur), keys: [] };
     const keys = [];
     const seen = new Set();
@@ -531,8 +539,8 @@ export function createObjectsServer(options = {}) {
 
   async function snapshot(params, ctx) {
     const root = requireRoot(params);
-    const { cur, segs } = await walk(root, params.path ?? [], ctx.who);
-    await check('snapshot', root, segs, ctx.who, { terminal: true });
+    const { cur, segs } = await walk(root, params.path ?? [], ctx);
+    await check('snapshot', root, segs, ctx, { terminal: true });
     const depth = params.depth === undefined ? limits.maxDepth : Number.isSafeInteger(params.depth) && params.depth >= 0 ? Math.min(params.depth, limits.maxDepth) : (() => { throw invalid('depth must be a whole number'); })();
     const ceiling = ctx.maxBytes ?? limits.maxValueBytes;
     const wanted = params.maxBytes === undefined ? ceiling : Number.isSafeInteger(params.maxBytes) && params.maxBytes > 0 ? Math.min(params.maxBytes, ceiling) : (() => { throw invalid('maxBytes must be a positive whole number'); })();
@@ -554,7 +562,8 @@ export function createObjectsServer(options = {}) {
       if (params === null || typeof params !== 'object' || Array.isArray(params)) throw invalid('params must be an object');
       try { return await fn(params, call); } catch (e) { if (e instanceof ObjectsError) throw e; throw wrapThrown(e, name); }
     });
-    method('roots', async () => ({ roots: rootNames.slice() }));
+    // A key that may use only some roots is told of those only.
+    method('roots', async (_params, call) => ({ roots: rootNames.filter((name) => typeof call.permit !== 'function' || call.permit(name, 'walk') === true) }));
     method('resolve', resolve);
     method('set', setValue);
     method('describe', describe);

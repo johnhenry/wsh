@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### `objects:ROOT[:OP]` key capabilities for `wsh-objects` (#190; JS)
+
+A key's capability list can now limit it to named roots and operations of a `wsh-objects` host: `objects:window` (every operation on that root), `objects:window:get` (`get`, `call` or `set` only), `objects:*:get` (every root).
+`exposeObjects` enforces it through the handler context's `permits` (asked afresh for each operation, so `expires` holds at call time), **intersected with the host's allow-lists: a capability never widens them**.
+
+- **No default changed.** A key with no capability list is unlimited as before, and one with only `rpc:wsh-objects` keeps today's behaviour (every root, every operation the lists allow). A key that names roots is limited to them, is not told of the other roots, and
+  may open the channel without `rpc:wsh-objects` (the `wsh-objects` handler declares `capabilityScoped`, as `mcp` does for `mcp:TOOL`).
+- **A released peer.** No wire change. A released JS host (0.46.x) does not know the grammar and refuses a key line with an `objects:` capability (unknown capability: the key does not log in), and so does `wsh-server`: it fails closed. Use this release on the host.
+- **Rust:** the Rust CLI's `wsh --sealed --via <relay> mcp` already reaches a page host's `mcp` channel; a test now says so (`test/rust/wsh-mcp-page-host.test.mjs`). No Rust change was needed. There is still no Rust `wsh-objects` client and no Rust host.
+
 ## 0.46.1 / Rust `rust-v0.17.1`
 
 ### Fixes only: no new option, feature string or wire message, and no default changed. A released peer needs nothing.
