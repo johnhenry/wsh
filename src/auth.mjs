@@ -465,31 +465,9 @@ export async function podId(publicKeyRaw) {
   return base64urlEncode(new Uint8Array(hash));
 }
 
-/**
- * Convert a hex fingerprint to a base64url pod ID.
- * @param {string} hexFingerprint - 64-char hex fingerprint
- * @returns {string} base64url pod ID
- */
-export function fingerprintToPodId(hexFingerprint) {
-  if (typeof hexFingerprint !== 'string' || !/^(?:[0-9a-fA-F]{2})+$/.test(hexFingerprint)) {
-    throw new TypeError('fingerprintToPodId: expected a hex fingerprint');
-  }
-  const bytes = new Uint8Array(hexFingerprint.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hexFingerprint.slice(i * 2, i * 2 + 2), 16);
-  }
-  return base64urlEncode(bytes);
-}
-
-/**
- * Convert a base64url pod ID to a hex fingerprint.
- * @param {string} podIdStr - base64url pod ID
- * @returns {string} hex fingerprint
- */
-export function podIdToFingerprint(podIdStr) {
-  const bytes = base64urlDecode(podIdStr);
-  return hexEncode(bytes);
-}
+// The two conversions between a fingerprint and a pod id live in `key-names.mjs` (pure, no crypto), so that the object and MCP layers
+// can use them without this file; they are the same functions, and strict: exactly a 32-byte hash, in its canonical spelling.
+export { fingerprintToPodId, podIdToFingerprint } from './key-names.mjs';
 
 /**
  * Get the shortest unique prefix of a fingerprint within a set.
@@ -527,15 +505,6 @@ function base64urlEncode(bytes) {
   let binary = '';
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function base64urlDecode(str) {
-  let b64 = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (b64.length % 4) b64 += '=';
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
 }
 
 function base64Encode(bytes) {
