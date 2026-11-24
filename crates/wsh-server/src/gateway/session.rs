@@ -28,6 +28,7 @@
 
 use super::forwarder::GatewayForwarder;
 use super::policy::{ConnectionGuard, GatewayPolicyEnforcer};
+use super::reverse_conn::{ReverseConn, Slot};
 use super::unix_policy::{self, SocketStat, UnixTarget};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -55,7 +56,6 @@ const MAX_DATA_BYTES: usize = 1024 * 1024;
 const HALF_CLOSE_GRACE: Duration = Duration::from_secs(1);
 const MAX_PENDING_INBOUND: usize = 16;
 const INBOUND_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
-const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DATAGRAM: usize = 65_507;
 
@@ -189,6 +189,8 @@ struct PendingInbound {
 }
 
 struct Listener {
+    /// A TCP reverse listener (counted against `reverse_max_listeners`, not `unix_max_listeners`).
+    tcp: bool,
     task: AbortHandle,
     /// A socket file this listener created, and what it looked like when it did.
     socket: Option<(PathBuf, Option<SocketStat>)>,
@@ -215,6 +217,11 @@ struct Inner {
     next_inbound: AtomicU32,
     listeners: Mutex<HashMap<u32, Listener>>,
     pending_listeners: Mutex<HashSet<u32>>,
+    /// UDP flows open or being opened (against `udp_max_flows`).
+    udp_flows: Arc<AtomicUsize>,
+    /// Datagrams and payload bytes over all of this client's UDP flows, both directions.
+    udp_client_packets: super::udp_policy::TokenBucket,
+    udp_client_bytes: super::udp_policy::TokenBucket,
     closed: AtomicBool,
 }
 
@@ -241,8 +248,13 @@ impl GatewaySession {
     ) -> Self {
         let (max_conn_bytes, max_client_bytes) = policy.buffer_limits();
         let credit = enabled && client_features.iter().any(|f| f == GATEWAY_CREDIT_FEATURE);
+        let udp_client_packets = policy.udp().client_packets();
+        let udp_client_bytes = policy.udp().client_bytes();
         Self {
             inner: Arc::new(Inner {
+                udp_flows: Arc::new(AtomicUsize::new(0)),
+                udp_client_packets,
+                udp_client_bytes,
                 forwarder: GatewayForwarder::new(policy.clone()),
                 policy,
                 out,
@@ -520,6 +532,15 @@ impl Inner {
         host: &str,
         port: u16,
     ) -> Result<(), (u32, String)> {
+        // The cap counts flows being opened too, so concurrent opens cannot both slip under it. The
+        // slot is given back when the flow ends (it travels with the relay task), or here on failure.
+        let max_flows = self.policy.udp().max_flows;
+        let Some(flow_slot) = Slot::take(&self.udp_flows, max_flows) else {
+            return Err((
+                FAIL_QUEUE_FULL,
+                format!("too many UDP flows (limit {max_flows})"),
+            ));
+        };
         let addrs = self.forwarder.authorized_destination(host, port).await?;
         // The first address that passed: the socket must be of its family.
         let target = addrs[0];
@@ -536,7 +557,7 @@ impl Inner {
             .await
             .map_err(|e| (FAIL_REFUSED, e.to_string()))?;
         info!(gateway_id = id, addr = %target, "UDP socket opened");
-        let ready = self.attach_datagrams(id, socket, guard);
+        let ready = self.attach_datagrams(id, socket, guard, flow_slot);
         self.send(ok(id, None)).await;
         ready.notify_one();
         Ok(())
@@ -676,29 +697,60 @@ impl Inner {
         }
     }
 
+    /// May a datagram of `n` payload bytes move? All three buckets (this flow's datagrams, the
+    /// client's datagrams, the client's bytes) must have room, or it is dropped.
+    fn admit_udp(&self, flow_packets: &super::udp_policy::TokenBucket, n: usize) -> bool {
+        flow_packets.take(1) && self.udp_client_packets.take(1) && self.udp_client_bytes.take(n)
+    }
+
     fn attach_datagrams(
         self: &Arc<Self>,
         id: u32,
         socket: UdpSocket,
         guard: ConnectionGuard,
+        flow_slot: Slot,
     ) -> Arc<Notify> {
         let (chan, mut write_rx) = self.new_chan(id, guard);
         let socket = Arc::new(socket);
         let ready = Arc::new(Notify::new());
+        let idle = self.policy.udp().idle;
+        let flow_packets = Arc::new(self.policy.udp().flow_packets());
+        // The last moment a datagram moved either way, in milliseconds since the flow opened: the
+        // idle limit counts both directions, as the Node host's does.
+        let opened = std::time::Instant::now();
+        let last_active = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let touch = {
+            let last_active = last_active.clone();
+            move || last_active.store(opened.elapsed().as_millis() as u64, Ordering::Release)
+        };
         let reader = {
             let inner = self.clone();
             let chan = chan.clone();
             let socket = socket.clone();
             let ready = ready.clone();
+            let flow_packets = flow_packets.clone();
+            let touch = touch.clone();
+            let last_active = last_active.clone();
             tokio::spawn(async move {
+                let _slot = flow_slot; // counted while the flow lives
                 ready.notified().await;
                 let mut buf = vec![0u8; MAX_DATAGRAM + 1];
                 loop {
-                    let got = tokio::time::timeout(UDP_IDLE_TIMEOUT, socket.recv(&mut buf)).await;
-                    match got {
+                    // Wait for a reply, but only as long as the flow has been quiet in BOTH directions.
+                    let quiet = Duration::from_millis(
+                        (opened.elapsed().as_millis() as u64)
+                            .saturating_sub(last_active.load(Ordering::Acquire)),
+                    );
+                    let Some(left) = idle.checked_sub(quiet) else {
+                        break;
+                    };
+                    match tokio::time::timeout(left, socket.recv(&mut buf)).await {
                         Ok(Ok(n)) => {
-                            // A datagram the client has no credit for is dropped, as a network would.
-                            if chan.send.try_take_exact(n)
+                            touch();
+                            // Over a rate, or a datagram the client has no credit for, is dropped,
+                            // as a network would.
+                            if inner.admit_udp(&flow_packets, n)
+                                && chan.send.try_take_exact(n)
                                 && inner
                                     .out
                                     .send(data_msg(chan.id, buf[..n].to_vec()))
@@ -708,7 +760,8 @@ impl Inner {
                                 break;
                             }
                         }
-                        Ok(Err(_)) | Err(_) => break,
+                        Ok(Err(_)) => break,
+                        Err(_) => continue, // the quiet time is recomputed from the last activity
                     }
                 }
                 inner.destroy(&chan, None);
@@ -721,7 +774,8 @@ impl Inner {
                 while let Some(cmd) = write_rx.recv().await {
                     if let WriteCmd::Data(data) = cmd {
                         let n = data.len();
-                        if n <= MAX_DATAGRAM {
+                        touch();
+                        if n <= MAX_DATAGRAM && inner.admit_udp(&flow_packets, n) {
                             let _ = socket.send(&data).await;
                         }
                         inner.consumed(&chan, n).await;
@@ -838,30 +892,92 @@ impl Inner {
             debug!(listener_id, requested = %bind_addr, bound = %bound_to, "ignoring the client's bind_addr: reverse listeners bind to the configured address");
         }
         let addr = SocketAddr::new(bound_to, port);
-        let guard = match self.policy.try_acquire() {
-            Ok(g) => g,
-            Err(reason) => return listen_fail(listener_id, &reason),
+        let reverse = self.policy.reverse().clone();
+        // The cap counts the listeners being bound too, so concurrent requests cannot both slip under it.
+        {
+            let held = self
+                .listeners
+                .lock()
+                .expect("listeners")
+                .values()
+                .filter(|l| l.tcp)
+                .count();
+            let mut pending = self.pending_listeners.lock().expect("pending");
+            if held + pending.len() >= reverse.max_listeners {
+                return listen_fail(
+                    listener_id,
+                    &format!(
+                        "too many reverse listeners (limit {})",
+                        reverse.max_listeners
+                    ),
+                );
+            }
+            pending.insert(listener_id);
+        }
+        let result = self.bind_reverse(listener_id, addr, port, &reverse).await;
+        self.pending_listeners
+            .lock()
+            .expect("pending")
+            .remove(&listener_id);
+        match result {
+            Ok(actual_port) => listen_ok(listener_id, actual_port),
+            Err(reason) => listen_fail(listener_id, &reason),
+        }
+    }
+
+    /// Bind a reverse listener (the policy has said yes) and start accepting on it.
+    async fn bind_reverse(
+        self: &Arc<Self>,
+        listener_id: u32,
+        addr: SocketAddr,
+        port: u16,
+        reverse: &super::reverse_policy::ReversePolicy,
+    ) -> Result<u16, String> {
+        let guard = self.policy.try_acquire()?;
+        // `TcpListener::bind` has no backlog: build the socket by hand, as it would.
+        let bind = || -> std::io::Result<TcpListener> {
+            let socket = match addr {
+                SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+                SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+            };
+            #[cfg(unix)]
+            socket.set_reuseaddr(true)?;
+            socket.bind(addr)?;
+            socket.listen(reverse.backlog)
         };
-        let listener = match TcpListener::bind(addr).await {
+        let listener = match bind() {
             Ok(l) => l,
             Err(e) => {
                 warn!(listener_id, %addr, error = %e, "listen bind failed");
-                return listen_fail(listener_id, &e.to_string());
+                return Err(match e.kind() {
+                    std::io::ErrorKind::AddrInUse => "address in use".to_string(),
+                    std::io::ErrorKind::PermissionDenied => {
+                        "permission denied binding that port".to_string()
+                    }
+                    _ => e.to_string(),
+                });
             }
         };
         let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
         info!(listener_id, %addr, actual_port, "reverse tunnel listener started");
         let inner = self.clone();
+        let open = Arc::new(AtomicUsize::new(0));
+        let max_connections = reverse.max_connections_per_listener;
+        let idle = reverse.idle;
         let task = tokio::spawn(async move {
             let _guard = guard; // counted while the listener lives
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
                         let _ = stream.set_nodelay(true);
+                        let Some(slot) = Slot::take(&open, max_connections) else {
+                            info!(listener_id, %peer, "reverse listener is at its limit of {max_connections} connections: dropped one");
+                            continue; // the stream is dropped: closed
+                        };
                         inner
                             .announce_inbound(
                                 listener_id,
-                                Box::new(stream),
+                                Box::new(ReverseConn::new(stream, slot, idle)),
                                 peer.ip().to_string(),
                                 peer.port(),
                             )
@@ -877,12 +993,13 @@ impl Inner {
         self.listeners.lock().expect("listeners").insert(
             listener_id,
             Listener {
+                tcp: true,
                 task: task.abort_handle(),
                 socket: None,
                 pending: HashSet::new(),
             },
         );
-        listen_ok(listener_id, actual_port)
+        Ok(actual_port)
     }
 
     fn listener_in_use(&self, id: u32) -> bool {
@@ -1018,6 +1135,7 @@ impl Inner {
         self.listeners.lock().expect("listeners").insert(
             listener_id,
             Listener {
+                tcp: false,
                 task: task.abort_handle(),
                 socket,
                 pending: HashSet::new(),

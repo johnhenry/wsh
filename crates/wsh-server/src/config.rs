@@ -279,6 +279,63 @@ pub struct GatewaySection {
     /// Default: `"127.0.0.1"`.
     #[serde(default = "default_reverse_bind_addr")]
     pub reverse_bind_addr: String,
+    /// Ports a client may ask a reverse tunnel listener to bind (`ListenRequest`), as integers and
+    /// `"lo-hi"` ranges: `reverse_ports = [0, "20000-20100", 8080]`. Unset: `[0, "1024-65535"]`
+    /// (ephemeral, or any unprivileged port). A list REPLACES that default, so a port below 1024
+    /// is allowed only when listed. A bad entry stops start-up.
+    #[serde(default)]
+    pub reverse_ports: Option<Vec<crate::gateway::reverse_policy::PortRule>>,
+    /// Reverse tunnel listeners one client connection may hold.
+    ///
+    /// Default: `4`.
+    #[serde(default = "default_reverse_max_listeners")]
+    pub reverse_max_listeners: usize,
+    /// Open (and not yet answered) connections one reverse listener may have; the next is closed.
+    ///
+    /// Default: `16`.
+    #[serde(default = "default_reverse_max_connections_per_listener")]
+    pub reverse_max_connections_per_listener: usize,
+    /// The `listen(2)` backlog of a reverse listener.
+    ///
+    /// Default: `8`.
+    #[serde(default = "default_reverse_backlog")]
+    pub reverse_backlog: u32,
+    /// Seconds without a byte in either direction before an accepted reverse connection is
+    /// closed; `0` never closes one for being idle. Only a connection the relay is reading is
+    /// watched: one parked waiting for the client's credit is bounded by the credit window and
+    /// the connection caps, not by this.
+    ///
+    /// Default: `300`.
+    #[serde(default = "default_reverse_idle_secs")]
+    pub reverse_idle_secs: u64,
+    /// UDP flows (`OpenUdp`) one client connection may hold.
+    ///
+    /// Default: `16`.
+    #[serde(default = "default_udp_max_flows")]
+    pub udp_max_flows: usize,
+    /// Datagrams per second one UDP flow may move, both directions together; the rest are dropped.
+    /// `0`: no limit.
+    ///
+    /// Default: `500`.
+    #[serde(default = "default_udp_packets_per_second_per_flow")]
+    pub udp_packets_per_second_per_flow: u64,
+    /// The same, over all of one client's flows. `0`: no limit.
+    ///
+    /// Default: `2000`.
+    #[serde(default = "default_udp_packets_per_second_per_client")]
+    pub udp_packets_per_second_per_client: u64,
+    /// Payload bytes per second over all of one client's UDP flows, both directions together (what
+    /// bounds amplification: no matter how much an origin answers with, no more than this reaches
+    /// the client). `0`: no limit.
+    ///
+    /// Default: `4194304` (4 MiB).
+    #[serde(default = "default_udp_bytes_per_second_per_client")]
+    pub udp_bytes_per_second_per_client: u64,
+    /// Seconds without a datagram in either direction before a UDP flow is closed. At least 1.
+    ///
+    /// Default: `60`.
+    #[serde(default = "default_udp_idle_secs")]
+    pub udp_idle_secs: u64,
     /// Unix-domain sockets in THIS machine's file system a client may connect to
     /// (`OpenUnix`, `wsh -L ...:/remote.sock`). Needs `enabled = true`. Each entry is an
     /// absolute path, exact (`"/var/run/docker.sock"`) or a directory prefix with a trailing
@@ -334,6 +391,16 @@ impl Default for GatewaySection {
             max_connections: default_gateway_max_connections(),
             enable_reverse_tunnels: false,
             reverse_bind_addr: default_reverse_bind_addr(),
+            reverse_ports: None,
+            reverse_max_listeners: default_reverse_max_listeners(),
+            reverse_max_connections_per_listener: default_reverse_max_connections_per_listener(),
+            reverse_backlog: default_reverse_backlog(),
+            reverse_idle_secs: default_reverse_idle_secs(),
+            udp_max_flows: default_udp_max_flows(),
+            udp_packets_per_second_per_flow: default_udp_packets_per_second_per_flow(),
+            udp_packets_per_second_per_client: default_udp_packets_per_second_per_client(),
+            udp_bytes_per_second_per_client: default_udp_bytes_per_second_per_client(),
+            udp_idle_secs: default_udp_idle_secs(),
             unix_connect: Vec::new(),
             unix_listen: Vec::new(),
             unix_replace_stale: false,
@@ -346,6 +413,33 @@ impl Default for GatewaySection {
 
 fn default_unix_max_listeners() -> usize {
     crate::gateway::unix_policy::DEFAULT_MAX_UNIX_LISTENERS
+}
+fn default_udp_max_flows() -> usize {
+    crate::gateway::udp_policy::DEFAULT_MAX_FLOWS
+}
+fn default_udp_packets_per_second_per_flow() -> u64 {
+    crate::gateway::udp_policy::DEFAULT_PACKETS_PER_SECOND_PER_FLOW
+}
+fn default_udp_packets_per_second_per_client() -> u64 {
+    crate::gateway::udp_policy::DEFAULT_PACKETS_PER_SECOND_PER_CLIENT
+}
+fn default_udp_bytes_per_second_per_client() -> u64 {
+    crate::gateway::udp_policy::DEFAULT_BYTES_PER_SECOND_PER_CLIENT
+}
+fn default_udp_idle_secs() -> u64 {
+    crate::gateway::udp_policy::DEFAULT_IDLE_SECS
+}
+fn default_reverse_max_listeners() -> usize {
+    crate::gateway::reverse_policy::DEFAULT_MAX_LISTENERS
+}
+fn default_reverse_max_connections_per_listener() -> usize {
+    crate::gateway::reverse_policy::DEFAULT_MAX_CONNECTIONS_PER_LISTENER
+}
+fn default_reverse_backlog() -> u32 {
+    crate::gateway::reverse_policy::DEFAULT_BACKLOG
+}
+fn default_reverse_idle_secs() -> u64 {
+    crate::gateway::reverse_policy::DEFAULT_IDLE_SECS
 }
 fn default_max_buffered_bytes() -> usize {
     crate::gateway::policy::DEFAULT_MAX_BUFFERED_BYTES
@@ -480,6 +574,10 @@ pub struct ServerConfig {
     pub gateway_enable_reverse_tunnels: bool,
     /// Where reverse tunnel listeners bind. See [`GatewaySection::reverse_bind_addr`].
     pub gateway_reverse_bind_addr: std::net::IpAddr,
+    /// Ports and bounds of reverse tunnel listeners. See [`crate::gateway::reverse_policy`].
+    pub gateway_reverse: crate::gateway::reverse_policy::ReversePolicy,
+    /// UDP flow count, rates and idle limit. See [`crate::gateway::udp_policy`].
+    pub gateway_udp: crate::gateway::udp_policy::UdpPolicy,
     /// Unix-domain socket policy. See [`GatewaySection::unix_connect`].
     pub gateway_unix: crate::gateway::unix_policy::UnixPolicy,
     /// See [`GatewaySection::max_buffered_bytes`].
@@ -603,6 +701,22 @@ impl ServerConfig {
         if client_env == crate::client_env::ClientEnvPolicy::Everything {
             warn!("[server] client_env = true: a client can set any environment variable (PATH, LD_PRELOAD...) for what it runs");
         }
+        let gateway_reverse = crate::gateway::reverse_policy::ReversePolicy::new(
+            file_config.gateway.reverse_ports.as_deref(),
+            file_config.gateway.reverse_max_listeners,
+            file_config.gateway.reverse_max_connections_per_listener,
+            file_config.gateway.reverse_backlog,
+            file_config.gateway.reverse_idle_secs,
+        )
+        .map_err(wsh_core::WshError::Other)?;
+        let gateway_udp = crate::gateway::udp_policy::UdpPolicy::new(
+            file_config.gateway.udp_max_flows,
+            file_config.gateway.udp_packets_per_second_per_flow,
+            file_config.gateway.udp_packets_per_second_per_client,
+            file_config.gateway.udp_bytes_per_second_per_client,
+            file_config.gateway.udp_idle_secs,
+        )
+        .map_err(wsh_core::WshError::Other)?;
         let gateway_unix = crate::gateway::unix_policy::UnixPolicy::new(
             file_config.gateway.unix_connect.clone(),
             file_config.gateway.unix_listen.clone(),
@@ -667,6 +781,8 @@ impl ServerConfig {
             gateway_max_connections: file_config.gateway.max_connections,
             gateway_enable_reverse_tunnels: file_config.gateway.enable_reverse_tunnels,
             gateway_reverse_bind_addr,
+            gateway_reverse,
+            gateway_udp,
             gateway_unix,
             gateway_max_buffered_bytes: max_buffered,
             gateway_max_client_buffered_bytes: max_client_buffered,
