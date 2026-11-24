@@ -594,10 +594,11 @@ describe('the core: path patterns and the wire rules', () => {
     assert.throws(() => fromWire({ constructor: 1 }), /never accepted/);
     assert.throws(() => fromWire(nest(10)), /maxDepth/);
     assert.throws(() => fromWire('x'.repeat(OBJECTS_DEFAULT_LIMITS.maxValueBytes + 1)), /maxValueBytes/);
-    // A decoded map with that key is not a plain object, and is refused as such.
+    // A decoded map with that key is a plain object with an own `__proto__` member (the decoder never lets a key change the
+    // prototype), and the key is refused as a refused key.
     const decoded = cborDecode(cborEncode(JSON.parse('{"__proto__":{"x":1}}')));
-    assert.notEqual(Object.getPrototypeOf(decoded), Object.prototype);
-    assert.throws(() => fromWire(decoded), /plain data/);
+    assert.equal(Object.getPrototypeOf(decoded), Object.prototype);
+    assert.throws(() => fromWire(decoded), /never accepted/);
     const copy = fromWire({ k: 1 });
     assert.equal(Object.getPrototypeOf(copy), Object.prototype);
   });
@@ -643,8 +644,8 @@ describe('over wsh: the capability, client.openObjects(), and the wire', () => {
     assert.match(asked[0].fingerprint, /^[0-9a-f]{64}$/);
   });
 
-  it('a map with a "__proto__" key in raw CBOR is refused as not plain data, and nothing changes', async () => {
-    // Our own encoder drops such a key, so the bytes of an unfriendly peer are made by hand and fed to the server's channel.
+  it('a map with a "__proto__" key in raw CBOR is refused as a refused key, and nothing changes', async () => {
+    // The decoder keeps such a key as an own member (it never alters the prototype), and the object core refuses it.
     const world = makeWorld();
     const handler = exposeObjects({ roots: { window: world.win }, allow: ALLOW });
     const replies = [];
@@ -658,8 +659,8 @@ describe('over wsh: the capability, client.openObjects(), and the wire', () => {
     send(3, { root: 'window', ops: [{ get: 'app' }, { call: 'record', args: [{ fine: 1 }] }] });
     await until(() => replies.length === 3, 'three replies');
     const byId = Object.fromEntries(replies.map((r) => [r.id, r]));
-    assert.match(byId[1].error?.message ?? '', /plain data/);
-    assert.match(byId[2].error?.message ?? '', /plain data/);
+    assert.match(byId[1].error?.message ?? '', /never accepted/);
+    assert.match(byId[2].error?.message ?? '', /never accepted/);
     assert.equal(byId[3].result?.v, 'recorded');
     assert.deepEqual(world.log.calls, [['record', { fine: 1 }]], 'only the plain call ran');
     assert.equal({}.polluted, undefined);
