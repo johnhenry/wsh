@@ -96,6 +96,7 @@ A request is an object with a `kind`. The capability needed (the name a refusal 
 | `{ kind: 'open', channel: 'rpc', protocol: 'mcp' }` | `mcp:*` (an `mcp:TOOL` key opens it only through a handler that narrows by tool itself, `scoped: true`) |
 | `{ kind: 'open', channel: 'rpc', protocol: 'wsh-objects', scoped: true }` | `rpc:wsh-objects` or any `objects:` entry |
 | `{ kind: 'open', channel: 'rpc', protocol: P }` | `rpc:P` |
+| `{ kind: 'open', channel: 'rpc', protocol: P, authorizesItself: true }` | nothing from the list: a handler that asks the host's own `permits` for every call (`handler.authorizesItself = true`) is opened by any key the options and expiry let in; its own checks decide |
 | `{ kind: 'file-op', op }` | `fs:read` for `stat`, `list`, `read`; `fs:write` for every other `op` |
 | `{ kind: 'mcp' }` (discovery) | any `mcp:` entry |
 | `{ kind: 'mcp-call' | 'mcp-tool', tool }` | `mcp:TOOL` or `mcp:*` |

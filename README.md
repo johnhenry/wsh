@@ -693,20 +693,20 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | browser bundle | minified | gzip |
 | --- | ---: | ---: |
 | `@johnhenry/wsh` (whole entry point) | 165.8 kB | 50.3 kB |
-| `@johnhenry/wsh/memory` (whole entry point) | 232.6 kB | 72.7 kB |
-| `@johnhenry/wsh/host` (whole entry point) | 127.3 kB | 41.9 kB |
-| `@johnhenry/wsh/reverse` (whole entry point) | 221.1 kB | 68.4 kB |
+| `@johnhenry/wsh/memory` (whole entry point) | 233.4 kB | 72.9 kB |
+| `@johnhenry/wsh/host` (whole entry point) | 127.9 kB | 42.1 kB |
+| `@johnhenry/wsh/reverse` (whole entry point) | 221.7 kB | 68.6 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
-| `@johnhenry/wsh/testing` (whole entry point) | 240.4 kB | 75.7 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 301.5 kB | 95.8 kB |
+| `@johnhenry/wsh/testing` (whole entry point) | 241.2 kB | 76.0 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 302.4 kB | 96.0 kB |
 | `@johnhenry/wsh/objects` (whole entry point) | 177.4 kB | 54.4 kB |
-| `@johnhenry/wsh/capabilities` (whole entry point) | 10.5 kB | 3.8 kB |
+| `@johnhenry/wsh/capabilities` (whole entry point) | 10.6 kB | 3.8 kB |
 | `@johnhenry/wsh/identity` (whole entry point) | 15.7 kB | 5.7 kB |
 | `@johnhenry/wsh/duplex` (whole entry point) | 140.1 kB | 42.4 kB |
 | `import { encodeRecord } from '@johnhenry/wsh/testing'` | 1.8 kB | 0.9 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 135.9 kB | 40.8 kB |
-| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 104.0 kB | 34.0 kB |
+| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 104.6 kB | 34.2 kB |
 <!-- bundle-size:end -->
 
 ### Signing with a page-held signer

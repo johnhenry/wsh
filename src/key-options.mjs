@@ -347,6 +347,9 @@ function capabilityRefusal(p, req) {
       else if (req.channel === 'file') { const need_ = req.direction === 'download' ? 'fs:read' : 'fs:write'; r = need(need_, has(need_)); }
       else if (req.channel === 'rpc') {
         const proto = req.protocol;
+        // A handler that says it authorizes for itself (`authorizesItself`: it asks the host's own `permits` for every call) is opened by any key the
+        // options let in: the list does not have to name its protocol. The options and the expiry were checked before this; only the `rpc:`/`mcp:` entry is deferred.
+        if (req.authorizesItself === true) return req.target === undefined || req.target === null ? null : target();
         // The file rpc has read and write methods on one channel: a key without both is refused it (a client falls back to
         // FileOp and the file channels, which are checked per operation).
         if (proto === 'wsh-fs') r = need('fs:read', has('fs:read')) ?? need('fs:write', has('fs:write'));

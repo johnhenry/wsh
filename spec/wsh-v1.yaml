@@ -1273,7 +1273,15 @@ messages:
           description: >
             Machine-readable failure reason.  Known values:
             1=CONNECTION_REFUSED, 2=HOST_UNREACHABLE, 3=DNS_FAILED,
-            4=POLICY_DENIED, 5=GATEWAY_DISABLED.
+            4=POLICY_DENIED, 5=GATEWAY_DISABLED, 6=CLOSED, 7=QUEUE_FULL.
+            KNOWN INCONSISTENCY (documentation only, behaviour unchanged):
+            the Rust wsh-server sends 5 for a disabled gateway, while the
+            Node gateway (@johnhenry/wsh/server, the page and memory hosts)
+            sends 5 for a timeout (TIMEOUT), and @johnhenry/browsermesh-netway
+            names 5 TIMEOUT.  A client that reads 5 should treat it as "timed
+            out or disabled".  6 and 7 are sent by the Node gateway (the Rust
+            server sends 7 for a full queue).  The table is exported as data
+            from @johnhenry/wsh (GATEWAY_FAIL_TABLE).
         message:
           type: string
           required: true
