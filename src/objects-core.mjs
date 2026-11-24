@@ -377,7 +377,8 @@ export function createObjectsServer(options = {}) {
     if (!rootNames.includes(name)) throw new TypeError(`exposeObjects: handles names ${JSON.stringify(name)}, which is no such root`);
     if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) throw new TypeError(`exposeObjects: handles.${name} must be an object ({ nodes?: boolean })`);
     if (cfg.nodes !== undefined && typeof cfg.nodes !== 'boolean') throw new TypeError(`exposeObjects: handles.${name}.nodes must be true or false`);
-    handleRoots.set(name, { nodes: cfg.nodes === true });
+    if (cfg.wideEntries !== undefined && typeof cfg.wideEntries !== 'boolean') throw new TypeError(`exposeObjects: handles.${name}.wideEntries must be true or false`);
+    handleRoots.set(name, { nodes: cfg.nodes === true, wideEntries: cfg.wideEntries === true });
   }
   if (handleRoots.size && typeof random !== 'function') throw new TypeError('exposeObjects: handles need a random source (random: (n) => Uint8Array of n random bytes, from crypto.getRandomValues)');
   const limits = { ...OBJECTS_DEFAULT_LIMITS };
@@ -403,6 +404,14 @@ export function createObjectsServer(options = {}) {
   };
   const lists = { get: compileList(allow.get, 'get'), call: compileList(allow.call, 'call'), set: compileList(allow.set, 'set'), on: compileOn(allow.on) };
   const every = [...lists.get, ...lists.call, ...lists.set, ...lists.on];
+  // With handles, a wildcard in `call` or `set` lets a caller hold and reuse every object under it: the root says so (`wideEntries: true`) or lists the paths.
+  for (const [name, mode] of handleRoots) {
+    if (mode.wideEntries) continue;
+    for (const kind of ['call', 'set']) {
+      const wide = lists[kind].find((p) => (p[0] === name || p[0] === '*' || p[0] === '**') && p.some((s) => s === '*' || s === '**'));
+      if (wide) throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(wide.join('.'))} is wide on the handles root "${name}": list the paths, or acknowledge it with handles: { ${name}: { wideEntries: true } }`);
+    }
+  }
 
   /** The checks every operation passes, in order. `terminal` ones need the operation's own list; the rest need only to walk toward something allowed. */
   async function check(kind, root, segs, ctx, { terminal, type }) {
@@ -562,7 +571,8 @@ export function createObjectsServer(options = {}) {
     const rel = segs.slice(1).map(bareName);
     for (const seq of [...NEEDS_LISTING, ...GRAPH_MEMBERS.map((n) => [n])]) if (containsSequence(rel, seq) && !lists.get.some((p) => matchPath(p, segs) && patternNames(p, seq))) return {};
     try {
-      const keys = Object.keys(value).filter((k) => !ALWAYS_REFUSED.has(k) && !k.includes('.') && k.length <= 64).slice(0, 8);
+      // Exactly the names describe() would list: the ones the allow-lists could walk to from here.
+      const keys = Object.keys(value).filter((k) => !ALWAYS_REFUSED.has(k) && !k.includes('.') && k.length <= 64 && every.some((p) => prefixPath(p, [...segs, k]))).slice(0, 8);
       return { preview: { keys } };
     } catch { return {}; }
   }

@@ -102,6 +102,9 @@ describe('createPageHost: what it refuses to start without', () => {
   it('expose: handles mode, the wide-open string, a root that is not the window without an object, and an empty expose are refused with a sentence', async () => {
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'values', nodes: true } } }), /only for mode: 'handles'/);
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles', nodes: 'yes' } } }), /boolean/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles', allow: { call: ['app.**'] } } } }), /wide.*list the paths|wideEntries/);
+    await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'values', wideEntries: true } } }), /only for mode: 'handles'/);
+    assert.ok(await createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'handles', wideEntries: true, allow: { call: ['app.**'] } } } }).then((h) => h.close().then(() => true)));
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { mode: 'sideways' } } }), /must be 'values'/);
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { window: { allow: 'everything-i-understand-this-is-remote-control' } } }), /not accepted/);
     await assert.rejects(createPageHost({ ...ok, window: win(), mcp: undefined, expose: { app: { allow: { get: ['**'] } } } }), /only a root named "window" is the window/);

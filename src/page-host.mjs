@@ -81,7 +81,8 @@ function exposedRoots(window, expose) {
     if (typeof cfg.allow === 'string') throw new TypeError('createPageHost: expose allow must be { get, call, set, on }: a wide-open string is not accepted, and the allow-lists apply to handles too');
     // 'handles' is this root's own opt-in; `nodes: true` is a second one, for nodes, windows and documents: control of the page.
     if (cfg.nodes !== undefined && (cfg.mode !== 'handles' || typeof cfg.nodes !== 'boolean')) throw new TypeError(`createPageHost: expose.${name}.nodes is a boolean, and only for mode: 'handles'`);
-    if (cfg.mode === 'handles') handles[name] = { nodes: cfg.nodes === true };
+    if (cfg.wideEntries !== undefined && (cfg.mode !== 'handles' || typeof cfg.wideEntries !== 'boolean')) throw new TypeError(`createPageHost: expose.${name}.wideEntries is a boolean, and only for mode: 'handles'`);
+    if (cfg.mode === 'handles') handles[name] = { nodes: cfg.nodes === true, wideEntries: cfg.wideEntries === true };
     const object = cfg.object ?? (name === 'window' ? window : undefined);
     if (object === undefined) throw new TypeError(`createPageHost: expose.${name}: only a root named "window" is the window; give { object } for another root`);
     roots[name] = object;

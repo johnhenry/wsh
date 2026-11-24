@@ -106,7 +106,8 @@ export interface ObjectsServerOptions {
    * Roots that opt in to handles: a value that cannot be cloned comes back as an opaque `RemoteHandle`, judged by the path that produced it. `nodes: true` is a
    * second opt-in, for DOM nodes, windows and documents (control of the page). Needs `random`.
    */
-  handles?: Record<string, { nodes?: boolean }>;
+  handles?: Record<string, { nodes?: boolean; wideEntries?: boolean }>;
+  // `wideEntries: true` acknowledges a wildcard in `allow.call` or `allow.set` on that root (without it the host refuses to start: list the paths, or say so).
   /** The random source for handle ids: `(n) => bytes` from `crypto.getRandomValues`. `exposeObjects` defaults to the platform's, the page host to its window's. */
   random?: (n: number) => Uint8Array;
   allow?: ObjectsAllow;

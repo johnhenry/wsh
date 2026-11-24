@@ -653,8 +653,8 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/reverse` (whole entry point) | 220.0 kB | 68.0 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 7.0 kB | 3.0 kB |
 | `@johnhenry/wsh/testing` (whole entry point) | 7.9 kB | 2.6 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 289.7 kB | 91.7 kB |
-| `@johnhenry/wsh/objects` (whole entry point) | 170.4 kB | 52.2 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 290.4 kB | 91.9 kB |
+| `@johnhenry/wsh/objects` (whole entry point) | 170.9 kB | 52.4 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 135.9 kB | 40.8 kB |
 | `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 102.9 kB | 33.6 kB |
@@ -870,7 +870,9 @@ await release(cart);                         // gives its place back; everything
   until an allow-list entry names them; a wildcard does not.
 - **A bounded table.** `maxHandles` (64) per channel, **refused by name on overflow, never evicted**; `release(handle)` is explicit; all of them go when the channel ends (the operator leaving, Stop, a navigation, a revoke). A far side's
   garbage-collection hints would be advisory only; none is used.
-- **Previews.** `handle.preview` (a bounded list of up to 8 member names) is present only if a `get` entry names the handle's path; otherwise a handle says its type and nothing more. `describe(use(handle))` lists only members the allow-lists could walk to.
+- **Previews.** `handle.preview` (a bounded list of up to 8 member names) is present only if a `get` entry names the handle's path, and lists only the names `describe(use(handle))` would list: those the allow-lists could walk to from there. Otherwise a handle says its type and nothing more.
+- **Wide entries need an acknowledgement.** A wildcard (`*` or `**`) in `allow.call` or `allow.set` on a handles root lets a caller hold and reuse every object under it, so the host refuses to start with one unless the root says
+  so, `handles: { window: { wideEntries: true } }` (in `createPageHost`, `wideEntries: true` beside `mode: 'handles'`), or lists the paths. A wildcard in `get` alone needs no acknowledgement. A values root is not affected.
 - **Capabilities.** `objects:ROOT[:OP]` apply unchanged: an operation through a handle is the same `get`, `call`, `set` of the producing path (a key with `objects:window:get` can read through a handle and cannot call through it).
 - **What a handle is not.** The host's real object stays in the page: calling a method runs the page's code with the caller's plain-data arguments, as for any `call`; a handle to an object with a powerful method is as powerful as that method's entry in `call`. A handle is
   a reference to something already reachable by a path, so it cannot reach more than the path's own entries; but a wide entry (`window.app.**`) covers every member of every object under it. Events are not offered through a handle, and callbacks are not built.
@@ -893,8 +895,8 @@ reach is exactly the paths the lists name (and, below a `get`, the plain data in
   written by third parties.
 - A sealed session, a key login and a visible indicator (the page host) are what keep a relay and an unknown caller out; `authorize` is where an embedder asks the person.
 
-Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 52.2 kB gzipped (it contains the client), and
-the page entry point is 91.7 kB with it; no other entry point changed. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
+Types: `@johnhenry/wsh/objects` ships `.d.ts` (`client.openObjects<T>()` types the roots; references are untyped). Size: `@johnhenry/wsh/objects` is 52.4 kB gzipped (it contains the client), and
+the page entry point is 91.9 kB with it; no other entry point changed. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
 Not built yet (later steps of #190): callbacks as arguments, typed remotes (`Remote<T>`), an MCP face for the allow-listed paths, and a dial-out form.
 
 ### WebTransport listener

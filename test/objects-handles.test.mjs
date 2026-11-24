@@ -72,7 +72,7 @@ const TRANSPORTS = { 'a bare in-memory duplex': overBare, 'a wsh rpc channel': o
 
 for (const [name, connect] of Object.entries(TRANSPORTS)) {
   describe(`handles over ${name}`, () => {
-    const open = async (extra = {}) => { const w = makeWorld(); const c = await connect({ roots: { window: w.win }, allow: ALLOW, handles: { window: {} }, ...extra }); return { ...w, ...c }; };
+    const open = async (extra = {}) => { const w = makeWorld(); const c = await connect({ roots: { window: w.win }, allow: ALLOW, handles: { window: { wideEntries: true } }, ...extra }); return { ...w, ...c }; };
 
     it('a value that cannot be cloned is an opaque handle on an opted-in root, usable across calls; on a values root it stays a named non-value', async () => {
       const { page } = await open();
@@ -190,9 +190,28 @@ for (const [name, connect] of Object.entries(TRANSPORTS)) {
       const without = await open({ allow: { call: ['window.app.makeCounter'] } });
       const h1 = await without.page.window.app.makeCounter();
       assert.equal(h1.preview, undefined);
+      // With a get entry for the path, but none for its members: the preview is there and lists no member name (none could be walked to).
       const withGet = await open({ allow: { get: ['window.app.makeCounter()'], call: ['window.app.makeCounter'] } });
       const h2 = await withGet.page.window.app.makeCounter();
-      assert.deepEqual(h2.preview, { keys: ['n'] });
+      assert.deepEqual(h2.preview, { keys: [] });
+      // The names a preview lists are those describe() would list: the ones the allow-lists could walk to.
+      const walkable = await open({ allow: { get: ['window.app.makeCounter()', 'window.app.makeCounter().n'], call: ['window.app.makeCounter'] } });
+      const h3 = await walkable.page.window.app.makeCounter();
+      assert.deepEqual(h3.preview, { keys: ['n'] });
+      assert.deepEqual((await describeRef(use(h3))).keys.map((k) => k.key), ['n']);
+    });
+
+    it('a wide entry (a wildcard) in call or set on a handles root needs an acknowledgement; get-only wide entries do not', () => {
+      const roots = { window: {} };
+      const mk = (allow, handles = { window: {} }) => () => createObjectsServer({ roots, random, allow, handles });
+      for (const allow of [{ call: ['window.app.**'] }, { call: ['window.*.add'] }, { set: ['window.app.*'] }, { call: ['*.app.add'] }, { call: ['window.**'], get: ['window.**'] }]) {
+        assert.throws(mk(allow), (e) => e instanceof TypeError && /wide/.test(e.message) && /list the paths|wideEntries/.test(e.message), JSON.stringify(allow));
+      }
+      assert.doesNotThrow(mk({ get: ['window.**'] }));
+      assert.doesNotThrow(mk({ get: ['window.app.*'], call: ['window.app.add'], set: ['window.app.count'] }));
+      assert.doesNotThrow(mk({ call: ['window.app.**'], set: ['window.app.*'] }, { window: { wideEntries: true } }));
+      assert.doesNotThrow(() => createObjectsServer({ roots, allow: { call: ['window.app.**'] } }), 'a values root is not affected');
+      assert.throws(mk({}, { window: { wideEntries: 'yes' } }), /wideEntries must be true or false/);
     });
 
     it('describe of a handle lists only the members the allow-list could walk to; snapshot is a plain copy', async () => {
@@ -214,7 +233,7 @@ for (const [name, connect] of Object.entries(TRANSPORTS)) {
 
 describe('handles: the session end, the key, and the configuration', () => {
   it('the end of the channel empties the table (the host holds nothing)', async () => {
-    const { page, attached, serverPeer, peer } = await overBare({ roots: { window: makeWorld().win }, allow: ALLOW, handles: { window: {} } });
+    const { page, attached, serverPeer, peer } = await overBare({ roots: { window: makeWorld().win }, allow: ALLOW, handles: { window: { wideEntries: true } } });
     await page.window.app.cart;
     await page.window.app.makeCounter();
     assert.equal(attached.handleCount(), 2);
@@ -225,7 +244,7 @@ describe('handles: the session end, the key, and the configuration', () => {
 
   it('the key\'s capabilities apply unchanged: an operation through a handle is the same get / call / set of the producing path', async () => {
     const w = makeWorld();
-    const host = createMemoryHost({ auth: { authorizedKeys: `capabilities="objects:window:get" ${keyLine}` }, rpc: { 'wsh-objects': exposeObjects({ roots: { window: w.win }, allow: ALLOW, handles: { window: {} } }) } });
+    const host = createMemoryHost({ auth: { authorizedKeys: `capabilities="objects:window:get" ${keyLine}` }, rpc: { 'wsh-objects': exposeObjects({ roots: { window: w.win }, allow: ALLOW, handles: { window: { wideEntries: true } } }) } });
     closers.push(() => host.close());
     const client = await host.connect({ username: 'alice', keyPair });
     closers.push(() => client.disconnect());
