@@ -542,6 +542,380 @@ async fn udp_datagrams_round_trip() {
     }
 }
 
+// ── UDP as WebTransport datagrams (`gateway-datagram`, #124) ──────────
+
+mod datagrams {
+    use super::*;
+    use crate::gateway::udp_policy::{Oversize, UdpPolicy};
+    use std::sync::atomic::AtomicUsize;
+    use wsh_core::gateway_datagram::{decode_datagram, encode_datagram};
+
+    const DG: &[&str] = &[GATEWAY_CREDIT_FEATURE, GATEWAY_DATAGRAM_FEATURE];
+
+    /// A transport's datagrams: what was sent, and a size limit that can be changed.
+    struct FakeSink {
+        sent: Mutex<Vec<Vec<u8>>>,
+        max: AtomicUsize,
+    }
+
+    impl FakeSink {
+        fn new(max: usize) -> Arc<Self> {
+            Arc::new(Self {
+                sent: Mutex::new(Vec::new()),
+                max: AtomicUsize::new(max),
+            })
+        }
+        fn sent(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl DatagramSink for FakeSink {
+        fn send(&self, datagram: Vec<u8>) -> bool {
+            self.sent.lock().unwrap().push(datagram);
+            true
+        }
+        fn max_size(&self) -> usize {
+            self.max.load(Ordering::Relaxed)
+        }
+    }
+
+    fn dg_rig(udp: UdpPolicy, features: &[&str], sink: Option<Arc<FakeSink>>) -> Rig {
+        let (tx, rx) = mpsc::channel(256);
+        let features: Vec<String> = features.iter().map(|f| f.to_string()).collect();
+        let policy = GatewayPolicy {
+            udp,
+            ..loopback_policy()
+        };
+        let session = GatewaySession::with_datagrams(
+            Arc::new(GatewayPolicyEnforcer::new(policy)),
+            tx,
+            true,
+            &features,
+            sink.map(|s| s as Arc<dyn DatagramSink>),
+        );
+        Rig { session, rx }
+    }
+
+    /// A UDP origin that records what it gets and echoes it, `times` times over (an amplifier).
+    async fn origin(times: usize) -> (u16, mpsc::UnboundedReceiver<Vec<u8>>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 70_000];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                let _ = tx.send(buf[..n].to_vec());
+                for _ in 0..times {
+                    let _ = sock.send_to(&buf[..n], from).await;
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    async fn open(r: &mut Rig, id: u32, port: u16) {
+        r.send(
+            MsgType::OpenUdp,
+            Payload::OpenUdp(OpenUdpPayload {
+                gateway_id: id,
+                host: "127.0.0.1".into(),
+                port,
+            }),
+        );
+        r.expect_ok(id).await;
+    }
+
+    async fn until_sent(sink: &FakeSink, n: usize) {
+        for _ in 0..200 {
+            if sink.sent().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected {n} datagrams, got {}", sink.sent().len());
+    }
+
+    #[tokio::test]
+    async fn a_flow_on_datagrams_moves_payloads_as_datagrams_and_nothing_as_gatewaydata() {
+        let (port, mut seen) = origin(1).await;
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(UdpPolicy::default(), DG, Some(sink.clone()));
+        assert!(r.session.datagrams_on());
+        open(&mut r, 7, port).await;
+
+        r.session.handle_datagram(&encode_datagram(7, b"ping"));
+        assert_eq!(seen.recv().await.unwrap(), b"ping", "the origin got it");
+        until_sent(&sink, 1).await;
+        let (id, payload) = {
+            let sent = sink.sent();
+            let (id, p) = decode_datagram(&sent[0]).unwrap();
+            (id, p.to_vec())
+        };
+        assert_eq!((id, payload.as_slice()), (7, &b"ping"[..]));
+        // The control stream carried nothing else for the flow.
+        assert_eq!(data_len(&r.drain(100).await), 0);
+    }
+
+    #[tokio::test]
+    async fn datagrams_for_unknown_flows_and_malformed_ones_are_dropped() {
+        let (port, mut seen) = origin(0).await;
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(UdpPolicy::default(), DG, Some(sink.clone()));
+        open(&mut r, 1, port).await;
+        r.session.handle_datagram(&encode_datagram(2, b"nobody")); // no such flow
+        r.session.handle_datagram(&[0, 0, 1]); // shorter than the header
+        r.session.handle_datagram(&[]);
+        r.session.handle_datagram(&encode_datagram(1, b"real"));
+        assert_eq!(
+            seen.recv().await.unwrap(),
+            b"real",
+            "only the real one arrived"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), seen.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_datagram_after_the_flow_closed_is_dropped() {
+        let (port, mut seen) = origin(0).await;
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(UdpPolicy::default(), DG, Some(sink));
+        open(&mut r, 1, port).await;
+        r.close(1);
+        let _ = r.drain(1300).await; // the flow ends, and the client is told
+        r.session.handle_datagram(&encode_datagram(1, b"late"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), seen.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_did_not_list_the_feature_is_served_on_the_control_stream_as_before() {
+        let (port, mut seen) = origin(1).await;
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(UdpPolicy::default(), CREDIT, Some(sink.clone()));
+        assert!(!r.session.datagrams_on());
+        open(&mut r, 1, port).await;
+        r.data(1, b"ping".to_vec());
+        assert_eq!(seen.recv().await.unwrap(), b"ping");
+        match r.next().await.payload {
+            Payload::GatewayData(d) => assert_eq!(d.data, b"ping"),
+            other => panic!("{other:?}"),
+        }
+        // A datagram from such a client is not heard, even for a flow it opened.
+        r.session.handle_datagram(&encode_datagram(1, b"stray"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), seen.recv())
+                .await
+                .is_err()
+        );
+        assert!(sink.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn udp_datagrams_false_and_a_transport_without_datagrams_keep_every_flow_on_the_control_stream(
+    ) {
+        for (udp, sink) in [
+            (
+                UdpPolicy::default().with_datagrams(false, Oversize::Reliable),
+                Some(FakeSink::new(1200)),
+            ),
+            (UdpPolicy::default(), None),
+        ] {
+            let (port, mut seen) = origin(1).await;
+            let mut r = dg_rig(udp, DG, sink.clone());
+            assert!(!r.session.datagrams_on());
+            open(&mut r, 1, port).await;
+            r.data(1, b"ping".to_vec());
+            assert_eq!(seen.recv().await.unwrap(), b"ping");
+            assert!(matches!(r.next().await.payload, Payload::GatewayData(_)));
+            if let Some(s) = sink {
+                assert!(s.sent().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_datagram_limit_goes_on_the_control_stream_by_default() {
+        let (port, mut seen) = origin(1).await;
+        // 1200 bytes fit; a 1197-byte payload is the largest that does (limit minus the 4-byte id)
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(UdpPolicy::default(), DG, Some(sink.clone()));
+        open(&mut r, 1, port).await;
+
+        r.session
+            .handle_datagram(&encode_datagram(1, &vec![5u8; 1196]));
+        assert_eq!(seen.recv().await.unwrap().len(), 1196);
+        until_sent(&sink, 1).await;
+        assert_eq!(
+            sink.sent()[0].len(),
+            1200,
+            "exactly at the limit: a datagram"
+        );
+
+        r.session
+            .handle_datagram(&encode_datagram(1, &vec![6u8; 1197]));
+        assert_eq!(seen.recv().await.unwrap().len(), 1197);
+        match r.next().await.payload {
+            Payload::GatewayData(d) => {
+                assert_eq!(d.data.len(), 1197, "one over: the control stream")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(sink.sent().len(), 1, "and not also as a datagram");
+    }
+
+    #[tokio::test]
+    async fn udp_oversize_drop_drops_a_reply_that_does_not_fit() {
+        let (port, mut seen) = origin(1).await;
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(
+            UdpPolicy::default().with_datagrams(true, Oversize::Drop),
+            DG,
+            Some(sink.clone()),
+        );
+        open(&mut r, 1, port).await;
+        r.session
+            .handle_datagram(&encode_datagram(1, &vec![6u8; 1197]));
+        assert_eq!(seen.recv().await.unwrap().len(), 1197);
+        assert_eq!(data_len(&r.drain(200).await), 0);
+        assert!(sink.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_read_again_for_every_payload() {
+        let (port, mut seen) = origin(1).await;
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(UdpPolicy::default(), DG, Some(sink.clone()));
+        open(&mut r, 1, port).await;
+        r.session.handle_datagram(&encode_datagram(1, &[1u8; 500]));
+        seen.recv().await.unwrap();
+        until_sent(&sink, 1).await;
+        sink.max.store(300, Ordering::Relaxed); // the path MTU estimate fell
+        r.session.handle_datagram(&encode_datagram(1, &[2u8; 500]));
+        seen.recv().await.unwrap();
+        assert!(matches!(r.next().await.payload, Payload::GatewayData(_)));
+        sink.max.store(0, Ordering::Relaxed); // datagrams no longer taken at all
+        r.session.handle_datagram(&encode_datagram(1, &[3u8; 10]));
+        seen.recv().await.unwrap();
+        assert!(matches!(r.next().await.payload, Payload::GatewayData(_)));
+        assert_eq!(sink.sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_oversize_payload_from_the_client_on_the_control_stream_still_reaches_the_origin() {
+        let (port, mut seen) = origin(0).await;
+        let sink = FakeSink::new(1200);
+        let mut r = dg_rig(UdpPolicy::default(), DG, Some(sink));
+        open(&mut r, 1, port).await;
+        r.data(1, vec![8u8; 5000]);
+        assert_eq!(seen.recv().await.unwrap().len(), 5000);
+    }
+
+    /// What a token bucket guarantees whatever the scheduling: no more than `burst + rate * T` over `T` seconds.
+    #[tokio::test]
+    async fn the_bounds_apply_to_the_datagram_path_per_flow_per_client_and_in_bytes() {
+        // per flow: 20/s, burst 16; 200 datagrams in a burst
+        let (port, mut seen) = origin(0).await;
+        let sink = FakeSink::new(1200);
+        let started = std::time::Instant::now();
+        let mut r = dg_rig(UdpPolicy::new(16, 20, 0, 0, 60).unwrap(), DG, Some(sink));
+        open(&mut r, 1, port).await;
+        for _ in 0..200 {
+            r.session.handle_datagram(&encode_datagram(1, &[1u8; 50]));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut got = 0;
+        while seen.try_recv().is_ok() {
+            got += 1;
+        }
+        let most = 16.0 + 20.0 * started.elapsed().as_secs_f64();
+        assert!(
+            got >= 1 && (got as f64) <= most + 1.0,
+            "{got} of 200, at most {most}"
+        );
+
+        // per client, over two flows: 20/s, burst 32
+        let (port, mut seen) = origin(0).await;
+        let started = std::time::Instant::now();
+        let mut r = dg_rig(
+            UdpPolicy::new(16, 0, 20, 0, 60).unwrap(),
+            DG,
+            Some(FakeSink::new(1200)),
+        );
+        open(&mut r, 1, port).await;
+        open(&mut r, 2, port).await;
+        for i in 0..200u32 {
+            r.session
+                .handle_datagram(&encode_datagram(1 + i % 2, &[1u8; 50]));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut got = 0;
+        while seen.try_recv().is_ok() {
+            got += 1;
+        }
+        let most = 32.0 + 20.0 * started.elapsed().as_secs_f64();
+        assert!(
+            got >= 1 && (got as f64) <= most + 1.0,
+            "{got} of 200, at most {most}"
+        );
+
+        // bytes per client, the amplification bound: small queries, 8000-byte answers, 4 answers each
+        let (port, mut seen) = origin(4).await;
+        let sink = FakeSink::new(10_000);
+        let started = std::time::Instant::now();
+        let mut r = dg_rig(
+            UdpPolicy::new(16, 0, 0, 40_000, 60).unwrap(),
+            DG,
+            Some(sink.clone()),
+        );
+        open(&mut r, 1, port).await;
+        // One query first, while the burst is full: its answers (4 x 8000) pass, so the bound is seen to let traffic through.
+        r.session.handle_datagram(&encode_datagram(1, &[7u8; 8000]));
+        until_sent(&sink, 1).await;
+        for _ in 0..39 {
+            r.session.handle_datagram(&encode_datagram(1, &[7u8; 8000]));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while seen.try_recv().is_ok() {}
+        let bytes: usize = sink.sent().iter().map(|d| d.len() - 4).sum();
+        // The burst is max(40000 / 4, 65536) bytes, refilled at 40000 a second, shared by the queries and the answers: of
+        // the 320000 query bytes and 1280000 answer bytes offered, no more than burst + rate * T pass in total.
+        let most = 65_536.0 + 40_000.0 * started.elapsed().as_secs_f64();
+        assert!(
+            bytes >= 8000 && (bytes as f64) <= most,
+            "{bytes} bytes, at most {most}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flow_with_traffic_only_as_datagrams_from_the_client_is_not_idle() {
+        // udp_idle_secs = 1; datagrams in one direction only for about 2.4 s keep the flow open.
+        let (port, _seen) = origin(0).await;
+        let mut r = dg_rig(
+            UdpPolicy::new(16, 0, 0, 0, 1).unwrap(),
+            DG,
+            Some(FakeSink::new(1200)),
+        );
+        open(&mut r, 1, port).await;
+        for _ in 0..8 {
+            r.session.handle_datagram(&encode_datagram(1, &[1u8; 10]));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let msgs = r.drain(10).await;
+        assert!(got_close(&msgs).is_none(), "kept alive by datagrams");
+        // and it closes once they stop
+        let msgs = r.drain(2500).await;
+        assert!(got_close(&msgs).is_some(), "idle at last");
+    }
+}
+
 // ── unix sockets ──────────────────────────────────────────────────
 
 #[cfg(unix)]

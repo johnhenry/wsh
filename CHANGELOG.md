@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Rust `wsh-server`: UDP flows as WebTransport datagrams, `gateway-datagram` (#124, #145, the last open item of the parity epic; Rust only)
+
+`wsh-server` now serves `OpenUdp` flows as WebTransport datagrams, as the Node host does (0.38.0), behind the same feature string. **No new wire message and no new
+feature string**: `gateway-datagram` is the existing one (`src/gateway-datagram.mjs`), listed by the server in `ServerHello.features` **only on a WebTransport
+connection, with `[gateway] enabled = true` and `udp_datagrams` not `false`**, and used per connection only when the client lists it in `Hello.features` too.
+
+- **Layout, as on the Node host:** the whole QUIC datagram payload is `[gateway_id u32 big endian][UDP payload]`; `OpenUdp`, `GatewayOk`/`GatewayFail` and
+  `GatewayClose` stay on the control stream, `GatewayCredit` does not apply to a datagram. A datagram that is malformed, names a flow the connection does not have, or
+  arrives before authentication, is dropped.
+- **Size:** the limit is read from the QUIC connection for every payload (`max_datagram_size`, minus the 4-byte id), not assumed. A reply that does not fit goes on the
+  control stream as `GatewayData` (the default, `udp_oversize = "reliable"`), or is dropped (`udp_oversize = "drop"`); a payload the client sends on the control stream
+  still reaches the origin. A payload over 65507 bytes is ignored, as before.
+- **The bounds of #145 apply to both paths:** the per-flow, per-client and byte buckets, `udp_max_flows` and the idle limit (a datagram in either direction counts as
+  activity) are the same code for a datagram and for a `GatewayData`.
+- **Config (new, `[gateway]`):** `udp_datagrams` (default `true`: **a WebTransport client that lists `gateway-datagram` now gets its UDP flows on datagrams where it
+  was served on the control stream before**; set `false` to keep the old behaviour) and `udp_oversize` (`"reliable"`, the default, or `"drop"`).
+- **What a released peer does:** a released `wsh-server` never lists the feature, so any client keeps the control stream against it. A released JS client (it has
+  listed the feature since 0.38.0, on WebTransport only) now gets datagrams from this server over WebTransport, as it does from the Node host; a client that does not
+  list it (any older client, or a WebSocket one) is served on the control stream exactly as before. The Rust `wsh` client has no UDP flows.
+- **Not done:** `gatewayStats()`-style counters (drops are logged at `debug`); a browser (Chromium) against the Rust server (the Playwright test runs against the Node host).
+- Tests: `test/rust/wsh-rust-server-udp-datagrams.test.mjs` (the JS client over a real QUIC session against the binary: negotiation, round trip, the size limit both ways,
+  `udp_oversize`, `udp_datagrams = false`, a WebSocket client, the bounds on the datagram path); unit tests in `wsh-core` (`gateway_datagram`, the same vector as
+  `test/gateway-datagram.test.mjs`), `udp_policy` and the gateway session (a fake transport). Each rule was broken once to see its test fail.
+
 ### Rust `wsh-server`: reverse tunnels and UDP flows get the Node host's bounds (#145, part; Rust only; **breaking defaults, read this**)
 
 The two rows of the README capability matrix that said "Rust still needs ... the same bounds" are done. **No wire change, no new feature string, nothing

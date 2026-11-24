@@ -21,6 +21,30 @@ pub const DEFAULT_PACKETS_PER_SECOND_PER_CLIENT: u64 = 2000;
 pub const DEFAULT_BYTES_PER_SECOND_PER_CLIENT: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_IDLE_SECS: u64 = 60;
 
+/// What to do with a payload that does not fit one WebTransport datagram (`udp_oversize`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Oversize {
+    /// Send it on the reliable control stream as `GatewayData` (ordered, retransmitted, metered by
+    /// credit): a tunnel that cannot carry a 1252-byte QUIC Initial is not useful. The default, as on
+    /// the Node host.
+    #[default]
+    Reliable,
+    /// Drop it, as a real UDP path over its MTU would.
+    Drop,
+}
+
+impl Oversize {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "reliable" => Ok(Self::Reliable),
+            "drop" => Ok(Self::Drop),
+            other => Err(format!(
+                "config: [gateway] udp_oversize must be \"reliable\" or \"drop\" (got {other:?})"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpPolicy {
     pub max_flows: usize,
@@ -29,6 +53,10 @@ pub struct UdpPolicy {
     pub packets_per_second_per_client: u64,
     pub bytes_per_second_per_client: u64,
     pub idle: Duration,
+    /// Offer `gateway-datagram` on WebTransport connections (`udp_datagrams`, default `true`).
+    pub datagrams: bool,
+    /// A payload that does not fit one datagram (`udp_oversize`).
+    pub oversize: Oversize,
 }
 
 impl Default for UdpPolicy {
@@ -39,6 +67,8 @@ impl Default for UdpPolicy {
             packets_per_second_per_client: DEFAULT_PACKETS_PER_SECOND_PER_CLIENT,
             bytes_per_second_per_client: DEFAULT_BYTES_PER_SECOND_PER_CLIENT,
             idle: Duration::from_secs(DEFAULT_IDLE_SECS),
+            datagrams: true,
+            oversize: Oversize::Reliable,
         }
     }
 }
@@ -63,7 +93,16 @@ impl UdpPolicy {
             packets_per_second_per_client,
             bytes_per_second_per_client,
             idle: Duration::from_secs(idle_secs),
+            datagrams: true,
+            oversize: Oversize::Reliable,
         })
+    }
+
+    /// The WebTransport datagram settings (`udp_datagrams`, `udp_oversize`).
+    pub fn with_datagrams(mut self, datagrams: bool, oversize: Oversize) -> Self {
+        self.datagrams = datagrams;
+        self.oversize = oversize;
+        self
     }
 
     /// The bucket for one flow's datagrams (burst: a quarter second, at least 16).
@@ -155,6 +194,19 @@ mod tests {
         assert!(b.take(200_000));
         assert!(!b.take(200_000));
         assert!(b.take(40_000));
+    }
+
+    #[test]
+    fn oversize_is_reliable_or_drop_and_nothing_else() {
+        assert_eq!(Oversize::parse("reliable"), Ok(Oversize::Reliable));
+        assert_eq!(Oversize::parse("drop"), Ok(Oversize::Drop));
+        assert!(Oversize::parse("fragment")
+            .unwrap_err()
+            .contains("udp_oversize"));
+        let p = UdpPolicy::default().with_datagrams(false, Oversize::Drop);
+        assert!(!p.datagrams);
+        assert_eq!(p.oversize, Oversize::Drop);
+        assert!(UdpPolicy::default().datagrams);
     }
 
     #[test]

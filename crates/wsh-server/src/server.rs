@@ -55,6 +55,27 @@ async fn write_control(
     }
 }
 
+/// A WebTransport connection's datagrams, for the gateway's UDP flows (`gateway-datagram`).
+struct WebTransportDatagrams(wtransport::Connection);
+
+impl crate::gateway::session::DatagramSink for WebTransportDatagrams {
+    fn send(&self, datagram: Vec<u8>) -> bool {
+        self.0.send_datagram(datagram).is_ok()
+    }
+    fn max_size(&self) -> usize {
+        self.0.max_datagram_size().unwrap_or(0)
+    }
+}
+
+/// Aborts the task when dropped (the datagram receive loop must not outlive its session).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Per-connection context threaded through the session loop.
 struct ConnectionContext {
     /// Authenticated username.
@@ -724,7 +745,13 @@ impl WshServer {
             .iter()
             .map(|k| k.fingerprint.clone())
             .collect();
-        let features = self.build_feature_list(false);
+        let mut features = self.build_feature_list(false);
+        // UDP flows as WebTransport datagrams (wsh #124): only here, where the transport has them, and
+        // only when the gateway is on (it serves UDP) and `udp_datagrams` is not off. Used per
+        // connection, and only when the client lists it too.
+        if self.gateway_enabled && self.gateway_policy.udp().datagrams {
+            features.push(wsh_core::gateway_datagram::GATEWAY_DATAGRAM_FEATURE.to_string());
+        }
         let hello_result = handshake::handle_hello(
             &hello,
             &server_fingerprints,
@@ -860,13 +887,28 @@ impl WshServer {
                     peer_tx: peer_tx.clone(),
                     conn_id: Some(conn_id),
                     mcp_calls: Default::default(),
-                    gateway: GatewaySession::new(
+                    gateway: GatewaySession::with_datagrams(
                         self.gateway_policy.clone(),
                         peer_tx.clone(),
                         self.gateway_enabled,
                         &hello.features,
+                        Some(Arc::new(WebTransportDatagrams(conn.connection.clone()))),
                     ),
                 };
+
+                // The client's datagrams (UDP flows on `gateway-datagram`) go to its gateway session
+                // from their own task, which ends with the connection or with this session.
+                let _datagram_task = ctx.gateway.datagrams_on().then(|| {
+                    let receiver = ctx.gateway.datagram_receiver();
+                    let wt = conn.connection.clone();
+                    AbortOnDrop(tokio::spawn(async move {
+                        while let Ok(datagram) = wt.receive_datagram().await {
+                            if !receiver.deliver(&datagram.payload()) {
+                                break;
+                            }
+                        }
+                    }))
+                });
 
                 // Session message loop
                 self.session_loop_quic(&mut send, &mut recv, &mut ctx, peer_rx)

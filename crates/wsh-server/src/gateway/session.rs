@@ -45,8 +45,50 @@ use wsh_core::messages::*;
 
 use wsh_core::gateway_credit::SendCredit;
 pub use wsh_core::gateway_credit::{GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW};
+use wsh_core::gateway_datagram::{
+    decode_datagram, encode_datagram, DATAGRAM_HEADER_BYTES, GATEWAY_DATAGRAM_FEATURE,
+};
 /// Advertised when unix sockets are configured.
 pub const GATEWAY_UNIX_FEATURE: &str = "gateway-unix";
+
+/// Where the datagrams of a connection go (WebTransport only): the transport's datagram send and
+/// its current size limit.
+pub trait DatagramSink: Send + Sync {
+    /// Hand one datagram to the transport. `false` when it was not taken (too big, no room, the
+    /// connection is gone): a datagram is never queued without bound, it is dropped.
+    fn send(&self, datagram: Vec<u8>) -> bool;
+    /// The largest datagram the transport takes now (header included); `0` when it takes none. It
+    /// can change, so it is read again for every payload.
+    fn max_size(&self) -> usize;
+}
+
+/// Delivers a connection's incoming datagrams to its gateway session (a weak reference: the
+/// session is closed by its owner dropping it, not by this).
+#[derive(Clone)]
+pub struct DatagramReceiver {
+    inner: std::sync::Weak<Inner>,
+}
+
+impl DatagramReceiver {
+    /// `false` once the session is gone.
+    pub fn deliver(&self, bytes: &[u8]) -> bool {
+        match self.inner.upgrade() {
+            Some(inner) => {
+                inner.on_datagram(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// What a datagram from the client needs to reach its flow's socket.
+struct UdpFlowHandle {
+    socket: Arc<UdpSocket>,
+    packets: Arc<super::udp_policy::TokenBucket>,
+    /// Marks the flow active (the idle limit counts both directions).
+    touch: Arc<dyn Fn() + Send + Sync>,
+}
 
 /// Largest `GatewayData` payload this host sends.
 const MAX_FRAME: usize = 65_536;
@@ -222,6 +264,12 @@ struct Inner {
     /// Datagrams and payload bytes over all of this client's UDP flows, both directions.
     udp_client_packets: super::udp_policy::TokenBucket,
     udp_client_bytes: super::udp_policy::TokenBucket,
+    /// The transport's datagrams, when it has them (WebTransport), and whether the client listed
+    /// `gateway-datagram`: both, and `udp_datagrams`, put the UDP flows opened from then on on datagrams.
+    datagrams: Option<Arc<dyn DatagramSink>>,
+    peer_datagrams: bool,
+    /// The flows that take datagrams from the client, by gateway_id.
+    udp_datagram_flows: Mutex<HashMap<u32, UdpFlowHandle>>,
     closed: AtomicBool,
 }
 
@@ -246,12 +294,31 @@ impl GatewaySession {
         enabled: bool,
         client_features: &[String],
     ) -> Self {
+        Self::with_datagrams(policy, out, enabled, client_features, None)
+    }
+
+    /// As [`GatewaySession::new`], on a transport that has datagrams (WebTransport). `datagrams` is
+    /// how to send one; it is used only when the client listed `gateway-datagram` and `udp_datagrams`
+    /// is on.
+    pub fn with_datagrams(
+        policy: Arc<GatewayPolicyEnforcer>,
+        out: mpsc::Sender<Envelope>,
+        enabled: bool,
+        client_features: &[String],
+        datagrams: Option<Arc<dyn DatagramSink>>,
+    ) -> Self {
         let (max_conn_bytes, max_client_bytes) = policy.buffer_limits();
         let credit = enabled && client_features.iter().any(|f| f == GATEWAY_CREDIT_FEATURE);
+        let peer_datagrams = client_features
+            .iter()
+            .any(|f| f == GATEWAY_DATAGRAM_FEATURE);
         let udp_client_packets = policy.udp().client_packets();
         let udp_client_bytes = policy.udp().client_bytes();
         Self {
             inner: Arc::new(Inner {
+                datagrams,
+                peer_datagrams,
+                udp_datagram_flows: Mutex::new(HashMap::new()),
                 udp_flows: Arc::new(AtomicUsize::new(0)),
                 udp_client_packets,
                 udp_client_bytes,
@@ -302,6 +369,24 @@ impl GatewaySession {
     /// Open connections (for tests and logs).
     pub fn open_connections(&self) -> usize {
         self.inner.conns.lock().expect("conns").len()
+    }
+
+    /// Do UDP flows opened now use WebTransport datagrams?
+    pub fn datagrams_on(&self) -> bool {
+        self.inner.datagrams_on()
+    }
+
+    /// A WebTransport datagram arrived from the client.
+    pub fn handle_datagram(&self, bytes: &[u8]) {
+        self.inner.on_datagram(bytes);
+    }
+
+    /// A handle that delivers the client's datagrams to this session from another task (the
+    /// transport's datagram receive loop); it keeps nothing alive but the session's tables.
+    pub fn datagram_receiver(&self) -> DatagramReceiver {
+        DatagramReceiver {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// Bytes received from the client and not yet taken by an origin.
@@ -703,6 +788,43 @@ impl Inner {
         flow_packets.take(1) && self.udp_client_packets.take(1) && self.udp_client_bytes.take(n)
     }
 
+    /// Do UDP flows opened now use WebTransport datagrams? The transport has them, the client
+    /// listed `gateway-datagram`, and `udp_datagrams` is on.
+    fn datagrams_on(&self) -> bool {
+        self.enabled
+            && self.peer_datagrams
+            && self.datagrams.is_some()
+            && self.policy.udp().datagrams
+    }
+
+    /// A datagram arrived from the client: `[gateway_id u32 BE][payload]`. One that is malformed,
+    /// names a flow this connection does not have (or that is not on datagrams), is over the UDP
+    /// size limit, is over a rate, or finds the socket full, is dropped.
+    fn on_datagram(&self, bytes: &[u8]) {
+        if self.closed.load(Ordering::Acquire) || !self.datagrams_on() {
+            return;
+        }
+        let Some((id, payload)) = decode_datagram(bytes) else {
+            return;
+        };
+        let (socket, packets, touch) = {
+            let flows = self.udp_datagram_flows.lock().expect("udp flows");
+            let Some(flow) = flows.get(&id) else { return };
+            (
+                flow.socket.clone(),
+                flow.packets.clone(),
+                flow.touch.clone(),
+            )
+        };
+        touch();
+        if payload.len() > MAX_DATAGRAM || !self.admit_udp(&packets, payload.len()) {
+            return;
+        }
+        // The socket is connect()ed to the destination that passed the policy at OpenUdp; a full
+        // send buffer drops the datagram, as a network would.
+        let _ = socket.try_send(payload);
+    }
+
     fn attach_datagrams(
         self: &Arc<Self>,
         id: u32,
@@ -723,6 +845,19 @@ impl Inner {
             let last_active = last_active.clone();
             move || last_active.store(opened.elapsed().as_millis() as u64, Ordering::Release)
         };
+        // Payloads travel as datagrams when both ends negotiated it (the flow keeps its way for its life).
+        let use_datagrams = self.datagrams_on();
+        if use_datagrams {
+            let touch_flow = touch.clone();
+            self.udp_datagram_flows.lock().expect("udp flows").insert(
+                id,
+                UdpFlowHandle {
+                    socket: socket.clone(),
+                    packets: flow_packets.clone(),
+                    touch: Arc::new(move || touch_flow()),
+                },
+            );
+        }
         let reader = {
             let inner = self.clone();
             let chan = chan.clone();
@@ -747,10 +882,33 @@ impl Inner {
                     match tokio::time::timeout(left, socket.recv(&mut buf)).await {
                         Ok(Ok(n)) => {
                             touch();
-                            // Over a rate, or a datagram the client has no credit for, is dropped,
-                            // as a network would.
-                            if inner.admit_udp(&flow_packets, n)
-                                && chan.send.try_take_exact(n)
+                            // Over a rate is dropped, as a network would.
+                            if !inner.admit_udp(&flow_packets, n) {
+                                continue;
+                            }
+                            if use_datagrams {
+                                let sink = inner.datagrams.as_ref().expect("datagrams on");
+                                if n + DATAGRAM_HEADER_BYTES <= sink.max_size() {
+                                    // Not retransmitted, not ordered, not metered by credit: a
+                                    // datagram the transport does not take is dropped.
+                                    if !sink.send(encode_datagram(chan.id, &buf[..n])) {
+                                        debug!(
+                                            gateway_id = chan.id,
+                                            "datagram not taken by the transport: dropped"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                if inner.policy.udp().oversize == super::udp_policy::Oversize::Drop
+                                {
+                                    debug!(gateway_id = chan.id, bytes = n, "a reply that does not fit a datagram: dropped (udp_oversize = \"drop\")");
+                                    continue;
+                                }
+                                // Otherwise it goes on the control stream, below.
+                            }
+                            // On the control stream a datagram the client has no credit for is
+                            // dropped as well.
+                            if chan.send.try_take_exact(n)
                                 && inner
                                     .out
                                     .send(data_msg(chan.id, buf[..n].to_vec()))
@@ -802,6 +960,10 @@ impl Inner {
             let mut conns = self.conns.lock().expect("conns");
             if conns.get(&chan.id).is_some_and(|c| Arc::ptr_eq(c, chan)) {
                 conns.remove(&chan.id);
+                self.udp_datagram_flows
+                    .lock()
+                    .expect("udp flows")
+                    .remove(&chan.id);
             }
         }
         let rest = chan.queued.swap(0, Ordering::AcqRel);

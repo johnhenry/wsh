@@ -8,6 +8,7 @@ pub mod codec;
 pub mod e2e_exchange;
 pub mod error;
 pub mod gateway_credit;
+pub mod gateway_datagram;
 pub mod host_key;
 pub mod identity;
 pub mod keys;
