@@ -1385,6 +1385,11 @@ describe('Rust wsh-server Attach/Resume (clawser #48)', () => {
     const sessionId = session.sessionId;
 
     await ownerClient.grantSessionAccess(sessionId, 'bob', ['read', 'write']);
+    // The grant is fire-and-forget: the server sends no acknowledgement, and `sendControl` resolves when the frame is written, not
+    // when the server has applied it. bob connects on another connection, which the server serves independently, so without this
+    // he could attach before the grant exists (seen once under load). The server handles one connection's control messages in
+    // order, so the answer to a request sent AFTER the grant proves the grant is in effect.
+    await ownerClient.listRemoteSessions();
 
     // bob never received the session's token -- only the opener (alice) did,
     // via OpenOk. This is the exact case Attach's ACL/ownership path exists
