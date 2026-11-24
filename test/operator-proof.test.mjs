@@ -351,6 +351,41 @@ describe('operator proof through a relay', () => {
       assert.deepEqual(w.ran, ['legit'], 'neither the plain Open nor the replayed frame ran anything');
     });
 
+    it('#162: an operator\'s first sealed frame that reaches the host before the key exchange has finished THERE is held, then run -- not dropped as "not sealed"', async () => {
+      // The operator sends its first frame the moment ITS side of the exchange is done; the host may still be deriving
+      // its own key (when the operator encapsulates, the host still has to decapsulate and combine). The hop makes
+      // that order certain: it holds the operator's ML-KEM ciphertext back until the first sealed frame has passed.
+      // Which side encapsulates depends on the two ephemeral keys, so rounds in which the host encapsulated (nothing
+      // to hold) do not count; three rounds must exercise the held ciphertext.
+      let exercised = 0;
+      for (let round = 0; round < 60 && exercised < 3; round++) {
+        let held = null;
+        let heldAny = false;
+        const hop = {
+          toClient(m) {
+            if (m.type !== MSG.RELAY_FORWARD) return m;
+            const type = cborDecodeType(m.inner);
+            if (type === MSG.KEY_EXCHANGE && !held && cborDecodeEnvelope(m.inner).kem_ciphertext) { held = m; heldAny = true; return null; }
+            if (type === MSG.ENCRYPTED_FRAME && held) { const out = [m, held]; held = null; return out; }
+            return m;
+          },
+        };
+        const ran = [];
+        const w = await world({ host: asHost, hop, ran });
+        const bob = await login(w.url, 'bob');
+        await bob.reverseConnect(keys.host.fp, 5000, { sealed: true });
+        const s = await bob.openSession({ type: 'exec', command: `legit-${round}`, timeout: 4000 });
+        assert.equal(await collect(s), `ran:legit-${round}\n`, `round ${round} (held ciphertext: ${heldAny})`);
+        assert.deepEqual(ran, [`legit-${round}`]);
+        if (heldAny) exercised++;
+        await bob.disconnect();
+        await w.host.close();
+        await w.server.close();
+        await w.mitm.close();
+      }
+      assert.ok(exercised >= 3, 'the hop never got to reorder the operator\'s ciphertext');
+    });
+
     it('injects an Open before the operator has connected at all (nobody is bridged): nothing runs', async () => {
       const w = await world({ host: asHost });
       await w.mitm.context().injectToClient(relayForward({ fromFingerprint: keys.bob.fp, inner: cborEncode(openMsg({ kind: 'exec', command: 'NOBODY-HOME' })) }));

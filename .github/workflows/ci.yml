@@ -24,6 +24,7 @@ jobs:
         npm run typecheck
         npm run examples
         npm run size
+        npm run matrix:check
 
   browser:
     # A real Chromium (Playwright) against this package: a browser client -> Node host, a host living in the page driven
