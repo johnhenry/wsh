@@ -13,6 +13,7 @@ pub mod keygen;
 pub mod keys;
 pub mod ls;
 pub mod mcp;
+pub mod objects;
 pub mod relay;
 pub mod reverse_host;
 pub mod scp;
