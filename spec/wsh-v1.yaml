@@ -11,7 +11,7 @@ protocol:
 enums:
   ChannelKind:
     type: string
-    values: [pty, exec, meta, file, tcp, udp, job]
+    values: [pty, exec, meta, file, tcp, udp, job, rpc]
     value_descriptions:
       pty: "Interactive pseudo-terminal session with resize support"
       exec: "One-shot command execution without a PTY"
@@ -20,6 +20,7 @@ enums:
       tcp: "Gateway-proxied TCP stream to an external host:port"
       udp: "Gateway-proxied UDP datagram socket to an external host:port"
       job: "Background automation job channel for structured task execution"
+      rpc: "Typed object-mode channel (wsh #85): Open.command names the protocol, the data stream is a CBOR sequence of JSON-RPC 2.0 messages; offered only when ServerHello.features lists rpc and rpc-protocol:<name>"
   AuthMethod:
     type: string
     values: [pubkey, password]

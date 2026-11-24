@@ -497,7 +497,16 @@ pub async fn connect_checked(
 
 /// Connect and authenticate a client for a resolved target.
 pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result<WshClient> {
-    let config = ConnectConfig {
+    connect_client_with(resolved, identity, |_| {}).await
+}
+
+/// [`connect_client`] with the connection settings adjusted first (`wsh mcp --host-key`, `--timeout`).
+pub async fn connect_client_with(
+    resolved: &ResolvedTarget,
+    identity: &str,
+    adjust: impl FnOnce(&mut ConnectConfig),
+) -> Result<WshClient> {
+    let mut config = ConnectConfig {
         username: resolved.user.clone(),
         key_name: Some(identity.to_string()),
         known_host: resolved.known_host.clone(),
@@ -508,6 +517,7 @@ pub async fn connect_client(resolved: &ResolvedTarget, identity: &str) -> Result
         },
         ..Default::default()
     };
+    adjust(&mut config);
 
     let mut attempts = Vec::with_capacity(1 + resolved.fallback_urls.len());
     attempts.push((transport_label(&resolved.url), resolved.url.clone()));

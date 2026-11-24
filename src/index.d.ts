@@ -217,6 +217,8 @@ export const CHANNEL_KIND: {
   readonly TCP: 'tcp';
   readonly UDP: 'udp';
   readonly JOB: 'job';
+  /** A typed object-mode channel (#85): `Open.command` names the protocol. `client.openRpc()` sends it. */
+  readonly RPC: 'rpc';
 };
 
 /** Authentication method constants. */

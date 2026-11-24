@@ -36,6 +36,7 @@ Type: `string`
 | `tcp` |
 | `udp` |
 | `job` |
+| `rpc` |
 
 ### AuthMethod
 

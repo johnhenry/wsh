@@ -303,6 +303,37 @@ enum Command {
         command: CheckCommand,
     },
 
+    /// Bridge stdio to the `mcp` rpc channel of a host, so an MCP client that launches a command
+    /// can use an MCP server behind it (wsh #127). stdout carries MCP messages only (one JSON-RPC
+    /// message per line); diagnostics go to stderr. Reconnects, answers a request that was in
+    /// flight with an error, and exits 2 (listing what it offers) when the host has no such channel.
+    /// An MCP client configuration: {"command": "wsh", "args": ["mcp", "-i", "default", "user@host"]}
+    Mcp {
+        /// Target in [user@]host format, or a ws://, wss:// or https:// URL
+        target: String,
+
+        /// The rpc channel to open
+        #[arg(long, default_value = "mcp")]
+        channel: String,
+
+        /// Pin the host: its key fingerprint (64 hex digits) or an `ssh-ed25519 AAAA...` line. The host
+        /// must prove that key, whatever known_hosts says; known_hosts is neither read nor written.
+        #[arg(long = "host-key", value_name = "KEY")]
+        host_key: Option<String>,
+
+        /// Exit when the connection is lost instead of reconnecting
+        #[arg(long = "no-reconnect")]
+        no_reconnect: bool,
+
+        /// Reconnect attempts before giving up, from 500 ms, doubling
+        #[arg(long = "reconnect-attempts", value_name = "N", default_value_t = 5)]
+        reconnect_attempts: u32,
+
+        /// To log in and to open the channel, in milliseconds
+        #[arg(long = "timeout", value_name = "MS", default_value_t = 15000, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_ms: u64,
+    },
+
     /// List MCP tools available on a remote host
     Tools {
         /// Target host (optional, uses config default)
@@ -451,7 +482,8 @@ async fn main() {
                 | Command::Scp { .. }
                 | Command::Ls { .. }
                 | Command::Sftp { .. }
-                | Command::Targets { .. },
+                | Command::Targets { .. }
+                | Command::Mcp { .. },
             ) => true,
             Some(_) => false,
         };
@@ -664,6 +696,34 @@ async fn main() {
                     .await
             }
         },
+        Some(Command::Mcp {
+            target,
+            channel,
+            host_key,
+            no_reconnect,
+            reconnect_attempts,
+            timeout_ms,
+        }) => {
+            let host_key = match host_key.as_deref().map(commands::mcp::normalize_host_key) {
+                None => None,
+                Some(Ok(fp)) => Some(fp),
+                Some(Err(e)) => {
+                    eprintln!("wsh mcp: {e}");
+                    std::process::exit(2);
+                }
+            };
+            commands::mcp::run(commands::mcp::Options {
+                target,
+                port,
+                transport: transport.clone(),
+                identity: identity.clone(),
+                channel,
+                host_key,
+                reconnect_attempts: if no_reconnect { 0 } else { reconnect_attempts },
+                timeout: std::time::Duration::from_millis(timeout_ms),
+            })
+            .await
+        }
         Some(Command::Tools { host }) => {
             commands::tools::run(host.as_deref(), port, &identity, transport.as_deref()).await
         }

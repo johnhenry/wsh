@@ -290,6 +290,7 @@ pub enum ChannelKind {
     Tcp,
     Udp,
     Job,
+    Rpc,
 }
 
 /// AuthMethod enum.
