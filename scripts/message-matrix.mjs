@@ -44,7 +44,7 @@ export const FILES = {
       'src/auth.mjs', 'src/bridge-seal.mjs', 'src/channel-binding.mjs', 'src/e2e-exchange.mjs', 'src/e2e-frame.mjs', 'src/features.mjs', 'src/host-key.mjs',
       'src/key-options.mjs', 'src/operator-proof.mjs', 'src/rpc.mjs', 'src/rpc-virtual.mjs', 'src/rpc-mcp.mjs', 'src/stream-frame.mjs', 'src/virtual-session.mjs',
     ],
-    ignored: ['src/index.mjs', 'src/messages.mjs', 'src/messages.gen.mjs', 'src/cbor.mjs', 'src/mlkem.mjs', 'src/pipe-relay.mjs', 'src/qmux.mjs', 'src/qmux-connection.mjs'],
+    ignored: ['src/index.mjs', 'src/messages.mjs', 'src/messages.gen.mjs', 'src/cbor.mjs', 'src/mlkem.mjs', 'src/pipe-relay.mjs', 'src/pipe-relay-node.mjs','src/qmux.mjs', 'src/qmux-connection.mjs'],
   },
   rust: {
     host: ['crates/wsh-server/src/'],

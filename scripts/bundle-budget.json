@@ -17,6 +17,10 @@
       "raw": 220638,
       "gzip": 67925
     },
+    "./pipe-relay": {
+      "raw": 7172,
+      "gzip": 3023
+    },
     ". (generateKeyPair only)": {
       "raw": 404,
       "gzip": 324

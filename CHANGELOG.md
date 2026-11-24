@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Pipe relay: a browser-safe entry, and a "paired" signal for the waiting host (additive; JS)
+
+- **`@johnhenry/wsh/pipe-relay` bundles for a browser.** Its `listen()` (an HTTP server through `ws` and `node:http`) moved to `src/pipe-relay-node.mjs`, which `listen()` loads by name when it is called, so a
+  bundler that follows a static import of the pipe relay no longer needs `ws` or `node:http`/`node:https` (the failure a page that imports `pipeUrl` next to `./memory` hit). **The export is unchanged:** `createPipeRelay().listen()`
+  works as before. `./pipe-relay` is now a bundled browser entry point (`npm run size` lists it, 3.0 kB gzip), and a test bundles it for the browser next to `./memory`.
+- **A host can be told its partner arrived.** `pipeUrl(relay, id, 'host', { notifyPaired: true })` (`?role=host&paired=1`), or `relay.accept(socket, { id, role: 'host', notifyPaired: true })`: the relay sends that host one
+  text frame, `wsh-pipe/1 paired` (`PAIRED_FRAME`), when the operator arrives, before anything the operator said. `watchPairing(socket)` returns `{ socket, paired }`: pass `socket` to `accept()` (the frame is kept out of what
+  the wsh host reads) and await `paired` (rejects if the socket closes first).
+- **Wire / negotiation:** the host opts in with a URL parameter; nothing else changes on the pipe, which is binary both ways. **A released peer:** a released relay ignores `paired=1` and never sends the frame (the host's
+  `paired` then never settles and the connection works as before); a released host never asks, so it is sent nothing; an operator is never sent it, whatever it passes. The Rust `wsh` operator side is unaffected.
+- Tests: `test/pipe-relay-paired.test.mjs` (the frame, its order against early bytes, a host that did not ask, the operator asking, `accept()` directly, `watchPairing` over a real socket, a login through it), the module-graph
+  and bundle tests in `test/pipe-relay.test.mjs` and `test/browser-bundle.test.mjs`. Putting the literal `import('./pipe-relay-node.mjs')` back made the bundle tests fail.
+
 ### rpc channels in virtual data mode: a sealed session and a host behind a relay can carry rpc (#191; JS)
 
 An `rpc` channel (`Open { kind: 'rpc', command: <protocol> }`, a CBOR sequence of JSON-RPC messages) can now ride the control plane -- as `SessionData`, and inside

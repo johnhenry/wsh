@@ -34,8 +34,12 @@ export interface PipeRelayOptions {
 
 export interface PipeRelay {
   /** Hand the relay one accepted connection; resolves false when it was refused (and closed). */
-  accept(socket: PipeSocket, who: { id: string; role?: 'host' | 'operator'; remote?: object }): Promise<boolean>;
-  /** Listen for WebSocket upgrades on `<path>/<id>` (default `/r`); `?role=host` is the host side. Needs the `ws` package. */
+  accept(socket: PipeSocket, who: { id: string; role?: 'host' | 'operator'; remote?: object; notifyPaired?: boolean }): Promise<boolean>;
+  /**
+   * Listen for WebSocket upgrades on `<path>/<id>` (default `/r`); `?role=host` is the host side, `&paired=1` asks to be told when the
+   * operator arrives. Node only, and needs the `ws` package: the code that does it is loaded when this is called, so the rest of this
+   * module bundles for a browser.
+   */
   listen(options?: { host?: string; port?: number; path?: string; tls?: object }): Promise<{ port: number; address: string; close(): Promise<void> }>;
   close(): Promise<void>;
   stats(): { waiting: number; pipes: number };
@@ -45,5 +49,16 @@ export interface PipeRelay {
 export function createPipeRelay(options?: PipeRelayOptions): PipeRelay;
 /** A fresh 128-bit rendezvous id, base64url. */
 export function newRendezvousId(): string;
-/** The URL one side dials: `<relay>/r/<id>`, with `?role=host` for the host. */
-export function pipeUrl(relayUrl: string, id: string, role?: 'host' | 'operator'): string;
+/**
+ * The URL one side dials: `<relay>/r/<id>`, with `?role=host` for the host. `notifyPaired` (host only) adds `&paired=1`: ask the relay to
+ * send `PAIRED_FRAME` when the operator arrives; a relay that predates it ignores the parameter.
+ */
+export function pipeUrl(relayUrl: string, id: string, role?: 'host' | 'operator', options?: { notifyPaired?: boolean }): string;
+/** The one text frame a relay sends a host that asked, when its partner arrives, before anything the partner said. */
+export const PAIRED_FRAME: 'wsh-pipe/1 paired';
+/**
+ * Host side of the paired signal: wrap the socket the host dialled (with `notifyPaired`) before anything is attached, pass `socket` on to
+ * `accept()`, await `paired`. It resolves when the operator arrives and rejects if the socket closes first; the signal frame is kept out
+ * of what the wsh host reads. Against a relay that does not know the flag it never resolves and the connection works as before.
+ */
+export function watchPairing<S extends object>(socket: S): { socket: S; paired: Promise<void> };
