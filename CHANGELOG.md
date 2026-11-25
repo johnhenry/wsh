@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Client: why the connection closed, `close()`, and the constructor's typings (#240; JS)
+
+- **`client.onClose(info)` and `client.closeInfo`.** When the peer or the network closes the connection, `onClose` is now called with `{ source, code, reason, wasClean }` (`source`: `websocket` with the socket's close code and reason, so a pipe relay's limit text arrives as is; `qmux` for a peer CONNECTION_CLOSE; `webtransport`; `transport` for a custom transport that did not say). Copied and bounded (reason at most 256 characters). `WshTransport` subclasses report it with `_emitClose(info)`; the transport keeps `closeInfo` too. **No change for callers that do not use it:** a handler that takes no argument works as before, and a close this side made (`disconnect()`) still does not call `onClose`.
+- **`client.close()`** is `disconnect()` (typed). The codebase has no other `close` on the client to collide with, so the alias is added rather than documenting `disconnect()` only.
+- **Typings:** `new WshClient({ transportFactories, pingIntervalMs, pongTimeoutMs })` (`WshClientOptions`), `WshCloseInfo`, `WshTransport.onClose(info?)` and `closeInfo`; type tests in `test/types/client-surface.ts` (with `@ts-expect-error` controls).
+- **Compatibility:** nothing on the wire. A released peer is unaffected (the reason comes from the close frame it already sends); the Rust client has no equivalent (README capability matrix).
+
 ## 0.52.0 / Rust `rust-v0.19.0`
 
 ### Rust client reads every GatewayFail code (Rust)

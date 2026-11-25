@@ -150,8 +150,29 @@ await session.resize(160, 50);
 
 // Close when done
 await session.close();
-await client.disconnect();
+await client.disconnect();                                    // `client.close()` is the same call
 ```
+
+**Why a connection closed (`onClose(info)`, `client.closeInfo`).** When the host, a relay or the network ends the connection, `client.onClose` is called with
+`{ source, code, reason, wasClean }` (the same object stays in `client.closeInfo` until the next `connect()`):
+
+```js
+client.onClose = ({ source, code, reason, wasClean }) => console.log(source, code, reason, wasClean);
+// websocket 1000 'maximum lifetime reached' true     -- a pipe relay's limit (see "A pipe relay"): not the other person leaving
+// websocket 1006 '' false                            -- the socket was cut (the browser reports 1006 and no reason)
+```
+
+| `source` | When | `code` | `reason` | `wasClean` |
+| --- | --- | --- | --- | --- |
+| `websocket` | the WebSocket transport's socket closed | the socket's close code | the socket's close reason | the platform's `wasClean` (1000 where the socket says none) |
+| `qmux` | the peer sent a CONNECTION_CLOSE frame first (WebSocket transport) | the QMux error code | its text | true |
+| `webtransport` | the WebTransport session ended | its close code (null when it failed) | its close reason, or the error text | true when it closed, false when it failed |
+| `transport` | a custom transport did not say | null | `''` | false |
+
+`reason` is cut at 256 characters. It is **not called, and `closeInfo` stays `null`, for a `disconnect()` / `close()` this side made**, and a handler that takes no
+argument works exactly as before. The reason text is whatever the far end or a relay in between chose to send: use it to tell a limit from the other person leaving, not as proof of
+who closed. A custom transport reports it by calling `_emitClose({ source, code, reason, wasClean })` (a `WshTransport` subclass) or `onClose(info)`; one that says nothing gets the `transport` row.
+`new WshClient({ transportFactories: { ws: () => new WebSocketTransport({ WebSocket }) } })` is typed (it replaces the defaults, so list every kind you use).
 
 ## One-Shot Command Execution
 
@@ -2472,6 +2493,7 @@ than left to be found.
 | Per-key capabilities and expiry (#122): `capabilities="..."`, `expires="..."`; `authorize()` may return a set | every entry the host has: `Open` kinds, `FileOp` read vs write, gateway TCP/UDP/unix/endpoint open and listen, MCP discovery and calls, targets, rpc channels, relay; refusals through `onRefused` (`not-permitted`, `key-expired`) | the same, except **no endpoints and no targets** (`endpoint:` / `target:` parse and grant nothing; such requests are refused); refusals are logged, there is no callback; no `authorize` | **Same grammar, same vectors, same refusal codes on both hosts**; default-deny only for a key whose line has `capabilities`. Neither covers sessions already open, see [Security model](#security-model). The notation is written in `spec/capabilities.md` and its vectors (`spec/capabilities.vectors.json`, `version` 1) ship in the npm package and are run by both; the Rust server's subset is stated by refusal: a key line with an `objects:` capability is refused at load (`unknown-capability`) |
 | A session over a caller-supplied duplex (#220): `serveWshOverDuplex`, `connectWshOverDuplex` from `@johnhenry/wsh/duplex` | exported, browser-safe; sealed by default | none: the Rust server and client dial a WebSocket, TLS or a pipe relay (a pipe relay carries the same bytes) | **Unified on the wire** (nothing new); the binding is the JS implementation's |
 | `permits(capabilities, request)`, `@johnhenry/wsh/identity` (fingerprint, pod id, OpenSSH line, `authorized_keys` line builder), the `GATEWAY_FAIL` table, `serveMcpOverDuplex`, `createDuplexPeer({ who, permit })` (#220) | exported pure functions and seams of the JS package, browser-safe | none: the Rust server and CLI export no library function of these; the Rust server sends the same `GatewayFail` numbers, with `5` meaning "gateway disabled"; the Node gateway sends `8` for a timeout (older Node gateways sent `5`, so a reader still takes a `5` as "disabled, or a timeout from an older Node gateway") | **Notation unified by vectors**; the functions are the JS implementation's and are not a wire feature |
+| Why a connection closed (#240): `WshClient.onClose(info)`, `closeInfo`, and `close()` as `disconnect()` | `{ source, code, reason, wasClean }` for the WebSocket, QMux and WebTransport transports; a custom transport may say or not | none: the Rust client has no close-reason API | **JS-only**; nothing on the wire (the reason is the close frame's own) |
 | Session recording/replay | `SessionRecorder`/`SessionPlayer` (asciicast-v2-shaped JSON) | none | **JS-only** -- no current Rust consumer needs playback; the vocabulary is asciicast v2's, so a Rust port could share it |
 | Self-signed cert pinning | `serverCertificateHashes` (WebTransport option) | `--cert-hash <sha256>` (repeatable) and `ConnectConfig.cert_hash`/`cert_hashes`, with the same rules (SHA-256, ECDSA P-256, at most 14 days); `wsh-server` prints its certificate hash at start-up. Without a pin the certificate is validated against the system trust store; `--insecure-skip-cert-verification` is the development-only opt-out | **Not a wire concept**; a default changed in the Rust client, see the CHANGELOG |
 

@@ -9,7 +9,7 @@
  */
 
 import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE } from './features.mjs';
-import { WebTransportTransport, normalizeWebTransportOptions } from './transport.mjs';
+import { WebTransportTransport, normalizeWebTransportOptions, normalizeCloseInfo } from './transport.mjs';
 import { clientChannelBinding, offeredKinds, TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH } from './channel-binding.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
 import {
@@ -422,8 +422,24 @@ export class WshClient {
 
   // ── Callbacks ───────────────────────────────────────────────────────
 
-  /** Called when the connection is closed (intentionally or otherwise). */
+  /**
+   * Called when the connection is closed by the peer or the network (not for a `disconnect()` / `close()` this side made).
+   * The one argument says why (#240): `{ source, code, reason, wasClean }`, also kept as `closeInfo`. A handler that takes no
+   * argument works as before.
+   */
   onClose = null;
+
+  #closeInfo = null;
+
+  /**
+   * Why the last connection closed, once the peer or the network closed it: `{ source, code, reason, wasClean }`, the same object
+   * `onClose` was given. `source` is `'websocket'` (the socket's close code and reason: a relay's limit text, a host's goodbye),
+   * `'qmux'` (the peer's CONNECTION_CLOSE frame, with its error code), `'webtransport'` (the session's close code and reason, or the
+   * error text when it failed), or `'transport'` (a custom transport that did not say; `code` null). `wasClean` is true when the peer
+   * ended it with a close handshake. `null` before a close, after a close this side made, and again at the next `connect()`.
+   * @returns {{ source: string, code: number | null, reason: string, wasClean: boolean } | null}
+   */
+  get closeInfo() { return this.#closeInfo; }
 
   /** Called on connection-level errors. */
   onError = null;
@@ -675,6 +691,7 @@ export class WshClient {
       throw new Error('username is required');
     }
     assertSealSession(sealSession);
+    this.#closeInfo = null;
     const cred = await resolveSigner({ keyPair, signer });
     this.#signer = cred;
     this.#loginUsername = username;
@@ -1228,6 +1245,11 @@ export class WshClient {
     }
 
     this.#rejectAllWaiters(new Error('Client disconnected'));
+  }
+
+  /** The same as `disconnect()` (#240): the name a WebSocket-shaped caller reaches for. */
+  close() {
+    return this.disconnect();
   }
 
   // ── Static one-shot exec ────────────────────────────────────────────
@@ -2817,7 +2839,7 @@ export class WshClient {
     transport.onControl = (msg) => this.#onTransportControl(msg);
     // A sealed frame is opened asynchronously, so the close of the socket behind the last frame must wait for it: the frames
     // that arrived before the close are delivered first (the host's last words, the exit of a command), then the close is handled.
-    transport.onClose = () => this.#afterOpens(() => this.#handleTransportClose());
+    transport.onClose = (info) => this.#afterOpens(() => this.#handleTransportClose(info));
     transport.onError = (err) => this.#handleTransportError(err);
     // A datagram is not a frame: on a sealed session a relay could inject one, so none is heard (UDP uses the reliable path).
     transport.onDatagram = (bytes) => { if (!this.#sessionSeal) this.#gateway?.handleDatagram(bytes); };
@@ -3567,10 +3589,11 @@ export class WshClient {
   /**
    * @private
    */
-  #handleTransportClose() {
+  #handleTransportClose(info) {
     if (this.#state === STATE_CLOSED) return;
 
     this.#state = STATE_CLOSED;
+    this.#closeInfo = normalizeCloseInfo(info);
     this.#bridgedFeatures = null;
     this.#gateway?.abandonAll('transport closed');
     this.#stopPing();
@@ -3583,7 +3606,7 @@ export class WshClient {
     this.#sessions.clear(); this.#rpcLinks.clear();
 
     try {
-      this.onClose?.();
+      this.onClose?.(this.#closeInfo);
     } catch (err) {
       console.error('[wsh:client] onClose handler error:', err);
     }

@@ -117,6 +117,24 @@ const STATE_CONNECTING   = 'connecting';
 const STATE_CONNECTED    = 'connected';
 const STATE_CLOSED       = 'closed';
 
+/**
+ * The close info a client hands to `onClose` (#240), always the same four fields, copied and bounded whatever a transport gave:
+ * `source` ('websocket', 'qmux' for a peer CONNECTION_CLOSE, 'webtransport', or 'transport' when the transport did not say),
+ * `code` (the close code of that source, or null), `reason` (at most 256 characters, '' when none), `wasClean` (the peer ended it
+ * with a close handshake; false when the connection was cut or the transport did not say).
+ * @param {unknown} [info]
+ * @returns {{ source: string, code: number | null, reason: string, wasClean: boolean }}
+ */
+export function normalizeCloseInfo(info) {
+  const o = info !== null && typeof info === 'object' ? info : {};
+  return Object.freeze({
+    source: typeof o.source === 'string' && o.source ? o.source.slice(0, 32) : 'transport',
+    code: Number.isSafeInteger(o.code) ? o.code : null,
+    reason: typeof o.reason === 'string' ? o.reason.slice(0, 256) : '',
+    wasClean: o.wasClean === true,
+  });
+}
+
 // ── Abstract base class ──────────────────────────────────────────────
 
 /**
@@ -137,7 +155,7 @@ export class WshTransport {
   /** @type {function({readable: ReadableStream, writable: WritableStream, id: number}): void} */
   onStreamOpen = null;
 
-  /** @type {function(): void} */
+  /** @type {function(object=): void} Called once when the connection ends; the argument, when there is one, is the close info. */
   onClose = null;
 
   /** @type {function(Error): void} */
@@ -278,10 +296,22 @@ export class WshTransport {
     }
   }
 
-  /** @protected Emit close event. */
-  _emitClose() {
+  /**
+   * Why the connection closed, when the peer or the network ended it: `{ source, code, reason, wasClean }` (see
+   * `normalizeCloseInfo`). `null` before a close, and after a close this side made.
+   */
+  get closeInfo() { return this.#closeInfo; }
+
+  #closeInfo = null;
+
+  /**
+   * @protected Emit close event. `info` says why (a transport that knows passes it; one that does not calls with none).
+   * @param {{ source?: string, code?: number | null, reason?: string, wasClean?: boolean }} [info]
+   */
+  _emitClose(info) {
     try {
-      this.onClose?.();
+      if (info === undefined) this.onClose?.();
+      else { this.#closeInfo = normalizeCloseInfo(info); this.onClose?.(this.#closeInfo); }
     } catch (err) {
       console.error('[wsh:transport] onClose handler error:', err);
     }
@@ -711,17 +741,17 @@ export class WebTransportTransport extends WshTransport {
     // The reader ends with the session, so this wait is bounded by it.
     const afterControl = () => this.#controlReaderDone?.catch(() => {}) ?? Promise.resolve();
     wt.closed
-      .then(() => afterControl().then(() => {
+      .then((info) => afterControl().then(() => {
         if (this.state !== 'closed') {
           this._setState('closed');
-          this._emitClose();
+          this._emitClose({ source: 'webtransport', code: info?.closeCode, reason: info?.reason, wasClean: true });
         }
       }))
       .catch((err) => afterControl().then(() => {
         if (this.state !== 'closed') {
           this._setState('closed');
           this._emitError(err);
-          this._emitClose();
+          this._emitClose({ source: 'webtransport', code: null, reason: err?.message, wasClean: false });
         }
       }));
   }

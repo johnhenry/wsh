@@ -191,7 +191,7 @@ export class WebSocketTransport extends WshTransport {
       };
       qmux.onError = (err) => this._emitError(err);
       qmux.onClose = (errorCode, reason) => {
-        this.#handleClose(errorCode, reason || 'peer sent CONNECTION_CLOSE');
+        this.#handleClose(errorCode, reason || 'peer sent CONNECTION_CLOSE', { source: 'qmux', code: errorCode, reason, wasClean: true });
       };
 
       ws.addEventListener('open', async () => {
@@ -220,7 +220,9 @@ export class WebSocketTransport extends WshTransport {
       });
 
       ws.addEventListener('close', (ev) => {
-        this.#handleClose(null, `WebSocket closed: ${ev.code} ${ev.reason}`);
+        this.#handleClose(null, `WebSocket closed: ${ev.code} ${ev.reason}`, {
+          source: 'websocket', code: ev.code, reason: ev.reason, wasClean: typeof ev.wasClean === 'boolean' ? ev.wasClean : ev.code === 1000,
+        });
       });
 
       ws.addEventListener('message', (ev) => {
@@ -322,8 +324,9 @@ export class WebSocketTransport extends WshTransport {
    * QMux's own terms for a termination with no prior CONNECTION_CLOSE).
    * @param {number|null} errorCode - QMux/QUIC error code, if this came from a CONNECTION_CLOSE frame
    * @param {string} reason
+   * @param {object} info - what `onClose` is told (`normalizeCloseInfo`)
    */
-  #handleClose(errorCode, reason) {
+  #handleClose(errorCode, reason, info) {
     if (this.state === 'closed') return;
     const err = new Error(reason);
     this.#qmux?.destroy(err);
@@ -334,8 +337,10 @@ export class WebSocketTransport extends WshTransport {
     // What arrived before the close is delivered before it is reported: messages are dispatched one per turn, so the close
     // (a separate event of the socket) could otherwise be handled while earlier ones are still waiting (a host's last words,
     // the exit of a command).
-    if (this.#inbox.busy) this.#inbox.idle().then(() => this._emitClose(), () => this._emitClose());
-    else this._emitClose();
+    // A close we made reports no reason (nobody needs to be told why we hung up).
+    const told = this.#closedByUs ? undefined : info;
+    if (this.#inbox.busy) this.#inbox.idle().then(() => this._emitClose(told), () => this._emitClose(told));
+    else this._emitClose(told);
   }
 
   /**
