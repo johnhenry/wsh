@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.53.0 / Rust `rust-v0.20.0`
 
 ### Docs: how wsh and browsermesh fit together (`spec/wsh-and-browsermesh.md`)
 
