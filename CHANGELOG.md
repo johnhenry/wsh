@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### The refusal at a deadline can no longer keep the connection open (#256; JS hosts and the Rust `wsh-server`)
+
+- **The defect.** When a login or seal deadline fired, or a login was refused, the host wrote its last message to the peer (`AuthFail`, or an `Error` at the seal deadline) and only then closed the connection. A peer that completed the QMux handshake but granted no flow-control credit (or, on a message transport such as WebTransport, whose write never settles) made that write wait without end, so the close behind it never ran and the deadline did not close the connection. Reproduced in both implementations; the Rust server also held its login deadline behind its own `ServerHello`, `Challenge` and `AuthOk` writes, and its WebSocket flush after the loop.
+- **The fix.** That last message is now a bounded best effort: the host tries to send it for at most 50 ms (the 50 ms drain the JS hosts already allowed before closing; `FINAL_MESSAGE_GRACE` in the Rust server) and closes whether or not it went. JS: the login-timeout, seal-timeout, refused-login (bad request, auth failure, rate limit) and plaintext-on-a-sealed-only-host refusals. Rust: the same refusals, the shutdown notice, the WebSocket flush after the session loop, and the WebTransport login refusals; its `ServerHello`, `Challenge` and `AuthOk` writes are held to the login deadline.
+- **Unchanged.** Nothing changes on the wire, and a peer that reads still gets the refusal before the close (the existing deadline tests, and new ones, show it). A peer that does not read now loses the refusal it was never going to get.
+- **Checked, not the same defect:** the pipe relay closes both halves of a pipe with synchronous `close()` calls inside `try`, one after the other, and sends with a synchronous `send()`: a blocked or failing half cannot hold back the close of the other.
+- Tests: `test/final-message-close.test.mjs` (mocked clock; a QMux peer with no credit, a message transport whose write never settles, each refusal, and a peer that reads) and `test/rust/wsh-final-message-close.test.mjs` (the Rust server against a peer that grants no credit, and a peer that reads).
+
 ## 0.54.1
 
 ### Fix for 0.54.0: the login deadline no longer runs while a page host waits for its operator (#253; JS only, a patch)
