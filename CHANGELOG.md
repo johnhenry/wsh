@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.54.0 / Rust `rust-v0.21.0`
 
 ### Tests: no colliding temp folders in the `wsh-server` config tests, and a port the server can bind in the sealing tests (#248; tests only, nothing shipped changes)
 
