@@ -88,6 +88,8 @@ export interface WshMemoryHostOptions {
   onShare?: WshOnShare;
   /** #155: seal the whole session end to end (needs `hostKey`; offered where `dataStreams` is false). `'require'` serves nothing unsealed. */
   sealSession?: false | 'offer' | 'require';
+  /** #244: with `sealSession: 'require'`, how long after login the session may stay unsealed before the host closes it as `seal-timeout` (default 30000; 0 = no deadline). */
+  sealTimeoutMs?: number;
   /** #163: told once per connection this host turned away (a key it does not allow, a plain client on a host that requires a sealed session, ...), with a stable reason code. */
   onRefused?: WshOnRefused;
   /**

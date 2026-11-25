@@ -132,6 +132,11 @@ pub struct ServerSection {
     /// `host_key`. Typed rpc channels are not offered while this is on (their streams are not frames).
     #[serde(default)]
     pub seal_session: SealSession,
+    /// With `seal_session = "require"`: seconds after a login that the session may stay unsealed
+    /// (wsh #244). At the deadline the server sends an `Error` saying so and closes the
+    /// connection. Default 30; 0 = no deadline. No effect where sealing is not required.
+    #[serde(default = "default_seal_timeout_secs")]
+    pub seal_timeout_secs: u64,
 }
 
 /// The most operators `[relay] max_operators_per_peer` may allow one peer.
@@ -160,6 +165,7 @@ impl Default for ServerSection {
             host_key: None,
             require_channel_binding: false,
             seal_session: SealSession::Off,
+            seal_timeout_secs: default_seal_timeout_secs(),
         }
     }
 }
@@ -553,6 +559,11 @@ fn default_session_ttl() -> u64 {
 fn default_idle_timeout() -> u64 {
     3600
 }
+/// How long a login under `seal_session = "require"` may stay unsealed: three times the
+/// 10 s every client step (login, key exchange) is given by default.
+fn default_seal_timeout_secs() -> u64 {
+    30
+}
 fn default_true() -> bool {
     true
 }
@@ -630,6 +641,8 @@ pub struct ServerConfig {
     pub require_channel_binding: bool,
     /// See [`ServerSection::seal_session`].
     pub seal_session: SealSession,
+    /// See [`ServerSection::seal_timeout_secs`] (0 = no deadline).
+    pub seal_timeout_secs: u64,
 }
 
 impl ServerConfig {
@@ -823,6 +836,7 @@ impl ServerConfig {
             host_key_path: file_config.server.host_key.as_deref().map(expand_tilde_str),
             require_channel_binding: file_config.server.require_channel_binding,
             seal_session: file_config.server.seal_session,
+            seal_timeout_secs: file_config.server.seal_timeout_secs,
         })
     }
 }
@@ -1093,6 +1107,29 @@ reverse_bind_addr = "0.0.0.0"
         }
         let e = load_err("[server]\nhost_key = \"/tmp/k\"\nseal_session = \"yes\"\n");
         assert!(e.contains("seal_session") || e.contains("yes"), "{e}");
+    }
+
+    #[test]
+    fn seal_timeout_defaults_to_thirty_seconds_and_is_configurable() {
+        assert_eq!(load_defaults().seal_timeout_secs, 30);
+        assert_eq!(load("").seal_timeout_secs, 30);
+        let set = load(
+            "[server]\nhost_key = \"/tmp/k\"\nseal_session = \"require\"\nseal_timeout_secs = 5\n",
+        );
+        assert_eq!(set.seal_timeout_secs, 5);
+        let off = load("[server]\nseal_timeout_secs = 0\n");
+        assert_eq!(off.seal_timeout_secs, 0, "0 turns the deadline off");
+    }
+
+    #[test]
+    fn seal_timeout_must_be_a_whole_number_of_seconds() {
+        for bad in ["-1", "\"soon\"", "1.5"] {
+            let e = load_err(&format!("[server]\nseal_timeout_secs = {bad}\n"));
+            assert!(
+                e.contains("seal_timeout_secs") || e.contains("invalid"),
+                "{bad}: {e}"
+            );
+        }
     }
 
     // ── passwords: off, salted, no legacy ────────────────────────────
