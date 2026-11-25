@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### A dial-out form of the page host: `createPageHost({ connect })` (#219; JS)
+
+Off unless written. Instead of waiting behind a pipe relay, the page dials an operator that **listens**: `createPageHost({ window, connect: 'wss://operator.example/pages/shop', name, authorizedKeys, mcp, expose })` (not together with `relay`). The URL is dialled exactly as written (no role or rendezvous id added), must be `ws://` or `wss://` with no user name, password or fragment, and is never logged. `host.operatorUrl` and `host.rendezvousId` are `null` (typed: `createPageHost` has an overload for the dial-out form that returns `WshPageDialOutHost`; the relay form is unchanged).
+
+- **The same login, approval, indicator and Stop.** Key login only (`authorizedKeys`), the session is sealed, `onSession`, the person's approval for consequential tools, the visible indicator and Stop (which refuses that key), the `mcp` and `wsh-objects` channels, closing when the window leaves its origin, and redialling after a session or a failed attempt (`reconnect`, same backoff). It is the same code path: only the socket's URL and the log line ("dialed the operator endpoint") differ.
+- **Wire: none.** The same handshake over a socket the page opened. **A released peer:** nothing on the far side needs to be newer (any client that logs in over the accepted socket works, for example `connectWshOverDuplex` from `@johnhenry/wsh/duplex`, 0.45.0 and later); the Rust CLI has no listening mode, so a Rust far side cannot be the listener (it keeps using `--via` a relay).
+- **What it does not protect against** (README, Security model): the page does not authenticate the endpoint it dials (the operator pins the page's host key; the page checks keys), the endpoint learns the page's host key and stated features before any login, and the page redials while the host is open.
+- **Verified in a real Chromium page** (`test/browser/page-dial-out.spec.mjs`): the page opens the WebSocket itself to a `ws` listener, the URL arrives as written, the login is sealed, objects work, the indicator is the page's and Stop refuses the key and the page dials again; a stranger's key gets nothing.
+- **Also fixed: `createDuplexSocket().receive()` given a Node `Buffer`** (what the `ws` package hands over for a message) delivered the whole pooled memory the Buffer is a view of, not its bytes (`Buffer.prototype.slice` does not copy), so a listener built on `ws` could not log in. It now copies the view's own bytes. A regression test is in `test/duplex.test.mjs`.
+
 ### Callback return values, off unless the host opts in per entry (#219; JS)
 
 An allow-list entry that ends in `(callback:returns)` (every function the call takes may answer) or `(callback:returns=0,2)` (only the functions at those argument positions) makes the page's stub return a **promise** of what the far side's function returned. Entries that say `(callback)` are exactly what they were: one-way, `undefined` at once.

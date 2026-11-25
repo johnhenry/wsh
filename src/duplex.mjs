@@ -124,7 +124,8 @@ export function createDuplexSocket({ send, close, maxMessageBytes = DUPLEX_DEFAU
       if (!bytes) { finish(1003, 'a message that is not bytes'); return; }
       if (bytes.byteLength > maxMessageBytes) { finish(1009, 'a message larger than maxMessageBytes'); return; }
       if (incoming.reduce((n, b) => n + b.byteLength, 0) + bytes.byteLength > maxBufferedBytes) { finish(1013, 'more arrived than the receiver takes'); return; }
-      incoming.push(bytes.slice().buffer);
+      // A copy that owns its memory: `Buffer.prototype.slice` (what the `ws` package hands over) returns a view of the same pool, whose `.buffer` is not these bytes.
+      incoming.push(new Uint8Array(bytes).buffer);
       queueMicrotask(flush); // in order, after `open`, once something listens
     },
     /** The duplex ended on its own (the peer left, the channel closed): the socket closes, `close` is not called back. */
