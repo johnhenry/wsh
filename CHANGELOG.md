@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.55.0
 
 ### The gateway's destination-address guard is a public entry point: `@johnhenry/wsh/address-guard` (a minor: a new export; Node)
 
