@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.54.2 / Rust `rust-v0.21.1`
 
 ### The refusal at a deadline can no longer keep the connection open (#256; JS hosts and the Rust `wsh-server`)
 
