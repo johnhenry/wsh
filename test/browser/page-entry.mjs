@@ -243,9 +243,9 @@ window.h.pageTools = async () => {
   await tool('read_secret', 'Read something the page keeps to itself', { readOnlyHint: true }, () => ({ secret: 'not for the agent' }));
 };
 let pageHostHandle = null;
-window.h.startPageHost = async ({ relay, authorizedKeys, allow, approve, expose }) => {
+window.h.startPageHost = async ({ relay, connect, authorizedKeys, allow, approve, expose }) => {
   pageHostHandle = await wsh.createPageHost({
-    window, relay, name: 'shop-tab', authorizedKeys,
+    window, ...(connect !== undefined ? { connect } : { relay }), name: 'shop-tab', authorizedKeys,
     ...(allow ? { mcp: { allow, ...(approve ? { approve } : {}) } } : {}),
     ...(expose ? { expose } : {}),
   });
