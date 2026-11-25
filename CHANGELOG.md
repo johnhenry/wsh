@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Tests: no colliding temp folders in the `wsh-server` config tests, and a port the server can bind in the sealing tests (#248; tests only, nothing shipped changes)
+
+- **`wsh-server` config tests.** Their scratch directory was named from the process id and a clock, so two tests of one process could get the same name and one read the other's config. It is now the process id and a process-wide counter (the scheme the `wsh-client` known-hosts tests already use), a directory left by an earlier process with the same id is removed first, and a test (`scratch_directories_never_share_a_name_within_one_process`, 8 threads taking 2000 names each) fails for the old naming and passes for the new. The whole config test module was run 200 times in a row without a failure.
+- **`test/rust/wsh-session-seal-server.test.mjs`.** The failure of "a plain message injected before the key exists..." was not reproduced in 124 runs of that test and file; what was reproduced, twice in about 75 runs of the file (the second time with its output captured), was a test of the same file failing in `startServer` with `WebTransport bind failed: Address already in use`. `wsh-server` binds the port it is given for TCP (WebSocket) and for UDP (WebTransport), and the helper that picked the port only looked at TCP, so any UDP socket on the machine could hold it. `test/helpers/free-port.mjs` now picks a port that is free for both (`test/free-port.test.mjs`). The same TCP-only helper is copied into the other `test/rust` files; they are not changed here.
+- The test itself now says what it does: it injects the plain message ahead of the client's own `KeyExchange` (so the key does not exist yet) and waits for the server's refusal in its log instead of sleeping; the case it used to run (a plain message into an already sealed session on a `require` server) is its own test and waits for the server's "dropped" log line.
+
 ## 0.53.0 / Rust `rust-v0.20.0`
 
 ### Docs: how wsh and browsermesh fit together (`spec/wsh-and-browsermesh.md`)
