@@ -196,7 +196,7 @@ The key's capability is asked again for every operation (an expiry holds at call
 
 - JavaScript (`@johnhenry/wsh` 0.46.0 to 0.51.0): the reference described above. 0.46.0 and 0.47.0 hosts have no `features` in `roots`, no events, handles or
   callbacks; a peer sees an empty `features`. 0.50.0 and earlier hosts do not state `types` or `handle-events`.
-- Rust client (`wsh_client::objects`, `wsh objects`): `rust-v0.18.0` speaks values, events by path and handles. The release after it also speaks callbacks, events
+- Rust client (`wsh_client::objects`, `wsh objects`): `rust-v0.18.0` speaks values, events by path and handles. `rust-v0.19.0` also speaks callbacks, events
   through a handle and `types`, each only to a host that states it (`callbacks`, `handle-events`, `types`); against an older host they are refused locally, by name, and
   nothing is sent. Rust released before the client (`rust-v0.17.1` and earlier) has no objects client at all.
 - `callback-returns` (callback return values, JS hosts only): a 0.51.0 client, and the Rust client, never list `callback-returns` in their `roots` request, so a host that
