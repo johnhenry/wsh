@@ -14,6 +14,10 @@ The Rust client of the `wsh-objects` protocol (`wsh_client::objects`, `wsh objec
 - Tests: unit tests of the client against a scripted host (`crates/wsh-client/src/objects/tests.rs`), and `test/rust/wsh-objects.test.mjs` runs the real Rust CLI against the real JavaScript page host (events through a handle and the host ending them with the handle, callbacks called by the page, `types` narrowed by the key, and a host that does not state each feature).
 - **Release:** needs a Rust release (the lead tags it); no version is bumped here.
 
+### Fixed: a flaky `wsh mcp` reconnect test (#229; test only)
+
+`test/rust/wsh-mcp.test.mjs` "more than 200 messages held while reconnecting" failed once on CI with `11 !== 10`. The cause was in the test, not the bridge: its `initialize()` helper writes `notifications/initialized` and returns at once, and the test then closed the host. The bridge reads the client's input independently of its connection, so when it read that notification after noticing the loss, the notification was held, took one of the 200 places, and 11 requests (not 10) were refused. The bound counts every message held, requests and notifications alike; that is unchanged. The test now makes one request round trip before closing the host (an answered request proves every line written before it was already read and forwarded), and a second test pins the counting (one held notification, 199 requests held, 11 refused). No wire or product change; nothing changes for a user of `wsh mcp`.
+
 ## 0.51.0 / Rust `rust-v0.18.0`
 
 Three JS features of #219 (events through a handle, typed remotes, an MCP face for allow-listed object paths) and the Rust `wsh-objects` client, in one release. The Rust client is the values, events and handles part of the protocol: **callbacks are not built in the Rust client, and events through a handle are a JS feature of this release that the Rust client does not have** (it neither writes the `handle` parameter of `subscribe` nor uses `types`; it ignores the `handle-events` and `types` strings a host states). Nothing else in the Rust crates changed besides the workspace version.
