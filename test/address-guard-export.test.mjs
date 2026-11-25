@@ -3,6 +3,7 @@
 // `@johnhenry/wsh/server` calls these same functions; test/gateway-address-policy.test.mjs and test/gateway-udp.test.mjs drive it.
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import net from 'node:net';
 import dgram from 'node:dgram';
 import {
@@ -91,6 +92,33 @@ describe('classifyAddress and isPublicAddress: every class, IPv4 and IPv6', () =
     const guard = await import('../src/server/address-guard.mjs');
     assert.equal(guard.isPublicAddress, pure.isPublicAddress);
   });
+});
+
+// The vectors the Rust wsh-server runs too (crates/wsh-server/src/gateway/address_class.rs): the two implementations agree address by address.
+const VECTORS = JSON.parse(readFileSync(new URL('../spec/address-class.vectors.json', import.meta.url), 'utf8'));
+
+describe('spec/address-class.vectors.json: the vectors shared with the Rust server', () => {
+  it('has a version, and names exactly the classes this implementation can return', () => {
+    assert.equal(VECTORS.version, 1);
+    assert.deepEqual([...VECTORS.classes], [...ADDRESS_CLASSES]);
+  });
+
+  it('is published as a package file, and every class has at least one vector in it', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    assert.ok(pkg.files.includes('spec/*.json'));
+    const seen = new Set(VECTORS.groups.flatMap((g) => g.vectors.map((v) => v.class)));
+    assert.deepEqual([...seen].sort(), [...ADDRESS_CLASSES].sort());
+  });
+
+  for (const group of VECTORS.groups) {
+    for (const v of group.vectors) {
+      it(`${group.name}: ${JSON.stringify(v.address)} is ${v.class}`, () => {
+        assert.equal(classifyAddress(v.address), v.class);
+        assert.equal(isPublicAddress(v.address), v.public);
+        assert.equal(v.public, v.class === 'public');
+      });
+    }
+  }
 });
 
 describe('checkAddress: the policy (allowPrivate, allow, deny)', () => {
