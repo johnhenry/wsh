@@ -245,7 +245,7 @@ window.h.pageTools = async () => {
 let pageHostHandle = null;
 window.h.startPageHost = async ({ relay, connect, authorizedKeys, allow, approve, expose }) => {
   pageHostHandle = await wsh.createPageHost({
-    window, ...(connect !== undefined ? { connect } : { relay }), name: 'shop-tab', authorizedKeys,
+    window, ...(connect !== undefined ? { connect } : { relay }), name: 'shop-tab', authorizedKeys, onLog: (line) => { (window.__hostLog ??= []).push(line); }, onRefused: (r) => { (window.__hostLog ??= []).push(`refused: ${r.reason} ${r.detail ?? ''}`); },
     ...(allow ? { mcp: { allow, ...(approve ? { approve } : {}) } } : {}),
     ...(expose ? { expose } : {}),
   });

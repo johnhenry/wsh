@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Verified in a real Chromium page host: typed remotes, and two keys one after the other (#219; tests only)
+
+`test/browser/page-objects-typed-keys.spec.mjs` runs a real page host in Chromium behind the repo's own pipe relay. (1) `rootDescription` from the page, `describeRootTypes` on it, and the `.d.ts` compiled with this repo's TypeScript against usage that must compile and usage that must be refused (`@ts-expect-error`, with a control that the compiler does reject the same usage without them); the same host and a key that may only read gives a smaller file (no `RemoteCall`, `WithSet` or `WithEvents`), and the host refuses the call, the `set` and the `on` that file does not offer. (2) Two different keys on one host, one after the other (a page host serves one operator at a time): a handle and a callback made by one key's channel are dead for the next, a handle id from another channel is "no such handle", a read-only key can read through a handle and cannot call through it or pass a callback. No library behaviour changed. Findings, not changes: for a key that may only read, `set` and `on` still type-check (a reference with no `WithSet` or `WithEvents` in its file stays permissive, as the README says types are advisory), and `test/browser/nodes.mjs`'s `startPipe` drops what an operator sends before its host is paired (the real relay holds it), so a spec with two operators in a row uses the real relay.
+
 ### A dial-out form of the page host: `createPageHost({ connect })` (#219; JS)
 
 Off unless written. Instead of waiting behind a pipe relay, the page dials an operator that **listens**: `createPageHost({ window, connect: 'wss://operator.example/pages/shop', name, authorizedKeys, mcp, expose })` (not together with `relay`). The URL is dialled exactly as written (no role or rendezvous id added), must be `ws://` or `wss://` with no user name, password or fragment, and is never logged. `host.operatorUrl` and `host.rendezvousId` are `null` (typed: `createPageHost` has an overload for the dial-out form that returns `WshPageDialOutHost`; the relay form is unchanged).
