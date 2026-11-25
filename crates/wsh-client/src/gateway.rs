@@ -945,14 +945,36 @@ impl GatewayHub {
     }
 }
 
+/// The name of a `GatewayFail` code, as in `spec/gateway-fail.vectors.json`; `None` for a number
+/// that is not in the table.
+#[cfg_attr(not(test), allow(dead_code))]
+fn gateway_fail_name(code: u32) -> Option<&'static str> {
+    Some(match code {
+        1 => "CONNECTION_REFUSED",
+        2 => "HOST_UNREACHABLE",
+        3 => "DNS_FAILED",
+        4 => "POLICY_DENIED",
+        5 => "GATEWAY_DISABLED",
+        6 => "CLOSED",
+        7 => "QUEUE_FULL",
+        8 => "TIMEOUT",
+        _ => return None,
+    })
+}
+
 fn gateway_failure(code: u32, message: &str) -> WshError {
     let what = match code {
         1 => "connection refused",
         2 => "host unreachable",
         3 => "name lookup failed",
         4 => "refused by the host's policy",
-        5 => "the host's gateway is disabled",
+        // The Rust server sends 5 for "disabled"; a Node gateway at 0.51.0 or earlier also sent
+        // it for a timeout.
+        5 => "the host's gateway is disabled, or a timeout from an older Node gateway",
+        6 => "the gateway connection was closed",
         7 => "too many gateway connections",
+        // A timeout is the client's own timeout error.
+        8 => return WshError::Timeout,
         _ => "gateway failure",
     };
     if message.is_empty() {

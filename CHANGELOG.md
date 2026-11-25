@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Rust client reads every GatewayFail code (Rust)
+
+The Rust client now words every code in `spec/gateway-fail.vectors.json`: a received `5` reads "the host's gateway is disabled, or a timeout from an older Node gateway" (a Node gateway at 0.51.0 or earlier sent `5` for a timeout), `6` (closed) has its own text, and `8` (timed out, what a current Node gateway sends) is reported as the client's `Timeout` error. No number the Rust server sends changes; the `FAIL_*` constants in `wsh-server` now say which codes only the Node gateway sends. A Rust test reads the shared vectors file and checks the client against it.
+
 ### Callback return values, off unless the host opts in per entry (#219; JS)
 
 An allow-list entry that ends in `(callback:returns)` (every function the call takes may answer) or `(callback:returns=0,2)` (only the functions at those argument positions) makes the page's stub return a **promise** of what the far side's function returned. Entries that say `(callback)` are exactly what they were: one-way, `undefined` at once.

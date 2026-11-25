@@ -560,3 +560,79 @@ fn a_missing_feature_is_named() {
     );
     assert!(require_feature(&["gateway-unix".into()], GATEWAY_UNIX_FEATURE, "x").is_ok());
 }
+
+// The GatewayFail code table, shared with the JS side as spec/gateway-fail.vectors.json.
+fn gateway_fail_vectors() -> Vec<(u32, String, Option<String>)> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/gateway-fail.vectors.json"
+    );
+    let text = std::fs::read_to_string(path).expect("read spec/gateway-fail.vectors.json");
+    let doc: serde_json::Value = serde_json::from_str(&text).expect("vectors are JSON");
+    doc["codes"]
+        .as_array()
+        .expect("codes array")
+        .iter()
+        .map(|row| {
+            (
+                row["code"].as_u64().expect("code") as u32,
+                row["name"].as_str().expect("name").to_string(),
+                row["alsoSentAs"][0].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn gateway_fail_names_match_the_shared_vectors() {
+    let rows = gateway_fail_vectors();
+    assert_eq!(rows.len(), 8);
+    for (code, name, _) in &rows {
+        assert_eq!(gateway_fail_name(*code), Some(name.as_str()), "code {code}");
+    }
+    assert_eq!(gateway_fail_name(0), None);
+    assert_eq!(gateway_fail_name(9), None);
+}
+
+#[test]
+fn every_shared_vector_has_its_own_message() {
+    for (code, name, also) in gateway_fail_vectors() {
+        if name == "TIMEOUT" {
+            // Reported as the client's own timeout error, checked below.
+            continue;
+        }
+        let text = gateway_failure(code, "").to_string();
+        assert!(
+            !text.contains("gateway failure"),
+            "code {code} {name} falls to the generic text: {text}"
+        );
+        assert!(text.contains(&format!("gateway code {code}")), "{text}");
+        if also.is_some() {
+            // A 5 may be a timeout from an older Node gateway: the message says both readings.
+            assert!(
+                text.contains("disabled") && text.contains("older Node gateway"),
+                "{text}"
+            );
+        }
+    }
+    assert!(gateway_failure(5, "")
+        .to_string()
+        .contains("the host's gateway is disabled, or a timeout from an older Node gateway"));
+    assert!(gateway_failure(6, "").to_string().contains("closed"));
+    assert!(gateway_failure(99, "")
+        .to_string()
+        .contains("gateway failure"));
+}
+
+#[test]
+fn a_timeout_code_is_the_clients_timeout_error() {
+    assert!(matches!(
+        gateway_failure(8, "connect timed out"),
+        WshError::Timeout
+    ));
+    // 5 stays a plain failure: the Rust server sends it for "disabled".
+    assert!(matches!(
+        gateway_failure(5, "gateway disabled"),
+        WshError::Other(_)
+    ));
+}

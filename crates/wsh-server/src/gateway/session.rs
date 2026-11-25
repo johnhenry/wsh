@@ -101,11 +101,19 @@ const INBOUND_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DATAGRAM: usize = 65_507;
 
-// GatewayFail codes (the table `@johnhenry/browsermesh-netway` decodes).
+// GatewayFail codes (the table `@johnhenry/browsermesh-netway` decodes; spec/gateway-fail.vectors.json).
+// Only the Node gateway sends 3 (DNS_FAILED), 6 (CLOSED) and 8 (TIMEOUT), so they are not
+// constants here. A Node gateway at 0.51.0 or earlier also sent 5 for a timeout; this server
+// sends 5 only for "gateway disabled".
+/// 1, CONNECTION_REFUSED (the Node gateway sends it too).
 const FAIL_REFUSED: u32 = 1;
+/// 2, HOST_UNREACHABLE (the Node gateway sends it too).
 const FAIL_UNREACHABLE: u32 = 2;
+/// 4, POLICY_DENIED (the Node gateway sends it too).
 const FAIL_POLICY: u32 = 4;
+/// 5, GATEWAY_DISABLED. A Node gateway at 0.51.0 or earlier also sent 5 for a timeout.
 const FAIL_DISABLED: u32 = 5;
+/// 7, QUEUE_FULL (the Node gateway sends it too).
 const FAIL_QUEUE_FULL: u32 = 7;
 
 /// Any byte stream a relay can carry: TCP, a unix socket, a boxed one.
