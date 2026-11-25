@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Rust client reads every GatewayFail code (Rust)
+
+The Rust client now words every code in `spec/gateway-fail.vectors.json`: a received `5` reads "the host's gateway is disabled, or a timeout from an older Node gateway" (a Node gateway at 0.51.0 or earlier sent `5` for a timeout), `6` (closed) has its own text, and `8` (timed out, what a current Node gateway sends) is reported as the client's `Timeout` error. No number the Rust server sends changes; the `FAIL_*` constants in `wsh-server` now say which codes only the Node gateway sends. A Rust test reads the shared vectors file and checks the client against it.
+
 ### Verified in a real Chromium page host: typed remotes, and two keys one after the other (#219; tests only)
 
 `test/browser/page-objects-typed-keys.spec.mjs` runs a real page host in Chromium behind the repo's own pipe relay. (1) `rootDescription` from the page, `describeRootTypes` on it, and the `.d.ts` compiled with this repo's TypeScript against usage that must compile and usage that must be refused (`@ts-expect-error`, with a control that the compiler does reject the same usage without them); the same host and a key that may only read gives a smaller file (no `RemoteCall`, `WithSet` or `WithEvents`), and the host refuses the call, the `set` and the `on` that file does not offer. (2) Two different keys on one host, one after the other (a page host serves one operator at a time): a handle and a callback made by one key's channel are dead for the next, a handle id from another channel is "no such handle", a read-only key can read through a handle and cannot call through it or pass a callback. No library behaviour changed. Findings, not changes: for a key that may only read, `set` and `on` still type-check (a reference with no `WithSet` or `WithEvents` in its file stays permissive, as the README says types are advisory), and `test/browser/nodes.mjs`'s `startPipe` drops what an operator sends before its host is paired (the real relay holds it), so a spec with two operators in a row uses the real relay.
