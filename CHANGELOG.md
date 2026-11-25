@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Rust `wsh-objects` client: callbacks, events through a handle and `types` (#219; Rust)
+
+The Rust client of the `wsh-objects` protocol (`wsh_client::objects`, `wsh objects`) now speaks what the JavaScript client speaks, so the three items #219 listed as "not built" in the Rust client are done. **Wire: nothing new.** Each is the existing message of the JavaScript implementation, sent only to a host that states its feature string in the `features` of its `roots` answer (`callbacks`, `handle-events`, `types`); against a host that does not (0.50.0 and earlier JavaScript hosts state no `types` or `handle-events`), the client refuses locally with `Unsupported`, naming the feature, and sends nothing. A released Rust peer (`rust-v0.18.0` and earlier, `deny_unknown_fields`) is unaffected: this changes only what the client writes to a host that said it understands it.
+
+- **Events through a handle.** `Target::subscribe` on a `Handle::target()` sends `subscribe` with `handle` in place of `root` (host must state `events` and `handle-events`). The subscription lives as long as the handle: releasing it (or the channel ending) ends the subscription's `recv()`, and a `Subscription` keeps its handle alive while it is held. `wsh objects session`: `{"op":"watch","handle":"h1","path":"","event":"ready"}`.
+- **Callbacks.** `ObjectsClient::callback(capacity)` makes a `Callback`; `Target::call_with` / `Chain::call_with` / `construct_with` pass it among the arguments (`null` at its place, `callbacks: [[index, id]]` as the host reads it; the same `Callback` is the same id; one from another channel or a released one is refused locally). The host's calls arrive one way, in a bounded queue read with `Callback::recv`: what does not fit is dropped here and counted (`dropped_here`), what the host dropped is `dropped_by_host`. `release()` (or dropping the last reference to one that was passed) sends `releaseCallback`. `wsh objects session`: `callback`, `next`, `release` and a `callbacks` list on `call` / `construct`.
+- **Types.** `ObjectsClient::root_description(root)` returns the host's `types` answer as plain data; `wsh --sealed objects HOST types ROOT` prints it as JSON. Not built in Rust: the `.d.ts` generator and `Remote<T>`.
+- **`wsh objects session` also gains** `types`, `watch` / `next` / `unwatch` for subscriptions (by root or by handle). Handle names stay `h1`, `h2`; callbacks are `c1`, subscriptions `s1`, each counted from 1.
+- **A `wsh-objects` host in `wsh-server` is not planned**, and `spec/objects.md` section 11 says why (a Rust server has no object graph for path allow-lists to name; its typed `wsh-host` channel is the equivalent); the item is closed by that reasoning, not left open. A key line with an `objects:` capability stays refused at load there.
+- Tests: unit tests of the client against a scripted host (`crates/wsh-client/src/objects/tests.rs`), and `test/rust/wsh-objects.test.mjs` runs the real Rust CLI against the real JavaScript page host (events through a handle and the host ending them with the handle, callbacks called by the page, `types` narrowed by the key, and a host that does not state each feature).
+- **Release:** needs a Rust release (the lead tags it); no version is bumped here.
+
 ## 0.51.0 / Rust `rust-v0.18.0`
 
 Three JS features of #219 (events through a handle, typed remotes, an MCP face for allow-listed object paths) and the Rust `wsh-objects` client, in one release. The Rust client is the values, events and handles part of the protocol: **callbacks are not built in the Rust client, and events through a handle are a JS feature of this release that the Rust client does not have** (it neither writes the `handle` parameter of `subscribe` nor uses `types`; it ignores the `handle-events` and `types` strings a host states). Nothing else in the Rust crates changed besides the workspace version.
