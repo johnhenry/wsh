@@ -2393,7 +2393,7 @@ instead of dragging its own toolchain and CI job into an unrelated
 browser-app repo. It was previously deleted from clawser by accident
 (2026-03-14) and restored (2026-07-05) before this move.
 
-Four crates, workspace-versioned (currently `0.21.0`):
+Four crates, workspace-versioned (currently `0.21.1`):
 
 | Crate | Kind | Description |
 |-------|------|--------------|
@@ -2649,7 +2649,7 @@ plus one `SHA256SUMS` file covering every archive in the release. These
 names are a stable contract other repos (clawser) pin and download by --
 do not change them without coordinating downstream.
 
-`wsh --version` and `wsh-server --version` print the workspace version the binary was built from (`wsh 0.21.0`), which is the
+`wsh --version` and `wsh-server --version` print the workspace version the binary was built from (`wsh 0.21.1`), which is the
 number in the `rust-vX.Y.Z` tag. Binaries of `rust-v0.9.0` to `rust-v0.10.0` printed a fixed `0.1.0`, so against one of those the
 version cannot be read from the binary (look for a flag in `wsh --help` instead).
 
