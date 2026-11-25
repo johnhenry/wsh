@@ -28,6 +28,7 @@
 //!         → relay tasks: origin → client (while credit is held), client → origin (credit returned)
 //! ```
 
+pub mod address_class;
 pub mod forwarder;
 pub mod policy;
 pub mod resolver;

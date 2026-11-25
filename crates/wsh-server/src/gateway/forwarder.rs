@@ -2,6 +2,7 @@
 //! `ResolveDns` that decides WHERE a client may reach. The per-connection relays, credit and
 //! reverse listeners live in [`session`](super::session).
 
+use super::address_class::describe_classes;
 use super::policy::GatewayPolicyEnforcer;
 use super::resolver::DnsResolver;
 use std::net::{IpAddr, SocketAddr};
@@ -60,6 +61,11 @@ impl GatewayForwarder {
                 let allowed = self.policy.authorize_addrs(name, None, &parsed);
                 let addresses: Vec<String> = allowed.iter().map(ToString::to_string).collect();
                 if addresses.is_empty() {
+                    tracing::info!(
+                        destination = %name,
+                        classes = %describe_classes(&parsed),
+                        "gateway: refused a lookup (no answer the policy allows)"
+                    );
                     return build_gateway_fail(
                         gateway_id,
                         4,
@@ -98,6 +104,13 @@ impl GatewayForwarder {
         };
         let allowed = self.policy.authorize_addrs(host, Some(port), &resolved);
         if allowed.is_empty() {
+            // The client is told only that the destination is not allowed; the class of what the
+            // name resolved to (`private`, `metadata`, ...) is for the operator's log.
+            tracing::info!(
+                destination = %format!("{host}:{port}"),
+                classes = %describe_classes(&resolved),
+                "gateway: refused a destination (no allowed address)"
+            );
             return Err((4, format!("destination not allowed: {host}:{port}")));
         }
         Ok(allowed

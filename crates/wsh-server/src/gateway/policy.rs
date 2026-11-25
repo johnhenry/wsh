@@ -12,13 +12,22 @@
 //!
 //! The default policy allows **no** destination, refuses reverse listeners, and
 //! would bind any listener it did allow to loopback. A destination must match a rule,
-//! and an address that is loopback, link-local, private (RFC 1918), unique-local
-//! (`fc00::/7`), carrier-grade NAT (`100.64.0.0/10`), unspecified or multicast is
-//! refused *after the name has been resolved* -- whatever rule matched the name --
-//! unless a rule names that address or range. The wildcard `"*"` and a host name
-//! rule therefore mean "that destination, at a public address", never "this
-//! machine's network": a name is not trusted to resolve to the same kind of place
-//! twice. The Node host's gateway applies the same rule (`allowPrivate`).
+//! and an address that is not global unicast -- loopback, link-local, private (RFC 1918),
+//! unique-local (`fc00::/7`), carrier-grade NAT (`100.64.0.0/10`), unspecified, multicast,
+//! a cloud metadata endpoint, a documentation or benchmarking range, Teredo, or any other
+//! reserved space (see [`super::address_class`] for the classes) -- is refused *after the
+//! name has been resolved* -- whatever rule matched the name -- unless a rule names that
+//! address or range. The wildcard `"*"` and a host name rule therefore mean "that
+//! destination, at a public address", never "this machine's network": a name is not
+//! trusted to resolve to the same kind of place twice. An IPv6 address that wraps an IPv4
+//! one (IPv4-mapped, NAT64, 6to4) is judged by the IPv4 address it carries. The Node host's
+//! gateway applies the same classifier (`@johnhenry/wsh/address-guard`), and both run the
+//! same vectors (spec/address-class.vectors.json).
+//!
+//! A rule that is an address range or a literal address permits whatever class that
+//! address has (a rule that names a metadata endpoint opens it); the wildcard and host
+//! name rules never do. There is no `allowPrivate`-style switch here: private space needs
+//! a rule that names it.
 //!
 //! # Rules
 //!
@@ -34,6 +43,7 @@
 //! To let a NAME reach an internal address, name the address or its range
 //! (`"10.1.2.3/32:5432"`); the name rule alone does not.
 
+use super::address_class::{classify_address, AddressClass};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -204,45 +214,14 @@ fn in_cidr(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
     }
 }
 
-/// An address that belongs to the host's own machine or network rather than the internet.
+/// An address a rule that does not name it may not reach: anything but global unicast.
 ///
-/// IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible and NAT64 (`64:ff9b::/96`) IPv6
-/// addresses are judged by the IPv4 address inside them.
+/// This is `!is_public_address(ip)`: the gateway accepts only what the classifier in
+/// [`super::address_class`] calls [`AddressClass::Public`], the same classifier the Node host
+/// runs (spec/address-class.vectors.json). IPv6 addresses that wrap an IPv4 one (IPv4-mapped,
+/// NAT64, 6to4) are judged by the IPv4 address inside them.
 pub fn is_restricted_address(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(a) => {
-            let o = a.octets();
-            a.is_loopback()
-                || a.is_private()
-                || a.is_link_local()
-                || a.is_unspecified()
-                || a.is_broadcast()
-                || a.is_multicast()
-                || o[0] == 0
-                // 100.64.0.0/10, carrier-grade NAT (also where some clouds put internal services)
-                || (o[0] == 100 && (o[1] & 0xc0) == 64)
-        }
-        IpAddr::V6(a) => {
-            if let Some(v4) = a.to_ipv4_mapped() {
-                return is_restricted_address(IpAddr::V4(v4));
-            }
-            let s = a.segments();
-            // ::a.b.c.d (IPv4-compatible) and 64:ff9b::a.b.c.d (NAT64)
-            if s[..6] == [0, 0, 0, 0, 0, 0] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-                let v4 =
-                    Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
-                if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || !a.is_unspecified() && !a.is_loopback() {
-                    return is_restricted_address(IpAddr::V4(v4));
-                }
-            }
-            a.is_loopback()
-                || a.is_unspecified()
-                || a.is_multicast()
-                || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-                || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local (deprecated)
-                || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-        }
-    }
+    classify_address(ip) != AddressClass::Public
 }
 
 /// Runtime policy enforcer with atomic connection tracking.
@@ -728,6 +707,113 @@ mod tests {
         let p = policy(&["10.0.0.0/33", "host:notaport", "", "10.0.0.0/8:x"]);
         assert!(!allowed(&p, "10.0.0.1", 80, &["10.0.0.1"]));
         assert!(p.check_connect("host", 80).is_err());
+    }
+
+    #[test]
+    fn the_wildcard_and_a_name_rule_refuse_everything_the_node_guard_refuses() {
+        // What the list-of-ranges check let through before it was the same classifier as the Node host's.
+        let wild = policy(&["*"]);
+        let named = policy(&["partner.example.com"]);
+        for addr in [
+            "2002:7f00:1::",
+            "2002:a00:1::1",
+            "2002:c0a8:101::1",
+            "2002:a9fe:a9fe::1",
+            "2002::",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:1::1",
+            "64:ff9b:1::1",
+            "64:ff9b:1::808:808",
+            "::8.8.8.8",
+            "192.0.2.1",
+            "198.51.100.7",
+            "203.0.113.9",
+            "198.18.0.1",
+            "192.0.0.8",
+            "192.88.99.1",
+            "240.0.0.1",
+            "2001:db8::1",
+            "3fff::1",
+            "2001:2::1",
+            "1::1",
+            "4000::1",
+            "100::1",
+            "168.63.129.16",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "::ffff:192.0.2.1",
+        ] {
+            assert!(
+                !allowed(&wild, addr, 80, &[addr]),
+                "{addr} must be refused by the wildcard"
+            );
+            assert!(
+                !allowed(&named, "partner.example.com", 80, &[addr]),
+                "a name resolving to {addr} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_address_carried_by_a_wrapped_form_is_public() {
+        let p = policy(&["*"]);
+        for addr in [
+            "2002:808:808::1",
+            "2002:5db8:d822::1",
+            "64:ff9b::808:808",
+            "::ffff:8.8.8.8",
+            "2606:4700:4700::1111",
+            "2001:200::1",
+        ] {
+            assert!(allowed(&p, addr, 443, &[addr]), "{addr} is public");
+        }
+    }
+
+    #[test]
+    fn a_rule_that_names_an_address_or_a_range_permits_it_whatever_its_class() {
+        // An explicit rule opens any class: that is how an operator reaches a metadata endpoint, a lab's
+        // documentation range or a multicast group on purpose. The wildcard never does.
+        for (rule, addr) in [
+            ("169.254.169.254", "169.254.169.254"),
+            ("169.254.169.254/32", "169.254.169.254"),
+            ("192.0.2.0/24", "192.0.2.77"),
+            ("198.18.0.0/15", "198.19.1.1"),
+            ("240.0.0.0/4", "240.1.2.3"),
+            ("224.0.0.0/4", "239.1.1.1"),
+            ("0.0.0.0/8", "0.1.2.3"),
+            ("fd00:ec2::254", "fd00:ec2::254"),
+            ("2001:db8::/32", "2001:db8::5"),
+            ("2002:7f00:1::/48", "2002:7f00:1::1"),
+            ("2001::/32", "2001:0:4136:e378:8000:63bf:3fff:fdd2"),
+            ("64:ff9b:1::/48", "64:ff9b:1::7f00:1"),
+            ("::ffff:0:0/96", "::ffff:127.0.0.1"),
+            ("::/0", "::1"),
+        ] {
+            let p = policy(&[rule]);
+            assert!(allowed(&p, addr, 80, &[addr]), "rule {rule} names {addr}");
+            if rule.contains('/') {
+                assert!(
+                    allowed(&p, "svc.example.com", 80, &[addr]),
+                    "rule {rule} lets a name resolve to {addr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rule_that_names_loopback_does_not_reach_the_forms_that_wrap_it() {
+        let p = policy(&["127.0.0.1", "10.0.0.0/8"]);
+        assert!(allowed(&p, "127.0.0.1", 80, &["127.0.0.1"]));
+        for addr in ["2002:7f00:1::", "64:ff9b::7f00:1", "::ffff:127.0.0.1"] {
+            assert!(!allowed(&p, addr, 80, &[addr]), "{addr}");
+        }
+        for addr in ["2002:a00:1::1", "64:ff9b::a00:1"] {
+            assert!(
+                !allowed(&p, addr, 80, &[addr]),
+                "{addr}: an IPv4 range names IPv4 addresses"
+            );
+        }
     }
 
     #[test]
