@@ -84,6 +84,11 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   return features;
 }
 /**
+ * The 50 ms the host has always let its last message drain before it closes the transport (a refusal, a deadline). Since #256 it is also how long the
+ * host waits for that message to be written at all: a peer that granted no credit, or does not read, cannot hold the close back past 2 x this.
+ */
+const FINAL_MESSAGE_DRAIN_MS = 50;
+/**
  * How long a connection that logged in under `sealSession: 'require'` may stay unsealed (#244): 30 s. The JS client's default for
  * each login step and for its own key exchange is 10 s, so a client on defaults gives up long before this and one on a slow link
  * (or with a longer `timeout`) is not cut off; the host had no bound at all before.
@@ -389,6 +394,16 @@ export function createConnectionFactory(cfg) {
       return Promise.resolve();
     };
 
+    /**
+     * The last message before the host drops a connection (a refusal, a deadline) is a best effort (#256): a peer that granted no flow-control
+     * credit, stopped reading, or whose transport never drains makes that write wait without end, and the close after it would never run.
+     * This waits for the write for at most `FINAL_MESSAGE_DRAIN_MS`; the caller then closes whether or not it went.
+     */
+    function boundedFinal(sent) {
+      let timer;
+      return Promise.race([Promise.resolve(sent).catch(() => {}), new Promise((r) => { timer = setTimeout(r, FINAL_MESSAGE_DRAIN_MS); })]).finally(() => clearTimeout(timer));
+    }
+
     function shutdown(why) {
       if (state.closed) return;
       state.closed = true;
@@ -568,8 +583,8 @@ export function createConnectionFactory(cfg) {
         if (state.closed || sealed.bridge) return;
         log('sealed session not established in time');
         reportRefused('seal-timeout', `the session was not sealed within ${cfg.sealTimeoutMs} ms of login`);
-        await deliverRaw(errorMsg({ code: 1, message: 'the sealed session was not established in time (seal-timeout)' }));
-        setTimeout(() => { if (!sealed.bridge) shutdown('sealed session not established in time'); }, 50);
+        await boundedFinal(deliverRaw(errorMsg({ code: 1, message: 'the sealed session was not established in time (seal-timeout)' })));
+        setTimeout(() => { if (!sealed.bridge) shutdown('sealed session not established in time'); }, FINAL_MESSAGE_DRAIN_MS);
       }, cfg.sealTimeoutMs);
       sealTimer.unref?.();
     }
@@ -587,8 +602,8 @@ export function createConnectionFactory(cfg) {
         loginExpired = true;
         log('login not completed in time');
         reportRefused('login-timeout', `the login was not completed within ${cfg.loginTimeoutMs} ms of the connection`);
-        await deliverRaw(authFail({ reason: 'the login was not completed in time (login-timeout)' }));
-        setTimeout(() => shutdown('login not completed in time'), 50);
+        await boundedFinal(deliverRaw(authFail({ reason: 'the login was not completed in time (login-timeout)' })));
+        setTimeout(() => shutdown('login not completed in time'), FINAL_MESSAGE_DRAIN_MS);
       }, cfg.loginTimeoutMs);
       loginTimer.unref?.();
     }
@@ -596,8 +611,8 @@ export function createConnectionFactory(cfg) {
     async function refuse(reason, code = 'bad-request', who) {
       log(`AUTH_FAIL: ${reason}`);
       reportRefused(code, reason, who);
-      await send(authFail({ reason }));
-      setTimeout(() => shutdown('auth failed'), 50);
+      await boundedFinal(send(authFail({ reason })));
+      setTimeout(() => shutdown('auth failed'), FINAL_MESSAGE_DRAIN_MS);
     }
 
     async function handleAuth(m) {
@@ -743,8 +758,8 @@ export function createConnectionFactory(cfg) {
       if (sealRequired) {
         log(`refused a plaintext message (type ${m.type}): this host requires a sealed session`);
         reportRefused('not-sealed', `a plaintext message (type ${m.type}) on a host that requires a sealed session`);
-        await deliverRaw(errorMsg({ code: 1, message: 'this host requires a sealed session (e2e-session-required)' }));
-        setTimeout(() => shutdown('sealed session required'), 50);
+        await boundedFinal(deliverRaw(errorMsg({ code: 1, message: 'this host requires a sealed session (e2e-session-required)' })));
+        setTimeout(() => shutdown('sealed session required'), FINAL_MESSAGE_DRAIN_MS);
         return undefined;
       }
       return m;

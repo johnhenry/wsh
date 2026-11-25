@@ -789,13 +789,20 @@ impl WshServer {
         // drains inbound messages one at a time with a microtask yield
         // between each dispatch), so both messages can be sent normally.
         let server_hello_frame = frame_encode(&hello_result.server_hello)?;
-        send.write_all(&server_hello_frame)
-            .await
-            .map_err(|e| WshError::Transport(format!("WebTransport write failed: {e}")))?;
+        // Held to the login deadline (wsh #256): a peer that grants no credit makes these writes wait.
+        within_login_deadline(login_deadline, async {
+            send.write_all(&server_hello_frame)
+                .await
+                .map_err(|e| WshError::Transport(format!("WebTransport write failed: {e}")))
+        })
+        .await?;
         let challenge_frame = frame_encode(&hello_result.challenge)?;
-        send.write_all(&challenge_frame)
-            .await
-            .map_err(|e| WshError::Transport(format!("WebTransport write failed: {e}")))?;
+        within_login_deadline(login_deadline, async {
+            send.write_all(&challenge_frame)
+                .await
+                .map_err(|e| WshError::Transport(format!("WebTransport write failed: {e}")))
+        })
+        .await?;
 
         // Read AUTH
         let auth_bytes =
@@ -813,7 +820,7 @@ impl WshServer {
             _ => {
                 let fail = handshake::build_auth_fail("expected AUTH message");
                 let fail_frame = frame_encode(&fail)?;
-                let _ = send.write_all(&fail_frame).await;
+                best_effort_final(send.write_all(&fail_frame)).await;
                 return Err(WshError::InvalidMessage("expected AUTH message".into()));
             }
         };
@@ -828,7 +835,7 @@ impl WshServer {
             if rate_limited {
                 let fail = handshake::build_auth_fail("rate limited: too many auth attempts");
                 let fail_frame = frame_encode(&fail)?;
-                let _ = send.write_all(&fail_frame).await;
+                best_effort_final(send.write_all(&fail_frame)).await;
                 return Err(WshError::AuthFailed("rate limited".into()));
             }
         }
@@ -842,14 +849,14 @@ impl WshServer {
                     if !self.check_password(&hello.username, password).await {
                         let fail = handshake::build_auth_fail("invalid password");
                         let fail_frame = frame_encode(&fail)?;
-                        let _ = send.write_all(&fail_frame).await;
+                        best_effort_final(send.write_all(&fail_frame)).await;
                         return Err(WshError::AuthFailed("invalid password".into()));
                     }
                 }
                 None => {
                     let fail = handshake::build_auth_fail("password required");
                     let fail_frame = frame_encode(&fail)?;
-                    let _ = send.write_all(&fail_frame).await;
+                    best_effort_final(send.write_all(&fail_frame)).await;
                     return Err(WshError::AuthFailed(
                         "password auth without password".into(),
                     ));
@@ -951,7 +958,7 @@ impl WshServer {
             Err(e) => {
                 let fail = handshake::build_auth_fail(&e.to_string());
                 let fail_frame = frame_encode(&fail)?;
-                let _ = send.write_all(&fail_frame).await;
+                best_effort_final(send.write_all(&fail_frame)).await;
                 return Err(e);
             }
         }
@@ -1625,7 +1632,7 @@ impl WshServer {
                             }),
                         };
                         if let Ok(frame) = frame_encode(&shutdown_msg) {
-                            let _ = write_control(&qmux, &seal, CONTROL_STREAM_ID, frame).await;
+                            best_effort_final(write_control(&qmux, &seal, CONTROL_STREAM_ID, frame)).await;
                         }
                     }
                     break 'session Ok(());
@@ -1643,7 +1650,7 @@ impl WshServer {
                         "closed a connection that did not complete its login in time (login-timeout)"
                     );
                     if let Ok(frame) = frame_encode(&handshake::build_auth_fail(LOGIN_TIMEOUT_REASON)) {
-                        let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
+                        best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &frame)).await;
                     }
                     break 'session Err(WshError::AuthFailed(LOGIN_TIMEOUT_REASON.into()));
                 }
@@ -1671,7 +1678,7 @@ impl WshServer {
                         }),
                     };
                     if let Ok(frame) = frame_encode(&refusal) {
-                        let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
+                        best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &frame)).await;
                     }
                     break 'session Err(WshError::AuthFailed("the sealed session was not established in time".into()));
                 }
@@ -1807,7 +1814,7 @@ impl WshServer {
                                             }),
                                         };
                                         if let Ok(frame) = frame_encode(&refusal) {
-                                            let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
+                                            best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &frame)).await;
                                         }
                                         break 'session Err(WshError::AuthFailed("a sealed session is required".into()));
                                     }
@@ -1931,15 +1938,15 @@ impl WshServer {
                                             Ok(f) => f,
                                             Err(e) => break 'session Err(e),
                                         };
-                                        if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &sh_frame).await {
-                                            break 'session Err(e.into());
+                                        if let Err(e) = write_login_step(&qmux, CONTROL_STREAM_ID, login_deadline, &sh_frame).await {
+                                            break 'session Err(e);
                                         }
                                         let challenge_frame = match frame_encode(&hello_result.challenge) {
                                             Ok(f) => f,
                                             Err(e) => break 'session Err(e),
                                         };
-                                        if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &challenge_frame).await {
-                                            break 'session Err(e.into());
+                                        if let Err(e) = write_login_step(&qmux, CONTROL_STREAM_ID, login_deadline, &challenge_frame).await {
+                                            break 'session Err(e);
                                         }
 
                                         state = ConnState::AwaitingAuth { hello, hello_result };
@@ -1951,7 +1958,7 @@ impl WshServer {
                                             _ => {
                                                 let fail = handshake::build_auth_fail("expected AUTH message");
                                                 if let Ok(fail_frame) = frame_encode(&fail) {
-                                                    let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                    best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &fail_frame)).await;
                                                 }
                                                 break 'session Err(WshError::InvalidMessage("expected AUTH message".into()));
                                             }
@@ -1967,7 +1974,7 @@ impl WshServer {
                                             if rate_limited {
                                                 let fail = handshake::build_auth_fail("rate limited: too many auth attempts");
                                                 if let Ok(fail_frame) = frame_encode(&fail) {
-                                                    let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                    best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &fail_frame)).await;
                                                 }
                                                 break 'session Err(WshError::AuthFailed("rate limited".into()));
                                             }
@@ -1979,7 +1986,7 @@ impl WshServer {
                                                 "this server requires a sealed session, which needs a key login",
                                             );
                                             if let Ok(fail_frame) = frame_encode(&fail) {
-                                                let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &fail_frame)).await;
                                             }
                                             break 'session Err(WshError::AuthFailed("sealed session needs a key login".into()));
                                         }
@@ -1994,7 +2001,7 @@ impl WshServer {
                                                     if !self.check_password(&hello.username, password).await {
                                                         let fail = handshake::build_auth_fail("invalid password");
                                                         if let Ok(fail_frame) = frame_encode(&fail) {
-                                                            let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                            best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &fail_frame)).await;
                                                         }
                                                         break 'session Err(WshError::AuthFailed("invalid password".into()));
                                                     }
@@ -2002,7 +2009,7 @@ impl WshServer {
                                                 None => {
                                                     let fail = handshake::build_auth_fail("password required");
                                                     if let Ok(fail_frame) = frame_encode(&fail) {
-                                                        let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                        best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &fail_frame)).await;
                                                     }
                                                     break 'session Err(WshError::AuthFailed(
                                                         "password auth without password".into(),
@@ -2035,8 +2042,8 @@ impl WshServer {
                                                     Ok(f) => f,
                                                     Err(e) => break 'session Err(e),
                                                 };
-                                                if let Err(e) = qmux.write_stream(CONTROL_STREAM_ID, &ok_frame).await {
-                                                    break 'session Err(e.into());
+                                                if let Err(e) = write_login_step(&qmux, CONTROL_STREAM_ID, login_deadline, &ok_frame).await {
+                                                    break 'session Err(e);
                                                 }
 
                                                 info!(
@@ -2114,7 +2121,7 @@ impl WshServer {
                                             Err(e) => {
                                                 let fail = handshake::build_auth_fail(&e.to_string());
                                                 if let Ok(fail_frame) = frame_encode(&fail) {
-                                                    let _ = qmux.write_stream(CONTROL_STREAM_ID, &fail_frame).await;
+                                                    best_effort_final(qmux.write_stream(CONTROL_STREAM_ID, &fail_frame)).await;
                                                 }
                                                 break 'session Err(e);
                                             }
@@ -2193,9 +2200,13 @@ impl WshServer {
         // (the synchronous `send` callback), not the wire; nothing drains
         // it once the loop has already exited, so do that explicitly here
         // before the WebSocket is dropped.
-        while let Ok(bytes) = outbound_rx.try_recv() {
-            let _ = websocket::ws_send_raw(&mut conn.ws_stream, &bytes).await;
-        }
+        // A peer that does not read (its TCP buffer full) makes this wait too, so it is bounded as the writes above are (wsh #256).
+        best_effort_final(async {
+            while let Ok(bytes) = outbound_rx.try_recv() {
+                let _ = websocket::ws_send_raw(&mut conn.ws_stream, &bytes).await;
+            }
+        })
+        .await;
 
         // Cleanup: unregister peer if it ever got registered, regardless of
         // whether the loop above ended cleanly or with an error.
@@ -5200,6 +5211,45 @@ impl WshServer {
 /// JS hosts' `AuthFail`; the parenthesised name is the reason a JS host reports to `onRefused`.
 const LOGIN_TIMEOUT_REASON: &str = "the login was not completed in time (login-timeout)";
 
+/// How long the host waits for the last message it sends before it drops a connection (a refusal, a deadline, a shutdown notice) to be written
+/// (wsh #256). A peer that granted no flow-control credit, or stopped reading, makes such a write wait without end, and the close after it would
+/// never run; after this the host closes whether or not the message went. The same 50 ms the JS hosts allow (`FINAL_MESSAGE_DRAIN_MS`).
+const FINAL_MESSAGE_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Run `write` (the last message to a peer that is about to be dropped) for at most [`FINAL_MESSAGE_GRACE`]; whether it finished is not the
+/// caller's concern, the connection ends either way.
+async fn best_effort_final<F: std::future::Future>(write: F) {
+    let _ = tokio::time::timeout(FINAL_MESSAGE_GRACE, write).await;
+}
+
+/// One of the host's login replies on the control stream (`ServerHello`, `Challenge`, `AuthOk`), held to the login deadline (wsh #256): a peer that granted
+/// no credit makes the write wait, and the loop that would notice the deadline is the one waiting. A reply still unwritten at the deadline ends the login
+/// with [`LOGIN_TIMEOUT_REASON`]; nothing more is written to a stream whose last message is half out.
+async fn write_login_step(
+    qmux: &QMuxConnection,
+    stream_id: u64,
+    deadline: Option<tokio::time::Instant>,
+    frame: &[u8],
+) -> WshResult<()> {
+    let write = async {
+        qmux.write_stream(stream_id, frame)
+            .await
+            .map_err(WshError::from)
+    };
+    match deadline {
+        None => write.await,
+        Some(at) => {
+            match tokio::time::timeout_at(at, write).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!("closed a connection that did not complete its login in time (login-timeout)");
+                    Err(WshError::AuthFailed(LOGIN_TIMEOUT_REASON.into()))
+                }
+            }
+        }
+    }
+}
+
 /// Wait for one step of the login until `deadline` (`None` = no deadline); a step still running
 /// then is dropped and fails with [`LOGIN_TIMEOUT_REASON`].
 async fn within_login_deadline<T>(
@@ -5224,7 +5274,7 @@ fn is_login_timeout(e: &WshError) -> bool {
 async fn refuse_login_timeout(send: &mut wtransport::SendStream) {
     warn!("closed a connection that did not complete its login in time (login-timeout)");
     if let Ok(frame) = frame_encode(&handshake::build_auth_fail(LOGIN_TIMEOUT_REASON)) {
-        let _ = send.write_all(&frame).await;
+        best_effort_final(send.write_all(&frame)).await;
     }
 }
 
