@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Tested: the Rust `wsh mcp` against the MCP face of a page host's objects (#219; test only)
+
+`test/rust/wsh-mcp-page-host.test.mjs` now runs the real Rust `wsh --sealed --via RELAY mcp` (driven by the MCP SDK's own client) against a real page host whose `expose.window.mcp.tools` names an object path as a tool (a call and a read-only get): it lists exactly the tools the host wrote, a call that is not marked read-only asks the person at the page and a read does not, arguments are checked before the person is asked, a path no tool names is an unknown tool, a key with `mcp:page_title,objects:window:get` sees only the read, and a recording relay never sees a tool name, argument or result. This was on #219's "not verified" list. No product change and no wire change.
+
 ## 0.51.0 / Rust `rust-v0.18.0`
 
 Three JS features of #219 (events through a handle, typed remotes, an MCP face for allow-listed object paths) and the Rust `wsh-objects` client, in one release. The Rust client is the values, events and handles part of the protocol: **callbacks are not built in the Rust client, and events through a handle are a JS feature of this release that the Rust client does not have** (it neither writes the `handle` parameter of `subscribe` nor uses `types`; it ignores the `handle-events` and `types` strings a host states). Nothing else in the Rust crates changed besides the workspace version.

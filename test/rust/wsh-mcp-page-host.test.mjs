@@ -72,4 +72,60 @@ describe('the Rust `wsh mcp --sealed --via` against a page host', () => {
     assert.ok(seen.length > 500);
     for (const word of [MARKER, 'search_okapi', 'tools/call', 'shop-tab']) assert.ok(!seen.includes(word), `"${word}" crossed the relay in the clear`);
   });
+
+  it('the MCP face for named object paths (#219): the Rust bridge lists exactly the tools the host wrote, a call asks the person, and a key limited to get sees only the read', async () => {
+    const home = realpathSync(mkdtempSync(path.join(tmpdir(), 'wsh-page-rust-objtools-')));
+    scratch.push(home);
+    for (const name of ['default', 'getter']) execFileSync(WSH_BIN, ['keygen', name], { env: cleanEnv(home), stdio: 'ignore' });
+    const pub = (name) => readFileSync(path.join(home, '.wsh', 'keys', `${name}.pub`), 'utf8').trim();
+    const relay = await copyingRelay();
+    const win = createFakeWindow();
+    win.document.title = `Shop ${MARKER}`;
+    const calls = [];
+    win.app = { cart: { items: [], add(item) { calls.push(item); this.items.push(item); return { count: this.items.length }; } }, secret: 'not listed' };
+    const asked = [];
+    const host = await createPageHost({
+      window: win, relay: relay.url, name: 'shop-tab',
+      authorizedKeys: [pub('default'), `capabilities="mcp:page_title,objects:window:get" ${pub('getter')}`],
+      mcp: { prompt: async (call) => { asked.push(call.name); return true; } },
+      expose: { window: {
+        allow: { get: ['document.title', 'app.cart.**'], call: ['app.cart.add'] },
+        mcp: { tools: [
+          { name: 'cart_add', description: 'Add a product to the cart', call: 'app.cart.add', inputSchema: { type: 'object', properties: { sku: { type: 'string' } }, required: ['sku'], additionalProperties: false } },
+          { name: 'page_title', description: 'The page title', get: 'document.title', readOnly: true },
+        ] },
+      } },
+    });
+    closers.push(() => host.close());
+    const connect = async (identity) => {
+      const transport = new StdioClientTransport({
+        command: WSH_BIN, args: ['--accept-new-host-key', '--via', host.operatorUrl, '--sealed', ...(identity ? ['-i', identity] : []), 'mcp', 'alice@tab.example'], env: cleanEnv(home), stderr: 'pipe',
+      });
+      const client = new Client({ name: 'an-mcp-client', version: '1' }, { capabilities: {} });
+      closers.push(() => client.close());
+      await client.connect(transport);
+      return client;
+    };
+    const a = await connect();
+    assert.deepEqual((await a.listTools()).tools.map((t) => t.name).sort(), ['cart_add', 'page_title']);
+    assert.equal((await a.callTool({ name: 'page_title', arguments: {} })).content[0].text, `Shop ${MARKER}`);
+    assert.deepEqual(asked, [], 'a read marked read-only does not ask');
+    assert.deepEqual((await a.callTool({ name: 'cart_add', arguments: { sku: 'Q' } })).structuredContent, { count: 1 });
+    assert.deepEqual(asked, ['cart_add'], 'a call that is not read-only asks the person at the page');
+    assert.deepEqual(calls, [{ sku: 'Q' }]);
+    // arguments are checked before the person is asked, and a path no tool names is not a tool
+    await assert.rejects(a.callTool({ name: 'cart_add', arguments: { sku: 'Q', extra: 1 } }), /invalid arguments/);
+    assert.equal(asked.length, 1);
+    await assert.rejects(a.callTool({ name: 'secret', arguments: {} }), /unknown tool/);
+    await a.close();
+    // a key with mcp:page_title and objects:window:get: the read and nothing else
+    const b = await connect('getter');
+    assert.deepEqual((await b.listTools()).tools.map((t) => t.name), ['page_title']);
+    assert.equal((await b.callTool({ name: 'page_title', arguments: {} })).content[0].text, `Shop ${MARKER}`);
+    await assert.rejects(b.callTool({ name: 'cart_add', arguments: { sku: 'Z' } }), /unknown tool/);
+    assert.equal(calls.length, 1);
+    const seen = relay.text();
+    assert.ok(seen.length > 500);
+    for (const word of [MARKER, 'cart_add', 'page_title', 'tools/call']) assert.ok(!seen.includes(word), `"${word}" crossed the relay in the clear`);
+  });
 });
