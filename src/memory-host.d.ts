@@ -93,6 +93,7 @@ export interface WshMemoryHostOptions {
   /**
    * Called once per connection when its session has been sealed (after login). With `sealSession: 'require'` a login is not yet a session
    * that can do anything: `auth.authorize(who)` is told `who.sealRequired: true`, and audit or an indicator belongs here instead.
+   * `auth` runs once for a client that never seals (the key exchange follows the login, so the host cannot know sooner; #240): count here, not there.
    */
   onSealed?: (who: { username: string | null; fingerprint: string | null }) => void;
   /**

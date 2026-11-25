@@ -10,6 +10,7 @@
 
 import { buildAuthorizer, parseAuthorizedKeys, parseAuthorizedKeyEntries, authMethods, FailureLimiter } from './auth.mjs';
 import { loadHostKey } from './host-key.mjs';
+import { assertEd25519HostKey } from '../host-key.mjs';
 import { buildBackends } from './backends.mjs';
 import { SessionRegistry } from './sessions.mjs';
 import { RelayHub } from './relay.mjs';
@@ -102,6 +103,9 @@ function tlsChannelBinding(socket) {
  * @param {false | 'offer' | 'require'} [options.sealSession=false] - #155: seal a session end to end when the client asks (`e2e-session`); see
  *   `createMemoryHost`. Offered on connections accepted with `dataStreams: false` (a socket handed to `server.accept`); a
  *   byte-stream connection with QMux data streams is not sealed.
+ * @param {(who: { username: string | null, fingerprint: string | null }) => void} [options.onSealed] - #240: called once per connection when
+ *   its session has been sealed (after login). With `sealSession: 'require'`, `auth` runs BEFORE the client says whether it will seal (the key
+ *   exchange follows the login), and is told `who.sealRequired: true`; count and audit here, not in `auth`.
  * @param {boolean | string[]} [options.requireChannelBinding=false] - Accept a key login only when its signature is bound to
  *   this connection (#119): `true` needs any binding kind, an array names kinds that must all be bound (`host` needs
  *   `hostKey`; `tls-exporter` needs `wss://` served by this process, not a TLS-terminating proxy; `cert-hash` needs
@@ -116,13 +120,15 @@ function tlsChannelBinding(socket) {
  * @returns {{ listen(): Promise<{address: string, port: number}>, accept(socket: object, options?: object): Promise<{ close(): void }>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onLog = () => {},
+  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, requireChannelBinding = false, sealSession = false, onSealed, onLog = () => {},
   onShare, onRefused, targets, requireTarget, usernamePattern,
 } = {}) {
   resolveUsernamePattern(usernamePattern, 'createWshServer');
   validateOnShare(onShare, 'createWshServer');
   validateOnRefused(onRefused, 'createWshServer');
   if (sealSession !== false && sealSession !== 'offer' && sealSession !== 'require') throw new TypeError("createWshServer: sealSession must be false, 'offer' or 'require'");
+  if (onSealed !== undefined && typeof onSealed !== 'function') throw new TypeError('createWshServer: onSealed must be a function');
+  if (hostKey !== undefined && hostKey !== null && hostKey !== false) assertEd25519HostKey(hostKey, 'createWshServer: hostKey');
   if (sealSession && !hostKey) throw new TypeError('createWshServer: sealSession needs a hostKey (the host signs its half of the key exchange with it)');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createWshServer: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
@@ -178,7 +184,7 @@ export function createWshServer({
       return createConnectionFactory({
         authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, createGatewaySession, sessions: registry, relay: hub,
-        onShare, onRefused, targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
+        onShare, onRefused, onSealed, targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
       });
     })();
     ready.catch(() => { ready = null; });

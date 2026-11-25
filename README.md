@@ -650,6 +650,9 @@ in memory: the TCP, DNS, UDP and unix-socket parts of `gateway`, `relay`, WebTra
 - `hostKey` -- a `CryptoKeyPair` (generate it with `generateKeyPair()` and the private key stays non-extractable), a signer
   `{ publicKey, sign(data) }` for a key held elsewhere, or `true` for a fresh non-extractable key. Clients pin it as for
   any host ([Host key](#host-key-fingerprint--tofu)); the proof is signed through `sign`, so the key never has to be readable.
+  **Ed25519 only (#240):** a key of another algorithm (ECDSA P-256, RSA, a raw key that is not 32 bytes) is refused when the host is created --
+  `createMemoryHost`, `createWshServer`, `createPageHost` (its promise rejects) and `resolveHostKey` -- with a `TypeError` that names the algorithm and what is accepted, not at the first `accept()` while the client waits out its timeout.
+  A `{ file }` key of `createWshServer` is checked when the file is read.
 - `dataStreams` (default `true`) -- whether to offer client-opened QMux data streams. **Set it to `false` for a peer that
   cannot open them: the released Rust client over WebSocket** (`wsh`, `rust-v0.6.0`: "WebSocket transport does not support
   real data streams for this server", #132). Exec output then rides `SessionData` (`data_mode: "virtual"`, as over a relay
@@ -1447,6 +1450,16 @@ login, so a client that must never talk in the clear passes `--sealed` (against 
 refused, but what it sent before the refusal -- its commands, if any -- was already readable). What it does NOT cover: the handshake before login (the user name, the login public key and the host key proof are
 readable by the relay; the signed key exchange is not secret), the sizes and timing of traffic, a host whose connection has client-opened
 QMux data streams (not offered there), and a denial of service (a relay can always drop or cut).
+
+**`auth` runs before a client says whether it seals (#240).** With `sealSession: 'require'`, a client that never seals is refused, but not before your `auth`
+callback ran once for it: the key exchange is signed with the login key and bound to the session the login created, so it can only come AFTER the login, and the host cannot
+know sooner. (A login by password is refused before `auth` is consulted: it has no key to seal with.) So do not count or spend anything in `auth` on a host that requires sealing.
+`auth` is told `who.sealRequired: true` (typed) so it can skip the work, and **`onSealed({ username, fingerprint })`** (`createMemoryHost`, and `createWshServer` since #240; a page host
+or a duplex host is a memory host) is called once per connection when the session is sealed: count and audit there. A client that does not seal is served nothing: its first message
+that is not a keepalive is refused (`onRefused` reason `not-sealed`, one per connection) and the connection ends (`test/seal-require-auth.test.mjs` runs this against `createMemoryHost` and
+`createWshServer`). A client that connects, logs in and then says nothing at all is not refused until it speaks: there is no deadline on the key exchange. The Rust `wsh-server` with
+`seal_session = "require"` has the same order: a password login is refused first, a key login is checked against `authorized_keys` as usual (the seal is only begun after `AuthOk`), and only then does it
+refuse every message but the keepalive and the key exchange and close the connection on the first one. It has no embedder callback, so there is nothing of yours to count in.
 
 The JS client is the initiator too: `client.connect(url, { sealSession: false | 'auto' | true })` (also `WshClient.exec`).
 `'auto'`, the default, seals only against a host that says `e2e-session-required` (so a client written before this option keeps
