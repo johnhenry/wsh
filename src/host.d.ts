@@ -109,6 +109,12 @@ export interface WshConnectionConfig extends Partial<WshResolvedBackends> {
   e2e?: { signKey: CryptoKey | null; hybrid?: boolean } | null;
   /** How long exec output waits for the client-opened data stream (default 3000). */
   bindTimeoutMs?: number;
+  /**
+   * With `sealSession: 'require'` (#244): how long after login the session may stay unsealed (default 30000). At the deadline the host
+   * reports `seal-timeout` (`onRefused`), sends an `Error` naming it and closes the connection. 0 = no deadline. No effect where
+   * sealing is not required.
+   */
+  sealTimeoutMs?: number;
   /** Folders the operator offers (`wsh --share`, #159): called once per share; listing it makes the host state `shares`. */
   onShare?: WshOnShare;
   /** Told once per connection this host turned away, with a stable reason code (#163). */
@@ -261,7 +267,7 @@ export type WshOnShare = (name: string, fs: WshShareFs, who: { username: string 
 export const REFUSAL_REASONS: readonly WshRefusalReason[];
 export type WshRefusalReason =
   | 'not-sealed' | 'unauthorized' | 'binding-required' | 'bad-signature' | 'method-disabled' | 'rate-limited' | 'bad-request'
-  | 'seal-failed' | 'busy' | 'proof-required' | 'proof-failed' | 'key-expired' | 'not-permitted';
+  | 'seal-failed' | 'busy' | 'proof-required' | 'proof-failed' | 'key-expired' | 'not-permitted' | 'seal-timeout';
 /**
  * Called once per connection a host turned away (#163): `reason` is a stable code, `who` what is known of the peer (a
  * refusal before the login names no one), `detail` human text that is not stable. Not for parsing `onLog`.

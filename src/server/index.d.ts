@@ -530,6 +530,8 @@ export interface WshServerOptions {
    * nothing unsealed. With `'require'`, `auth` runs before the client has said whether it will seal (see `WshServerPrincipal.sealRequired`).
    */
   sealSession?: false | 'offer' | 'require';
+  /** #244: with `sealSession: 'require'`, how long after login the session may stay unsealed before the host closes it as `seal-timeout` (default 30000; 0 = no deadline). */
+  sealTimeoutMs?: number;
   /** #240: called once per connection when its session has been sealed (after login): count and audit here, not in `auth`, with `sealSession: 'require'`. */
   onSealed?: (who: { username: string | null; fingerprint: string | null }) => void;
   /**
