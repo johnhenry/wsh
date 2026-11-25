@@ -2248,14 +2248,21 @@ export interface WshUdpFlow extends WshGatewayDuplex {
 /** Feature string for UDP over WebTransport datagrams. */
 export const GATEWAY_DATAGRAM_FEATURE: 'gateway-datagram';
 
-/** A GatewayFail / ListenFail as an Error: `code` 4 = refused by the host's policy, 7 = too many connections, 1 = refused by the target. */
+/**
+ * A GatewayFail / ListenFail as an Error: `code` 4 = refused by the host's policy, 7 = too many connections, 1 = refused by the target,
+ * 8 = timed out. A `5` is "the gateway is disabled, or a timeout from an older Node gateway", and the message says so.
+ */
 export class GatewayError extends Error { code: number }
 
-/** The codes of `GatewayFail` by name (the one table the Node gateway, the page host and netway share). Frozen; a number is never reused. */
+/**
+ * The codes of `GatewayFail` by name (the one table the Node gateway, the page host and netway share). Frozen. `5` is `GATEWAY_DISABLED` (the
+ * spec, the Rust server); `TIMEOUT` is `8`. A Node gateway older than the one that sends `8` sent `5` for a timeout, so keep reading a `5` as
+ * "disabled, or a timeout from an older Node gateway".
+ */
 export const GATEWAY_FAIL: Readonly<{
-  CONNECTION_REFUSED: 1; HOST_UNREACHABLE: 2; DNS_FAILED: 3; POLICY_DENIED: 4; TIMEOUT: 5; CLOSED: 6; QUEUE_FULL: 7;
+  CONNECTION_REFUSED: 1; HOST_UNREACHABLE: 2; DNS_FAILED: 3; POLICY_DENIED: 4; GATEWAY_DISABLED: 5; CLOSED: 6; QUEUE_FULL: 7; TIMEOUT: 8;
 }>;
-/** The same codes with their meaning; `alsoSentAs` is a second name another implementation gives the number (the Rust server sends `5` for a disabled gateway). */
+/** The same codes with their meaning; `alsoSentAs` is a second name another (or an older) implementation gives the number (`5` is also what an older Node gateway sent for a timeout). */
 export const GATEWAY_FAIL_TABLE: ReadonlyArray<Readonly<{ name: keyof typeof GATEWAY_FAIL; code: number; meaning: string; alsoSentAs?: readonly string[] }>>;
 /** Codes a client gives its own `GatewayError` when it never asked the host (not on the wire): `UNSUPPORTED` is `0`, a feature the host did not advertise. */
 export const GATEWAY_FAIL_LOCAL: Readonly<{ UNSUPPORTED: 0 }>;

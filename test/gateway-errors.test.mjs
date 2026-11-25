@@ -6,9 +6,10 @@ import { readFileSync } from 'node:fs';
 import { GATEWAY_FAIL, GATEWAY_FAIL_TABLE, GATEWAY_FAIL_LOCAL, gatewayFailName, GatewayError } from '@johnhenry/wsh';
 import { GATEWAY_FAIL as serverTable } from '../src/server/gateway-core.mjs';
 
-// What @johnhenry/browsermesh-netway's `GATEWAY_ERROR` held when this table was written (packages/browsermesh-netway/src/constants.mjs):
-// the export must stay a superset of it, name for name and number for number.
-const NETWAY_GATEWAY_ERROR = { CONNECTION_REFUSED: 1, HOST_UNREACHABLE: 2, DNS_FAILED: 3, POLICY_DENIED: 4, TIMEOUT: 5, CLOSED: 6, QUEUE_FULL: 7 };
+// What @johnhenry/browsermesh-netway's `GATEWAY_ERROR` held when this table was first written (packages/browsermesh-netway/src/constants.mjs).
+// Every name but TIMEOUT keeps its number. TIMEOUT moved from 5 to 8 (#223): 5 is GATEWAY_DISABLED, what the spec and the Rust server say.
+const NETWAY_GATEWAY_ERROR = { CONNECTION_REFUSED: 1, HOST_UNREACHABLE: 2, DNS_FAILED: 3, POLICY_DENIED: 4, CLOSED: 6, QUEUE_FULL: 7 };
+const vectors = JSON.parse(readFileSync(new URL('../spec/gateway-fail.vectors.json', import.meta.url), 'utf8'));
 
 describe('GATEWAY_FAIL: the codes of GatewayFail', () => {
   it('is the table the Node gateway sends, one object (not a copy), frozen', () => {
@@ -18,8 +19,10 @@ describe('GATEWAY_FAIL: the codes of GatewayFail', () => {
     assert.throws(() => { 'use strict'; GATEWAY_FAIL.NEW = 9; }, TypeError);
   });
 
-  it('is a superset of what netway mirrors, name for name and number for number', () => {
+  it('keeps every number netway mirrors, except that TIMEOUT is 8 and 5 is GATEWAY_DISABLED', () => {
     for (const [name, code] of Object.entries(NETWAY_GATEWAY_ERROR)) assert.equal(GATEWAY_FAIL[name], code, name);
+    assert.equal(GATEWAY_FAIL.TIMEOUT, 8);
+    assert.equal(GATEWAY_FAIL.GATEWAY_DISABLED, 5);
   });
 
   it('has a row for every code: its number, its name and what it means; numbers and names are unique', () => {
@@ -41,11 +44,60 @@ describe('GATEWAY_FAIL: the codes of GatewayFail', () => {
     assert.equal(new GatewayError('x', GATEWAY_FAIL_LOCAL.UNSUPPORTED).code, 0);
   });
 
-  it('says where the Rust server differs: the code 5 it sends for a disabled gateway', () => {
+  it('5 is GATEWAY_DISABLED (the spec and the Rust server) and says it is also what an older Node gateway sent for a timeout; TIMEOUT is 8', () => {
     const five = GATEWAY_FAIL_TABLE.find((r) => r.code === 5);
-    assert.equal(five.name, 'TIMEOUT');
-    assert.deepEqual(five.alsoSentAs, ['GATEWAY_DISABLED']);
+    assert.equal(five.name, 'GATEWAY_DISABLED');
+    assert.deepEqual(five.alsoSentAs, ['TIMEOUT']);
     assert.match(five.meaning, /disabled/);
+    assert.match(five.meaning, /timeout/);
+    assert.match(five.meaning, /older/);
+    const eight = GATEWAY_FAIL_TABLE.find((r) => r.code === 8);
+    assert.equal(eight.name, 'TIMEOUT');
+    assert.equal(eight.alsoSentAs, undefined);
+    assert.equal(gatewayFailName(5), 'GATEWAY_DISABLED');
+    assert.equal(gatewayFailName(8), 'TIMEOUT');
+  });
+
+  it('a GatewayError that carries 5 says both readings in its message and keeps the host\'s words; other codes are untouched', () => {
+    const e = new GatewayError('gateway disabled', 5);
+    assert.equal(e.code, 5);
+    assert.match(e.message, /^gateway disabled/);
+    assert.match(e.message, /disabled/);
+    assert.match(e.message, /timeout from an older Node gateway/);
+    assert.equal(new GatewayError('connect timed out', 8).message, 'connect timed out');
+    assert.equal(new GatewayError('refused', 4).message, 'refused');
+    assert.equal(new GatewayError('x', 0).message, 'x');
+  });
+
+  it('the Node gateway sends 8 (not 5) when a connect times out', async () => {
+    const { socksConnect } = await import('../src/server/gateway.mjs');
+    const { createServer } = await import('node:net');
+    const held = new Set();
+    const srv = createServer((s) => { held.add(s); s.on('error', () => {}); });  // accepts and never answers
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    try {
+      await assert.rejects(socksConnect({ host: '127.0.0.1', port: srv.address().port }, 'example.test', 80, { timeoutMs: 50 }), (e) => e.code === 8 && e.code === GATEWAY_FAIL.TIMEOUT);
+    } finally { for (const s of held) s.destroy(); await new Promise((r) => srv.close(r)); }
+  });
+
+  it('the shared vectors (spec/gateway-fail.vectors.json) match the table, name for name and number for number', () => {
+    assert.equal(vectors.version, 1);
+    assert.deepEqual(vectors.codes.map((c) => c.code), GATEWAY_FAIL_TABLE.map((r) => r.code));
+    for (const v of vectors.codes) {
+      const row = GATEWAY_FAIL_TABLE.find((r) => r.code === v.code);
+      assert.equal(row.name, v.name);
+      assert.deepEqual(row.alsoSentAs ?? [], v.alsoSentAs ?? []);
+      assert.equal(GATEWAY_FAIL[v.name], v.code);
+      assert.ok(Array.isArray(v.sentBy) && v.sentBy.length > 0);
+    }
+    assert.equal(vectors.codes.find((c) => c.code === 5).name, 'GATEWAY_DISABLED');
+    assert.equal(vectors.codes.find((c) => c.code === 8).name, 'TIMEOUT');
+  });
+
+  it('the spec lists 5, 6, 7 and 8 under the numbers the table uses', () => {
+    const spec = readFileSync(new URL('../spec/wsh-v1.yaml', import.meta.url), 'utf8');
+    const block = spec.slice(spec.indexOf('Machine-readable failure reason'), spec.indexOf('Machine-readable failure reason') + 1600).replace(/\s+/g, ' ');
+    for (const row of GATEWAY_FAIL_TABLE) assert.ok(block.includes(`${row.code}=${row.name}`), `${row.code}=${row.name}`);
   });
 
   it('covers every code the Rust server sends (read from its source)', () => {
