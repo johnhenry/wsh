@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### `GatewayFail` code 5 is `GATEWAY_DISABLED`; a timeout is `8` (#223; JS and spec, a minor)
+
+`GatewayFail.code` `5` meant "gateway disabled" on the Rust `wsh-server` (and in `spec/wsh-v1.yaml`) and "timeout" on the Node gateway. The spec is now the authority: **`5` stays `GATEWAY_DISABLED`, and the Node gateway (`@johnhenry/wsh/server`, the page host and the memory host) sends `8` (`TIMEOUT`) for a timeout.** The spec lists `1`..`8` (`6` CLOSED, `7` QUEUE_FULL and `8` TIMEOUT were missing or wrong). The number the Rust server sends is unchanged.
+
+- **Wire: no new message, field or feature string**; only the number a Node gateway puts in `GatewayFail.code` for a timed-out connect, name lookup or SOCKS5 connect changes, from `5` to `8`.
+- **A released peer.** A released Node peer (0.51.0 and earlier) still sends `5` for a timeout, and every reader in this repository keeps accepting it: `GATEWAY_FAIL_TABLE` says `5` is `GATEWAY_DISABLED` and also what an older Node gateway sent for a timeout (`alsoSentAs: ['TIMEOUT']`), and a `GatewayError` that carries `5` has "(code 5: the gateway is disabled, or a timeout from an older Node gateway)" appended to the host's own message. A released JS client that reads `8` from a new Node gateway sees an unknown number (it is only a number on a `GatewayError`, nothing switches on it in the package); a client of your own that decided "`code === 5` is a timeout" must also accept `8`. A released Rust client reads `8` as "gateway failure" (its generic text) and still reads `5` as "gateway disabled", as before; the Rust server is unchanged.
+- **`GATEWAY_FAIL`** has `GATEWAY_DISABLED: 5` and `TIMEOUT: 8` (the order of the table is by number except that `TIMEOUT` is last). `gatewayFailName(5)` is `'GATEWAY_DISABLED'`, `gatewayFailName(8)` is `'TIMEOUT'`. **This is the one renumbering the table ever had**; the number of every other name is unchanged.
+- **Vectors**: `spec/gateway-fail.vectors.json` (number, name, who sends it), tested against the table and the spec text.
+- **`@johnhenry/browsermesh-netway` has to follow**: its `GATEWAY_ERROR` names `TIMEOUT: 5`. It should (or import `GATEWAY_FAIL` from `@johnhenry/wsh` instead of keeping a copy) make `TIMEOUT` `8` and add `GATEWAY_DISABLED: 5`, and keep mapping a `5` to a timeout-or-disabled error (a timeout from a peer that still sends `5`) rather than only a timeout.
+
 ## 0.51.0 / Rust `rust-v0.18.0`
 
 Three JS features of #219 (events through a handle, typed remotes, an MCP face for allow-listed object paths) and the Rust `wsh-objects` client, in one release. The Rust client is the values, events and handles part of the protocol: **callbacks are not built in the Rust client, and events through a handle are a JS feature of this release that the Rust client does not have** (it neither writes the `handle` parameter of `subscribe` nor uses `types`; it ignores the `handle-events` and `types` strings a host states). Nothing else in the Rust crates changed besides the workspace version.
