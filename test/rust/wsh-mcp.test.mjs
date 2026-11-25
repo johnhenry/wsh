@@ -392,6 +392,12 @@ describe('wsh mcp: an MCP client reaches an MCP server behind a wsh host (#127, 
     const a = await nodeHost();
     const b = bridge(['--reconnect-attempts', '3', '--timeout', '1000', `alice@${a.url}`]);
     await b.initialize();
+    // initialize() writes `notifications/initialized` and returns at once. The bridge reads stdin independently of the
+    // connection, so closing the host right away can lose the race: the notification is then read after the connection
+    // is gone and is HELD, taking one of the 200 slots (the cap counts every message, not only requests). An answered
+    // request proves every line written before it was read and forwarded while the connection was still up (#229).
+    b.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    await b.next((m) => m.id === 2);
     await a.server.close();
     const until = Date.now() + 10_000;
     while (!/reconnecting \(attempt 1 of 3\)/.test(b.stderr()) && Date.now() < until) await sleep(10);
@@ -403,6 +409,25 @@ describe('wsh mcp: an MCP client reaches an MCP server behind a wsh host (#127, 
     await b.next((m) => m.error?.message === 'the wsh host is unreachable', 30_000);
     assert.equal((await b.exited).code, 1);
     assert.equal(b.lines.filter((l) => JSON.parse(l).error?.message === 'the wsh host is unreachable').length, 200);
+  });
+
+  it('the 200 held while reconnecting are counted over every message: a notification held takes a slot (#229)', async () => {
+    const a = await nodeHost();
+    const b = bridge(['--reconnect-attempts', '3', '--timeout', '1000', `alice@${a.url}`]);
+    await b.initialize();
+    b.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    await b.next((m) => m.id === 2);
+    await a.server.close();
+    const until = Date.now() + 10_000;
+    while (!/reconnecting \(attempt 1 of 3\)/.test(b.stderr()) && Date.now() < until) await sleep(10);
+    // one notification first, so it is certainly held (this is what the race above does by accident)
+    b.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'none' } });
+    for (let i = 0; i < 210; i++) b.send({ jsonrpc: '2.0', id: 1000 + i, method: 'tools/list' });
+    await b.next((m) => m.error?.message === 'too many messages while reconnecting', 20_000);
+    await b.next((m) => m.error?.message === 'the wsh host is unreachable', 30_000);
+    assert.equal((await b.exited).code, 1);
+    assert.equal(b.lines.filter((l) => JSON.parse(l).error?.message === 'too many messages while reconnecting').length, 11, '199 requests held next to the notification');
+    assert.equal(b.lines.filter((l) => JSON.parse(l).error?.message === 'the wsh host is unreachable').length, 199);
   });
 
   it('the client closing stdin ends the bridge with 0, and a signal ends it cleanly', async () => {
