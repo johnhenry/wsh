@@ -19,10 +19,17 @@
 //!   side dropped (its receiver was full) are both counted and told;
 //! - **handles**: a host that states `handles` returns [`Handle`]s for what is not plain data; operations
 //!   through one are [`Handle::target`]; [`Handle::release`] (or dropping it) gives its place back, and the end of
-//!   the session releases all of them.
+//!   the session releases all of them. A host that also states `handle-events` accepts [`Target::subscribe`] on
+//!   a handle's target; releasing the handle ends the subscriptions made through it;
+//! - **callbacks**: a host that states `callbacks` takes a function of this side as an argument of a call whose
+//!   allow-list entry ends in `(callback)`. Here a function is a [`Callback`] ([`ObjectsClient::callback`]) passed
+//!   with [`Target::call_with`]: the host's calls of it arrive, one way, in a bounded queue read with
+//!   [`Callback::recv`]; the host never waits for this side and gets no return value;
+//! - **types**: [`ObjectsClient::root_description`] asks a host that states `types` what this key may do on a root
+//!   (the allow-list entries, the host's type map, the event fields), as plain data.
 //!
-//! What it does not do: callbacks (passing a function to the host); events through a handle (the host offers
-//! none); serving objects.
+//! What it does not do: serve objects (a `wsh-objects` host is a JavaScript thing; `wsh-server` has none, see
+//! `spec/objects.md` section 11), return values from callbacks (the protocol has none).
 //!
 //! Everything the host says in text (names, previews, strings, error messages) is untrusted data: it is kept
 //! as strings and never interpreted. A feature the host did not state (`events`, `handles`) is refused here,
@@ -50,8 +57,12 @@ pub const OBJECTS_PROTOCOL: &str = "wsh-objects";
 pub const FEATURE_EVENTS: &str = "events";
 /// `roots` feature: the host may return handles for what is not plain data.
 pub const FEATURE_HANDLES: &str = "handles";
-/// `roots` feature: the host accepts callbacks (this client passes none).
+/// `roots` feature: the host accepts callbacks (a function of this side, passed to a call, that the host may call back).
 pub const FEATURE_CALLBACKS: &str = "callbacks";
+/// `roots` feature: the host accepts `subscribe` with a `handle` in place of a `root`.
+pub const FEATURE_HANDLE_EVENTS: &str = "handle-events";
+/// `roots` feature: the host answers the `types` method.
+pub const FEATURE_TYPES: &str = "types";
 
 /// How long a request waits for its answer unless [`OpenOptions::timeout`] says otherwise. (A host waits up to
 /// 30 seconds for a call that returns a promise.)
@@ -574,11 +585,35 @@ impl From<()> for Path {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// An argument of a call: plain data, or a function of this side (a [`Callback`]) that the host may call back.
+#[derive(Debug, Clone)]
+pub enum Arg {
+    Value(Value),
+    Callback(Callback),
+}
+
+impl From<Value> for Arg {
+    fn from(v: Value) -> Self {
+        Arg::Value(v)
+    }
+}
+impl From<Callback> for Arg {
+    fn from(c: Callback) -> Self {
+        Arg::Callback(c)
+    }
+}
+impl From<&Callback> for Arg {
+    fn from(c: &Callback) -> Self {
+        Arg::Callback(c.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
 enum Op {
     Get(String),
-    Call(String, Vec<Value>),
-    Construct(String, Vec<Value>),
+    /// The key, the arguments (null where a callback stands) and the callbacks by argument index.
+    Call(String, Vec<Value>, Vec<(usize, Callback)>),
+    Construct(String, Vec<Value>, Vec<(usize, Callback)>),
 }
 
 /// A whole chain of operations, sent as one `resolve` request: `window.app.getCart().items` is
@@ -601,25 +636,66 @@ impl Chain {
 
     /// Call the method named by the last segment of the path (the earlier ones are read on the way).
     pub fn call(self, path: impl Into<Path>, args: Vec<Value>) -> Self {
+        self.method(
+            path.into(),
+            args.into_iter().map(Arg::Value).collect(),
+            false,
+        )
+    }
+
+    /// Like [`Chain::call`], with functions of this side among the arguments (the host must state `callbacks`, and
+    /// the allow-list entry of the method must end in `(callback)`).
+    pub fn call_with(self, path: impl Into<Path>, args: Vec<Arg>) -> Self {
         self.method(path.into(), args, false)
     }
 
     /// Construct with the constructor named by the last segment of the path.
     pub fn construct(self, path: impl Into<Path>, args: Vec<Value>) -> Self {
+        self.method(
+            path.into(),
+            args.into_iter().map(Arg::Value).collect(),
+            true,
+        )
+    }
+
+    /// Like [`Chain::construct`], with callbacks among the arguments.
+    pub fn construct_with(self, path: impl Into<Path>, args: Vec<Arg>) -> Self {
         self.method(path.into(), args, true)
     }
 
-    fn method(mut self, mut path: Path, args: Vec<Value>, construct: bool) -> Self {
+    fn method(mut self, mut path: Path, args: Vec<Arg>, construct: bool) -> Self {
         let last = path.0.pop();
         self.ops.extend(path.0.into_iter().map(Op::Get));
         // A path with no segment names nothing to call: left as a call of "" which `check` refuses.
         let key = last.unwrap_or_default();
+        let mut values = Vec::with_capacity(args.len());
+        let mut callbacks = Vec::new();
+        for (i, a) in args.into_iter().enumerate() {
+            match a {
+                Arg::Value(v) => values.push(v),
+                Arg::Callback(c) => {
+                    values.push(Value::Null);
+                    callbacks.push((i, c));
+                }
+            }
+        }
         self.ops.push(if construct {
-            Op::Construct(key, args)
+            Op::Construct(key, values, callbacks)
         } else {
-            Op::Call(key, args)
+            Op::Call(key, values, callbacks)
         });
         self
+    }
+
+    /// The callbacks the chain passes.
+    fn callbacks(&self) -> impl Iterator<Item = &Callback> {
+        self.ops
+            .iter()
+            .flat_map(|op| match op {
+                Op::Call(_, _, cbs) | Op::Construct(_, _, cbs) => cbs.as_slice(),
+                Op::Get(_) => &[],
+            })
+            .map(|(_, c)| c)
     }
 
     fn to_cbor(&self) -> Result<Cbor> {
@@ -630,20 +706,41 @@ impl Chain {
                     check_segment(k)?;
                     map([("get", Cbor::Text(k.clone()))])
                 }
-                Op::Call(k, args) | Op::Construct(k, args) => {
+                Op::Call(k, args, cbs) | Op::Construct(k, args, cbs) => {
                     check_segment(k)?;
                     let name = if matches!(op, Op::Call(..)) {
                         "call"
                     } else {
                         "construct"
                     };
-                    map([
+                    let mut entries = vec![
                         (name, Cbor::Text(k.clone())),
                         (
                             "args",
                             Cbor::Array(args.iter().map(Value::to_cbor).collect()),
                         ),
-                    ])
+                    ];
+                    if !cbs.is_empty() {
+                        entries.push((
+                            "callbacks",
+                            Cbor::Array(
+                                cbs.iter()
+                                    .map(|(i, c)| {
+                                        Cbor::Array(vec![
+                                            Cbor::Integer((*i as u64).into()),
+                                            Cbor::Integer(c.inner.id.into()),
+                                        ])
+                                    })
+                                    .collect(),
+                            ),
+                        ));
+                    }
+                    Cbor::Map(
+                        entries
+                            .into_iter()
+                            .map(|(k, v)| (Cbor::Text(k.to_string()), v))
+                            .collect(),
+                    )
                 }
             });
         }
@@ -734,11 +831,20 @@ struct SubState {
     tx: mpsc::Sender<Event>,
     lost_here: Arc<AtomicU64>,
     lost_by_host: Arc<AtomicU64>,
+    /// The handle it was made through: the host ends it with the handle.
+    handle: Option<String>,
+}
+
+struct CallbackState {
+    tx: mpsc::Sender<CallbackCall>,
+    lost_here: Arc<AtomicU64>,
+    lost_by_host: Arc<AtomicU64>,
 }
 
 struct Shared {
     pending: StdMutex<HashMap<u64, Pending>>,
     subs: StdMutex<HashMap<u64, SubState>>,
+    callbacks: StdMutex<HashMap<u64, CallbackState>>,
     /// Why the host said it was ending the channel (`closing`), or `Some("")` for an end without a word.
     ended: StdMutex<Option<String>>,
     closed: AtomicBool,
@@ -752,7 +858,18 @@ struct Inner {
     features: OnceLock<Vec<String>>,
     next_id: AtomicU64,
     next_sub: AtomicU64,
+    next_callback: AtomicU64,
     timeout: Duration,
+}
+
+impl Shared {
+    /// The host ends the subscriptions made through a handle with it: forget them here too (their readers see the end).
+    fn forget_handle_subs(&self, handle: &str) {
+        self.subs
+            .lock()
+            .expect("objects state")
+            .retain(|_, s| s.handle.as_deref() != Some(handle));
+    }
 }
 
 impl Drop for Inner {
@@ -812,6 +929,7 @@ impl ObjectsClient {
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
             subs: StdMutex::new(HashMap::new()),
+            callbacks: StdMutex::new(HashMap::new()),
             ended: StdMutex::new(None),
             closed: AtomicBool::new(false),
         });
@@ -824,6 +942,7 @@ impl ObjectsClient {
             features: OnceLock::new(),
             next_id: AtomicU64::new(1),
             next_sub: AtomicU64::new(1),
+            next_callback: AtomicU64::new(1),
             timeout: options.timeout,
         });
         let answer = inner.request("roots", Cbor::Map(Vec::new())).await?;
@@ -878,6 +997,60 @@ impl ObjectsClient {
         Ok(Target {
             inner: self.inner.clone(),
             start: Start::Root(name.to_string()),
+        })
+    }
+
+    /// What this key may do on a root, as plain data: `{ version, root, ops, allow, eventFields, types, handles }` (the
+    /// host's allow-list entries for the root, narrowed by the key's capabilities, and the host's type map for them).
+    /// Needs the host to state `types`. Everything in it is the host's own text: untrusted, never evaluated.
+    pub async fn root_description(&self, root: &str) -> Result<Value> {
+        self.inner.require(FEATURE_TYPES)?;
+        // the same local refusal as any request that names a root the host did not list
+        self.root(root)?;
+        let answer = self
+            .inner
+            .request("types", map([("root", Cbor::Text(root.to_string()))]))
+            .await?;
+        Value::from_cbor(answer)
+    }
+
+    /// A function of this side for the host to call: pass it to [`Target::call_with`]. The host's calls arrive in a
+    /// queue of `capacity` calls ([`Callback::recv`]); more are dropped here and counted. Needs `capacity >= 1`; the
+    /// host must state `callbacks` when it is passed.
+    pub fn callback(&self, capacity: usize) -> Result<Callback> {
+        if capacity == 0 {
+            return Err(ObjectsError::invalid("a callback holds at least one call"));
+        }
+        if self.inner.shared.closed.load(Ordering::Relaxed) {
+            return Err(self.inner.ended_error());
+        }
+        let id = self.inner.next_callback.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(capacity);
+        let lost_here = Arc::new(AtomicU64::new(0));
+        let lost_by_host = Arc::new(AtomicU64::new(0));
+        self.inner
+            .shared
+            .callbacks
+            .lock()
+            .expect("objects state")
+            .insert(
+                id,
+                CallbackState {
+                    tx,
+                    lost_here: lost_here.clone(),
+                    lost_by_host: lost_by_host.clone(),
+                },
+            );
+        Ok(Callback {
+            inner: Arc::new(CallbackInner {
+                client: self.inner.clone(),
+                id,
+                rx: tokio::sync::Mutex::new(rx),
+                lost_here,
+                lost_by_host,
+                sent: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+            }),
         })
     }
 
@@ -1017,6 +1190,7 @@ async fn read_loop(channel: Arc<RpcChannel>, shared: Arc<Shared>) {
         })));
     }
     shared.subs.lock().expect("objects state").clear();
+    shared.callbacks.lock().expect("objects state").clear();
 }
 
 async fn dispatch(channel: &RpcChannel, shared: &Shared, message: Cbor) {
@@ -1045,11 +1219,12 @@ async fn dispatch(channel: &RpcChannel, shared: &Shared, message: Cbor) {
             let params = cbor_get(&message, "params");
             match (method.as_str(), params) {
                 ("event", Some(p)) => deliver_event(shared, p),
+                ("callback", Some(p)) => deliver_callback(shared, p),
                 ("closing", Some(p)) => {
                     let reason = cbor_text(p, "reason").unwrap_or("closing");
                     *shared.ended.lock().expect("objects state") = Some(reason.to_string());
                 }
-                // callbacks (this client passes none), progress: noise
+                // progress and anything else: noise
                 _ => {}
             }
         }
@@ -1095,6 +1270,38 @@ fn deliver_event(shared: &Shared, params: &Cbor) {
     if sub.tx.try_send(event).is_err() {
         sub.lost_here.fetch_add(owed_here + 1, Ordering::Relaxed);
         sub.lost_by_host.fetch_add(owed_host, Ordering::Relaxed);
+    }
+}
+
+fn deliver_callback(shared: &Shared, params: &Cbor) {
+    let (Some(id), Some(seq)) = (cbor_u64(params, "id"), cbor_u64(params, "seq")) else {
+        return;
+    };
+    let by_host = cbor_u64(params, "dropped").unwrap_or(0);
+    let Some(Cbor::Array(items)) = cbor_get(params, "args") else {
+        return;
+    };
+    let Ok(args) = items
+        .iter()
+        .map(|a| Value::from_cbor(a.clone()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    let callbacks = shared.callbacks.lock().expect("objects state");
+    let Some(cb) = callbacks.get(&id) else { return };
+    let owed_here = cb.lost_here.swap(0, Ordering::Relaxed);
+    let owed_host = cb.lost_by_host.swap(0, Ordering::Relaxed) + by_host;
+    let call = CallbackCall {
+        seq,
+        args,
+        dropped_by_host: owed_host,
+        dropped_here: owed_here,
+    };
+    // Never waits, as for events: what does not fit is lost here, counted, and told with the next call that does.
+    if cb.tx.try_send(call).is_err() {
+        cb.lost_here.fetch_add(owed_here + 1, Ordering::Relaxed);
+        cb.lost_by_host.fetch_add(owed_host, Ordering::Relaxed);
     }
 }
 
@@ -1147,7 +1354,27 @@ impl Target {
 
     /// A chain of operations as one request: the last operation is the one the host's allow-list must allow.
     pub async fn resolve(&self, chain: Chain) -> Result<Reply> {
+        // A function sent to a host that does not know callbacks would arrive there as null: refuse it here, by name.
+        let mut passes_callbacks = false;
+        for cb in chain.callbacks() {
+            passes_callbacks = true;
+            if !Arc::ptr_eq(&cb.inner.client, &self.inner) {
+                return Err(ObjectsError::invalid(
+                    "a callback of another channel cannot be passed here",
+                ));
+            }
+            if cb.inner.released.load(Ordering::Relaxed) {
+                return Err(ObjectsError::invalid("the callback was released"));
+            }
+        }
+        if passes_callbacks {
+            self.inner.require(FEATURE_CALLBACKS)?;
+        }
         let ops = chain.to_cbor()?;
+        // From here the host may know the callback (even if the call then fails or times out).
+        for cb in chain.callbacks() {
+            cb.inner.sent.store(true, Ordering::Relaxed);
+        }
         let answer = self
             .inner
             .request("resolve", self.params(vec![("ops", ops)])?)
@@ -1165,6 +1392,13 @@ impl Target {
     pub async fn call(&self, path: impl Into<Path>, args: Vec<Value>) -> Result<Reply> {
         let path = path.into();
         self.resolve(Chain::new().call(path, args)).await
+    }
+
+    /// Like [`Target::call`], with functions of this side ([`Callback`]) among the arguments. The host must state
+    /// `callbacks`, and the allow-list entry of the method must end in `(callback)`.
+    pub async fn call_with(&self, path: impl Into<Path>, args: Vec<Arg>) -> Result<Reply> {
+        let path = path.into();
+        self.resolve(Chain::new().call_with(path, args)).await
     }
 
     /// `new` the constructor the last segment of `path` names.
@@ -1240,19 +1474,24 @@ impl Target {
     }
 
     /// Listen to the events of type `event` of the source at `path` (an entry of the host's `allow.on`). Needs the
-    /// host to state `events`, and a root (the host offers no events through a handle).
+    /// host to state `events`. From a handle's target the host must also state `handle-events`: the source is the
+    /// path that produced the handle, extended by `path`, judged as a path subscription for it (its own `allow.on`
+    /// entry naming the type). Releasing the handle ends the subscription.
     pub async fn subscribe(
         &self,
         path: impl Into<Path>,
         event: &str,
         options: SubscribeOptions,
     ) -> Result<Subscription> {
-        let Start::Root(root) = &self.start else {
-            return Err(ObjectsError::unsupported(
-                "events through a handle (name the source by its path from a root)",
-            ));
-        };
         self.inner.require(FEATURE_EVENTS)?;
+        let keepalive = match &self.start {
+            Start::Root(_) => None,
+            Start::Handle(h) => {
+                self.inner.require(FEATURE_HANDLE_EVENTS)?;
+                Some(h.clone())
+            }
+        };
+        let (start_key, start_value) = self.start_entry()?;
         let path = path.into();
         path.check()?;
         if event.is_empty()
@@ -1289,11 +1528,12 @@ impl Target {
                     tx,
                     lost_here: lost_here.clone(),
                     lost_by_host: lost_by_host.clone(),
+                    handle: keepalive.as_ref().map(|h| h.id.clone()),
                 },
             );
         let mut params = vec![
             (Cbor::Text("id".into()), Cbor::Integer(id.into())),
-            (Cbor::Text("root".into()), Cbor::Text(root.clone())),
+            (Cbor::Text(start_key.to_string()), start_value),
             (Cbor::Text("path".into()), path.to_cbor()),
             (Cbor::Text("type".into()), Cbor::Text(event.to_string())),
         ];
@@ -1319,6 +1559,7 @@ impl Target {
             lost_here,
             lost_by_host,
             done: false,
+            _handle: keepalive,
         })
     }
 }
@@ -1398,6 +1639,8 @@ pub struct Subscription {
     lost_here: Arc<AtomicU64>,
     lost_by_host: Arc<AtomicU64>,
     done: bool,
+    /// The handle a subscription through one stands on lives as long as the subscription does.
+    _handle: Option<Arc<HandleInner>>,
 }
 
 impl Subscription {
@@ -1419,12 +1662,18 @@ impl Subscription {
     /// Stop listening. Returns how many events the host says it dropped and never told of.
     pub async fn unsubscribe(mut self) -> Result<u64> {
         self.done = true;
-        self.inner
+        let existed = self
+            .inner
             .shared
             .subs
             .lock()
             .expect("objects state")
-            .remove(&self.id);
+            .remove(&self.id)
+            .is_some();
+        if !existed {
+            // Ended already (the handle it stood on was released, or the channel ended): the host forgot it too.
+            return Ok(0);
+        }
         let answer = self
             .inner
             .request("unsubscribe", map([("id", Cbor::Integer(self.id.into()))]))
@@ -1438,16 +1687,18 @@ impl Drop for Subscription {
         if self.done {
             return;
         }
-        self.inner
+        let existed = self
+            .inner
             .shared
             .subs
             .lock()
             .expect("objects state")
-            .remove(&self.id);
+            .remove(&self.id)
+            .is_some();
         // Best effort: the host removes the listener (it would anyway when the channel ends).
         let inner = self.inner.clone();
         let id = self.id;
-        if !inner.shared.closed.load(Ordering::Relaxed) {
+        if existed && !inner.shared.closed.load(Ordering::Relaxed) {
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move {
                     let _ = inner
@@ -1473,6 +1724,7 @@ struct HandleInner {
 impl Drop for HandleInner {
     fn drop(&mut self) {
         // A handle that is let go of gives its place back (the table holds 64 and evicts nothing).
+        self.client.shared.forget_handle_subs(&self.id);
         if self.released.swap(true, Ordering::Relaxed)
             || self.client.shared.closed.load(Ordering::Relaxed)
         {
@@ -1539,6 +1791,8 @@ impl Handle {
         if self.inner.released.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
+        // The host ends the subscriptions made through the handle with it.
+        self.inner.client.shared.forget_handle_subs(&self.inner.id);
         self.inner
             .client
             .request(
@@ -1547,6 +1801,129 @@ impl Handle {
             )
             .await
             .map(|_| ())
+    }
+
+    pub fn is_released(&self) -> bool {
+        self.inner.released.load(Ordering::Relaxed)
+    }
+}
+
+// ── Callbacks ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One call of a [`Callback`] by the host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallbackCall {
+    /// The host's count of delivered calls of this callback, from 1.
+    pub seq: u64,
+    /// The arguments, copied as plain data (what the host could not clone is null).
+    pub args: Vec<Value>,
+    /// Calls the host dropped (rate, size, a full queue) before this one, since the last it delivered; plus those it
+    /// reported for calls this side then dropped.
+    pub dropped_by_host: u64,
+    /// Calls this side dropped because the reader's queue was full, since the last one it was given.
+    pub dropped_here: u64,
+}
+
+struct CallbackInner {
+    client: Arc<Inner>,
+    id: u64,
+    rx: tokio::sync::Mutex<mpsc::Receiver<CallbackCall>>,
+    lost_here: Arc<AtomicU64>,
+    lost_by_host: Arc<AtomicU64>,
+    /// Passed to a call at least once: the host may hold a stub for it.
+    sent: AtomicBool,
+    released: AtomicBool,
+}
+
+impl Drop for CallbackInner {
+    fn drop(&mut self) {
+        self.client
+            .shared
+            .callbacks
+            .lock()
+            .expect("objects state")
+            .remove(&self.id);
+        // The host holds a stub only for a callback that was passed (16 per channel): give its place back.
+        if self.released.swap(true, Ordering::Relaxed)
+            || !self.sent.load(Ordering::Relaxed)
+            || self.client.shared.closed.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let client = self.client.clone();
+        let id = self.id;
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let _ = client
+                    .request("releaseCallback", map([("id", Cbor::Integer(id.into()))]))
+                    .await;
+            });
+        }
+    }
+}
+
+/// A function of this side for the host to call ([`ObjectsClient::callback`]), passed in the arguments of
+/// [`Target::call_with`]. It is one-way: the host copies its arguments as plain data and queues the call; it never
+/// waits for this side and gets nothing back. Calls arrive in a bounded queue ([`Callback::recv`]); what does not fit
+/// is dropped and counted. The same `Callback` (or a clone of it) is the same function on the host, one place of the
+/// host's 16 per channel. Cheap to clone; releasing it, or dropping the last reference, ends it.
+#[derive(Clone)]
+pub struct Callback {
+    inner: Arc<CallbackInner>,
+}
+
+impl fmt::Debug for Callback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Callback({})", self.inner.id)
+    }
+}
+
+impl Callback {
+    /// The next call the host made; `None` once the callback was released or the channel ended (and the queue is empty).
+    pub async fn recv(&self) -> Option<CallbackCall> {
+        self.inner.rx.lock().await.recv().await
+    }
+
+    /// Calls dropped here since the last one was read, not yet told to the reader.
+    pub fn pending_dropped_here(&self) -> u64 {
+        self.inner.lost_here.load(Ordering::Relaxed)
+    }
+
+    /// Calls the host reported dropped, for calls this side then dropped, not yet told.
+    pub fn pending_dropped_by_host(&self) -> u64 {
+        self.inner.lost_by_host.load(Ordering::Relaxed)
+    }
+
+    /// Kill the host's stub of this function (a call of it is then a no-op there) and end the queue. Releasing a
+    /// released callback does nothing, and one that was never passed to the host is only forgotten here. A host that
+    /// says it has no such callback (a call that failed on the host takes its new callbacks with it) is not an error.
+    pub async fn release(&self) -> Result<()> {
+        if self.inner.released.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.inner
+            .client
+            .shared
+            .callbacks
+            .lock()
+            .expect("objects state")
+            .remove(&self.inner.id);
+        if !self.inner.sent.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match self
+            .inner
+            .client
+            .request(
+                "releaseCallback",
+                map([("id", Cbor::Integer(self.inner.id.into()))]),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind == ErrorKind::Invalid => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn is_released(&self) -> bool {
