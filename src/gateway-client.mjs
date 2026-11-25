@@ -15,16 +15,20 @@ import {
 } from './messages.mjs';
 import { GatewayChannel, GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
 import { UdpFlow, decodeDatagram } from './gateway-datagram.mjs';
+import { GATEWAY_FAIL_FIVE_NOTE } from './gateway-errors.mjs';
 
 const ID_BASE = 0x40000000;
 const ID_LIMIT = 0xffffffff;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const CLIENT_GRACE_MS = 5_000;
 
-/** An Error from a GatewayFail / ListenFail: `.code` is the GatewayFail code (4 = refused by policy), `.reason` the host's text. */
+/**
+ * An Error from a GatewayFail / ListenFail: `.code` is the GatewayFail code (4 = refused by policy, 8 = timed out). A `5` is "the gateway is
+ * disabled, or a timeout from an older Node gateway" and the message says both (the host's own words come first).
+ */
 export class GatewayError extends Error {
   constructor(message, code) {
-    super(message);
+    super(code === 5 ? `${message} (${GATEWAY_FAIL_FIVE_NOTE})` : message);
     this.name = 'GatewayError';
     this.code = code;
   }
