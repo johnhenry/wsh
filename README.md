@@ -757,6 +757,34 @@ On the far side nothing new is needed: `wsh-mcp --sealed --host-key <host.finger
 server any MCP client can launch, and in code `client.connect(host.operatorUrl, { keyPair, sealSession: true })` then
 `client.openRpc('mcp')`. The host serves one operator at a time and dials the relay again when a session ends.
 
+**The dial-out form (`connect`, #219), off unless written.** For an operator that *listens* (a process of yours that accepts connections), the page can dial it itself
+instead of waiting behind a relay: `createPageHost({ window, connect: 'wss://operator.example/pages/shop', name, authorizedKeys, mcp, expose })` (not together with `relay`;
+there is no `operatorUrl` and no rendezvous id, both are `null`). The URL is dialled **exactly as written** (no role or rendezvous id is added), must be `ws://` or `wss://` with
+no user name, password or fragment in it, and is **never logged** (its query may hold a secret). Everything after the socket opens is what it is behind a relay: key login only
+(`authorizedKeys`), a sealed session, `onSession`, the person's approval for consequential tools, the visible indicator and **Stop** (which also refuses that key), the
+`mcp` and `wsh-objects` channels, closing when the window leaves its origin, and dialling again after a session or a failed attempt (`reconnect`, with the same backoff). The operator
+is the wsh *client* on what it accepts, for example in Node:
+
+```js
+import { WebSocketServer } from 'ws';
+import { connectWshOverDuplex } from '@johnhenry/wsh/duplex';
+
+new WebSocketServer({ port: 9000 }).on('connection', (ws) => {
+  const link = connectWshOverDuplex({ send: (bytes) => ws.send(bytes), close: () => ws.close(1000) },
+    { username: 'alice', keyPair, expectHostKey: pageHostFingerprint });   // the page shows host.fingerprint; the login is sealed and bound to it
+  ws.on('message', (data) => link.receive(data));
+  ws.on('close', () => link.end('the page left'));
+  link.connected.then((client) => client.openRpc('mcp'));
+});
+```
+
+What the form changes: **nothing sits between the page and the operator**, so there is no relay to see ciphertext (the sealed session still hides the traffic from a hop you did not
+choose, such as a proxy), and **the page chooses whom to dial**: whoever answers at that URL learns the page's host key and what its handshake states before any key logs in, and can
+only try to log in (a key that is not in `authorizedKeys`, or whose `capabilities` do not allow it, gets nothing). What it does **not** protect against: a URL that points at the wrong
+listener is not noticed by the page (the operator must pin the page's host key, and the page does not pin the operator: it authenticates keys, not endpoints); a page that
+is told to dial by code you did not write dials; the page redials the URL for as long as the host is open, so a listener that wants a quiet period must say no at login, or the host be
+closed. Browser pages can dial `wss://` endpoints their content security policy allows (`connect-src`), and not `ws://` from an `https:` page.
+
 **`window` is explicit.** `createPageHost`, `webmcpTools` and `captureWebMcp` read nothing but the object they are given: where tools are
 registered (`window.document.modelContext`, the older `window.navigator.modelContext`), where the indicator is drawn
 (`window.document`), which `WebSocket` dials the relay, and whose origin is reported. A test greps the entry point's source for
@@ -1022,7 +1050,7 @@ reach is exactly the paths the lists name (and, below a `get`, the plain data in
 - A sealed session, a key login and a visible indicator (the page host) are what keep a relay and an unknown caller out; `authorize` is where an embedder asks the person.
 
 Size: see the size table (`npm run size`) for `@johnhenry/wsh/objects` (it contains the client and the checks the host runs on a type map), `@johnhenry/wsh/objects-types` and the page entry point. A capability per root and operation (`objects:ROOT[:OP]`) is described under [per-key capabilities](#authorized-key-options-122).
-Not built yet: a dial-out form.
+A dial-out form of the page host (`createPageHost({ connect })`, an operator that listens) is described under [A page as a host](#a-page-as-a-host-johnhenrywshpage-190).
 
 #### Typed remotes (#219)
 
@@ -2417,6 +2445,7 @@ than left to be found.
 | Dial target | a URL | `wsh [user@]host` (dials `https://` then `wss://` on `--port`), or a full URL: `wsh wss://host:8443/rendezvous/ab12 command`, `ws://127.0.0.1:PORT/` | **CLI-only convenience**: a URL is dialled exactly as given (no transport fallback; `--port` and `--transport` do not apply). Plain `ws://` is accepted only to a loopback host |
 | Host that runs in a browser page (`createMemoryHost`, `@johnhenry/wsh/reverse`) | yes, with injected `pty` / `fs` / `hostKey` | no (a Rust host is a process) | **JS-only**. A Rust *client* can operate such a host only with `dataStreams: false` (#132): the released Rust client over WebSocket cannot open QMux data streams, and says nothing in `Hello` that a host could use to decide. `wsh scp` works against such a host with the Rust client of the next `rust-v` release (it speaks `FileChunk`, #140); a released `rust-v0.11.0` or older `wsh scp` hangs against it (`wsh ls` and exec work) |
 | A page's WebMCP tools served as MCP, behind a pipe relay (#190) | `createPageHost`, `webmcpTools`, `captureWebMcp` from `@johnhenry/wsh/page`; the far side is `wsh-mcp --sealed` or `openRpc('mcp')` | the far side only: `wsh --sealed --via <relay>/r/<id> mcp user@host` (the Rust CLI, `rust-v0.17.1`+) lists and calls a page host's tools (`test/rust/wsh-mcp-page-host.test.mjs`); the Rust `wsh objects` is a `wsh-objects` client (next row), and no Rust host serves either | **JS-only** host (a page); the far side is unchanged wire (`mcp` rpc in virtual mode, #191) |
+| A page host that dials an operator that listens, instead of a relay (#219): `createPageHost({ connect })` | `@johnhenry/wsh/page`; the operator is any process that accepts the socket and logs in as the client (`connectWshOverDuplex` from `@johnhenry/wsh/duplex`) | none: the Rust CLI has no listening operator mode (`wsh --via` dials a relay's operator side), so a Rust far side cannot be the listener | **JS-only**, no wire change: the same handshake and sealed session over a socket the page opened, URL as written |
 | Remote objects by path, `values` mode (#190): `wsh-objects`, `client.openObjects()` | `exposeObjects` / `createObjectsServer` / `createPageHost({ expose })` host side; `get`, `set`, `call`, `construct`, `snapshot`, `describe` far side (`@johnhenry/wsh/objects`) | **Client only** (`rust-v0.18.0`, #219): `wsh_client::objects` (`ObjectsClient`, values mode, events with a bounded `Subscription`, handles; from the release after `rust-v0.18.0`: events through a handle, callbacks, `root_description`) and `wsh --sealed [--via RELAY] objects user@host roots\|get\|call\|set\|snapshot\|describe\|watch\|types\|session` (sealed sessions only; JSON on stdout; exit 3 refused, 4 not found, 5 unsupported); a feature the host does not state is refused locally. Callback return values (`(callback:returns)`, a JS host notation) are not asked of it: it never lists `callback-returns`, so a callback it passes stays one-way. Not planned: a host in `wsh-server` (it has no object graph to expose, see `spec/objects.md` section 11); it serves no `wsh-objects` and refuses an `objects:` key capability. The wire is `spec/objects.md`; tested against a real page host through a recording relay (`test/rust/wsh-objects.test.mjs`) | **JS host, Rust or JS far side**; an rpc protocol on the existing `rpc` channel (no new message or feature string), so a released peer simply does not offer or open it. The Rust codec gained a CBOR-value read path so byte strings survive (the existing `rpc` channels still reject them) |
 | Events through a handle (#219): `on(use(handle).path, type, listener)` | `@johnhenry/wsh/objects` (`exposeObjects({ handles })`); the host states `handle-events` in the `features` of its `roots` answer | **Client only** (the release after `rust-v0.18.0`): `Target::subscribe` on a handle's `target()` and, in `wsh objects session`, `{"op":"watch","handle":...}`; refused locally unless the host states `handle-events`; releasing the handle ends the subscription. No Rust host | **JS host**; a new `subscribe` parameter (`handle`) on the existing `wsh-objects` rpc channel, offered only to a client that saw `handle-events`. A 0.50.0 host does not say it, and a new client then refuses to subscribe through a handle with a named `unsupported` error without sending anything; a 0.50.0 client cannot write such a request |
 | Typed remotes (#219): `describeRootTypes`, `rootDescription`, `Remote<T>`, `wsh-objects-types` | `@johnhenry/wsh/objects` (the `types` method, the `types` option, `Remote<T>`, `RemoteRoots<T>`), `@johnhenry/wsh/objects-types` (the pure generator), the `wsh-objects-types` bin | **Client only, the data not the generator** (the release after `rust-v0.18.0`): `ObjectsClient::root_description` and `wsh objects types ROOT` print the host's `types` answer as JSON; refused locally unless the host states `types`. No `.d.ts` generator and no `Remote<T>` in Rust; no Rust host | **JS host**; a new `types` method on the existing `wsh-objects` rpc channel and a `types` string in the `features` of its `roots` answer (no new message type or `ServerHello` feature). A 0.50.0 host does not state it, and a new client then refuses with a named `unsupported` error and sends nothing; a 0.50.0 client never calls it |
@@ -2614,7 +2643,9 @@ out explicitly below rather than left to be discovered.
   bounds, a visible Stop) and what it cannot make safe (a tool does whatever its `execute` does with the user's session; results may carry
   third-party text and are untrusted to the MCP client; the dialog and the indicator belong to the page and are not a defence against code
   already in it; a fresh host key per page load means no pin outlives it unless `hostKeyStore` is given) are stated in
-  [A page as a host](#a-page-as-a-host-johnhenrywshpage-190).
+  [A page as a host](#a-page-as-a-host-johnhenrywshpage-190). The **dial-out form** (`connect`, off unless written) makes the page dial an endpoint of the embedder's choosing:
+  the page does not authenticate that endpoint (the operator pins the page's host key, the page checks keys), the endpoint learns the host key and the stated features before
+  any login, and the page redials it while the host is open; the URL is not logged. The key login, sealing, approval, indicator and Stop are unchanged.
 - **Objects and MCP over a transport that is not wsh (`createDuplexPeer`, `serveMcpOverDuplex`, #220) are only as authenticated as that transport.** The
   identity they hand to `authorize(who, op)`, a prompt and `onCall` is whatever the adapter gave (`who`, `permit`, `permits`): `fingerprint` and `podId`
   are checked to agree, nothing else is verified, and the messages carry no proof of either. They bound what they receive (message size, requests in

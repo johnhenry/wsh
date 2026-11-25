@@ -195,11 +195,10 @@ export interface WshPageIndicatorCallbacks {
   disconnected(who: { username: string; fingerprint: string }): void;
 }
 
-export interface WshPageHostOptions {
+/** The options every form of the page host takes (where it dials is `relay` or `connect`, see `WshPageHostOptions` and `WshPageDialOutOptions`). */
+export interface WshPageHostBaseOptions {
   /** The realm to serve: required, and the only thing read. Passing it exposes nothing by itself. */
   window: WshPageWindow;
-  /** A pipe relay (`@johnhenry/wsh/pipe-relay`): its `ws://` / `wss://` URL, or `{ url, id }` with a rendezvous id of your own. */
-  relay: string | { url: string; id?: string };
   /** What this tab is called: shown in the indicator, the `serverInfo.name` of the MCP server. */
   name: string;
   /** Who may log in: `authorized_keys` lines (options such as `capabilities="mcp:search"` apply) or raw 32-byte keys. Required. */
@@ -232,6 +231,23 @@ export interface WshPageHostOptions {
   onLog?: (line: string) => void;
 }
 
+/** The default form: the page dials a pipe relay and the operator dials the same relay. */
+export interface WshPageHostOptions extends WshPageHostBaseOptions {
+  /** A pipe relay (`@johnhenry/wsh/pipe-relay`): its `ws://` / `wss://` URL, or `{ url, id }` with a rendezvous id of your own. */
+  relay: string | { url: string; id?: string };
+  connect?: never;
+}
+
+/**
+ * The dial-out form, off unless written: the page dials an operator that WAITS (a process that listens and logs in as the client over what it accepts, for example
+ * with `connectWshOverDuplex`) instead of a relay. Not together with `relay`. The URL is dialled exactly as written (no role or rendezvous id is added), must be
+ * `ws://` or `wss://` with no user name, password or fragment, and is never logged. The login, the sealed session, the approval, the indicator and Stop are the same.
+ */
+export interface WshPageDialOutOptions extends WshPageHostBaseOptions {
+  connect: string | { url: string };
+  relay?: never;
+}
+
 export interface WshPageHost {
   /** The URL an operator dials. Its rendezvous id is the secret that pairs the operator with this page. */
   readonly operatorUrl: string;
@@ -251,7 +267,12 @@ export interface WshPageHost {
   close(): Promise<void>;
 }
 
+/** What `createPageHost` gives for the dial-out form: nobody dials this page, so there is no `operatorUrl` and no rendezvous id. */
+export type WshPageDialOutHost = Omit<WshPageHost, 'operatorUrl' | 'rendezvousId'> & { readonly operatorUrl: null; readonly rendezvousId: null };
+
 /** A page (or any window-shaped realm) as a host behind a pipe relay it chose: key login only, sealed sessions only, the window's WebMCP tools as MCP. */
 export function createPageHost(options: WshPageHostOptions): Promise<WshPageHost>;
+/** The dial-out form: the page dials an operator that listens (`connect`). */
+export function createPageHost(options: WshPageDialOutOptions): Promise<WshPageDialOutHost>;
 
 export type { RpcChannel, WshRpcContext };
