@@ -602,7 +602,7 @@ async fn a_handle_is_used_across_calls_and_released_once() {
         task.await.unwrap().unwrap();
     }
 
-    // events cannot be made through a handle
+    // events through a handle need the host to state `handle-events`: this one did not, so nothing is sent
     let e = handle
         .target()
         .subscribe("x", "y", SubscribeOptions::default())
@@ -610,6 +610,7 @@ async fn a_handle_is_used_across_calls_and_released_once() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(e.kind, ErrorKind::Unsupported);
+    assert!(e.message.contains("\"events\""), "{}", e.message);
 
     let rel = tokio::spawn({
         let handle = handle.clone();
@@ -701,4 +702,412 @@ async fn a_host_that_makes_a_request_of_the_client_is_told_there_is_no_such_meth
         cbor_get(&answer, "error").and_then(|e| cbor_get(e, "code")),
         Some(&int(-32601))
     );
+}
+
+// ── events through a handle ──
+
+/// A handle `H1` of an object, from a host that states `features`.
+async fn with_handle(features: &[&str]) -> (ObjectsClient, Host, Handle) {
+    let (objects, mut host) = open(&["window"], Some(features)).await;
+    let window = objects.root("window").unwrap();
+    let get = tokio::spawn(async move { window.get("app.bus").await });
+    let req = host.request().await;
+    host.reply(req.id, cmap(&[("h", t("H1")), ("kind", t("object"))]));
+    let Reply::Handle(handle) = get.await.unwrap().unwrap() else {
+        panic!("a handle");
+    };
+    (objects, host, handle)
+}
+
+#[tokio::test]
+async fn events_through_a_handle_name_the_handle_and_not_a_root_and_need_handle_events() {
+    // a host that states events and handles but not handle-events: refused locally, by name, nothing sent
+    let (_objects, mut host, handle) = with_handle(&["events", "handles"]).await;
+    let e = handle
+        .target()
+        .subscribe("inner", "ready", SubscribeOptions::default())
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unsupported);
+    assert!(e.message.contains("\"handle-events\""), "{}", e.message);
+    assert!(host.quiet().await, "the host never saw it");
+
+    let (_objects, mut host, handle) = with_handle(&["events", "handles", "handle-events"]).await;
+    let sub = tokio::spawn({
+        let target = handle.target();
+        async move {
+            target
+                .subscribe(
+                    "inner",
+                    "ready",
+                    SubscribeOptions {
+                        capacity: 4,
+                        fields: vec!["detail".into()],
+                    },
+                )
+                .await
+        }
+    });
+    let req = host.request().await;
+    assert_eq!(req.method, "subscribe");
+    assert_eq!(cbor_text(&req.params, "handle"), Some("H1"));
+    assert!(
+        cbor_get(&req.params, "root").is_none(),
+        "a handle, not a root"
+    );
+    assert_eq!(cbor_get(&req.params, "path"), Some(&texts(&["inner"])));
+    assert_eq!(cbor_text(&req.params, "type"), Some("ready"));
+    assert_eq!(cbor_get(&req.params, "fields"), Some(&texts(&["detail"])));
+    let id = cbor_u64(&req.params, "id").unwrap();
+    host.reply(req.id, cmap(&[("ok", Cbor::Bool(true))]));
+    let mut sub = sub.await.unwrap().unwrap();
+    host.event(id, 1, None, cmap(&[("type", t("ready"))]));
+    let e = sub.recv().await.unwrap();
+    assert_eq!(e.seq, 1);
+}
+
+#[tokio::test]
+async fn releasing_a_handle_ends_the_subscriptions_made_through_it_and_only_those() {
+    let (objects, mut host, handle) = with_handle(&["events", "handles", "handle-events"]).await;
+    // one through the handle, one by path from the root
+    let through = tokio::spawn({
+        let target = handle.target();
+        async move {
+            target
+                .subscribe("", "ready", SubscribeOptions::default())
+                .await
+        }
+    });
+    let req = host.request().await;
+    host.reply(req.id, cmap(&[("ok", Cbor::Bool(true))]));
+    let mut through = through.await.unwrap().unwrap();
+    let by_path = tokio::spawn({
+        let window = objects.root("window").unwrap();
+        async move {
+            window
+                .subscribe("app.other", "ready", SubscribeOptions::default())
+                .await
+        }
+    });
+    let req = host.request().await;
+    let path_id = cbor_u64(&req.params, "id").unwrap();
+    host.reply(req.id, cmap(&[("ok", Cbor::Bool(true))]));
+    let mut by_path = by_path.await.unwrap().unwrap();
+
+    let release = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.release().await }
+    });
+    let req = host.request().await;
+    assert_eq!(req.method, "release");
+    host.reply(req.id, cmap(&[("ok", Cbor::Bool(true))]));
+    release.await.unwrap().unwrap();
+
+    assert!(
+        through.recv().await.is_none(),
+        "the host ends it with the handle: so does this side"
+    );
+    // ending it again tells the host nothing (it already forgot it) and says nothing was lost
+    assert_eq!(through.unsubscribe().await.unwrap(), 0);
+    assert!(host.quiet().await);
+    // the one by path is untouched
+    host.event(path_id, 1, None, cmap(&[("type", t("ready"))]));
+    assert_eq!(by_path.recv().await.unwrap().seq, 1);
+}
+
+// ── types ──
+
+#[tokio::test]
+async fn root_description_is_one_types_request_and_needs_the_feature_and_a_listed_root() {
+    let (old, mut host) = open(&["window"], Some(&["events"])).await;
+    let e = old.root_description("window").await.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unsupported);
+    assert!(e.message.contains("\"types\""), "{}", e.message);
+    assert!(
+        host.quiet().await,
+        "a host that did not state types is not asked"
+    );
+
+    let (objects, mut host) = open(&["window"], Some(&["events", "types"])).await;
+    let e = objects.root_description("other").await.unwrap_err();
+    assert_eq!(
+        (e.kind, e.reason.as_deref()),
+        (ErrorKind::NotFound, Some("no-such-root"))
+    );
+    assert!(host.quiet().await);
+    let ask = tokio::spawn({
+        let objects = objects.clone();
+        async move { objects.root_description("window").await }
+    });
+    let req = host.request().await;
+    assert_eq!(req.method, "types");
+    assert_eq!(cbor_text(&req.params, "root"), Some("window"));
+    host.reply(
+        req.id,
+        cmap(&[
+            ("version", int(1)),
+            ("root", t("window")),
+            ("ops", texts(&["get"])),
+            ("handles", Cbor::Bool(false)),
+        ]),
+    );
+    let d = ask.await.unwrap().unwrap();
+    assert_eq!(d.member("version"), Some(&Value::Int(1)));
+    assert_eq!(d.member("root").and_then(Value::as_str), Some("window"));
+    // the host's refusal keeps its reason
+    let ask = tokio::spawn({
+        let objects = objects.clone();
+        async move { objects.root_description("window").await }
+    });
+    let req = host.request().await;
+    host.refuse(req.id, -32003, "not-permitted", "refused");
+    assert_eq!(ask.await.unwrap().unwrap_err().kind, ErrorKind::Refused);
+}
+
+// ── callbacks ──
+
+#[tokio::test]
+async fn a_callback_takes_the_place_of_an_argument_and_is_named_with_its_id() {
+    let (objects, mut host) = open(&["window"], Some(&["callbacks"])).await;
+    let window = objects.root("window").unwrap();
+    let cb = objects.callback(4).unwrap();
+    let call = tokio::spawn({
+        let cb = cb.clone();
+        async move {
+            window
+                .call_with(
+                    "app.onTick",
+                    vec![Value::from("a").into(), (&cb).into(), Value::Int(3).into()],
+                )
+                .await
+        }
+    });
+    let req = host.request().await;
+    assert_eq!(req.method, "resolve");
+    let ops = match cbor_get(&req.params, "ops") {
+        Some(Cbor::Array(ops)) => ops.clone(),
+        other => panic!("ops: {other:?}"),
+    };
+    let last = ops.last().unwrap();
+    assert_eq!(cbor_text(last, "call"), Some("onTick"));
+    assert_eq!(
+        cbor_get(last, "args"),
+        Some(&Cbor::Array(vec![t("a"), Cbor::Null, int(3)])),
+        "null at the callback's place"
+    );
+    let id = match cbor_get(last, "callbacks") {
+        Some(Cbor::Array(list)) => match &list[..] {
+            [Cbor::Array(pair)] => {
+                assert_eq!(pair[0], int(1));
+                u64::try_from(match &pair[1] {
+                    Cbor::Integer(i) => i128::from(*i),
+                    other => panic!("{other:?}"),
+                })
+                .unwrap()
+            }
+            other => panic!("{other:?}"),
+        },
+        other => panic!("callbacks: {other:?}"),
+    };
+    assert!(id >= 1, "an id from 1");
+    host.reply(req.id, cmap(&[("u", t("undefined"))]));
+    assert!(matches!(
+        call.await.unwrap().unwrap(),
+        Reply::NonValue(NonValue { .. })
+    ));
+
+    // the host calls it: args arrive as plain data, with what the host dropped before this one
+    host.notify(
+        "callback",
+        cmap(&[
+            ("id", int(id as i64)),
+            ("seq", int(1)),
+            ("args", Cbor::Array(vec![int(7), t("x")])),
+        ]),
+    );
+    host.notify(
+        "callback",
+        cmap(&[
+            ("id", int(id as i64)),
+            ("seq", int(2)),
+            ("args", Cbor::Array(vec![])),
+            ("dropped", int(5)),
+        ]),
+    );
+    let one = cb.recv().await.unwrap();
+    assert_eq!(one.seq, 1);
+    assert_eq!(one.args, vec![Value::Int(7), Value::from("x")]);
+    let two = cb.recv().await.unwrap();
+    assert_eq!((two.seq, two.dropped_by_host, two.dropped_here), (2, 5, 0));
+    // a callback id this side does not have is noise
+    host.notify(
+        "callback",
+        cmap(&[
+            ("id", int(999)),
+            ("seq", int(1)),
+            ("args", Cbor::Array(vec![])),
+        ]),
+    );
+    assert!(host.quiet().await);
+}
+
+#[tokio::test]
+async fn the_same_callback_is_the_same_id_and_a_host_without_callbacks_is_refused_locally() {
+    let (old, mut host) = open(&["window"], Some(&["events"])).await;
+    let cb = old.callback(2).unwrap();
+    let e = old
+        .root("window")
+        .unwrap()
+        .call_with("f", vec![(&cb).into()])
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unsupported);
+    assert!(e.message.contains("\"callbacks\""), "{}", e.message);
+    assert!(
+        host.quiet().await,
+        "a host that does not know callbacks would see null"
+    );
+
+    let (objects, mut host) = open(&["window"], Some(&["callbacks"])).await;
+    let window = objects.root("window").unwrap();
+    let cb = objects.callback(2).unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let call = tokio::spawn({
+            let window = window.clone();
+            let cb = cb.clone();
+            async move { window.call_with("f", vec![(&cb).into()]).await }
+        });
+        let req = host.request().await;
+        let Some(Cbor::Array(ops)) = cbor_get(&req.params, "ops") else {
+            panic!("ops")
+        };
+        ids.push(cbor_get(ops.last().unwrap(), "callbacks").cloned());
+        host.reply(req.id, cmap(&[("v", Cbor::Null)]));
+        call.await.unwrap().unwrap();
+    }
+    assert_eq!(ids[0], ids[1], "one function, one id");
+    // another channel's callback is not ours to send
+    let (other, _h) = open(&["window"], Some(&["callbacks"])).await;
+    let foreign = other.callback(2).unwrap();
+    let e = window
+        .call_with("f", vec![(&foreign).into()])
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Invalid);
+    assert!(host.quiet().await);
+}
+
+#[tokio::test]
+async fn callback_calls_wait_in_a_bounded_queue_and_what_does_not_fit_is_counted_and_told() {
+    let (objects, mut host) = open(&["window"], Some(&["callbacks"])).await;
+    let cb = objects.callback(1).unwrap();
+    let call = tokio::spawn({
+        let window = objects.root("window").unwrap();
+        let cb = cb.clone();
+        async move { window.call_with("f", vec![(&cb).into()]).await }
+    });
+    let req = host.request().await;
+    let Some(Cbor::Array(ops)) = cbor_get(&req.params, "ops") else {
+        panic!("ops")
+    };
+    let Some(Cbor::Array(list)) = cbor_get(ops.last().unwrap(), "callbacks") else {
+        panic!("callbacks")
+    };
+    let Cbor::Array(pair) = &list[0] else {
+        panic!()
+    };
+    let Cbor::Integer(id) = pair[1] else { panic!() };
+    let id = i64::try_from(i128::from(id)).unwrap();
+    host.reply(req.id, cmap(&[("v", Cbor::Null)]));
+    call.await.unwrap().unwrap();
+    for seq in 1..=3 {
+        host.notify(
+            "callback",
+            cmap(&[
+                ("id", int(id)),
+                ("seq", int(seq)),
+                ("args", Cbor::Array(vec![int(seq)])),
+            ]),
+        );
+    }
+    for _ in 0..200 {
+        if cb.pending_dropped_here() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(cb.pending_dropped_here(), 2, "calls 2 and 3 did not fit");
+    let first = cb.recv().await.unwrap();
+    assert_eq!(first.seq, 1);
+    host.notify(
+        "callback",
+        cmap(&[
+            ("id", int(id)),
+            ("seq", int(4)),
+            ("args", Cbor::Array(vec![])),
+        ]),
+    );
+    let next = cb.recv().await.unwrap();
+    assert_eq!((next.seq, next.dropped_here), (4, 2));
+}
+
+#[tokio::test]
+async fn releasing_a_callback_tells_the_host_once_and_one_never_sent_is_not_told() {
+    let (objects, mut host) = open(&["window"], Some(&["callbacks"])).await;
+    // never passed to the host: there is nothing there to release
+    let unused = objects.callback(1).unwrap();
+    unused.release().await.unwrap();
+    assert!(unused.is_released());
+    assert!(host.quiet().await);
+    assert!(unused.recv().await.is_none(), "a released callback ends");
+
+    let cb = objects.callback(1).unwrap();
+    let call = tokio::spawn({
+        let window = objects.root("window").unwrap();
+        let cb = cb.clone();
+        async move { window.call_with("f", vec![(&cb).into()]).await }
+    });
+    let req = host.request().await;
+    host.reply(req.id, cmap(&[("v", Cbor::Null)]));
+    call.await.unwrap().unwrap();
+    let rel = tokio::spawn({
+        let cb = cb.clone();
+        async move {
+            cb.release().await?;
+            cb.release().await // does nothing
+        }
+    });
+    let req = host.request().await;
+    assert_eq!(req.method, "releaseCallback");
+    assert!(cbor_u64(&req.params, "id").is_some());
+    host.reply(req.id, cmap(&[("ok", Cbor::Bool(true))]));
+    rel.await.unwrap().unwrap();
+    assert!(host.quiet().await);
+    // a released callback is not sent again
+    let e = objects
+        .root("window")
+        .unwrap()
+        .call_with("f", vec![(&cb).into()])
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Invalid);
+}
+
+#[tokio::test]
+async fn dropping_the_last_reference_to_a_sent_callback_releases_it_on_the_host() {
+    let (objects, mut host) = open(&["window"], Some(&["callbacks"])).await;
+    let cb = objects.callback(1).unwrap();
+    let call = tokio::spawn({
+        let window = objects.root("window").unwrap();
+        let cb = cb.clone();
+        async move { window.call_with("f", vec![(&cb).into()]).await }
+    });
+    let req = host.request().await;
+    host.reply(req.id, cmap(&[("v", Cbor::Null)]));
+    call.await.unwrap().unwrap();
+    drop(cb);
+    let req = host.request().await;
+    assert_eq!(req.method, "releaseCallback");
 }
