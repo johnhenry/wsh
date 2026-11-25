@@ -12,7 +12,6 @@ import { describe, it, before, after } from 'node:test';
 import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import net from 'node:net';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -25,6 +24,7 @@ import { buildBackends } from '../../src/server/backends.mjs';
 import { createConnectionFactory } from '../../src/server/connection.mjs';
 import { generateSelfSignedCertificate } from '../../src/server/self-signed.mjs';
 import { WshClient, generateKeyPair, fingerprint, MSG, TARGETS_FEATURE, open as openMsg, fileOp, listTargets } from '@johnhenry/wsh';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -49,7 +49,6 @@ after(async () => {
 });
 
 const cleanEnv = (home, extra = {}) => ({ PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester', TERM: 'xterm', ...extra });
-const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
 
 /** A scratch HOME holding a Rust `wsh` identity: its SSH line and fingerprint. */
 async function rustIdentity(name) {

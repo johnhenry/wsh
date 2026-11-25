@@ -12,7 +12,6 @@ import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
@@ -23,6 +22,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { createWshServer, mcpServerAdapter } from '@johnhenry/wsh/server';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -468,7 +468,6 @@ describe('wsh mcp: an MCP client reaches an MCP server behind a wsh host (#127, 
 const readKnownHosts = (home) => { try { return readFileSync(path.join(home, '.wsh', 'known_hosts'), 'utf8'); } catch { return ''; } };
 
 describe('wsh mcp against the Rust wsh-server (#127)', { skip: !existsSync(SERVER_BIN) && `no wsh-server at ${SERVER_BIN}` }, () => {
-  const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
   let me; let server; let port;
   before(async () => {
     me = makeHome();

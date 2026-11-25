@@ -237,10 +237,11 @@ describe('seal_session = "offer"', () => {
     assert.equal(await roundTrip(c, echo.port, 'hi'), 'hi');
     const before = echo.seen();
     await relay.context().injectToRelay({ type: MSG.OPEN_TCP, gateway_id: 99, host: '127.0.0.1', port: echo.port });
-    await sleep(400);
-    assert.equal(echo.seen(), before, 'the plain OpenTcp was not heard');
-    assert.match(s.logs(), /plaintext message/);
+    // The server says so when it has read and dropped the message: that, not a stretch of time, is when "not heard" can be judged.
+    await until(() => /plaintext message/.test(s.logs()), `the server to drop the plain message: ${s.logs()}`);
+    // The round trip is the marker: its request comes after the injected message on the same connection, so by its answer the injected one was handled.
     assert.equal(await roundTrip(c, echo.port, 'still up'), 'still up');
+    assert.equal(echo.seen(), before + 1, 'only the marker round trip opened a connection: the plain OpenTcp was not heard');
   });
 
   it('a plain message injected toward the client is not heard either', async () => {
@@ -250,9 +251,12 @@ describe('seal_session = "offer"', () => {
     const c = await login(s, relay.url, { sealSession: true });
     let closed = false; c.onClose = () => { closed = true; };
     assert.equal(await roundTrip(c, echo.port, 'hi'), 'hi');
+    const drops = []; c.onDrop = (d) => drops.push(d);
     relay.context().injectToClient({ type: MSG.SHUTDOWN, reason: 'injected by the relay' });
-    await sleep(300);
-    assert.equal(closed, false);
+    // The client says so when it has heard and dropped the message (`onDrop`): that, not a stretch of time, is when "not heard" can be judged.
+    await until(() => drops.length, 'the client to report the plain message it dropped');
+    assert.deepEqual(drops.map((d) => [d.reason, d.messageType]), [['plaintext-on-sealed-session', MSG.SHUTDOWN]]);
+    assert.equal(closed, false, 'the injected plain Shutdown did not end the session');
     assert.equal(await roundTrip(c, echo.port, 'still up'), 'still up');
   });
 
@@ -345,9 +349,14 @@ describe('seal_session = "require"', () => {
 
   it('#244: seal_timeout_secs = 0 turns the deadline off; a value that is not a whole number of seconds is refused at start', async () => {
     const off = await startServer({ seal: 'require', sealTimeoutSecs: 0 });
-    const c = await login(off, undefined, { sealSession: false });
+    const on = await startServer({ seal: 'require', sealTimeoutSecs: 1 });
+    const c = await login(off, undefined, { sealSession: false }); // logged in first
     let closed = false; c.onClose = () => { closed = true; };
-    await sleep(1500); // one real wait, to show the key is not enforced: 0 must not mean "at once" either
+    const control = await login(on, undefined, { sealSession: false });
+    let controlClosed = false; control.onClose = () => { controlClosed = true; };
+    // The close of the control (a server with the 1 s deadline) is the event that proves the deadline has passed for `c` too: 0 must not mean "at once" either, nor one second.
+    await until(() => controlClosed, 'the server with the 1 s deadline to close its silent connection', 6000);
+    assert.match(on.logs(), /not sealed in time/);
     assert.equal(closed, false);
     assert.doesNotMatch(off.logs(), /not sealed in time/);
     await assert.rejects(startServer({ seal: 'require', sealTimeoutSecs: -1 }), /seal_timeout_secs|invalid|exited/i);

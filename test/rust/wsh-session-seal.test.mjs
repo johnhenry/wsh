@@ -192,10 +192,11 @@ describe('a sealed session through a pipe relay that copies bytes', () => {
     await Promise.race([until(() => p.port() > 0, `the forward to come up: ${p.stderr()}`), p.exited.then((r) => { throw new Error(`wsh exited early (${JSON.stringify(r)}): ${p.stderr()}`); })]);
     assert.equal((await roundTrip(p.port(), Buffer.from('hi'))).toString(), 'hi');
     await mitm.context().injectToRelay({ type: MSG.OPEN_ENDPOINT, gateway_id: 99, name: 'probe' });
-    await sleep(600);
-    assert.equal(counters.probe, 0, 'the plain OpenEndpoint was not heard');
-    assert.ok(logs.some((l) => /plaintext message/.test(l)), logs.join(' | '));
+    // The host says so when it has read and dropped the message: that, not a stretch of time, is when "not heard" can be judged.
+    await until(() => logs.some((l) => /plaintext message/.test(l)), `the host to drop the plain message: ${logs.join(' | ')}`);
+    // The round trip is the marker: its data comes after the injected message on the same connection, so by its answer the injected one was handled.
     assert.equal((await roundTrip(p.port(), Buffer.from('still up'))).toString(), 'still up', 'and the session carries on');
+    assert.equal(counters.probe, 0, 'the plain OpenEndpoint was not heard');
   });
 
   it('a host that REQUIRES sealing: the CLI seals on its own, and a plain client gets nothing', async () => {
@@ -210,8 +211,13 @@ describe('a sealed session through a pipe relay that copies bytes', () => {
     const h2 = createMemoryHost({ auth: { authorizedKeys: `${await exportPublicKeySSH(kp.publicKey)} u` }, exec: async () => 0, hostKey: true, dataStreams: false, sealSession: 'require', endpoints: { probe: () => { counters.probe += 1; } } });
     closers.push(() => h2.close());
     const c = await h2.connect({ username: 'u', keyPair: kp, sealSession: false });
-    await assert.rejects(c.openEndpoint('probe', { timeoutMs: 1500 }));
+    let closed = false; c.onClose = () => { closed = true; };
+    const refused = c.openEndpoint('probe', { timeoutMs: 1500 });
+    const outcome = refused.then(() => 'opened', () => 'refused'); // settles without an unhandled rejection
+    // The host closes a plain connection on a server that requires sealing: that close, not the open's timeout, is the event to wait for.
+    await until(() => closed, 'the host to close the plain connection');
     assert.equal(counters.probe, 0, 'the endpoint was never opened');
+    assert.equal(await outcome, 'refused');
     void host;
   });
 

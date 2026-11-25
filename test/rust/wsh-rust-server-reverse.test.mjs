@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 import { WshClient, generateKeyPair, exportPublicKeySSH } from '../../src/index.mjs';
 import { GatewayError } from '../../src/gateway-client.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248); the gateway listeners below bind TCP only, where it is merely stricter
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -27,7 +28,6 @@ async function until(cond, what, ms = 8000) {
   const t0 = Date.now();
   for (;;) { const v = await cond(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`); await sleep(20); }
 }
-const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
 const dial = (port) => new Promise((resolve, reject) => { const s = net.connect({ port, host: '127.0.0.1' }); s.once('connect', () => resolve(s)); s.once('error', reject); });
 const refusedConnect = (port) => new Promise((resolve) => { const s = net.connect({ port, host: '127.0.0.1' }); s.once('connect', () => { s.destroy(); resolve(false); }); s.once('error', () => resolve(true)); });
 const refused = (p, re) => assert.rejects(p, (e) => e instanceof GatewayError && e.code === 4 && re.test(e.message), `expected a policy refusal matching ${re}`);

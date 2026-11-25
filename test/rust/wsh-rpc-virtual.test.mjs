@@ -20,7 +20,6 @@ import { describe, it, before, after, afterEach } from 'node:test';
 import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import net from 'node:net';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -38,6 +37,7 @@ import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { createWshServer, mcpServerAdapter } from '@johnhenry/wsh/server';
 import { newRendezvousId } from '@johnhenry/wsh/pipe-relay';
 import { hostileRelay } from '../helpers/hostile-relay.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -69,9 +69,6 @@ const until = async (cond, what, ms = 10_000) => {
   for (;;) { const v = await cond(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`); await sleep(20); }
 };
 const cleanEnv = (home) => ({ PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'alice', TERM: 'xterm' });
-const freePort = () => new Promise((resolve) => {
-  const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
-});
 const tmpDir = (prefix) => { const d = realpathSync(mkdtempSync(path.join(tmpdir(), prefix))); scratch.push(d); return d; };
 const dec = new TextDecoder();
 const enc = new TextEncoder();

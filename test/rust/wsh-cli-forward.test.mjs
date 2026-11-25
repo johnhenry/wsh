@@ -27,6 +27,7 @@ import { WebSocket as WsClient, WebSocketServer } from 'ws';
 import { createPipeRelay, newRendezvousId, pipeUrl } from '@johnhenry/wsh/pipe-relay';
 import { createWshServer } from '@johnhenry/wsh/server';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -495,7 +496,7 @@ const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 
 
 /** A `wsh-server` with a scratch HOME that authorizes `h`'s key and the given [gateway] config. */
 async function startRustServer(h, gatewayToml) {
-  const port = await new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
+  const port = await freePort();
   const serverHome = mkdtempSync(path.join(tmpdir(), 'wsh-cli-fwd-server-'));
   scratch.push(serverHome);
   mkdirSync(path.join(serverHome, '.wsh'));

@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import {
   WshClient, generateKeyPair, exportPublicKeySSH, openTcp, listenRequest, resolveDns, MSG,
 } from '../../src/index.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -36,10 +37,6 @@ after(() => {
   for (const d of scratch.splice(0)) rmSync(d, { recursive: true, force: true });
   if (ORIGINAL_TLS_REJECT === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   else process.env.NODE_TLS_REJECT_UNAUTHORIZED = ORIGINAL_TLS_REJECT;
-});
-
-const freePort = () => new Promise((resolve) => {
-  const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
 });
 
 /** Hash a password with the server's own `--hash-password`, the way an operator would. */
