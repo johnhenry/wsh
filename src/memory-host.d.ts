@@ -90,7 +90,7 @@ export interface WshMemoryHostOptions {
   sealSession?: false | 'offer' | 'require';
   /** #244: with `sealSession: 'require'`, how long after login the session may stay unsealed before the host closes it as `seal-timeout` (default 30000; 0 = no deadline). */
   sealTimeoutMs?: number;
-  /** #248: how long a connection may take, from the moment this host accepts it, to complete its login (Hello and Auth); at the deadline it is closed as `login-timeout` (default 60000; 0 = no deadline). */
+  /** #248: how long a connection may take, from the moment this host accepts it (or, for `accept(socket, { waitForPeer })`, from the moment the far side arrives: #253), to complete its login (Hello and Auth); at the deadline it is closed as `login-timeout` (default 60000; 0 = no deadline). */
   loginTimeoutMs?: number;
   /** #163: told once per connection this host turned away (a key it does not allow, a plain client on a host that requires a sealed session, ...), with a stable reason code. */
   onRefused?: WshOnRefused;

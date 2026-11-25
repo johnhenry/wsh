@@ -196,8 +196,12 @@ export function createConnectionFactory(cfg) {
    *    (`{ username, fingerprint }`) skips the handshake for a peer something else has already authenticated;
    *    `dataStreams: false` means there are no client-opened streams to bind, so exec output rides SessionData.
    *    `e2e` overrides `cfg.e2e` for this connection.
+   *
+   * `waitForPeer: true` (#253) says the far side is not there yet (the half a page dialled to a pipe relay, before any operator has): the login clock
+   * (`loginTimeoutMs`) does not start at `attach()` but at the first byte or message the far side sends, or at `startLoginClock()` (a pairing signal), whichever
+   * comes first. Default `false`: the connection is the far side arriving, so the clock starts now. No effect on an `authenticated` connection.
    */
-  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride, channelBinding = null, datagrams = null, sealSession: sealOverride }) {
+  return function attach({ send: sendBytes, sendMessage = null, remote = {}, authenticated = null, dataStreams = true, closeTransport = null, e2e: e2eOverride, channelBinding = null, datagrams = null, sealSession: sealOverride, waitForPeer = false }) {
     const cid = ++counter;
     const log = (m) => cfg.log(`[conn ${cid}] ${m}`);
     const state = {
@@ -309,8 +313,9 @@ export function createConnectionFactory(cfg) {
     /** @type {{ bridge: SealedBridge | null, responder: E2EResponder | null }} */
     const sealed = { bridge: null, responder: null };
     // A peer something else already authenticated (`authenticated`) has no login here to count from: its deadline runs from attach.
+    // A connection whose far side is not there yet (`waitForPeer`, #253) starts the login clock when it is (`startLoginClock`).
     if (authenticated) armSealDeadline();
-    else armLoginDeadline();
+    else if (!waitForPeer) armLoginDeadline();
 
     // The gateway needs Node sockets, so `gateway.mjs` is not imported here (a browser host must not pull it in):
     // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`; a
@@ -576,7 +581,7 @@ export function createConnectionFactory(cfg) {
      * that completed its login, a closed one and `loginTimeoutMs: 0` never reach it.
      */
     function armLoginDeadline() {
-      if (!(cfg.loginTimeoutMs > 0) || loginTimer) return;
+      if (!(cfg.loginTimeoutMs > 0) || loginTimer || state.closed || state.authed) return;
       loginTimer = setTimeout(async () => {
         if (state.closed || state.authed) return;
         loginExpired = true;
@@ -1503,10 +1508,16 @@ export function createConnectionFactory(cfg) {
     }
 
     return {
-      receive(bytes) { if (!state.closed) qmux?.receiveBytes(bytes); },
+      receive(bytes) {
+        if (state.closed) return;
+        if (waitForPeer && bytes?.length) armLoginDeadline(); // the far side is there: the first byte starts its login clock (#253)
+        qmux?.receiveBytes(bytes);
+      },
+      /** The far side of a `waitForPeer` connection is there (a relay said its partner arrived): start the login clock, once. Nothing otherwise. */
+      startLoginClock() { if (waitForPeer) armLoginDeadline(); },
       /** A transport datagram (WebTransport) arrived: only the gateway's UDP flows use them. */
       receiveDatagram(bytes) { if (!state.closed && state.authed) gateway?.handleDatagram?.(bytes); },
-      receiveMessage(msg) { if (!state.closed) chain = chain.then(() => handle(msg)).catch((e) => log(`handler error: ${e.message}`)); },
+      receiveMessage(msg) { if (!state.closed && waitForPeer) armLoginDeadline(); if (!state.closed) chain = chain.then(() => handle(msg)).catch((e) => log(`handler error: ${e.message}`)); },
       bindStream: bindDataStream,
       close() { shutdownAfterQueue('transport closed'); },
     };

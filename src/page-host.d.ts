@@ -228,6 +228,12 @@ export interface WshPageHostBaseOptions {
   timers?: WshPageTimers;
   /** Dial the relay again after a session or a failed attempt (default true). */
   reconnect?: boolean;
+  /**
+   * How long an operator may take, from the moment it ARRIVES, to complete its login (#248; default 60000; 0 = no deadline). The clock does not run while the page
+   * waits for an operator: behind a relay it starts when the relay says one arrived (or at its first byte, on a relay that does not say), dialling out at the first byte
+   * the listener sends. So a page can wait for a person's operator as long as it likes; one that arrives and never logs in is closed at the deadline (`login-timeout`).
+   */
+  loginTimeoutMs?: number;
   onLog?: (line: string) => void;
 }
 

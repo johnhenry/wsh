@@ -243,14 +243,16 @@ window.h.pageTools = async () => {
   await tool('read_secret', 'Read something the page keeps to itself', { readOnlyHint: true }, () => ({ secret: 'not for the agent' }));
 };
 let pageHostHandle = null;
-window.h.startPageHost = async ({ relay, connect, authorizedKeys, allow, approve, expose }) => {
+window.h.startPageHost = async ({ relay, connect, authorizedKeys, allow, approve, expose, loginTimeoutMs }) => {
   pageHostHandle = await wsh.createPageHost({
-    window, ...(connect !== undefined ? { connect } : { relay }), name: 'shop-tab', authorizedKeys, onLog: (line) => { (window.__hostLog ??= []).push(line); }, onRefused: (r) => { (window.__hostLog ??= []).push(`refused: ${r.reason} ${r.detail ?? ''}`); },
+    window, ...(connect !== undefined ? { connect } : { relay }), ...(loginTimeoutMs !== undefined ? { loginTimeoutMs } : {}), name: 'shop-tab', authorizedKeys, onLog: (line) => { (window.__hostLog ??= []).push(line); }, onRefused: (r) => { (window.__hostLog ??= []).push(`refused: ${r.reason} ${r.detail ?? ''}`); },
     ...(allow ? { mcp: { allow, ...(approve ? { approve } : {}) } } : {}),
     ...(expose ? { expose } : {}),
   });
-  return { fingerprint: pageHostHandle.fingerprint, origin: pageHostHandle.origin };
+  return { fingerprint: pageHostHandle.fingerprint, origin: pageHostHandle.origin, operatorUrl: pageHostHandle.operatorUrl };
 };
+/** What the page host has logged (`onLog`, and `onRefused` as "refused: REASON ...") so far. */
+window.h.hostLog = () => (window.__hostLog ?? []).slice();
 /** An application object for object access to reach into, a title, and a cookie that must stay unreachable. */
 window.h.pageApp = () => {
   document.title = 'Planted Shop Title';

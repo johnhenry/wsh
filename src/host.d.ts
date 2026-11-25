@@ -144,6 +144,11 @@ export interface WshConnectionPipe {
    * `stream-announce` is not offered, and rpc is stated as `rpc-virtual` (#191). Default `true`. Needed for a peer that cannot open streams (#132).
    */
   dataStreams?: boolean;
+  /**
+   * #253: the far side is not there yet (a relay half waiting for its partner): `loginTimeoutMs` does not start at `attach()` but at the first byte `receive()` is given, or at
+   * `startLoginClock()` on the returned connection, whichever is first. Default `false`: the clock starts now.
+   */
+  waitForPeer?: boolean;
 }
 
 /** One connection over messages (a transport that does its own framing, e.g. a relay bridge). */
@@ -152,6 +157,8 @@ export interface WshConnectionMessages {
   /** The identity something else already authenticated: skips the handshake. */
   authenticated?: { username: string; fingerprint: string } | null;
   dataStreams?: boolean;
+  /** #253: as for {@link WshConnectionPipe.waitForPeer}; the first message `receiveMessage()` is given starts the login clock. */
+  waitForPeer?: boolean;
   e2e?: { signKey: CryptoKey | null; hybrid?: boolean } | null;
   remote?: { address?: string; headers?: Record<string, unknown> };
   closeTransport?(): void;
@@ -164,6 +171,8 @@ export interface WshConnection {
   receiveMessage(message: object): void;
   /** A QMux-style stream opened by the peer (message form, when it has them). */
   bindStream?(stream: object): void;
+  /** #253: the far side of a `waitForPeer` connection is there: start its login clock (once). Does nothing for any other connection. */
+  startLoginClock(): void;
   close(): void;
 }
 

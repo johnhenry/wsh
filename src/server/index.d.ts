@@ -532,7 +532,7 @@ export interface WshServerOptions {
   sealSession?: false | 'offer' | 'require';
   /** #244: with `sealSession: 'require'`, how long after login the session may stay unsealed before the host closes it as `seal-timeout` (default 30000; 0 = no deadline). */
   sealTimeoutMs?: number;
-  /** #248: how long a connection may take, from the moment this host accepts it, to complete its login (Hello and Auth); at the deadline it is closed as `login-timeout` (default 60000; 0 = no deadline). */
+  /** #248: how long a connection may take, from the moment this host accepts it (or, for `accept(socket, { waitForPeer })`, from the moment the far side arrives: #253), to complete its login (Hello and Auth); at the deadline it is closed as `login-timeout` (default 60000; 0 = no deadline). */
   loginTimeoutMs?: number;
   /** #240: called once per connection when its session has been sealed (after login): count and audit here, not in `auth`, with `sealSession: 'require'`. */
   onSealed?: (who: { username: string | null; fingerprint: string | null }) => void;
@@ -614,6 +614,13 @@ export interface WshAcceptOptions {
    * (the released Rust client over WebSocket). Default `true`.
    */
   dataStreams?: boolean;
+  /**
+   * #253: the far side of this socket is not there yet -- the half a page or a host dialled to a pipe relay, held before any operator has arrived. The login deadline
+   * (`loginTimeoutMs`, #248) then starts when the far side does, not when the socket is handed over: `true` means at the first byte it sends; a promise (the relay's paired signal,
+   * `watchPairing(socket).paired`) means when it resolves, or at the first byte if that comes first. Default `false`: the socket is the far side arriving (an upgraded
+   * connection) and the clock starts now, so a peer that connects and says nothing is closed at the deadline. Set it only for a half that waits for a partner.
+   */
+  waitForPeer?: boolean | Promise<unknown>;
 }
 
 export interface WshServer {
