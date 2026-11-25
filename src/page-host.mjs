@@ -177,6 +177,9 @@ function createDomIndicator(window, { name }) {
  *   and whose origin is reported. Passing it exposes nothing by itself.
  * @param {string | { url: string, id?: string }} options.relay - a pipe relay (`@johnhenry/wsh/pipe-relay`): its `ws://` / `wss://` URL, and
  *   optionally the rendezvous id (default: a fresh random one, exposed as `host.rendezvousId`)
+ * @param {string | { url: string }} [options.connect] - the dial-out form, OFF unless written and not together with `relay`: the `ws://` / `wss://` URL of an operator that
+ *   WAITS (it listens, and logs in as the client over what it accepts). Dialled exactly as written (no role or rendezvous id is added), never logged, no user name,
+ *   password or fragment in it. The login, sealing, approval, indicator and Stop are the same as behind a relay; there is no `operatorUrl` (it is `null`).
  * @param {Record<string, { mode?: 'values', allow?: { get?: string[], call?: string[], set?: string[] }, authorize?: Function, limits?: object, object?: object }>} [options.expose]
  *   object access, off unless written: named roots (`window` is the window passed; another name needs `object`), each with its allow-lists by
  *   operation (paths relative to the root: `'document.title'`, `'app.**'`; nothing allowed by default). `mode: 'handles'` is this root's own opt-in to handles (`nodes: true` a second one, for nodes and the window graph).
@@ -208,7 +211,7 @@ function createDomIndicator(window, { name }) {
  * @param {(line: string) => void} [options.onLog]
  */
 export async function createPageHost(options = {}) {
-  const { window, relay, name, authorizedKeys, mcp, expose, indicator = true, unattended = false, hostKey, hostKeyStore, onSession, onSessionEnd, onRefused, onClose, reconnect = true, onLog = () => {} } = options;
+  const { window, relay, connect, name, authorizedKeys, mcp, expose, indicator = true, unattended = false, hostKey, hostKeyStore, onSession, onSessionEnd, onRefused, onClose, reconnect = true, onLog = () => {} } = options;
   if (!window || (typeof window !== 'object' && typeof window !== 'function')) {
     throw new TypeError('createPageHost: window is required: it is the realm served and the only thing this reads (pass `window`, an iframe\'s contentWindow, or a worker\'s self)');
   }
@@ -237,11 +240,25 @@ export async function createPageHost(options = {}) {
   for (const [k, fn] of Object.entries({ onSession, onSessionEnd, onRefused, onClose })) if (fn !== undefined && typeof fn !== 'function') throw new TypeError(`createPageHost: ${k} must be a function`);
   if (hostKeyStore !== undefined && (typeof hostKeyStore?.load !== 'function' || typeof hostKeyStore?.save !== 'function')) throw new TypeError('createPageHost: hostKeyStore needs load() and save(keyPair)');
 
-  const relayOptions = typeof relay === 'string' ? { url: relay } : relay;
-  if (!isObj(relayOptions) || typeof relayOptions.url !== 'string') throw new TypeError('createPageHost: relay is required: the ws:// or wss:// URL of a pipe relay (or { url, id })');
-  const rendezvousId = relayOptions.id ?? randomRendezvousId(window.crypto);
-  const hostUrl = pipeUrl(relayOptions.url, rendezvousId, 'host');
-  const operatorUrl = pipeUrl(relayOptions.url, rendezvousId, 'operator');
+  // Where the page dials: a pipe relay (the default form: the operator dials the same relay and the rendezvous id pairs them), or, only when `connect` is written, an
+  // endpoint of an operator that WAITS. Exactly one; neither is dialled until createPageHost is called with it.
+  if (relay !== undefined && connect !== undefined) throw new TypeError('createPageHost: give relay or connect, not both: relay is a pipe relay the operator also dials, connect is an operator that listens');
+  let hostUrl; let operatorUrl = null; let rendezvousId = null;
+  if (connect !== undefined) {
+    const connectUrl = typeof connect === 'string' ? connect : isObj(connect) && Object.keys(connect).every((k) => k === 'url') ? connect.url : undefined;
+    let parsed = null;
+    try { parsed = typeof connectUrl === 'string' ? new URL(connectUrl) : null; } catch { parsed = null; }
+    if (!parsed || (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') || parsed.username !== '' || parsed.password !== '' || parsed.hash !== '' || connectUrl.includes('#')) {
+      throw new TypeError('createPageHost: connect must be the ws:// or wss:// URL of an operator that listens (or { url }), with no user name, password or fragment in it');
+    }
+    hostUrl = connectUrl;   // dialled as written: no role or rendezvous id is added, and the URL is never logged (its query may be a secret)
+  } else {
+    const relayOptions = typeof relay === 'string' ? { url: relay } : relay;
+    if (!isObj(relayOptions) || typeof relayOptions.url !== 'string') throw new TypeError('createPageHost: relay is required: the ws:// or wss:// URL of a pipe relay (or { url, id }), or connect: the URL of an operator that listens');
+    rendezvousId = relayOptions.id ?? randomRendezvousId(window.crypto);
+    hostUrl = pipeUrl(relayOptions.url, rendezvousId, 'host');
+    operatorUrl = pipeUrl(relayOptions.url, rendezvousId, 'operator');
+  }
 
   const timers = timersOf(window, options.timers);
   const origin = readOrigin(window);
@@ -342,7 +359,7 @@ export async function createPageHost(options = {}) {
     let socket;
     try { socket = new window.WebSocket(hostUrl); } catch (e) { onLog(`dialing the relay failed: ${e?.message ?? e}`); schedule(false); return; }
     halfSocket = socket;
-    onLog('dialed the relay, waiting for an operator');
+    onLog(operatorUrl === null ? 'dialed the operator endpoint, waiting for it to log in' : 'dialed the relay, waiting for an operator');
     let served = false;
     void memory.accept(socket, { remote: { address: 'relay' } }).catch((e) => onLog(`accept failed: ${e?.message ?? e}`));
     const onEnd = () => {

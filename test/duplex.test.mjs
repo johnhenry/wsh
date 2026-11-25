@@ -83,6 +83,19 @@ describe('createDuplexSocket: the WebSocket-shaped object over a duplex', () => 
     await until(() => link.socket.bufferedAmount === 0, 'the buffer to drain');
   });
 
+  it('a Node Buffer (what the `ws` package hands over) and a view into a bigger ArrayBuffer arrive as their own bytes, not as the memory they sit in', async () => {
+    const link = createDuplexSocket({ send: () => {} });
+    const got = [];
+    link.socket.addEventListener('message', (e) => got.push([...new Uint8Array(e.data)]));
+    await until(() => link.socket.readyState === 1, 'open');
+    const pool = new Uint8Array([9, 9, 1, 2, 3, 9, 9]);
+    link.receive(Buffer.from(pool.buffer, 2, 3));            // a Buffer is a view: Buffer.prototype.slice() does not copy it
+    link.receive(new Uint8Array(pool.buffer, 2, 3));         // so is any other view
+    link.receive(Buffer.from([4, 5]));                       // small Buffers come from a shared pool
+    await until(() => got.length === 3, 'three messages');
+    assert.deepEqual(got, [[1, 2, 3], [1, 2, 3], [4, 5]]);
+  });
+
   it('cuts a large write into messages of at most maxMessageBytes, in order, and ends the link on a larger incoming message', async () => {
     const sent = [];
     const link = createDuplexSocket({ send: (b) => { sent.push(b); }, maxMessageBytes: 300 });
