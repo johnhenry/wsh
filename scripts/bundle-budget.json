@@ -49,6 +49,10 @@
       "raw": 145046,
       "gzip": 44026
     },
+    "./address-guard": {
+      "raw": 9286,
+      "gzip": 3669
+    },
     "./testing (encodeRecord only)": {
       "raw": 1887,
       "gzip": 938
@@ -60,6 +64,10 @@
     ". (WshClient only)": {
       "raw": 140766,
       "gzip": 42371
+    },
+    "./address-guard (isPublicAddress only)": {
+      "raw": 3144,
+      "gzip": 1333
     },
     "./host (createConnectionFactory only)": {
       "raw": 107356,

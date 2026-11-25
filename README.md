@@ -541,6 +541,54 @@ addresses) for names and `"*"`, or an `allow` entry that is itself an IP literal
 exactly that address. `ResolveDns` answers are filtered with the same rule. Through `socks` the proxy resolves the name,
 so only IP literals can be checked there. See the Security model below and the CHANGELOG (this is a behaviour change).
 
+**The guard is a public entry point: `@johnhenry/wsh/address-guard` (Node).** The gateway above calls these functions, so
+another package that dials where someone else asks (a mesh egress provider, a DNS-lookup service) uses the same tested
+check instead of writing a second one:
+
+```js
+import { classifyAddress, isPublicAddress, checkAddress, resolveChecked, dialChecked, dialUdpChecked } from '@johnhenry/wsh/address-guard';
+
+classifyAddress('169.254.169.254');          // 'metadata'; isPublicAddress('8.8.8.8') is true
+classifyAddress('::ffff:10.0.0.1');          // 'private' (the IPv4 address inside decides)
+checkAddress('10.0.0.1', { allow: ['10.0.0.0/8'], deny: ['10.9.0.0/16'] }); // { permitted: true, class: 'private' }
+
+// Resolve a name once; only the addresses that pass come back (the others are named in the error).
+const addresses = await resolveChecked('example.com', { family: 4 }); // [{ address, family, class }]
+
+// Resolve once, check, and connect to the address that passed; never to the name, so it is never resolved twice.
+const { socket, address, family, class: cls } = await dialChecked('example.com', 443, { timeoutMs: 5000, signal });
+
+// The same for UDP: a datagram socket connect()ed to the checked address, so a reply from any other address or port is dropped.
+const { socket: udp } = await dialUdpChecked('example.com', 53);
+```
+
+- **Classes** (`ADDRESS_CLASSES`): `public`, or the reason it is not: `unspecified`, `loopback`, `private` (RFC 1918 and the
+  deprecated site-local block), `unique-local`, `link-local`, `metadata` (the cloud instance-metadata addresses:
+  `169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `192.0.0.192`, `168.63.129.16`, `fd00:ec2::254`), `carrier-nat`,
+  `documentation`, `benchmarking`, `multicast`, `teredo`, `reserved`; `invalid` is anything that is not an IP address.
+  `isPublicAddress(ip)` and `classifyAddress(ip)` are pure and import nothing from Node: `import { isPublicAddress } from
+  '@johnhenry/wsh/address-guard'` bundles for a browser at about 1.3 kB gzipped (the dial functions need Node and are only
+  loaded when called).
+- **IPv6 forms that carry an IPv4 address** are judged as the IPv4 address they carry, because that is where a translator or
+  tunnel sends the packet: IPv4-mapped (`::ffff:a.b.c.d`), NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`). `::ffff:10.0.0.1`
+  is `private`; `64:ff9b::808:808` is `public`. Teredo (`2001::/32`) hides the addresses it carries and is refused whatever
+  they are (`teredo`). The deprecated IPv4-compatible form (`::127.0.0.1`) and the local-use NAT64 prefix (`64:ff9b:1::/48`)
+  are `reserved`.
+- **The policy**: `allowPrivate: true` lets the private-network classes through (`private`, `loopback`, `link-local`,
+  `unique-local`, `carrier-nat`) and nothing else: not `metadata`, `unspecified`, `multicast`, `reserved`, `documentation`,
+  `benchmarking` or `teredo`. `allow` is a list of CIDR blocks or addresses permitted whatever their class (this is what the
+  gateway's `allowPrivate` array is, and the way to permit a metadata address on purpose); `deny` is refused always, public
+  addresses included, wins over both, and also refuses the mapped, NAT64 and 6to4 forms of a denied IPv4 block. A bad entry
+  is a `TypeError`, never an open check.
+- **Mixed answers**: a name with some permitted and some refused answers keeps the permitted ones (`refuseMixed: true`
+  refuses the whole name instead, for a service that must not talk to a name that points anywhere private). Every answer
+  refused rejects with `AddressGuardError` (`code: 'ADDRESS_REFUSED'`, `refused: [{ address, class }]`), so a caller can say
+  why in words. The other codes are `NAME_NOT_FOUND`, `LOOKUP_FAILED`, `CONNECTION_REFUSED`, `UNREACHABLE`, `TIMEOUT`, `ABORTED`.
+- **What it does not do**: it is not a name allow list (the gateway's `allow` matches names and ports; this checks addresses);
+  it does not limit rates, bytes or connections (the gateway's `maxConnections` and `udp` bounds do); it does not follow
+  redirects or check an address a peer later hands over (check every address you are about to dial); and a host's own
+  firewall or network policy remains the second layer under it.
+
 **Flow control.** Gateway data is metered in both directions when both ends offer the `gateway-credit` feature: each
 direction of each connection starts with 256 KiB of credit that the receiver tops up (`GatewayCredit`) as its
 application consumes data, so a slow reader stops its peer (the origin socket is paused, `write()` results and `drain`
@@ -770,9 +818,11 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | `@johnhenry/wsh/capabilities` (whole entry point) | 10.6 kB | 3.8 kB |
 | `@johnhenry/wsh/identity` (whole entry point) | 15.7 kB | 5.7 kB |
 | `@johnhenry/wsh/duplex` (whole entry point) | 141.6 kB | 43.0 kB |
+| `@johnhenry/wsh/address-guard` (whole entry point) | 9.1 kB | 3.6 kB |
 | `import { encodeRecord } from '@johnhenry/wsh/testing'` | 1.8 kB | 0.9 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 137.5 kB | 41.4 kB |
+| `import { isPublicAddress } from '@johnhenry/wsh/address-guard'` | 3.1 kB | 1.3 kB |
 | `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 104.8 kB | 34.3 kB |
 <!-- bundle-size:end -->
 
@@ -2750,6 +2800,8 @@ out explicitly below rather than left to be discovered.
 - **The Node gateway checks where a connection goes, not only what it was called.** `gateway.allow` matches the name a
   client sent, and then the address it resolves to must be globally routable (or permitted by `allowPrivate` or an
   IP-literal rule); the connection is made to that checked address, and `ResolveDns` answers are filtered the same way.
+  The check is public as `@johnhenry/wsh/address-guard` (see the gateway section); it classifies addresses and dials the
+  checked one, and does not itself limit rates, bytes or connections or follow a later redirect to another address.
   Unix-domain sockets (`gateway.unix`) and named endpoints (`gateway.endpoints`) are off unless configured, are listed
   paths or names only, and sockets the host creates are `0600`.
 - **TCP reverse tunnels (`gateway.reverse`) are off unless configured, bind where the operator says, and cap what they open.**

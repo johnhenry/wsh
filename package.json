@@ -13,6 +13,10 @@
       "types": "./src/server/index.d.ts",
       "import": "./src/server/index.mjs"
     },
+    "./address-guard": {
+      "types": "./src/address-guard.d.ts",
+      "import": "./src/address-guard.mjs"
+    },
     "./pipe-relay": {
       "types": "./src/pipe-relay.d.ts",
       "import": "./src/pipe-relay.mjs"

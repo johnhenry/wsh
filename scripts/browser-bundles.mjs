@@ -34,9 +34,11 @@ export const ENTRY_POINTS = [
   { name: './capabilities', entry: 'src/capabilities.mjs' },
   { name: './identity', entry: 'src/identity.mjs' },
   { name: './duplex', entry: 'src/duplex.mjs' },
+  { name: './address-guard', entry: 'src/address-guard.mjs' },
   { name: './testing (encodeRecord only)', contents: "import { encodeRecord } from './src/testing.mjs'; globalThis.x = encodeRecord;" },
   { name: '. (generateKeyPair only)', contents: "import { generateKeyPair } from './src/index.mjs'; globalThis.x = generateKeyPair;" },
   { name: '. (WshClient only)', contents: "import { WshClient } from './src/index.mjs'; globalThis.x = WshClient;" },
+  { name: './address-guard (isPublicAddress only)', contents: "import { isPublicAddress } from './src/address-guard.mjs'; globalThis.x = isPublicAddress;" },
   { name: './host (createConnectionFactory only)', contents: "import { createConnectionFactory } from './src/host.mjs'; globalThis.x = createConnectionFactory;" },
 ];
 
