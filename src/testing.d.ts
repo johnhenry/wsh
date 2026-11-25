@@ -63,7 +63,7 @@ export interface InProcessPipeRelay {
   tap: ((info: RelayTapInfo) => Uint8Array | Uint8Array[] | null | undefined) | null;
   /** A `WebSocket` constructor that dials this relay: `new env.WebSocket(pipeUrl(anyBase, id, role))`. */
   WebSocket: new (url: string) => any;
-  stats(): { waiting: number; pipes: number };
+  stats(): { waiting: number; pipes: number; retired: number };
   /** End every pipe at once, as a relay restart would. */
   dropAll(): void;
   close(): Promise<void>;

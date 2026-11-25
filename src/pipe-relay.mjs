@@ -138,18 +138,58 @@ export function watchPairing(socket) {
   return { socket: proxy, paired };
 }
 
+/**
+ * The close reason texts a relay sends (#240), a stable list: a program may compare against these. Each limit closes BOTH halves of a
+ * pipe with the same code and the same text, so the far side can tell a limit from the other person leaving (`peerClosed`, the only
+ * text that means the partner's socket went away; the close code is then the partner's own). New texts may be added; none is renamed.
+ *
+ *   peerClosed       the partner's socket closed (code: the partner's)
+ *   noPartner        1000  a half waited `rendezvousTimeoutMs` for a partner
+ *   idle             1000  no byte either way for `idleTimeoutMs`
+ *   lifetime         1000  `maxLifetimeMs` after pairing
+ *   byteLimit        1008  `maxBytes` copied
+ *   messageTooLarge  1009  one message over `maxMessageBytes` (also when the WebSocket server's own payload limit caught it first)
+ *   binaryOnly       1003  a text frame (everything on a pipe is binary)
+ *   earlyOverflow    1009 / 1003  a half sent more than `earlyBytes` (or a text frame) before its partner arrived (no partner exists yet)
+ *   receiverTooSlow  1013  the receiver's buffer passed `highWaterBytes` and the sender cannot pause
+ *   sendFailed       1011  writing to a socket threw
+ *   shuttingDown     1001  `relay.close()`
+ *   badId / badRole / notPermitted / idInUse / idRetired / tooManyWaiting   a refusal (1008; 1013 for tooManyWaiting) when the half arrived
+ */
+export const PIPE_CLOSE_REASONS = Object.freeze({
+  peerClosed: 'peer closed',
+  noPartner: 'no partner arrived',
+  idle: 'idle',
+  lifetime: 'maximum lifetime reached',
+  byteLimit: 'byte limit reached',
+  messageTooLarge: 'message too large',
+  binaryOnly: 'binary messages only',
+  earlyOverflow: 'too much before the partner arrived',
+  receiverTooSlow: 'receiver too slow',
+  sendFailed: 'send failed',
+  shuttingDown: 'relay is shutting down',
+  badId: 'bad rendezvous id',
+  badRole: 'bad role',
+  notPermitted: 'not permitted',
+  idInUse: 'rendezvous id in use',
+  idRetired: 'rendezvous id already used',
+  tooManyWaiting: 'too many waiting connections',
+});
+const R = PIPE_CLOSE_REASONS;
+
 const sane = (code) => (Number.isInteger(code) && code >= 1000 && code <= 4999 && ![1004, 1005, 1006, 1015].includes(code) ? code : 1000);
 
 /** Adapt a `ws`-style (`on`) or browser-style (`addEventListener`) socket to message/close callbacks. */
-function listenOn(socket, onMessage, onClose) {
+function listenOn(socket, onMessage, onClose, onTooLarge) {
   if (typeof socket.addEventListener === 'function') {
     socket.addEventListener('message', (ev) => onMessage(ev?.data));
     socket.addEventListener('close', (ev) => onClose(ev?.code));
-    socket.addEventListener('error', () => {});
+    socket.addEventListener('error', (ev) => { if ((ev?.error ?? ev)?.code === 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH') onTooLarge(); });
   } else if (typeof socket.on === 'function') {
     socket.on('message', (data, isBinary) => onMessage(data, isBinary));
     socket.on('close', (code) => onClose(code));
-    socket.on('error', () => {});
+    // The `ws` package closes a socket itself when a frame passes its `maxPayload` (the relay's `maxMessageBytes`), and says so with this code.
+    socket.on('error', (e) => { if (e?.code === 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH') onTooLarge(); });
   } else {
     throw new TypeError('createPipeRelay: socket must support on() or addEventListener()');
   }
@@ -177,15 +217,26 @@ const sizeOf = (data) => (typeof data === 'string' ? -1
 export function createPipeRelay({
   maxWaiting = 1024, rendezvousTimeoutMs = 120_000, idleTimeoutMs = 300_000, maxLifetimeMs = 12 * 3600_000,
   maxBytes = 1024 ** 3, maxMessageBytes = 4 * 1024 * 1024, earlyBytes = 64 * 1024, highWaterBytes = 1024 * 1024,
+  retirePaired = false, maxRetired = 10_000,
   authorize, onLog = () => {},
 } = {}) {
   for (const [name, v] of Object.entries({ maxWaiting, rendezvousTimeoutMs, idleTimeoutMs, maxLifetimeMs, maxBytes, maxMessageBytes, earlyBytes, highWaterBytes })) {
     if (!Number.isFinite(v) || v < 1) throw new TypeError(`createPipeRelay: ${name} must be a positive number`);
   }
+  if (typeof retirePaired !== 'boolean') throw new TypeError('createPipeRelay: retirePaired must be a boolean');
+  if (!Number.isInteger(maxRetired) || maxRetired < 1) throw new TypeError('createPipeRelay: maxRetired must be a positive integer');
   if (authorize !== undefined && typeof authorize !== 'function') throw new TypeError('createPipeRelay: authorize must be a function');
 
   /** id -> the one half waiting for its partner. */
   const waiting = new Map();
+  /** With `retirePaired`: the ids whose pipe paired, oldest first, at most `maxRetired` (a Set keeps insertion order). */
+  const retired = new Set();
+  const retire = (id) => {
+    if (!retirePaired) return;
+    retired.delete(id);
+    retired.add(id);
+    if (retired.size > maxRetired) retired.delete(retired.values().next().value);
+  };
   /** Live pipes. */
   const pipes = new Set();
   let closed = false;
@@ -196,7 +247,7 @@ export function createPipeRelay({
   const closeSocket = (socket, code = 1000, reason = '') => { try { socket.close(code, reason); } catch { /* gone */ } };
 
   function wait(half) {
-    half.timer = setTimeout(() => { waiting.delete(half.id); closeSocket(half.socket, 1000, 'no partner arrived'); onLog(`pipe ${half.id.slice(0, 6)}: ${half.role} waited too long`); }, rendezvousTimeoutMs);
+    half.timer = setTimeout(() => { waiting.delete(half.id); closeSocket(half.socket, 1000, R.noPartner); onLog(`pipe ${half.id.slice(0, 6)}: ${half.role} waited too long`); }, rendezvousTimeoutMs);
     half.timer.unref?.();
     waiting.set(half.id, half);
   }
@@ -204,6 +255,7 @@ export function createPipeRelay({
   function pair(first, second) {
     clearTimeout(first.timer);
     waiting.delete(first.id);
+    retire(first.id);
     const pipe = { halves: [first, second], bytes: 0, last: Date.now(), timers: [], done: false };
     pipes.add(pipe);
     // A host that asked is told its partner is here, ahead of anything the partner said (not counted as pipe traffic).
@@ -219,8 +271,8 @@ export function createPipeRelay({
       onLog(`pipe ${first.id.slice(0, 6)} closed (${reason || code}) after ${pipe.bytes} bytes`);
     };
     pipe.end = end;
-    const life = setTimeout(() => end(1000, 'maximum lifetime reached'), maxLifetimeMs);
-    const idle = setInterval(() => { if (Date.now() - pipe.last > idleTimeoutMs) end(1000, 'idle'); }, Math.max(1000, Math.min(idleTimeoutMs / 4, 30_000)));
+    const life = setTimeout(() => end(1000, R.lifetime), maxLifetimeMs);
+    const idle = setInterval(() => { if (Date.now() - pipe.last > idleTimeoutMs) end(1000, R.idle); }, Math.max(1000, Math.min(idleTimeoutMs / 4, 30_000)));
     for (const t of [life, idle]) t.unref?.();
     pipe.timers.push(life, idle);
 
@@ -229,13 +281,13 @@ export function createPipeRelay({
       from.forward = (data, isBinary) => {
         if (pipe.done) return;
         const n = sizeOf(data);
-        if (n < 0 || isBinary === false) return end(1003, 'binary messages only', null);
-        if (n > maxMessageBytes) return end(1009, 'message too large', null);
+        if (n < 0 || isBinary === false) return end(1003, R.binaryOnly, null);
+        if (n > maxMessageBytes) return end(1009, R.messageTooLarge, null);
         pipe.bytes += n;
         pipe.last = Date.now();
-        if (pipe.bytes > maxBytes) return end(1008, 'byte limit reached', null);
+        if (pipe.bytes > maxBytes) return end(1008, R.byteLimit, null);
         if (to.socket.readyState !== OPEN) return;
-        try { to.socket.send(data); } catch { return end(1011, 'send failed', null); }
+        try { to.socket.send(data); } catch { return end(1011, R.sendFailed, null); }
         if ((to.socket.bufferedAmount ?? 0) > highWaterBytes) throttle(from, to, pipe);
       };
       // Whatever it said before its partner arrived.
@@ -245,7 +297,7 @@ export function createPipeRelay({
 
   function throttle(from, to, pipe) {
     if (from.paused) return;
-    if (typeof from.socket.pause !== 'function' || typeof from.socket.resume !== 'function') return pipe.end(1013, 'receiver too slow', null);
+    if (typeof from.socket.pause !== 'function' || typeof from.socket.resume !== 'function') return pipe.end(1013, R.receiverTooSlow, null);
     from.paused = true;
     from.socket.pause();
     from.resume = () => { if (from.paused) { from.paused = false; try { from.socket.resume(); } catch { /* gone */ } } };
@@ -268,12 +320,12 @@ export function createPipeRelay({
     if (!socket || typeof socket.send !== 'function' || typeof socket.close !== 'function') throw new TypeError('createPipeRelay.accept: socket must be a WebSocket-like duplex');
     if (notifyPaired && role !== 'host') throw new TypeError('createPipeRelay.accept: notifyPaired is for the host side');
     const refuse = (code, reason) => { closeSocket(socket, code, reason); return false; };
-    if (closed) return refuse(1001, 'relay is shutting down');
-    if (typeof id !== 'string' || !ID_RE.test(id)) return refuse(1008, 'bad rendezvous id');
-    if (!ROLES.has(role)) return refuse(1008, 'bad role');
+    if (closed) return refuse(1001, R.shuttingDown);
+    if (typeof id !== 'string' || !ID_RE.test(id)) return refuse(1008, R.badId);
+    if (!ROLES.has(role)) return refuse(1008, R.badRole);
 
     // Listeners first, so nothing the peer says while we decide is lost; it is held (bounded) until it can be passed on.
-    const half = { id, role, socket, early: [], earlyBytes: 0, timer: null, forward: null, paused: false, resume: null, notifyPaired: notifyPaired === true };
+    const half = { id, role, socket, early: [], earlyBytes: 0, timer: null, forward: null, paused: false, resume: null, notifyPaired: notifyPaired === true, tooLarge: false };
     let pipeRef = null;
     listenOn(socket, (data, isBinary) => {
       if (half.forward) return half.forward(data, isBinary);
@@ -281,29 +333,33 @@ export function createPipeRelay({
       half.earlyBytes += Math.max(n, 0);
       if (n < 0 || isBinary === false || half.earlyBytes > earlyBytes) {
         waiting.get(id) === half && (clearTimeout(half.timer), waiting.delete(id));
-        return closeSocket(socket, n < 0 || isBinary === false ? 1003 : 1009, 'too much before the partner arrived');
+        return closeSocket(socket, n < 0 || isBinary === false ? 1003 : 1009, R.earlyOverflow);
       }
       half.early.push({ data, isBinary });
     }, (code) => {
       if (waiting.get(id) === half) { clearTimeout(half.timer); waiting.delete(id); }
       for (const p of pipes) if (p.halves.includes(half)) { pipeRef = p; break; }
-      pipeRef?.end(code, 'peer closed', half);
-    });
+      // A socket the WebSocket server closed itself for an oversize frame is a limit, not the person leaving: say so to the partner.
+      if (half.tooLarge) pipeRef?.end(1009, R.messageTooLarge, half);
+      else pipeRef?.end(code, R.peerClosed, half);
+    }, () => { half.tooLarge = true; });
 
     if (authorize) {
       let ok = false;
       try { ok = (await authorize({ id, role, remote })) === true; } catch (e) { onLog(`authorize threw: ${e.message}`); }
-      if (!ok) return refuse(1008, 'not permitted');
+      if (!ok) return refuse(1008, R.notPermitted);
       if (closed || socket.readyState !== OPEN) return false;
     }
 
+    // After `authorize` (which still sees the attempt), so a caller it refuses learns nothing about whether an id was used.
+    if (retired.has(id)) return refuse(1008, R.idRetired);
     const other = waiting.get(id);
     if (!other) {
-      if (waiting.size >= maxWaiting) return refuse(1013, 'too many waiting connections');
+      if (waiting.size >= maxWaiting) return refuse(1013, R.tooManyWaiting);
       wait(half);
       return true;
     }
-    if (other.role === role) return refuse(1008, 'rendezvous id in use');
+    if (other.role === role) return refuse(1008, R.idInUse);
     pair(other, half);
     onLog(`pipe ${id.slice(0, 6)}: paired`);
     return true;
@@ -328,16 +384,16 @@ export function createPipeRelay({
   async function close() {
     closed = true;
     listening = false;
-    for (const h of waiting.values()) { clearTimeout(h.timer); closeSocket(h.socket, 1001, 'relay is shutting down'); }
+    for (const h of waiting.values()) { clearTimeout(h.timer); closeSocket(h.socket, 1001, R.shuttingDown); }
     waiting.clear();
-    for (const p of [...pipes]) p.end(1001, 'relay is shutting down', null);
+    for (const p of [...pipes]) p.end(1001, R.shuttingDown, null);
     for (const fn of closers.splice(0)) await fn();
   }
 
   return {
     accept, listen, close,
-    /** `{ waiting, pipes }` right now. */
-    stats: () => ({ waiting: waiting.size, pipes: pipes.size }),
+    /** `{ waiting, pipes, retired }` right now (`retired`: ids remembered by `retirePaired`, 0 when it is off). */
+    stats: () => ({ waiting: waiting.size, pipes: pipes.size, retired: retired.size }),
     newRendezvousId,
   };
 }
