@@ -269,6 +269,9 @@ window.h.pageApp = () => {
   window.app.watch = (fn) => { window.__watchers.push(fn); return 'watching'; };
   window.app.tick = (n) => { for (const fn of window.__watchers) fn({ n, at: 'page' }); return window.__watchers.length; };
   window.app.noCallbacks = (fn) => typeof fn;
+  // A call whose callbacks may return a value (`(callback:returns)`): the page keeps the stub and asks it later, as a real application would (a confirmation, a vote).
+  window.__askers = [];
+  window.app.ask = (fn) => { window.__askers.push(fn); return 'asked'; };
 };
 window.h.pageHostInfo = () => ({ sessions: pageHostHandle.sessions.map((s) => s.fingerprint), closed: pageHostHandle.closed, closedReason: pageHostHandle.closedReason, cart: window.__cart, ran: window.__ran.map((r) => r.name) });
 window.h.stopPageHost = () => pageHostHandle?.close();
