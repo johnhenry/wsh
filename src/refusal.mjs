@@ -14,6 +14,8 @@
  *  - `seal-failed`      a sealed session's key exchange failed, or one of its frames did not open
  *  - `seal-timeout`     the host requires a sealed session, the peer logged in, and the session was not sealed within `sealTimeoutMs`
  *                       (default 30 s; #244)
+ *  - `login-timeout`    the connection was accepted and did not complete its login (Hello and Auth) within `loginTimeoutMs`
+ *                       (default 60 s; #248)
  *  - `busy`             (reverse host) it already serves its operators
  *  - `key-expired`      the key is past the `expires` of its `authorized_keys` line (or of what `authorize` returned), at login or on a
  *                       later request (#122)
@@ -26,7 +28,7 @@
  */
 export const REFUSAL_REASONS = Object.freeze([
   'not-sealed', 'unauthorized', 'binding-required', 'bad-signature', 'method-disabled', 'rate-limited', 'bad-request',
-  'seal-failed', 'busy', 'proof-required', 'proof-failed', 'key-expired', 'not-permitted', 'seal-timeout',
+  'seal-failed', 'busy', 'proof-required', 'proof-failed', 'key-expired', 'not-permitted', 'seal-timeout', 'login-timeout',
 ]);
 
 /** @throws {TypeError} when `onRefused` is given and is not a function */
