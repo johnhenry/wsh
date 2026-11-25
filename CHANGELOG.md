@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.54.1
 
 ### Fix for 0.54.0: the login deadline no longer runs while a page host waits for its operator (#253; JS only, a patch)
 
