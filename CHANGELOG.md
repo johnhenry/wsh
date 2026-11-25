@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Docs: how wsh and browsermesh fit together (`spec/wsh-and-browsermesh.md`)
+
+- A page that says what each project is for, which published browsermesh packages build on wsh (objects, mcp, transport's `/wsh` subpath, netway's gateway backend, the relaying pod, apps' `createMeshNode({ wsh })`) and which wsh entry points and exports they import, the one capability notation and its shared vectors, converting a wsh key and a pod id (both directions, never automatic), the `GatewayFail` table both share, which versions go together (wsh 0.52.0 with apps 0.22.0, transport 0.12.0, primitives 0.7.0, netway 0.3.0, objects 0.1.2, mcp 0.2.1), and what is not verified. Linked from the README's "wsh and browsermesh" section; the counterpart is browsermesh's `docs/wsh-and-browsermesh.md`. No code, wire or default changes.
+
 ### Hosts that require a sealed session close a connection that logs in and never seals (#244; JS and Rust)
 
 - **A deadline for the key exchange.** With `sealSession: 'require'` (`createMemoryHost`, `createWshServer`, and so every host built on `createConnectionFactory`, a page host and a duplex host included) a client that completed login and sent nothing used to hold its connection (and, on a relay, its pipe) open for as long as it liked. The host now closes it when the session is not sealed `sealTimeoutMs` after login: it sends an `Error` ending "(seal-timeout)", reports `onRefused` reason `seal-timeout` (new, in `REFUSAL_REASONS`) and ends the connection. Default **30000** ms (three times the client's 10 s per login step and for its own key exchange, so a client on defaults gives up first and a slow link is not cut off); `sealTimeoutMs: 0` turns it off; a negative or non-numeric value is a `TypeError`.

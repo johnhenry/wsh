@@ -3065,6 +3065,9 @@ is the **peer fabric**: pods that find each other, link, route messages and shar
 into a place; the other is the place between places. They are separate packages with separate versions, and **wsh has no dependency on
 browsermesh** (a test of the pod id derivation uses `@johnhenry/browsermesh-primitives` as a dev dependency only).
 
+The full page, with which browsermesh packages build on wsh and the exports they import, the shared capability notation and gateway failure table, key conversion, which versions go together
+and what has not been verified, is **[`spec/wsh-and-browsermesh.md`](spec/wsh-and-browsermesh.md)** (browsermesh has the counterpart, `docs/wsh-and-browsermesh.md`).
+
 **Where they meet**
 
 - **The mesh's wsh peer link** (`@johnhenry/browsermesh-transport`, off by default): a link between two pods is one wsh session, sealed and
