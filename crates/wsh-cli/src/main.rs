@@ -464,10 +464,24 @@ enum ObjectsCommand {
         capacity: u64,
     },
 
+    /// What this key may do on ROOT, as the host describes it (its allow-list entries for the root, its type map,
+    /// the event fields): one JSON value. Needs the host to state `types`. All of it is the host's own text.
+    Types {
+        /// ROOT
+        root: String,
+    },
+
     /// One connection, JSON requests on stdin (one per line), one answer line each: how to hold a handle across
     /// calls. {"op":"call","path":"ROOT.a.f","args":[..]} answers {"ok":true,"result":..}; a handle comes back
     /// as {"$handle":{"id":"h1",..}} and is used with {"op":"get","handle":"h1","path":"x"} and given back with
-    /// {"op":"release","handle":"h1"}. Ops: roots, get, call, construct, set, describe, snapshot, release.
+    /// {"op":"release","handle":"h1"}. Ops: roots, types, get, call, construct, set, describe, snapshot, release.
+    ///
+    /// Events and callbacks, one answer line each, in order: {"op":"watch","path":"ROOT.a.b","event":"ready"}
+    /// (or "handle":"h1","path":"x" through a handle) answers {"subscription":"s1"}; {"op":"callback"} answers
+    /// {"callback":"c1"}, which a call passes as {"op":"call",...,"args":[1,null],"callbacks":[[1,"c1"]]}.
+    /// {"op":"next","subscription":"s1"} / {"op":"next","callback":"c1"} waits (default 10000 ms, "timeoutMs")
+    /// for the next event or call; {"op":"unwatch","subscription":"s1"} and {"op":"release","callback":"c1"}
+    /// end them.
     Session,
 }
 
@@ -903,6 +917,7 @@ async fn main() {
                     count,
                     capacity: capacity as usize,
                 },
+                ObjectsCommand::Types { root } => Op::Types { root },
                 ObjectsCommand::Session => Op::Session,
             };
             commands::objects::run(commands::objects::Options {

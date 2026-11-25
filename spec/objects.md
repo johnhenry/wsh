@@ -1,6 +1,6 @@
 # The `wsh-objects` protocol (remote objects)
 
-Status: describes what `@johnhenry/wsh/objects` (`src/objects-core.mjs`, `src/objects.mjs`) serves and speaks as of 0.50.0, and what the Rust client
+Status: describes what `@johnhenry/wsh/objects` (`src/objects-core.mjs`, `src/objects.mjs`) serves and speaks as of 0.51.0, and what the Rust client
 (`wsh_client::objects`, `wsh objects`) speaks. It adds nothing to the wire: this file only writes down what the code does. The JavaScript
 implementation is the reference; where this text and `src/objects-core.mjs` differ, the code is right and this file is a bug.
 
@@ -31,16 +31,23 @@ Every `params` is an object. A request names where it starts: `root: "window"` (
 | `set` | `{ root \| handle, path: [seg…], value }` | `{ ok: true }` |
 | `describe` | `{ root \| handle, path?: [seg…] }` | `{ type, keys: [{ key, type, own }…], truncated? }` |
 | `snapshot` | `{ root \| handle, path?: [seg…], depth?, maxBytes? }` | a wire value; `truncated: true` when a subtree deeper than `depth` was cut to `null` |
-| `subscribe` | `{ id, root, path?: [seg…], type, fields?: [name…] }` | `{ ok: true }` |
+| `subscribe` | `{ id, root \| handle, path?: [seg…], type, fields?: [name…] }` | `{ ok: true }` |
 | `unsubscribe` | `{ id }` | `{ ok: true, dropped }` |
 | `release` | `{ handle }` | `{ ok: true }` |
 | `releaseCallback` | `{ id }` | `{ ok: true }` |
 | `callbackResult` | `{ rid, value? \| error?: true }` | `{ ok }` (peer to host, section 6) |
+| `types` | `{ root }` | `{ version, root, ops, allow, eventFields, types, handles }`: plain data |
 
-`roots` lists only the roots the key may use (`objects:ROOT[:OP]`). `features` is what the host supports: `events`, `callbacks`, `types`, `callback-returns`
-(only when an allow-list entry lets a callback return a value) and (when a root opted in) `handles` and `handle-events`. A host that says nothing (before 0.48.0)
-supports none of them; a peer must not use a feature the host did not state. A peer says what it can do in the optional `features` of its `roots` request:
-`callback-returns` means it answers a callback that asks for a return value (section 6). A host that predates the field ignores it.
+`roots` lists only the roots the key may use (`objects:ROOT[:OP]`). `features` is what the host supports: `events`, `callbacks`, `callback-returns` (only when an
+allow-list entry lets a callback return a value), `types` and (when a root opted in) `handles` and `handle-events`. A host that says nothing (before 0.48.0) supports
+none of them; a host before 0.51.0 does not say `types` or `handle-events`; a peer must not use a feature the host did not state. A peer says what it can do in the
+optional `features` of its `roots` request: `callback-returns` means it answers a callback that asks for a return value (section 6). A host that predates the field
+ignores it.
+
+**`types`** answers what this key may do on one root: `ops` (the operations among `get`, `call`, `set`, `on` the key holds on it), `allow` (the host's allow-list
+entries for the root, by operation, only for those operations; entries are written with the root first, `window.app.cart.add`), `eventFields` (the extra event
+fields of the types the key may listen to), `types` (the host's type map, `{ path: { value?, args?, result?, data? } }`: host-authored type text, never to be
+evaluated), `handles` (whether the root opted in). Every string in it is the host's text: untrusted.
 
 **`resolve`** walks a whole chain in one request. `ops` is up to 32 operations, each an object with exactly one of:
 
@@ -60,7 +67,9 @@ number, at most the host's `maxDepth`, 8) and `maxBytes` bound it.
 **`subscribe`** listens to an event source named by an `allow.on` entry `path@type`: the object at `path` must have `addEventListener` /
 `removeEventListener` or `on` / `off`. `id` is a whole number chosen by the peer, at least 1, not yet used on the channel. `type` is a name of
 letters, digits and `_ $ : . -` (up to 128). `fields` (at most 16) are extra event properties the host lists for the type (`eventFields`); a field it
-does not offer is `not-allowed`. A subscription cannot be made through a handle (0.50.0): `subscribe` takes a `root` only.
+does not offer is `not-allowed`. A subscription through a handle (`handle` in place of `root`, only if `features` has `handle-events`) is judged as a path subscription
+for the path that produced the handle extended by `path` (its own `allow.on` entry naming the type, the key's `objects:ROOT:on`, `authorize`) and ends with the
+handle: `release`, the session ending and a revoke end it. A host before 0.51.0 takes a `root` only.
 
 ## 3. Wire values
 
@@ -185,9 +194,19 @@ The key's capability is asked again for every operation (an expiry holds at call
 
 ## 11. What the released peers do
 
-- JavaScript (`@johnhenry/wsh` 0.46.0 to 0.50.0): the reference described above. 0.46.0 and 0.47.0 hosts have no `features` in `roots`, no events, handles or
-  callbacks; a peer sees an empty `features`.
-- `callback-returns` (callback return values): a 0.51.0 client against a host that states it is never asked for an answer (it did not list the feature), so the page gets
-  `undefined` at once and the callback is delivered one-way; a 0.51.0 host ignores the `features` of a `roots` request. The Rust client has no callbacks.
+- JavaScript (`@johnhenry/wsh` 0.46.0 to 0.51.0): the reference described above. 0.46.0 and 0.47.0 hosts have no `features` in `roots`, no events, handles or
+  callbacks; a peer sees an empty `features`. 0.50.0 and earlier hosts do not state `types` or `handle-events`.
+- Rust client (`wsh_client::objects`, `wsh objects`): `rust-v0.18.0` speaks values, events by path and handles. The release after it also speaks callbacks, events
+  through a handle and `types`, each only to a host that states it (`callbacks`, `handle-events`, `types`); against an older host they are refused locally, by name, and
+  nothing is sent. Rust released before the client (`rust-v0.17.1` and earlier) has no objects client at all.
+- `callback-returns` (callback return values, JS hosts only): a 0.51.0 client, and the Rust client, never list `callback-returns` in their `roots` request, so a host that
+  states it never asks them for an answer: the page gets `undefined` at once and the callback is delivered one-way. A 0.51.0 host ignores the `features` of a `roots` request.
 - Rust `wsh-server`: serves no `wsh-objects` channel and no page host, and refuses a key line with an `objects:` capability (an unknown capability
-  fails closed). Rust released before the `wsh_client::objects` client (`rust-v0.17.1` and earlier) has no objects client at all.
+  fails closed). **This is a decision, not a gap to close.** `wsh-objects` exists to reach a *live object graph* by path (a page's `window`, a worker's `self`, a
+  Node object), under allow-lists written over that graph's names; a Rust server has no such graph to expose, and anything it could name (its configuration, its
+  sessions, its counters) would be a fixed set of paths written in Rust, which is what a typed rpc channel is for. The Rust server already offers one
+  (`wsh-host`, `wsh mcp --channel wsh-host`), with its methods, bounds and `rpc:` capability checked in Rust rather than reconstructed as path rules over a
+  dynamic graph. A second, path-addressed way to read the same few fields would add a surface (allow-list syntax, `needs-listing` names, handles, callbacks that
+  call back into the server's own tasks) with nothing to protect it that the typed channel does not already have. So the server does not serve `wsh-objects`, and
+  a key line that asks for `objects:` capabilities stays refused rather than accepted and ignored. What would change this: a Rust host that embeds a scripting
+  runtime or another real object graph (none is planned).
