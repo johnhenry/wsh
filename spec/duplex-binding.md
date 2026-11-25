@@ -18,7 +18,8 @@ whose messages are the duplex's. That is `createDuplexSocket`. The rest is polic
 - the client must **name the host key** it expects;
 - `sealSession: 'require'` can now be asked for per connection (`bindSocket(..., { sealSession: 'require' })`, `host.accept(socket, { sealSession: 'require' })`):
   it can only strengthen the host's own setting, and a host that cannot seal (no host key, or data streams) refuses to attach the connection at all;
-- a connection that must be sealed and logs in but does not seal is closed by the host after `sealTimeoutMs` (default 30 s; 0 = no deadline; `onRefused` reason `seal-timeout`, #244).
+- a connection that must be sealed and logs in but does not seal is closed by the host after `sealTimeoutMs` (default 30 s; 0 = no deadline; `onRefused` reason `seal-timeout`, #244);
+- a connection that does not complete its login (Hello and Auth) within `loginTimeoutMs` of the host accepting it (default 60 s; 0 = no deadline) is closed with an `AuthFail` ending "(login-timeout)" (`onRefused` reason `login-timeout`, #248). Nothing changes on the wire.
 
 ## What the duplex must guarantee
 

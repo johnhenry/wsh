@@ -532,6 +532,8 @@ export interface WshServerOptions {
   sealSession?: false | 'offer' | 'require';
   /** #244: with `sealSession: 'require'`, how long after login the session may stay unsealed before the host closes it as `seal-timeout` (default 30000; 0 = no deadline). */
   sealTimeoutMs?: number;
+  /** #248: how long a connection may take, from the moment this host accepts it, to complete its login (Hello and Auth); at the deadline it is closed as `login-timeout` (default 60000; 0 = no deadline). */
+  loginTimeoutMs?: number;
   /** #240: called once per connection when its session has been sealed (after login): count and audit here, not in `auth`, with `sealSession: 'require'`. */
   onSealed?: (who: { username: string | null; fingerprint: string | null }) => void;
   /**

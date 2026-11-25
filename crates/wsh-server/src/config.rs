@@ -137,6 +137,11 @@ pub struct ServerSection {
     /// connection. Default 30; 0 = no deadline. No effect where sealing is not required.
     #[serde(default = "default_seal_timeout_secs")]
     pub seal_timeout_secs: u64,
+    /// Seconds a connection may take, from the moment the server accepts it, to complete its login
+    /// (wsh #248): the TLS and WebSocket handshakes, `Hello` and `Auth`. At the deadline the server
+    /// sends an `AuthFail` saying so and closes the connection. Default 60; 0 = no deadline.
+    #[serde(default = "default_login_timeout_secs")]
+    pub login_timeout_secs: u64,
 }
 
 /// The most operators `[relay] max_operators_per_peer` may allow one peer.
@@ -166,6 +171,7 @@ impl Default for ServerSection {
             require_channel_binding: false,
             seal_session: SealSession::Off,
             seal_timeout_secs: default_seal_timeout_secs(),
+            login_timeout_secs: default_login_timeout_secs(),
         }
     }
 }
@@ -564,6 +570,12 @@ fn default_idle_timeout() -> u64 {
 fn default_seal_timeout_secs() -> u64 {
     30
 }
+/// How long a connection may take to complete its login: twice the 30 s a login takes at the
+/// client's default of 10 s for each of its three steps, so a person confirming on the client
+/// (with its timeout raised to allow it) is not cut off.
+fn default_login_timeout_secs() -> u64 {
+    60
+}
 fn default_true() -> bool {
     true
 }
@@ -643,6 +655,8 @@ pub struct ServerConfig {
     pub seal_session: SealSession,
     /// See [`ServerSection::seal_timeout_secs`] (0 = no deadline).
     pub seal_timeout_secs: u64,
+    /// See [`ServerSection::login_timeout_secs`] (0 = no deadline).
+    pub login_timeout_secs: u64,
 }
 
 impl ServerConfig {
@@ -837,6 +851,7 @@ impl ServerConfig {
             require_channel_binding: file_config.server.require_channel_binding,
             seal_session: file_config.server.seal_session,
             seal_timeout_secs: file_config.server.seal_timeout_secs,
+            login_timeout_secs: file_config.server.login_timeout_secs,
         })
     }
 }
@@ -1127,6 +1142,27 @@ reverse_bind_addr = "0.0.0.0"
             let e = load_err(&format!("[server]\nseal_timeout_secs = {bad}\n"));
             assert!(
                 e.contains("seal_timeout_secs") || e.contains("invalid"),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_timeout_defaults_to_sixty_seconds_and_is_configurable() {
+        assert_eq!(load_defaults().login_timeout_secs, 60);
+        assert_eq!(load("").login_timeout_secs, 60);
+        let set = load("[server]\nlogin_timeout_secs = 5\n");
+        assert_eq!(set.login_timeout_secs, 5);
+        let off = load("[server]\nlogin_timeout_secs = 0\n");
+        assert_eq!(off.login_timeout_secs, 0, "0 turns the deadline off");
+    }
+
+    #[test]
+    fn login_timeout_must_be_a_whole_number_of_seconds() {
+        for bad in ["-1", "\"soon\"", "1.5"] {
+            let e = load_err(&format!("[server]\nlogin_timeout_secs = {bad}\n"));
+            assert!(
+                e.contains("login_timeout_secs") || e.contains("invalid"),
                 "{bad}: {e}"
             );
         }

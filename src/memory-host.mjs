@@ -30,7 +30,7 @@
 
 import { WshClient } from './client.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
-import { createConnectionFactory, DEFAULT_SEAL_TIMEOUT_MS, assertSealTimeoutMs } from './server/connection.mjs';
+import { createConnectionFactory, DEFAULT_SEAL_TIMEOUT_MS, assertSealTimeoutMs, DEFAULT_LOGIN_TIMEOUT_MS, assertLoginTimeoutMs } from './server/connection.mjs';
 import { resolveUsernamePattern } from './server/username.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
 import { assertEd25519HostKey } from './host-key.mjs';
@@ -137,6 +137,8 @@ function createRegistry(sessions, log) {
  *   `e2e-session-required`) serves nobody who has not sealed, and no password login. The keepalive stays plain.
  * @param {number} [options.sealTimeoutMs=30000] - #244: with `sealSession: 'require'`, how long after login the session may stay unsealed;
  *   then the host reports `seal-timeout` (`onRefused`), says so in an `Error` and closes the connection. 0 = no deadline.
+ * @param {number} [options.loginTimeoutMs=60000] - #248: how long a connection may take, from the moment this host accepts it, to complete its login
+ *   (Hello and Auth); then the host reports `login-timeout` (`onRefused`), says so in an `AuthFail` and closes the connection. 0 = no deadline.
  * @param {true | CryptoKeyPair | { publicKey: Uint8Array | CryptoKey, sign: Function }} [options.hostKey]
  *   This host's own identity, so clients can pin it (TOFU): a `CryptoKeyPair` (non-extractable is fine), a signer
  *   `{ publicKey, sign(data) }`, or `true` for a fresh non-extractable key.
@@ -182,7 +184,7 @@ function createRegistry(sessions, log) {
  *   from `@johnhenry/wsh/host`), what is known of `who`, and a human `detail` (not stable). Not for parsing `onLog`.
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onLog = () => {},
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, loginTimeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onLog = () => {},
   onShare, onRefused, onSealed, targets, requireTarget, usernamePattern } = {}) {
   if (onSealed !== undefined && typeof onSealed !== 'function') throw new TypeError('createMemoryHost: onSealed must be a function');
   resolveUsernamePattern(usernamePattern, 'createMemoryHost');
@@ -190,6 +192,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   validateOnRefused(onRefused, 'createMemoryHost');
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
   assertSealTimeoutMs(sealTimeoutMs, 'createMemoryHost');
+  assertLoginTimeoutMs(loginTimeoutMs, 'createMemoryHost');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
   }
@@ -222,7 +225,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({})), targetEndpoints: true };
 
   const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
-    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, log: onLog,
+    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, loginTimeoutMs, log: onLog,
     methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused, onSealed,
     targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
     gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,

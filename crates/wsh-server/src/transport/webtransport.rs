@@ -16,6 +16,8 @@ pub struct WebTransportConnection {
     pub connection: wtransport::Connection,
     /// Remote address.
     pub remote_addr: SocketAddr,
+    /// When the QUIC connection was accepted: the clock of the login deadline (wsh #248) starts here.
+    pub accepted_at: tokio::time::Instant,
 }
 
 /// Shared endpoint handle used to keep the listener alive.
@@ -48,6 +50,7 @@ pub async fn start_listener(
         loop {
             let incoming_session = listener_endpoint.accept().await;
             let tx = tx.clone();
+            let accepted_at = tokio::time::Instant::now();
             tokio::spawn(async move {
                 match incoming_session.await {
                     Ok(session_request) => {
@@ -64,6 +67,7 @@ pub async fn start_listener(
                                 let wt_conn = WebTransportConnection {
                                     connection,
                                     remote_addr: remote,
+                                    accepted_at,
                                 };
                                 if tx.send(wt_conn).await.is_err() {
                                     warn!("WebTransport connection channel closed");

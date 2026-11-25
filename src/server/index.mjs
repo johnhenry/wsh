@@ -15,7 +15,7 @@ import { buildBackends } from './backends.mjs';
 import { SessionRegistry } from './sessions.mjs';
 import { RelayHub } from './relay.mjs';
 import { startWebTransport } from './webtransport.mjs';
-import { createConnectionFactory, STREAM_ANNOUNCE, DEFAULT_SEAL_TIMEOUT_MS, assertSealTimeoutMs } from './connection.mjs';
+import { createConnectionFactory, STREAM_ANNOUNCE, DEFAULT_SEAL_TIMEOUT_MS, assertSealTimeoutMs, DEFAULT_LOGIN_TIMEOUT_MS, assertLoginTimeoutMs } from './connection.mjs';
 import { validateOnShare } from '../shares.mjs';
 import { validateOnRefused } from '../refusal.mjs';
 import { normalizeGateway, createGatewaySession } from './gateway.mjs';
@@ -105,6 +105,9 @@ function tlsChannelBinding(socket) {
  *   byte-stream connection with QMux data streams is not sealed.
  * @param {number} [options.sealTimeoutMs=30000] - #244: with `sealSession: 'require'`, how long after login the session may stay
  *   unsealed; then the host reports `seal-timeout` (`onRefused`), says so in an `Error` and closes the connection. 0 = no deadline.
+ * @param {number} [options.loginTimeoutMs=60000] - #248: how long a connection may take, from the moment this server accepts it (the WebSocket upgrade
+ *   has already completed), to complete its login (Hello and Auth); then the host reports `login-timeout` (`onRefused`), says so in an `AuthFail` and
+ *   closes the connection. 0 = no deadline.
  * @param {(who: { username: string | null, fingerprint: string | null }) => void} [options.onSealed] - #240: called once per connection when
  *   its session has been sealed (after login). With `sealSession: 'require'`, `auth` runs BEFORE the client says whether it will seal (the key
  *   exchange follows the login), and is told `who.sealRequired: true`; count and audit here, not in `auth`.
@@ -122,7 +125,7 @@ function tlsChannelBinding(socket) {
  * @returns {{ listen(): Promise<{address: string, port: number}>, accept(socket: object, options?: object): Promise<{ close(): void }>, close(): Promise<void>, address(): ({address: string, port: number} | null) }}
  */
 export function createWshServer({
-  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onSealed, onLog = () => {},
+  host = '127.0.0.1', port = 0, tls, auth, exec, pty, fs, hostKey, mcp, rpc, rpcMaxMessageBytes, rpcMaxInflight, sessions, sessionSecret, relay, extensions, gateway, webTransport, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, loginTimeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onSealed, onLog = () => {},
   onShare, onRefused, targets, requireTarget, usernamePattern,
 } = {}) {
   resolveUsernamePattern(usernamePattern, 'createWshServer');
@@ -136,6 +139,7 @@ export function createWshServer({
     throw new TypeError(`createWshServer: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
   }
   assertSealTimeoutMs(sealTimeoutMs, 'createWshServer');
+  assertLoginTimeoutMs(loginTimeoutMs, 'createWshServer');
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createWshServer: connectionTtlMs must be a non-negative number of milliseconds (0 = no limit)');
   let wss = null;
   let httpsServer = null;
@@ -185,7 +189,7 @@ export function createWshServer({
       if (relay) hub = new RelayHub({ ...relay, log: onLog });
       if (extensions !== undefined && (extensions === null || typeof extensions !== 'object')) throw new TypeError('createWshServer: extensions must be an object of handlers');
       return createConnectionFactory({
-        authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, log: onLog,
+        authorize, execRunner, execOptions, pty: ptyConfig, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, loginTimeoutMs, log: onLog,
         methods, hostKey: host_, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, gateway: gatewayCfg, createGatewaySession, sessions: registry, relay: hub,
         onShare, onRefused, onSealed, targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
       });

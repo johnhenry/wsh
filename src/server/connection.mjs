@@ -95,6 +95,19 @@ export function assertSealTimeoutMs(v, where) {
   if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new TypeError(`${where}: sealTimeoutMs must be a non-negative number of milliseconds (0 = no deadline)`);
 }
 
+/**
+ * How long a connection may take, from the moment a host accepts it, to complete its login -- Hello and Auth (#248): 60 s. The JS client gives
+ * each of the three steps (ServerHello, Challenge, AuthOk) 10 s by default, so a login on defaults is over within about 30 s whatever the link;
+ * 60 s leaves a person's confirmation on the client (`onHostKey`, a signer on a device) inside the deadline when the client's own `timeout` is
+ * raised to let it. The password a login sends is asked for before the connection is opened, not during it. The host had no bound at all before.
+ */
+export const DEFAULT_LOGIN_TIMEOUT_MS = 60_000;
+
+/** `loginTimeoutMs` must be a finite, non-negative number of milliseconds (0 = no deadline). */
+export function assertLoginTimeoutMs(v, where) {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new TypeError(`${where}: loginTimeoutMs must be a non-negative number of milliseconds (0 = no deadline)`);
+}
+
 const MAX_PENDING_WRITES = 8;
 const MAX_RENAME_PATH_BYTES = 4096;
 const WRITE_IDLE_MS = 30_000;
@@ -137,6 +150,8 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {number} [cfg.bindTimeoutMs=3000] - how long exec output waits for the data stream
  * @param {number} [cfg.sealTimeoutMs=30000] - with `sealSession: 'require'` (#244): how long after login the session may stay unsealed; at the deadline the
  *   connection is refused as `seal-timeout` and closed. 0 = no deadline. Nothing changes where sealing is not required.
+ * @param {number} [cfg.loginTimeoutMs=60000] - #248: how long a connection may take from `attach()` to a completed login (Hello and Auth); at the deadline it is
+ *   refused as `login-timeout` and closed. 0 = no deadline. A connection attached as `authenticated` has none.
  * @param {(line: string) => void} [cfg.log]
  */
 export function createConnectionFactory(cfg) {
@@ -147,11 +162,13 @@ export function createConnectionFactory(cfg) {
     methods: cfg.methods ?? { pubkey: true, password: null },
     bindTimeoutMs: cfg.bindTimeoutMs ?? 3000,
     sealTimeoutMs: cfg.sealTimeoutMs ?? DEFAULT_SEAL_TIMEOUT_MS,
+    loginTimeoutMs: cfg.loginTimeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS,
     log: cfg.log ?? (() => {}),
     usernamePattern: resolveUsernamePattern(cfg.usernamePattern, 'createConnectionFactory'),
   };
   validateOnRefused(cfg.onRefused, 'createConnectionFactory');
   assertSealTimeoutMs(cfg.sealTimeoutMs, 'createConnectionFactory');
+  assertLoginTimeoutMs(cfg.loginTimeoutMs, 'createConnectionFactory');
   const notifyRefused = refusalNotifier(cfg.onRefused, cfg.log);
   let counter = 0;
   // What a client may put in `Open.env` (#126): an allow-list unless the host says otherwise.
@@ -275,6 +292,10 @@ export function createConnectionFactory(cfg) {
     let ttlTimer = null;
     /** Ends a connection that must seal and has not, `sealTimeoutMs` after login (#244). */
     let sealTimer = null;
+    /** Ends a connection that has not completed its login `loginTimeoutMs` after it was attached (#248). */
+    let loginTimer = null;
+    /** Set when the login deadline has passed: nothing the peer sends after that is handled, and a login still in flight does not complete. */
+    let loginExpired = false;
 
     // A sealed session (#155): after login, a signed KeyExchange for this connection's session id seals everything
     // that follows (control messages, gateway and endpoint data included) as EncryptedFrames on channel 0.
@@ -289,6 +310,7 @@ export function createConnectionFactory(cfg) {
     const sealed = { bridge: null, responder: null };
     // A peer something else already authenticated (`authenticated`) has no login here to count from: its deadline runs from attach.
     if (authenticated) armSealDeadline();
+    else armLoginDeadline();
 
     // The gateway needs Node sockets, so `gateway.mjs` is not imported here (a browser host must not pull it in):
     // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`; a
@@ -368,6 +390,7 @@ export function createConnectionFactory(cfg) {
       liveConnections.delete(live);
       clearTimeout(ttlTimer);
       clearTimeout(sealTimer);
+      clearTimeout(loginTimer);
       // A hosted session survives its connection (it is detached, then expires or is resumed);
       // everything else dies with it.
       for (const ch of [...channels.values()]) (ch.detach ?? ch.kill)?.call(ch);
@@ -421,7 +444,7 @@ export function createConnectionFactory(cfg) {
     // ── Auth ──────────────────────────────────────────────────────────
 
     async function handle(m) {
-      if (state.closed) return;
+      if (state.closed || loginExpired) return;
       if (!state.authed) return handleAuth(m);
       if (sealOn) {
         const inner = await sealedInput(m);
@@ -511,6 +534,7 @@ export function createConnectionFactory(cfg) {
      * and released peers parse it, but nothing on this host accepts it back.
      */
     async function grantAuth() {
+      clearTimeout(loginTimer);
       armSealDeadline();
       const ttlMs = cfg.connectionTtlMs ?? 0;
       if (ttlMs > 0) {
@@ -543,6 +567,25 @@ export function createConnectionFactory(cfg) {
         setTimeout(() => { if (!sealed.bridge) shutdown('sealed session not established in time'); }, 50);
       }, cfg.sealTimeoutMs);
       sealTimer.unref?.();
+    }
+
+    /**
+     * Bounds the time from the connection being attached to a completed login (Hello and Auth) (#248): a peer that connects and never
+     * logs in, or stops half way, otherwise holds the connection (and, on a relay, its pipe) for as long as it likes. At the deadline the
+     * peer is told why (an `AuthFail`, as for any refused login), the embedder hears `login-timeout`, and the connection ends. A connection
+     * that completed its login, a closed one and `loginTimeoutMs: 0` never reach it.
+     */
+    function armLoginDeadline() {
+      if (!(cfg.loginTimeoutMs > 0) || loginTimer) return;
+      loginTimer = setTimeout(async () => {
+        if (state.closed || state.authed) return;
+        loginExpired = true;
+        log('login not completed in time');
+        reportRefused('login-timeout', `the login was not completed within ${cfg.loginTimeoutMs} ms of the connection`);
+        await deliverRaw(authFail({ reason: 'the login was not completed in time (login-timeout)' }));
+        setTimeout(() => shutdown('login not completed in time'), 50);
+      }, cfg.loginTimeoutMs);
+      loginTimer.unref?.();
     }
 
     async function refuse(reason, code = 'bad-request', who) {
@@ -647,6 +690,7 @@ export function createConnectionFactory(cfg) {
         for (const perms of [cfg.authorize.permissionsFor?.(fp) ?? null, grant]) {
           if (perms && checkKeyRequest(perms, { kind: 'login' })) return refuse('key has expired', 'key-expired', claimed);
         }
+        if (loginExpired) return; // the deadline passed while `authorize` was thinking: the peer has been told
         state.grant = grant;
         state.authed = true;
         state.fingerprint = fp;
@@ -719,6 +763,7 @@ export function createConnectionFactory(cfg) {
         return refuse('authentication failed', 'unauthorized');
       }
       rl.limiter.succeed(key);
+      if (loginExpired) return;
       state.authed = true;
       await grantAuth();
       log(`authenticated ${state.username} (password)`);
