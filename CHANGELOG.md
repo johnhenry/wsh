@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Callback return values, off unless the host opts in per entry (#219; JS)
+
+An allow-list entry that ends in `(callback:returns)` (every function the call takes may answer) or `(callback:returns=0,2)` (only the functions at those argument positions) makes the page's stub return a **promise** of what the far side's function returned. Entries that say `(callback)` are exactly what they were: one-way, `undefined` at once.
+
+- **The page never waits unboundedly.** The wait is bounded by the host: `limits.callbackReturnTimeoutMs` (default 2000, **at most 30000**, a larger value is a `TypeError` when the host is created), counted from the call. The promise **never rejects**; it is settled with `undefined` for a timeout, an error in the far side's function (its text stays there, in `onCallbackError`), a result that is not plain data or larger than `maxCallbackResultBytes` (16384), a call dropped by the rate or size bound, a table of `maxPendingCallbackReturns` (8, at most 64) waiting calls that is full (the call is dropped and not sent), a released callback, the end of the channel (Stop, a navigation and a revoke settle every waiting call at once and clear the timers) and a far side that did not say it can answer. `attach(...).callbackReturnStats()` counts them. A host needs `timers` for such an entry (`exposeObjects` and `createPageHost` supply them); without, it is a `TypeError`.
+- **Wire (all optional, negotiated):** the string `callback-returns` in the `features` of the `roots` answer (only when an entry says it); an optional `features` list in the `roots` request (a client lists `callback-returns` to say it answers); an optional `rid` in the `callback` notification (only to a client that said it answers); one new method, `callbackResult { rid, value? | error? }`, from the far side. Documented in `spec/objects.md` section 6.
+- **A released peer.** A 0.51.0 host ignores the `features` of the `roots` request, never has such an entry, and never sends a `rid`. A 0.51.0 client against a new host never listed `callback-returns`, so the host never asks it for an answer: the callback is delivered one-way and the page's promise resolves `undefined` at once (no wait). The `types` answer tells such an entry as `(callback)` so a 0.51.0 client's `rootDescription` still parses it. Rust peers do not have callbacks and ignore the feature string.
+- **README:** the Callbacks rule now says what the exception is, and the Security model says what it does not protect (a page that trusts the answer, a far side that makes the page wait up to the bound).
+
 ## 0.51.0 / Rust `rust-v0.18.0`
 
 Three JS features of #219 (events through a handle, typed remotes, an MCP face for allow-listed object paths) and the Rust `wsh-objects` client, in one release. The Rust client is the values, events and handles part of the protocol: **callbacks are not built in the Rust client, and events through a handle are a JS feature of this release that the Rust client does not have** (it neither writes the `handle` parameter of `subscribe` nor uses `types`; it ignores the `handle-events` and `types` strings a host states). Nothing else in the Rust crates changed besides the workspace version.

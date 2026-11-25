@@ -26,7 +26,7 @@ Every `params` is an object. A request names where it starts: `root: "window"` (
 
 | method | params | result |
 |---|---|---|
-| `roots` | `{}` | `{ roots: [name…], features: [string…] }` |
+| `roots` | `{ features?: [string…] }` | `{ roots: [name…], features: [string…] }` |
 | `resolve` | `{ root \| handle, ops: [op…] }` | a **wire value** (section 3) |
 | `set` | `{ root \| handle, path: [seg…], value }` | `{ ok: true }` |
 | `describe` | `{ root \| handle, path?: [seg…] }` | `{ type, keys: [{ key, type, own }…], truncated? }` |
@@ -35,9 +35,12 @@ Every `params` is an object. A request names where it starts: `root: "window"` (
 | `unsubscribe` | `{ id }` | `{ ok: true, dropped }` |
 | `release` | `{ handle }` | `{ ok: true }` |
 | `releaseCallback` | `{ id }` | `{ ok: true }` |
+| `callbackResult` | `{ rid, value? \| error?: true }` | `{ ok }` (peer to host, section 6) |
 
-`roots` lists only the roots the key may use (`objects:ROOT[:OP]`). `features` is what the host supports: `events`, `callbacks` and (when a root opted
-in) `handles`. A host that says nothing (before 0.48.0) supports none of them; a peer must not use a feature the host did not state.
+`roots` lists only the roots the key may use (`objects:ROOT[:OP]`). `features` is what the host supports: `events`, `callbacks`, `types`, `callback-returns`
+(only when an allow-list entry lets a callback return a value) and (when a root opted in) `handles` and `handle-events`. A host that says nothing (before 0.48.0)
+supports none of them; a peer must not use a feature the host did not state. A peer says what it can do in the optional `features` of its `roots` request:
+`callback-returns` means it answers a callback that asks for a return value (section 6). A host that predates the field ignores it.
 
 **`resolve`** walks a whole chain in one request. `ops` is up to 32 operations, each an object with exactly one of:
 
@@ -125,6 +128,18 @@ copies its arguments as plain data, queues a `callback` notification and returns
 queue is full are dropped and counted (`dropped`, told with the next delivered call). There are at most 16 callbacks per channel
 (`maxCallbacks`). `releaseCallback` kills a stub. `features` has `callbacks`.
 
+**Return values (optional, off unless the host says so).** The allow-list entry is `(callback)` for a one-way stub, `(callback:returns)` when every function it takes
+may return a value, `(callback:returns=I,J)` for the functions at those argument positions only (0 to 99). Such a stub returns a promise to the page's code, never
+blocks, and the host settles it at the latest `callbackReturnTimeoutMs` (default 2000, at most 30000) after the call: with the value, or with `undefined` in every
+other case (timeout, an error in the peer's function, a value that is not plain data or is over `maxCallbackResultBytes` (16384), a call dropped by the rate or size
+bound, a full table of waiting calls (`maxPendingCallbackReturns`, default 8, at most 64: such a call is not sent), a released callback, the end of the channel).
+A host asks only a peer that listed `callback-returns` in its `roots` request, and says it supports this in `features` (`callback-returns`). The `callback`
+notification then has one more field, `rid` (a whole number from 1, per channel): `callback { id, seq, args, dropped?, rid? }`. The peer answers once with the request
+`callbackResult { rid, value }` (`value` plain data, left out for `undefined`) or `callbackResult { rid, error: true }` (an error, a function, a handle, anything that
+is not plain data: the text of an error is never sent), result `{ ok: true }`, or `{ ok: false }` for a `rid` nobody waits for (late, unknown or already answered);
+the host counts such an answer against `maxRequestsPerSecond` and ignores it. A peer that does not answer costs the page the timeout, once per call; a host never has
+more than `maxPendingCallbackReturns` calls waiting. In the `types` answer the entry is told as `(callback)`.
+
 ## 7. Notifications (host to peer)
 
 - `event { id, seq, data, dropped? }`: `id` is the subscription's, `seq` counts the delivered events of that subscription from 1. `data` is plain: for
@@ -172,5 +187,7 @@ The key's capability is asked again for every operation (an expiry holds at call
 
 - JavaScript (`@johnhenry/wsh` 0.46.0 to 0.50.0): the reference described above. 0.46.0 and 0.47.0 hosts have no `features` in `roots`, no events, handles or
   callbacks; a peer sees an empty `features`.
+- `callback-returns` (callback return values): a 0.51.0 client against a host that states it is never asked for an answer (it did not list the feature), so the page gets
+  `undefined` at once and the callback is delivered one-way; a 0.51.0 host ignores the `features` of a `roots` request. The Rust client has no callbacks.
 - Rust `wsh-server`: serves no `wsh-objects` channel and no page host, and refuses a key line with an `objects:` capability (an unknown capability
   fails closed). Rust released before the `wsh_client::objects` client (`rust-v0.17.1` and earlier) has no objects client at all.

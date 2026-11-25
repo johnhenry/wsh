@@ -74,6 +74,15 @@ export const OBJECTS_DEFAULT_LIMITS = Object.freeze({
   maxCallbacksPerSecond: 20,
   /** Bytes of the arguments of one callback call; a bigger one is dropped and counted. */
   maxCallbackBytes: 16 * 1024,
+  /**
+   * Callbacks whose entry says `(callback:returns)`: the longest the page's stub waits for the far side's answer, from the call (queueing included). After it the
+   * promise the stub returned is settled with `undefined`. At most 30000.
+   */
+  callbackReturnTimeoutMs: 2000,
+  /** Calls of returning callbacks waiting for an answer, per channel; a call beyond it is dropped and counted, never sent. At most 64. */
+  maxPendingCallbackReturns: 8,
+  /** Bytes of the value a far-side callback answers with; a bigger one (or one that is not plain data) becomes `undefined` for the page and is counted. */
+  maxCallbackResultBytes: 16 * 1024,
   /** Event subscriptions per channel. */
   maxSubscriptions: 16,
   /** Events delivered per second, per subscription; the rest are dropped and counted. */
@@ -104,6 +113,10 @@ export const NEEDS_LISTING = Object.freeze([
 
 const KEY_MAX = 256;
 const CALLBACK_SUFFIX = '(callback)';
+/** The ceilings of the bounds a host may set for callbacks that return a value: the page's wait is bounded whatever the host asks for. */
+const RETURN_CEILINGS = Object.freeze({ callbackReturnTimeoutMs: 30_000, maxPendingCallbackReturns: 64 });
+/** The end of a call entry that accepts callbacks: `(callback)` one-way, `(callback:returns)` every function may answer, `(callback:returns=0,2)` the functions at those argument positions may. */
+const CALLBACK_NOTATION = /\(callback(?::returns(?:=(\d{1,2}(?:,\d{1,2})*))?)?\)$/;
 const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 /** On a root with handles: members that lead from a node back up to the document or window graph. Refused until an allow-list entry names them, nodes opt-in or not. */
 const GRAPH_MEMBERS = Object.freeze(['ownerDocument', 'defaultView', 'parentNode', 'parentElement', 'getRootNode', 'contentWindow', 'contentDocument', 'self', 'window', 'top', 'parent', 'frames', 'opener', 'globalThis']);
@@ -125,15 +138,19 @@ function compileList(list, kind) {
   return list.map((original) => {
     if (typeof original !== 'string' || original === '') throw new TypeError(`exposeObjects: allow.${kind} entries must be non-empty strings`);
     // A call entry that ends in `(callback)` says the call accepts functions as arguments (they arrive as stubs the page can call, one-way).
+    // `(callback:returns)` (every function it takes may answer) and `(callback:returns=0,2)` (the functions at those argument positions) also let the stub return the far side's value.
     let entry = original;
     let callbacks = false;
-    if (entry.endsWith(CALLBACK_SUFFIX)) {
+    let returns = null;
+    const notation = CALLBACK_NOTATION.exec(entry);
+    if (notation) {
       if (kind !== 'call') throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(original)}: only a call entry can accept callbacks`);
-      entry = entry.slice(0, -CALLBACK_SUFFIX.length);
+      entry = entry.slice(0, notation.index);
       callbacks = true;
+      if (notation[0] !== CALLBACK_SUFFIX) returns = notation[1] === undefined ? true : new Set(notation[1].split(',').map(Number));
     }
-    if (entry.includes(CALLBACK_SUFFIX)) throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(original)}: "(callback)" ends an entry`);
-    const segs = Object.assign(entry.split('.'), { callbacks });
+    if (entry.includes('(callback')) throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(original)}: "(callback)", "(callback:returns)" or "(callback:returns=N,M)" ends an entry`);
+    const segs = Object.assign(entry.split('.'), { callbacks, returns });
     for (const s of segs) {
       if (s === '') throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(entry)} has an empty segment`);
       if (ALWAYS_REFUSED.has(s)) throw new TypeError(`exposeObjects: allow.${kind} entry ${JSON.stringify(entry)} names "${s}", which is never reachable`);
@@ -405,6 +422,7 @@ export function createObjectsServer(options = {}) {
   for (const [k, v] of Object.entries(limitOptions)) {
     if (!(k in OBJECTS_DEFAULT_LIMITS)) throw new TypeError(`exposeObjects: unknown limit ${JSON.stringify(k)} (${Object.keys(OBJECTS_DEFAULT_LIMITS).join(', ')})`);
     if (!Number.isSafeInteger(v) || v < 1) throw new TypeError(`exposeObjects: limits.${k} must be a positive integer`);
+    if (k in RETURN_CEILINGS && v > RETURN_CEILINGS[k]) throw new TypeError(`exposeObjects: limits.${k} is at most ${RETURN_CEILINGS[k]}: the page's wait for a callback's answer is bounded whatever the host asks for`);
     limits[k] = v;
   }
   // `on` entries are `path@type` (`'window.app.bus@ready'`): the source and the event type, both named exactly (no wildcard in either); each is compiled as a path with its type attached.
@@ -424,6 +442,9 @@ export function createObjectsServer(options = {}) {
   };
   const lists = { get: compileList(allow.get, 'get'), call: compileList(allow.call, 'call'), set: compileList(allow.set, 'set'), on: compileOn(allow.on) };
   const every = [...lists.get, ...lists.call, ...lists.set, ...lists.on];
+  // A callback that returns a value makes the page wait for the far side, so it needs a clock to cut the wait: this module reaches for no global.
+  const anyReturns = lists.call.some((p) => p.returns);
+  if (anyReturns && !timers) throw new TypeError('exposeObjects: an entry that says (callback:returns) needs timers ({ setTimeout, clearTimeout }): the page\'s wait for the far side\'s answer is bounded by a timer');
   // With handles, a wildcard in `call` or `set` lets a caller hold and reuse every object under it: the root says so (`wideEntries: true`) or lists the paths.
   for (const [name, mode] of handleRoots) {
     if (mode.wideEntries) continue;
@@ -564,7 +585,7 @@ export function createObjectsServer(options = {}) {
       const clean = fromWire(args, limits);
       const made = [];
       try {
-        for (const [index, id] of spec) { const had = ctx.session.callbacks.has(id); const stub = makeCallback(ctx.session, id); if (!had) made.push(id); clean[index] = stub; }
+        for (const [index, id] of spec) { const had = ctx.session.callbacks.has(id); const stub = makeCallback(ctx.session, id, returnsAt(next, index)); if (!had) made.push(id); clean[index] = stub; }
       } catch (e) { for (const id of made) killCallback(ctx.session, id); throw e; }
       if (kind === 'call' && isTimerCallee(key) && typeof clean[0] === 'string') throw refuse('always-refused', `refused: ${key} with a string would evaluate it`);
       let fn;
@@ -778,10 +799,10 @@ export function createObjectsServer(options = {}) {
     session.pumping = true;
     try {
       while (session.queue.length && !session.closed) {
-        const { sub, cb, data, dropped } = session.queue.shift();
-        const message = cb ? { id: cb.id, seq: ++cb.seq, args: data, ...(dropped ? { dropped } : {}) } : { id: sub.id, seq: ++sub.seq, data, ...(dropped ? { dropped } : {}) };
+        const { sub, cb, data, dropped, rid } = session.queue.shift();
+        const message = cb ? { id: cb.id, seq: ++cb.seq, args: data, ...(dropped ? { dropped } : {}), ...(rid ? { rid } : {}) } : { id: sub.id, seq: ++sub.seq, data, ...(dropped ? { dropped } : {}) };
         // The write waits for the transport (credit): events and callback calls behind it queue, to `maxQueuedEvents`, and beyond that are dropped and counted.
-        try { await session.peer.notify(cb ? 'callback' : 'event', message); } catch { /* the channel is going away */ }
+        try { await session.peer.notify(cb ? 'callback' : 'event', message); } catch { if (rid) finishReturn(session, rid, undefined, 'failed'); /* the channel is going away */ }
       }
     } finally { session.pumping = false; }
   }
@@ -791,14 +812,35 @@ export function createObjectsServer(options = {}) {
   // values (what cannot be cloned is null; never a handle), bounds them, queues a notification through the channel's credit, and returns undefined at once, so
   // the page cannot be made to wait for the far side and learns nothing of it. After the channel ends, or after a release, a call is a no-op that is counted.
 
-  function makeCallback(session, id) {
-    // The same function sent again (an id the channel already has) is the same stub.
+  //
+  // `(callback:returns)` (or `=N,M`, per argument position) is the one exception, and only where the host wrote it: the stub then returns a PROMISE, never a block. It is
+  // settled with the far side's return value if that arrives within `callbackReturnTimeoutMs` (counted from the call; 2 s, at most 30 s), as plain data within
+  // `maxCallbackResultBytes`, and with `undefined` in every other case: a timeout, an error on the far side (its text stays there), a result that is too big or is not plain
+  // data, a full table (`maxPendingCallbackReturns`), a call dropped by the rate or size bound, a dead channel, a released callback, and a far side that did not say it can
+  // answer (an older client): the page never waits on a peer that cannot answer. The answer comes as a `callbackResult` request for a request id the host gave, once.
+
+  /** Does an entry that matches `segs` let the function at argument `index` answer? (Any matching entry that says so: the allow-list is a union, as everywhere.) */
+  function returnsAt(segs, index) {
+    return lists.call.some((p) => p.callbacks && p.returns && matchPath(p, segs) && (p.returns === true || p.returns.has(index)));
+  }
+
+  function makeCallback(session, id, returns = false) {
+    // The same function sent again (an id the channel already has) is the same stub. A returning stub that is also sent to an entry that says only (callback) stops returning.
     const existing = session.callbacks.get(id);
-    if (existing) return existing.stub;
+    if (existing) { if (!returns) existing.returns = false; return existing.stub; }
     if (session.callbacks.size >= limits.maxCallbacks) throw limitError('maxCallbacks', limits.maxCallbacks, 'too many callbacks on this channel: release some');
-    const cb = { id, seq: 0, stamps: [], dropped: 0, dead: false, stub: null };
+    const cb = { id, seq: 0, stamps: [], dropped: 0, dead: false, stub: null, returns };
     cb.stub = function callback(...args) {
-      try { deliverCallback(session, cb, args); } catch { cb.dropped++; }
+      if (!cb.returns) {
+        try { deliverCallback(session, cb, args, null); } catch { cb.dropped++; }
+        return undefined;
+      }
+      // Always a promise, settled at the latest `callbackReturnTimeoutMs` after this call, whatever the far side does.
+      return new Promise((resolve) => {
+        let waiting = false;
+        try { waiting = deliverCallback(session, cb, args, resolve); } catch { cb.dropped++; session.returnStats.dropped++; }
+        if (!waiting) resolve(undefined);
+      });
     };
     session.callbacks.set(id, cb);
     return cb.stub;
@@ -806,25 +848,57 @@ export function createObjectsServer(options = {}) {
 
   function killCallback(session, id) {
     const cb = session.callbacks.get(id);
-    if (cb) { cb.dead = true; session.callbacks.delete(id); }
+    if (cb) {
+      cb.dead = true;
+      session.callbacks.delete(id);
+      for (const [rid, p] of [...session.pendingReturns]) if (p.cb === cb) finishReturn(session, rid, undefined, 'failed');
+    }
     return !!cb;
   }
 
-  function deliverCallback(session, cb, args) {
-    if (session.closed || cb.dead || guard?.()) { session.deadCalls++; return; }
+  /** Settle one waiting call (once) with `value`, and take its timer away. `outcome` is the counter it adds to. Returns whether anything was waiting. */
+  function finishReturn(session, rid, value, outcome) {
+    const p = session.pendingReturns.get(rid);
+    if (!p) return false;
+    session.pendingReturns.delete(rid);
+    if (p.timer !== null) timers?.clearTimeout(p.timer);
+    session.returnStats[outcome]++;
+    p.resolve(value);
+    return true;
+  }
+
+  /** The channel ended: nobody can answer any more. */
+  function finishAllReturns(session) {
+    for (const rid of [...session.pendingReturns.keys()]) finishReturn(session, rid, undefined, 'failed');
+  }
+
+  /** Returns whether a call is now waiting for an answer (then `resolve` is called later, by `finishReturn`); else the caller resolves `undefined` at once. */
+  function deliverCallback(session, cb, args, resolve) {
+    if (session.closed || cb.dead || guard?.()) { session.deadCalls++; return false; }
     const t = now();
     while (cb.stamps.length && t - cb.stamps[0] >= 1000) cb.stamps.shift();
+    const dropOne = () => { cb.dropped++; if (resolve) session.returnStats.dropped++; return false; };
     // Rate and room first, copy after: a dropped call costs a counter.
-    if (cb.stamps.length >= limits.maxCallbacksPerSecond || session.queue.length >= limits.maxQueuedEvents) { cb.dropped++; return; }
+    if (cb.stamps.length >= limits.maxCallbacksPerSecond || session.queue.length >= limits.maxQueuedEvents) return dropOne();
+    // A call that would have to wait but has no room to: dropped, not sent (a far side cannot make the table grow).
+    const answerable = resolve !== null && session.clientReturns;
+    if (answerable && session.pendingReturns.size >= limits.maxPendingCallbackReturns) return dropOne();
     let copy;
     try {
       copy = args.slice(0, limits.maxArgs).map((a) => { const w = toWire(a, { maxDepth: 4, maxBytes: limits.maxCallbackBytes }); return 'v' in w ? w.v : null; });
       toWire(copy, { maxDepth: 6, maxBytes: limits.maxCallbackBytes });
-    } catch { cb.dropped++; return; }
+    } catch { return dropOne(); }
     cb.stamps.push(t);
-    session.queue.push({ cb, data: copy, dropped: cb.dropped });
+    let rid;
+    if (answerable) {
+      rid = session.nextRid++;
+      const timer = timers.setTimeout(() => { finishReturn(session, rid, undefined, 'timedOut'); }, limits.callbackReturnTimeoutMs);
+      session.pendingReturns.set(rid, { cb, resolve, timer });
+    }
+    session.queue.push({ cb, data: copy, dropped: cb.dropped, ...(rid ? { rid } : {}) });
     cb.dropped = 0;
     void pump(session);
+    return rid !== undefined;
   }
 
   async function releaseCallback(params, ctx) {
@@ -910,7 +984,11 @@ export function createObjectsServer(options = {}) {
   function attach(peer, { who } = {}) {
     if (typeof peer?.onRequest !== 'function') throw new TypeError('attach: the peer needs onRequest(method, handler)');
     const defaultWho = callerIdentity(who);
-    const session = { peer, subs: new Map(), queue: [], pumping: false, closed: false, handles: new Map(), callbacks: new Map(), deadCalls: 0 };
+    const session = {
+      peer, subs: new Map(), queue: [], pumping: false, closed: false, handles: new Map(), callbacks: new Map(), deadCalls: 0,
+      // Callbacks that return a value: the calls waiting for an answer by request id, whether the far side said it answers, and what became of the calls.
+      pendingReturns: new Map(), nextRid: 1, clientReturns: false, returnStats: { answered: 0, timedOut: 0, failed: 0, refused: 0, dropped: 0 },
+    };
     // The end of the channel (the peer left, Stop, a navigation, a revoke) takes every listener out of the page's sources.
     const prior = peer.onClose;
     peer.onClose = (reason) => {
@@ -921,14 +999,29 @@ export function createObjectsServer(options = {}) {
       session.handles.clear(); // the end of the channel (leaving, Stop, navigation, revoke) releases every handle
       for (const cb of session.callbacks.values()) cb.dead = true; // and kills every callback stub
       session.callbacks.clear();
+      finishAllReturns(session); // a page that is waiting for a far side that has gone is told `undefined` now, and its timers go
       try { prior?.(reason); } catch { /* ignore */ }
     };
     const stamps = [];
-    const method = (name, fn) => peer.onRequest(name, async (params, ctx = {}) => {
+    const spendRequest = () => {
       const t = now();
       while (stamps.length && t - stamps[0] >= 1000) stamps.shift();
       if (stamps.length >= limits.maxRequestsPerSecond) throw limitError('maxRequestsPerSecond', limits.maxRequestsPerSecond, 'too many requests in a second');
       stamps.push(t);
+    };
+    // The far side's answer to a callback that returns a value. It completes a call the host is already waiting on (by a request id this channel gave, once), so it
+    // takes nothing from the request rate; an answer nobody waits for does, and is the only way to spend it with no effect.
+    peer.onRequest('callbackResult', async (params) => {
+      if (params === null || typeof params !== 'object' || Array.isArray(params) || !Number.isSafeInteger(params.rid) || params.rid < 1) throw invalid('callbackResult needs { rid }');
+      if (!session.pendingReturns.has(params.rid)) { spendRequest(); return { ok: false }; }
+      if (params.error === true) { finishReturn(session, params.rid, undefined, 'failed'); return { ok: true }; }
+      let value;
+      try { value = params.value === undefined ? undefined : fromWire(params.value, { maxDepth: 4, maxBytes: limits.maxCallbackResultBytes }); } catch { finishReturn(session, params.rid, undefined, 'refused'); return { ok: true }; }
+      finishReturn(session, params.rid, value, 'answered');
+      return { ok: true };
+    });
+    const method = (name, fn) => peer.onRequest(name, async (params, ctx = {}) => {
+      spendRequest();
       // A value is kept under what the transport carries in one message, with room for the envelope.
       const maxBytes = Math.min(limits.maxValueBytes, Math.max(1024, (peer.maxMessageBytes ?? Infinity) - 4096));
       const call = { ...ctx, signal: ctx.signal, who: ctx.who === undefined || ctx.who === null ? defaultWho : callerIdentity(ctx.who), maxBytes, session };
@@ -937,10 +1030,14 @@ export function createObjectsServer(options = {}) {
     });
     // A key that may use only some roots is told of those only.
     // The host also says what it supports (additive: an older client ignores it), so a client does not send a function to a host that would drop it, nor misread a handle.
-    method('roots', async (_params, call) => ({
-      roots: rootNames.filter((name) => keyMay(call, name, 'walk')),
-      features: ['events', 'callbacks', 'types', ...(handleRoots.size ? ['handles', 'handle-events'] : [])],
-    }));
+    // A client that answers a callback says so here (`features: ['callback-returns']`): an older one does not, and a returning stub then never waits for it.
+    method('roots', async (params, call) => {
+      session.clientReturns = anyReturns && Array.isArray(params.features) && params.features.includes('callback-returns');
+      return {
+        roots: rootNames.filter((name) => keyMay(call, name, 'walk')),
+        features: ['events', 'callbacks', ...(anyReturns ? ['callback-returns'] : []), 'types', ...(handleRoots.size ? ['handles', 'handle-events'] : [])],
+      };
+    });
     // What this key may do on one root, as data a far side turns into a `.d.ts` (`describeRootTypes`): the allow-list entries of that root for the operations the key's
     // capabilities grant, the host's type map for them, the event fields of the types it may subscribe to. Nothing of another root, and nothing that is not allowed.
     method('types', async (params, call) => {
@@ -948,7 +1045,9 @@ export function createObjectsServer(options = {}) {
       permitted(call, root, 'walk');
       const ops = ['get', 'call', 'set', 'on'].filter((op) => keyMay(call, root, op));
       const mine = (list) => (Array.isArray(list) ? list : []).filter((entry) => { const first = String(entry).split(/[.@]/, 1)[0]; return first === root || first === '*' || first === '**'; });
-      const lists = Object.fromEntries(['get', 'call', 'set', 'on'].map((op) => [op, ops.includes(op) ? mine(allowStrings[op]) : []]));
+      // An entry that lets a callback return is told as `(callback)`: a client that predates the notation parses only that, and the types do not describe a return.
+      const told = (op, entry) => (op === 'call' ? String(entry).replace(CALLBACK_NOTATION, '(callback)') : entry);
+      const lists = Object.fromEntries(['get', 'call', 'set', 'on'].map((op) => [op, ops.includes(op) ? mine(allowStrings[op]).map((e) => told(op, e)) : []]));
       const typeMap = narrowTypes({ root, ops, allow: allowStrings, types: typesByRoot.get(root) ?? {} });
       const offered = new Set(lists.on.map((entry) => entry.slice(entry.indexOf('@') + 1)));
       const fields = Object.fromEntries(Object.entries(eventFields).filter(([type]) => type === '*' ? offered.size > 0 : offered.has(type)));
@@ -965,7 +1064,11 @@ export function createObjectsServer(options = {}) {
     method('unsubscribe', unsubscribe);
     method('release', releaseHandle);
     method('releaseCallback', releaseCallback);
-    return { limits, handleCount: () => session.handles.size, callbackCount: () => session.callbacks.size, deadCallbackCalls: () => session.deadCalls };
+    return {
+      limits, handleCount: () => session.handles.size, callbackCount: () => session.callbacks.size, deadCallbackCalls: () => session.deadCalls,
+      /** What became of the calls of callbacks that return a value: `pending` now, and since the channel began `answered`, `timedOut`, `failed` (the far side's error, a write that failed, the channel ending, a release), `refused` (too big or not plain data) and `dropped` (the rate, the size, a full table). */
+      callbackReturnStats: () => ({ pending: session.pendingReturns.size, ...session.returnStats }),
+    };
   }
 
   /**
@@ -1319,6 +1422,30 @@ export async function describe(ref, { signal } = {}) {
 }
 
 /**
+ * Answer a host that asked for a callback's return value: plain data within the bound, or an error mark (the text of an error never travels). Never throws: the host bounds
+ * its own wait, so an answer that cannot be sent costs the page `undefined`, nothing more.
+ */
+async function answerCallback(session, rid, threw, out, onCallbackError) {
+  let body;
+  try {
+    if (threw) body = { rid, error: true };
+    else {
+      const value = await out;
+      if (value === undefined) body = { rid };
+      else if (typeof value === 'function' || value instanceof RemoteHandle) body = { rid, error: true };
+      else {
+        const w = toWire(value, { maxDepth: 4, maxBytes: OBJECTS_DEFAULT_LIMITS.maxValueBytes });
+        body = 'v' in w ? { rid, value: w.v } : { rid, error: true };
+      }
+    }
+  } catch (e) {
+    try { onCallbackError?.(e); } catch { /* ours */ }
+    body = { rid, error: true };
+  }
+  try { await session.peer.request('callbackResult', body); } catch { /* the channel is going away, or the host gave up */ }
+}
+
+/**
  * The client half over any peer: asks for the roots and returns them as lazy references, `{ window }`.
  * @param {object} peer
  * @param {{ timeoutMs?: number }} [options]
@@ -1332,7 +1459,10 @@ export async function createObjectsClient(peer, { timeoutMs, onCallbackError, on
     const fn = session.callbacks.get(params?.id);
     if (!fn || !Array.isArray(params.args)) return;
     if (Number.isSafeInteger(params.dropped) && params.dropped > 0) { try { onCallbackDropped?.({ dropped: params.dropped, fn }); } catch { /* ours */ } }
-    try { fn(...params.args); } catch (e) { try { onCallbackError?.(e); } catch { /* ours */ } }
+    let out; let threw = false;
+    try { out = fn(...params.args); } catch (e) { threw = true; try { onCallbackError?.(e); } catch { /* ours */ } }
+    // The host asked for the return value (`rid`: only a host whose entry says (callback:returns), and only because the roots request below said this side answers).
+    if (Number.isSafeInteger(params.rid) && params.rid >= 1) void answerCallback(session, params.rid, threw, out, onCallbackError);
   });
   // An event the host delivers: to the listener that asked, in this process. A listener that throws is this side's business and goes to its `onError`: it never travels back.
   peer.onNotification?.('event', (params) => {
@@ -1345,7 +1475,8 @@ export async function createObjectsClient(peer, { timeoutMs, onCallbackError, on
   peer.onNotification?.('closing', (params) => { session.closing = typeof params?.reason === 'string' ? clip(params.reason, TEXT_MAX) : 'closing'; });
   let roots;
   try {
-    const answer = await peer.request('roots', {});
+    // This side answers a callback's return value when a host asks for it: a host that predates the notation ignores the field, and one that has no such entry never asks.
+    const answer = await peer.request('roots', { features: ['callback-returns'] });
     roots = answer?.roots;
     // What the host says it supports; a host that says nothing (before 0.48.0) supports none of the three.
     session.features = Array.isArray(answer?.features) ? answer.features.filter((f) => typeof f === 'string') : [];
