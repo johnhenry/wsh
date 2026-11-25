@@ -27,7 +27,19 @@ export interface PipeRelayOptions {
   earlyBytes?: number;
   /** Outgoing buffer size past which the sender is paused (default 1 MiB). */
   highWaterBytes?: number;
-  /** Optional gate before a half may wait or pair; default: anyone holding a well-formed id. */
+  /**
+   * Make a rendezvous id single-use (#240): once its pipe has paired, the id is remembered and any later arrival with it, in either role,
+   * is refused with 1008 `PIPE_CLOSE_REASONS.idRetired`, while the pipe lives and after it ended. Default `false`: an id can be used again
+   * after its pipe paired (a page host that redials the same id relies on that). An id that never paired (a half that timed out or left) is
+   * not retired. The memory this takes is bounded by `maxRetired`.
+   */
+  retirePaired?: boolean;
+  /**
+   * With `retirePaired`: the most retired ids remembered (default 10000, a positive integer; about a megabyte). When it is full the OLDEST is
+   * forgotten, and that id can be used again. Ignored when `retirePaired` is off.
+   */
+  maxRetired?: number;
+  /** Optional gate before a half may wait or pair; default: anyone holding a well-formed id. `authorize` runs before the retired check. */
   authorize?: (who: { id: string; role: 'host' | 'operator'; remote?: object }) => boolean | Promise<boolean>;
   onLog?: (line: string) => void;
 }
@@ -42,9 +54,34 @@ export interface PipeRelay {
    */
   listen(options?: { host?: string; port?: number; path?: string; tls?: object }): Promise<{ port: number; address: string; close(): Promise<void> }>;
   close(): Promise<void>;
-  stats(): { waiting: number; pipes: number };
+  /** `retired`: the ids `retirePaired` remembers right now (0 when it is off). */
+  stats(): { waiting: number; pipes: number; retired: number };
   newRendezvousId(): string;
 }
+
+/**
+ * The close reason texts a relay sends (#240), a stable list: new texts may be added, none is renamed. Each limit closes BOTH halves of a
+ * pipe with the same code and the same text; `peerClosed` is the one text that means the partner's own socket went away.
+ */
+export const PIPE_CLOSE_REASONS: Readonly<{
+  peerClosed: 'peer closed';
+  noPartner: 'no partner arrived';
+  idle: 'idle';
+  lifetime: 'maximum lifetime reached';
+  byteLimit: 'byte limit reached';
+  messageTooLarge: 'message too large';
+  binaryOnly: 'binary messages only';
+  earlyOverflow: 'too much before the partner arrived';
+  receiverTooSlow: 'receiver too slow';
+  sendFailed: 'send failed';
+  shuttingDown: 'relay is shutting down';
+  badId: 'bad rendezvous id';
+  badRole: 'bad role';
+  notPermitted: 'not permitted';
+  idInUse: 'rendezvous id in use';
+  idRetired: 'rendezvous id already used';
+  tooManyWaiting: 'too many waiting connections';
+}>;
 
 export function createPipeRelay(options?: PipeRelayOptions): PipeRelay;
 /** A fresh 128-bit rendezvous id, base64url. */

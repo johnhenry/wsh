@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Pipe relay: single-use ids (`retirePaired`) and a reason on every limit (#240; JS)
+
+- **`createPipeRelay({ retirePaired: true, maxRetired })`, off by default.** Once a host and an operator have paired on an id, a later arrival with it (either role, while the pipe lives or after it ended) is refused with 1008 `rendezvous id already used`. **The default stays as it was** (an id is forgotten when its pipe pairs): the README documents reuse (a second operator after the first left) and `createPageHost` redials the id it has by default, so retiring by default would break both. **The bound:** at most `maxRetired` ids (default 10000, a positive integer); when full the oldest is forgotten and can be used again. `relay.stats()` gains `retired`. An id that never paired is not retired; `authorize` runs before the check. Not shared between relay processes, not kept across a restart.
+- **A limit closes the partner with its reason.** Idle, lifetime, byte limit, message size, text frame, slow receiver and shutdown already closed both halves with the same code and text; an oversize message on `listen()` (caught by the WebSocket server first) told the partner `peer closed`, which read as the other person leaving. It now closes the partner with 1009 `message too large`. `peer closed` now means only that the partner's socket closed (a partner that closes with 1009 of its own is still `peer closed`). The texts are a stable list: `PIPE_CLOSE_REASONS` (exported, typed, tabulated in the README); close codes unchanged.
+- **Compatibility.** Nothing new on the wire; every option is optional. A released client or host (JS 0.45.0 and later, Rust `rust-v0.16.0`) sees ordinary close frames, with a more accurate reason in the one case above. A relay without these options keeps its behaviour exactly.
+
 ## 0.52.0 / Rust `rust-v0.19.0`
 
 ### Rust client reads every GatewayFail code (Rust)

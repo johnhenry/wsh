@@ -38,7 +38,7 @@ describe('createInProcessPipeRelay', () => {
     const { env, client, connect } = await pipeWorld();
     await connect();
     assert.equal(client.state, 'authenticated');
-    assert.deepEqual(env.stats(), { waiting: 0, pipes: 1 });
+    assert.deepEqual(env.stats(), { waiting: 0, pipes: 1, retired: 0 });
     assert.ok(env.recorded.length > 0);
     assert.deepEqual([...new Set(env.recorded.map((r) => r.to))].sort(), ['host', 'operator']);
     for (const r of env.recorded) { assert.ok(r.bytes instanceof Uint8Array); assert.match(r.id, /^[A-Za-z0-9_-]{22}$/); }
