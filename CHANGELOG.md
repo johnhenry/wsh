@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Docs: how wsh and browsermesh fit together (`spec/wsh-and-browsermesh.md`)
+
+- A page that says what each project is for, which published browsermesh packages build on wsh (objects, mcp, transport's `/wsh` subpath, netway's gateway backend, the relaying pod, apps' `createMeshNode({ wsh })`) and which wsh entry points and exports they import, the one capability notation and its shared vectors, converting a wsh key and a pod id (both directions, never automatic), the `GatewayFail` table both share, which versions go together (wsh 0.52.0 with apps 0.22.0, transport 0.12.0, primitives 0.7.0, netway 0.3.0, objects 0.1.2, mcp 0.2.1), and what is not verified. Linked from the README's "wsh and browsermesh" section; the counterpart is browsermesh's `docs/wsh-and-browsermesh.md`. No code, wire or default changes.
+
 ### Hosts: a host key that is not Ed25519 is refused at creation; `auth` and `sealSession: 'require'` (#240; JS)
 
 - **`hostKey` of another algorithm fails at creation.** `createMemoryHost` and `createWshServer` (synchronously), `createPageHost` (its promise rejects, before any relay is dialled) and `resolveHostKey` throw a `TypeError` that names the algorithm (`ECDSA (P-256)`, `RSASSA-PKCS1-v1_5 (2048-bit)`, a raw key of 65 bytes) and says wsh host keys are Ed25519 only. Before, a P-256 key was accepted and the first `accept()` failed while the client waited out its timeout. An Ed25519 key (extractable or not), a signer with a 32-byte or Ed25519 `CryptoKey` public key, `true` and a `{ file }` are accepted as before; a `{ file }` is checked when the file is read, as before.
