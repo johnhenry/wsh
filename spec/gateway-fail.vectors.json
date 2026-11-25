@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "description": "The codes of GatewayFail (#223): the number, its name, and who sends it. Code 5 is GATEWAY_DISABLED (what spec/wsh-v1.yaml says and what the Rust wsh-server sends). A Node gateway older than the release that introduced 8 sent 5 for a timeout, so a reader treats a 5 as 'disabled, or a timeout from an older Node gateway'. TIMEOUT is 8. A code is never reused and a reader that gets a number it does not know says so rather than guessing.",
+  "codes": [
+    { "code": 1, "name": "CONNECTION_REFUSED", "sentBy": ["node", "rust"] },
+    { "code": 2, "name": "HOST_UNREACHABLE", "sentBy": ["node", "rust"] },
+    { "code": 3, "name": "DNS_FAILED", "sentBy": ["node"] },
+    { "code": 4, "name": "POLICY_DENIED", "sentBy": ["node", "rust"] },
+    { "code": 5, "name": "GATEWAY_DISABLED", "alsoSentAs": ["TIMEOUT"], "sentBy": ["rust", "node-before-timeout-8"] },
+    { "code": 6, "name": "CLOSED", "sentBy": ["node"] },
+    { "code": 7, "name": "QUEUE_FULL", "sentBy": ["node", "rust"] },
+    { "code": 8, "name": "TIMEOUT", "sentBy": ["node"] }
+  ]
+}

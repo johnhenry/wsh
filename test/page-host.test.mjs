@@ -682,6 +682,25 @@ describe('object access through the page host (wsh-objects, values mode)', () =>
     assert.deepEqual(got, [{ n: 1 }]);
   });
 
+  it('callback return values: (callback:returns) gives the page a promise of the far side\'s answer; Stop settles a call that is waiting with undefined at once', async () => {
+    const { win } = worldWindow();
+    const stubs = [];
+    win.app.ask = (fn) => { stubs.push(fn); return 'asked'; };
+    const page = await startPage({ window: win, registered: [], mcp: undefined, host: { mcp: undefined, expose: { window: { allow: { call: ['app.ask(callback:returns)'] } } } } });
+    const wsh = new WshClient(); closers.push(() => wsh.disconnect());
+    await wsh.connect(page.host.operatorUrl, { username: 'alice', keyPair: alice, transport: 'ws', sealSession: true });
+    const { window: remote } = await wsh.openObjects();
+    let hold = false;
+    assert.equal(await remote.app.ask((q) => (hold ? new Promise(() => {}) : `answer to ${q}`)), 'asked');
+    assert.equal(await stubs[0]('why'), 'answer to why');
+    hold = true;
+    const waiting = stubs[0]('never');
+    byRole(win, 'stop')[0].click();
+    assert.equal(await waiting, undefined, 'Stop settles the waiting call, well before the 2 second bound');
+    await until(() => page.host.sessions.length === 0, 'the session to end');
+    assert.equal(await stubs[0]('late'), undefined);
+  });
+
   it('authorize(who, op) of a root is asked, with the key of the caller', async () => {
     const { win } = worldWindow();
     const asked = [];

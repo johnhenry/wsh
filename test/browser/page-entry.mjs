@@ -243,9 +243,9 @@ window.h.pageTools = async () => {
   await tool('read_secret', 'Read something the page keeps to itself', { readOnlyHint: true }, () => ({ secret: 'not for the agent' }));
 };
 let pageHostHandle = null;
-window.h.startPageHost = async ({ relay, authorizedKeys, allow, approve, expose }) => {
+window.h.startPageHost = async ({ relay, connect, authorizedKeys, allow, approve, expose }) => {
   pageHostHandle = await wsh.createPageHost({
-    window, relay, name: 'shop-tab', authorizedKeys, onLog: (line) => { (window.__hostLog ??= []).push(line); }, onRefused: (r) => { (window.__hostLog ??= []).push(`refused: ${r.reason} ${r.detail ?? ''}`); },
+    window, ...(connect !== undefined ? { connect } : { relay }), name: 'shop-tab', authorizedKeys, onLog: (line) => { (window.__hostLog ??= []).push(line); }, onRefused: (r) => { (window.__hostLog ??= []).push(`refused: ${r.reason} ${r.detail ?? ''}`); },
     ...(allow ? { mcp: { allow, ...(approve ? { approve } : {}) } } : {}),
     ...(expose ? { expose } : {}),
   });
@@ -269,6 +269,9 @@ window.h.pageApp = () => {
   window.app.watch = (fn) => { window.__watchers.push(fn); return 'watching'; };
   window.app.tick = (n) => { for (const fn of window.__watchers) fn({ n, at: 'page' }); return window.__watchers.length; };
   window.app.noCallbacks = (fn) => typeof fn;
+  // A call whose callbacks may return a value (`(callback:returns)`): the page keeps the stub and asks it later, as a real application would (a confirmation, a vote).
+  window.__askers = [];
+  window.app.ask = (fn) => { window.__askers.push(fn); return 'asked'; };
 };
 window.h.pageHostInfo = () => ({ sessions: pageHostHandle.sessions.map((s) => s.fingerprint), closed: pageHostHandle.closed, closedReason: pageHostHandle.closedReason, cart: window.__cart, ran: window.__ran.map((r) => r.name) });
 window.h.stopPageHost = () => pageHostHandle?.close();

@@ -79,7 +79,9 @@ function parseEntry(raw, op) {
     text = text.slice(0, at);
     if (!EVENT_TYPE.test(type)) throw bad(`allow.on entry ${JSON.stringify(raw.slice(0, 80))}: the event type is not a name`);
   }
-  if (op === 'call' && text.endsWith('(callback)')) { callbacks = true; text = text.slice(0, -'(callback)'.length); }
+  // `(callback)`, and the notations that also let the far side's function return a value (`(callback:returns)`, `(callback:returns=0,2)`): the types do not describe a return.
+  const callbackEnd = op === 'call' ? /\(callback(?::returns(?:=\d{1,2}(?:,\d{1,2})*)?)?\)$/.exec(text) : null;
+  if (callbackEnd) { callbacks = true; text = text.slice(0, callbackEnd.index); }
   const segs = splitPath(text, `allow.${op} entry`);
   if (op === 'on' && segs.some((s) => s.includes('*'))) throw bad(`allow.on entry ${JSON.stringify(raw.slice(0, 80))}: an event source is named exactly`);
   return { segs, callbacks, type, text };

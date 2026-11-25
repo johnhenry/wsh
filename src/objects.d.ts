@@ -124,6 +124,12 @@ export interface ObjectsLimits {
   maxCallbacksPerSecond: number;
   /** Bytes of the arguments of one callback call; a bigger one is dropped and counted. Default 16384. */
   maxCallbackBytes: number;
+  /** The longest the page's stub waits for a far-side function that returns (`(callback:returns)`), from the call; then its promise is settled with `undefined`. Default 2000, at most 30000. */
+  callbackReturnTimeoutMs: number;
+  /** Calls of returning callbacks waiting for an answer per channel; a call beyond it is dropped and counted, never sent. Default 8, at most 64. */
+  maxPendingCallbackReturns: number;
+  /** Bytes of the value a far-side callback answers with; a bigger one, or one that is not plain data, is `undefined` for the page. Default 16384. */
+  maxCallbackResultBytes: number;
 }
 export const OBJECTS_DEFAULT_LIMITS: Readonly<ObjectsLimits>;
 
@@ -133,7 +139,9 @@ export const NEEDS_LISTING: ReadonlyArray<readonly string[]>;
 /** Allow-lists by operation: path patterns from a root (`'window.document.title'`, `'window.app.**'`; `*` is one segment, `**` any number). `call` covers `construct`. Nothing is allowed by default. */
 export interface ObjectsAllow {
   get?: string[];
-  // (`call` entries may end in `(callback)`: the call accepts functions as arguments, which reach the page as one-way stubs.)
+  // (`call` entries may end in `(callback)`: the call accepts functions as arguments, which reach the page as one-way stubs. `(callback:returns)` also lets the stub return a
+  // promise of the far side's return value, `(callback:returns=0,2)` only for the functions at those argument positions; the wait is bounded by `callbackReturnTimeoutMs`
+  // and every other outcome is `undefined`. It needs `timers` (`exposeObjects` and `createPageHost` supply them).)
   call?: string[];
   set?: string[];
   /** Event sources, as `path@type` (`'window.app.bus@ready'`; the source and the type are named exactly, a wildcard in either is refused). Never implied by the other lists. */
@@ -210,7 +218,11 @@ export interface ObjectsPeer {
 /** The transport-neutral server half: roots, allow-lists and limits, attachable to any peer. Knows nothing about wsh. */
 export function createObjectsServer(options: ObjectsServerOptions): {
   /** `who`: the identity of every call unless the peer gives one per call (`ctx.who`); one that names two keys, or is not an identity, throws a `TypeError` here. */
-  attach(peer: Pick<ObjectsPeer, 'onRequest' | 'maxMessageBytes'>, options?: { who?: ObjectsIdentity }): { limits: ObjectsLimits };
+  attach(peer: Pick<ObjectsPeer, 'onRequest' | 'maxMessageBytes'>, options?: { who?: ObjectsIdentity }): {
+    limits: ObjectsLimits;
+    /** What became of the calls of callbacks that return: `pending` now, and in total `answered`, `timedOut`, `failed`, `refused` and `dropped`. */
+    callbackReturnStats(): { pending: number; answered: number; timedOut: number; failed: number; refused: number; dropped: number };
+  };
   /**
    * One `get` or `call` of a named path (`path` starts with the root), through the same checks as an objects call (the key's grants as `permit(root, op)`, the allow-lists,
    * the names that need listing, `authorize`, the window guard). No session, so no handle and no callback; resolves with the wire value (`{ v }`, or a named non-value `{ u }`).
