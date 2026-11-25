@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.52.0 / Rust `rust-v0.19.0`
 
 ### Rust client reads every GatewayFail code (Rust)
 
@@ -54,7 +54,7 @@ The Rust client of the `wsh-objects` protocol (`wsh_client::objects`, `wsh objec
 - **`wsh objects session` also gains** `types`, `watch` / `next` / `unwatch` for subscriptions (by root or by handle). Handle names stay `h1`, `h2`; callbacks are `c1`, subscriptions `s1`, each counted from 1.
 - **A `wsh-objects` host in `wsh-server` is not planned**, and `spec/objects.md` section 11 says why (a Rust server has no object graph for path allow-lists to name; its typed `wsh-host` channel is the equivalent); the item is closed by that reasoning, not left open. A key line with an `objects:` capability stays refused at load there.
 - Tests: unit tests of the client against a scripted host (`crates/wsh-client/src/objects/tests.rs`), and `test/rust/wsh-objects.test.mjs` runs the real Rust CLI against the real JavaScript page host (events through a handle and the host ending them with the handle, callbacks called by the page, `types` narrowed by the key, and a host that does not state each feature).
-- **Release:** needs a Rust release (the lead tags it); no version is bumped here.
+- **Release:** `rust-v0.19.0`.
 
 ### Fixed: a flaky `wsh mcp` reconnect test (#229; test only)
 
