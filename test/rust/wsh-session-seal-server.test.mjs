@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 import { WshClient, generateKeyPair, exportPublicKeySSH, MSG, cborEncode } from '../../src/index.mjs';
 import { hostileRelay } from '../helpers/hostile-relay.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // a port free for TCP and UDP: the server binds both (#248)
 import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-components/webtransport';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -51,9 +52,6 @@ const until = async (cond, what, ms = 8000) => {
   for (;;) { const v = await cond(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`); await sleep(20); }
 };
 const cleanEnv = (home, extra = {}) => ({ PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester', TERM: 'xterm', ...extra });
-const freePort = () => new Promise((resolve) => {
-  const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
-});
 
 /** A TCP echo server (the gateway's destination); `seen()` is how many connections it took. */
 async function echoServer() {
@@ -383,13 +381,34 @@ describe('seal_session = "require"', () => {
   it('a plain message injected before the key exists is answered with the refusal, not served', async () => {
     const s = await startServer({ seal: 'require' });
     const echo = await echoServer();
+    // The relay writes a plain OpenTcp onto the wire directly ahead of the client's own KeyExchange (same connection, so the server reads
+    // it first): the peer has logged in and no key exists yet. Ordering, not a delay, is what puts it before the key.
+    let injected = false;
+    const relay = await viaRelay(s, {
+      toRelay: (m) => {
+        if (injected || m.type !== MSG.KEY_EXCHANGE) return m;
+        injected = true;
+        return [{ type: MSG.OPEN_TCP, gateway_id: 77, host: '127.0.0.1', port: echo.port }, m];
+      },
+    });
+    await assert.rejects(login(s, relay.url, { sealSession: true, timeout: 4000 }));
+    assert.equal(injected, true, 'the plain message was put ahead of the key exchange');
+    await until(() => /requires a sealed session/.test(s.logs()), `the server to refuse the plain message: ${s.logs()}`);
+    assert.equal(echo.seen(), 0, 'the plain OpenTcp was not served');
+  });
+
+  it('a plain message injected into a sealed session on a server that requires sealing is not heard, and the session carries on', async () => {
+    const s = await startServer({ seal: 'require' });
+    const echo = await echoServer();
     const relay = await viaRelay(s);
     const c = await login(s, relay.url, { sealSession: true });
     assert.equal(await roundTrip(c, echo.port, 'hi'), 'hi');
     const before = echo.seen();
     await relay.context().injectToRelay({ type: MSG.OPEN_TCP, gateway_id: 77, host: '127.0.0.1', port: echo.port });
-    await sleep(400);
-    assert.equal(echo.seen(), before);
+    // The server says so when it has read and dropped the message: that, not a stretch of time, is when "not heard" can be judged.
+    await until(() => /dropping a plaintext message on a sealed session/.test(s.logs()), `the server to drop the plain message: ${s.logs()}`);
+    assert.equal(echo.seen(), before, 'the plain OpenTcp was not served');
+    assert.equal(await roundTrip(c, echo.port, 'still up'), 'still up');
   });
 });
 

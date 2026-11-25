@@ -942,16 +942,53 @@ pub(crate) fn expand_tilde_str(s: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn load(toml_text: &str) -> ServerConfig {
-        let dir = std::env::temp_dir().join(format!(
-            "wsh-config-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    /// The name of a scratch directory for one config test (not created yet). The process id keeps two
+    /// test processes apart and a process-wide counter keeps two tests of this process apart: unlike a
+    /// clock, the counter cannot give two callers the same value (wsh #248; the same scheme as the
+    /// known-hosts tests of `wsh-client`).
+    fn scratch_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("wsh-config-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// A fresh, empty scratch directory for one config test. A directory left behind under the same
+    /// name by an earlier process that had this process id is removed first.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = scratch_path(tag);
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scratch_directories_never_share_a_name_within_one_process() {
+        use std::collections::HashSet;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 2_000;
+        let names: Vec<PathBuf> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..PER_THREAD)
+                        .map(|_| scratch_path("t"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let distinct: HashSet<&PathBuf> = names.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            names.len(),
+            "two scratch directories got one name"
+        );
+    }
+
+    fn load(toml_text: &str) -> ServerConfig {
+        let dir = scratch_dir("test");
         let path = dir.join("config.toml");
         std::fs::write(&path, toml_text).unwrap();
         let cfg = ServerConfig::load(Some(&path), None, None, None, None, None, None, false)
@@ -1051,8 +1088,7 @@ reverse_bind_addr = "0.0.0.0"
 
     #[test]
     fn a_reverse_bind_address_that_is_not_an_address_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("wsh-config-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("bad");
         let path = dir.join("config.toml");
         std::fs::write(&path, "[gateway]\nreverse_bind_addr = \"all interfaces\"\n").unwrap();
         let result = ServerConfig::load(Some(&path), None, None, None, None, None, None, false);
@@ -1063,15 +1099,7 @@ reverse_bind_addr = "0.0.0.0"
     // ── sealed sessions (#155): off by default, `offer` / `require` need the host key ──
 
     fn load_err(toml_text: &str) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "wsh-config-seal-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("seal");
         let path = dir.join("config.toml");
         std::fs::write(&path, toml_text).unwrap();
         let result = ServerConfig::load(Some(&path), None, None, None, None, None, None, false);
