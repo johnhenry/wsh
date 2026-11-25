@@ -73,12 +73,14 @@ async function copyingRelay() {
 function makeWorld() {
   const win = createFakeWindow();
   const listeners = new Map();
-  const bus = {
-    addEventListener(t, fn) { listeners.set(t, [...(listeners.get(t) ?? []), fn]); },
-    removeEventListener(t, fn) { listeners.set(t, (listeners.get(t) ?? []).filter((f) => f !== fn)); },
-    emit(t, detail) { for (const fn of listeners.get(t) ?? []) fn({ type: t, timeStamp: 5, isTrusted: false, detail }); },
-    listening: (t) => (listeners.get(t) ?? []).length,
-  };
+  // a class instance, so that on a root with handles it comes back as a handle (a plain object with only methods would be plain data)
+  class Bus {
+    addEventListener(t, fn) { listeners.set(t, [...(listeners.get(t) ?? []), fn]); }
+    removeEventListener(t, fn) { listeners.set(t, (listeners.get(t) ?? []).filter((f) => f !== fn)); }
+    emit(t, detail) { for (const fn of listeners.get(t) ?? []) fn({ type: t, timeStamp: 5, isTrusted: false, detail }); }
+    listening(t) { return (listeners.get(t) ?? []).length; }
+  }
+  const bus = new Bus();
   class Cart { constructor(owner = 'anon') { this.owner = owner; this.items = [{ sku: 'A1' }]; this.total = 3; this.secret = 'hidden'; } sum() { return this.total; } }
   const cart = new Cart();
   const app = {
@@ -92,6 +94,9 @@ function makeWorld() {
     fn() {},
     boom() { throw new Error('\u001b[31mboom'); },
     getCart: () => cart,
+    // keeps the stubs of the far side's functions: the test calls them like the page would
+    fns: [],
+    listen(fn) { this.fns.push(fn); return this.fns.length; },
     Cart,
     bus,
     [MARKER]: `value-of-${MARKER}`,
@@ -411,7 +416,7 @@ describe('wsh --sealed objects session: handles', () => {
     assert.match((await wsh(['roots'])).stdout, /handles/);
   });
 
-  it('a key that may only get cannot use a handle to call, and events are not offered through one', async () => {
+  it('a key that may only get cannot use a handle to call', async () => {
     const { session } = await handlesHost();
     const s = session({ identity: 'getter' });
     // `getCart` is a call: the key may not make the handle at all
@@ -421,9 +426,115 @@ describe('wsh --sealed objects session: handles', () => {
   });
 });
 
+describe('wsh --sealed objects session: events through a handle (the Rust client against the JS host)', () => {
+  const eventsHost = (extra = {}) => pageHost({ expose: { window: { mode: 'handles', allow: { ...ALLOW, get: [...ALLOW.get, 'app.bus'] }, eventFields: { ping: ['detail'] }, ...extra } } });
+
+  it('listens to the source a handle stands on, judged by its own allow.on entry, and the host ends it with the handle', async () => {
+    const { session, world } = await eventsHost();
+    const s = session();
+    const roots = await s.ask({ op: 'roots' });
+    assert.equal(roots.ok, true);
+    const made = await s.ask({ op: 'get', path: 'window.app.bus' });
+    assert.equal(made.result.$handle.id, 'h1', JSON.stringify(made));
+    const watch = await s.ask({ op: 'watch', handle: 'h1', path: '', event: 'ping', fields: ['detail'] });
+    assert.deepEqual(watch, { ok: true, result: { subscription: 's1' } });
+    await until(() => world.bus.listening('ping') === 1, 'the listener on the page bus');
+    world.bus.emit('ping', { n: 1 });
+    const one = await s.ask({ op: 'next', subscription: 's1' });
+    assert.equal(one.ok, true, JSON.stringify(one));
+    assert.deepEqual([one.result.seq, one.result.dropped, one.result.dropped_here], [1, 0, 0]);
+    assert.deepEqual(one.result.data, { type: 'ping', timeStamp: 5, isTrusted: false, detail: { n: 1 } });
+    // an event type its own allow.on entry does not name is refused, through a handle as by path
+    const other = await s.ask({ op: 'watch', handle: 'h1', path: '', event: 'other' });
+    assert.deepEqual([other.ok, other.error.kind, other.error.reason], [false, 'refused', 'not-allowed']);
+    // nothing waiting: `next` times out, as a failure with its reason, not a hang
+    const quiet = await s.ask({ op: 'next', subscription: 's1', timeoutMs: 150 });
+    assert.deepEqual([quiet.ok, quiet.error.reason], [false, 'timeout']);
+    // releasing the handle takes the page's listener away and ends the subscription here
+    assert.equal((await s.ask({ op: 'release', handle: 'h1' })).ok, true);
+    await until(() => world.bus.listening('ping') === 0, 'the page to drop its listener with the handle');
+    const gone = await s.ask({ op: 'next', subscription: 's1' });
+    assert.deepEqual([gone.ok, gone.error.kind], [false, 'closed']);
+    assert.equal(await s.end(), 0);
+  });
+
+  it('a key that may not listen is refused through a handle too (not-permitted)', async () => {
+    const { session } = await eventsHost();
+    const s = session({ identity: 'getter' });
+    const made = await s.ask({ op: 'get', path: 'window.app.bus' });
+    assert.equal(made.ok, true, JSON.stringify(made));
+    const refused = await s.ask({ op: 'watch', handle: 'h1', path: '', event: 'ping' });
+    assert.deepEqual([refused.ok, refused.error.reason], [false, 'not-permitted']);
+    assert.equal(await s.end(), 0);
+  });
+});
+
+describe('wsh --sealed objects: types of a root', () => {
+  it('prints what this key may do on the root as the host describes it, narrowed by the key', async () => {
+    const { wsh } = await pageHost({ expose: { window: { allow: ALLOW, eventFields: { ping: ['detail'] }, types: { 'app.n': { value: 'number' } } } } });
+    const r = await wsh(['types', 'window']);
+    assert.equal(r.code, 0, r.stderr);
+    const d = json(r);
+    assert.equal(d.version, 1);
+    assert.equal(d.root, 'window');
+    assert.deepEqual(d.ops, ['get', 'call', 'set', 'on']);
+    assert.ok(d.allow.get.includes('window.app.n') && d.allow.call.includes('window.app.add') && d.allow.on.includes('window.app.bus@ping'), JSON.stringify(d.allow));
+    assert.deepEqual(d.eventFields, { ping: ['detail'] });
+    assert.equal(d.types['window.app.n'].value, 'number', JSON.stringify(d.types));
+    assert.ok(!r.stdout.includes('S3CRET') && !r.stdout.includes('hidden'));
+    // a key limited to `get` is told of get only
+    const g = await wsh(['types', 'window'], { identity: 'getter' });
+    assert.equal(g.code, 0, g.stderr);
+    assert.deepEqual(json(g).ops, ['get']);
+    assert.deepEqual(json(g).allow.call, []);
+    // a root the host does not list is not found, and a path is a usage error
+    assert.equal((await wsh(['types', 'nope'])).code, 4);
+    assert.equal((await wsh(['types', 'window.app'])).code, 2);
+  });
+});
+
+describe('wsh --sealed objects session: callbacks (the Rust client against the JS host)', () => {
+  const callbackHost = () => pageHost({ expose: { window: { allow: { ...ALLOW, call: [...ALLOW.call, 'app.listen(callback)'] } } } });
+
+  it('a function of the Rust side is passed to a call whose entry ends in (callback), the page calls it one way, and release kills the stub', async () => {
+    const { session, world } = await callbackHost();
+    const s = session();
+    assert.deepEqual(await s.ask({ op: 'callback' }), { ok: true, result: { callback: 'c1' } });
+    const sent = await s.ask({ op: 'call', path: 'window.app.listen', args: [null], callbacks: [[0, 'c1']] });
+    assert.deepEqual(sent, { ok: true, result: 1 }, JSON.stringify(sent));
+    assert.equal(world.app.fns.length, 1);
+    // the page calls its stub: arguments are copied as plain data, the return is undefined at once
+    assert.equal(world.app.fns[0](7, 'x', { k: [1] }), undefined);
+    const call = await s.ask({ op: 'next', callback: 'c1' });
+    assert.equal(call.ok, true, JSON.stringify(call));
+    assert.deepEqual([call.result.seq, call.result.dropped, call.result.dropped_here], [1, 0, 0]);
+    assert.deepEqual(call.result.args, [7, 'x', { k: [1] }]);
+    // an entry that does not end in (callback) refuses a callback, and nothing is registered
+    const no = await s.ask({ op: 'call', path: 'window.app.add', args: [null], callbacks: [[0, 'c1']] });
+    assert.deepEqual([no.ok, no.error.kind, no.error.reason], [false, 'refused', 'not-allowed']);
+    // an unknown callback name and a place that is not there are usage errors of the session
+    assert.equal((await s.ask({ op: 'call', path: 'window.app.listen', args: [null], callbacks: [[0, 'c9']] })).error.kind, 'invalid');
+    assert.equal((await s.ask({ op: 'call', path: 'window.app.listen', args: [], callbacks: [[0, 'c1']] })).error.kind, 'invalid');
+    // release: the stub in the page is dead (a call of it does nothing), and the callback ends here
+    assert.deepEqual(await s.ask({ op: 'release', callback: 'c1' }), { ok: true, result: { ok: true } });
+    assert.equal(world.app.fns[0](8), undefined);
+    assert.equal((await s.ask({ op: 'next', callback: 'c1' })).error.kind, 'invalid', 'no such callback any more');
+    assert.equal(await s.end(), 0);
+  });
+
+  it('a key that may not call cannot pass a callback (not-permitted)', async () => {
+    const { session } = await callbackHost();
+    const s = session({ identity: 'getter' });
+    await s.ask({ op: 'callback' });
+    const r = await s.ask({ op: 'call', path: 'window.app.listen', args: [null], callbacks: [[0, 'c1']] });
+    assert.deepEqual([r.ok, r.error.reason], [false, 'not-permitted']);
+    assert.equal(await s.end(), 0);
+  });
+});
+
 describe('wsh --sealed objects against a host that does not state what is asked', () => {
   /** A released 0.47-style host: roots only (no `features`), and a `resolve` that answers a handle without ever having said it supports them. */
-  async function oldHost() {
+  async function oldHost({ features } = {}) {
     const h = makeHome();
     const relay = await copyingRelay();
     const received = [];
@@ -432,9 +543,11 @@ describe('wsh --sealed objects against a host that does not state what is asked'
       auth: { authorizedKeys: h.pub }, exec: async () => 0, hostKey: true, dataStreams: false, requireChannelBinding: true, sealSession: 'require',
       rpc: { 'wsh-objects': (channel) => {
         const on = (method, fn) => channel.onRequest(method, (p) => { received.push(method); return fn(p); });
-        on('roots', () => ({ roots: ['window'] }));
+        on('roots', () => ({ roots: ['window'], ...(features ? { features } : {}) }));
         on('resolve', (p) => (p.ops[0].get === 'thing' ? { h: 'abc', kind: 'object' } : { v: 7 }));
         on('subscribe', () => ({ ok: true }));
+        on('types', () => ({ version: 1 }));
+        on('releaseCallback', () => ({ ok: true }));
       } },
     });
     closers.push(() => host.close());
@@ -447,7 +560,7 @@ describe('wsh --sealed objects against a host that does not state what is asked'
       await host.accept(ws);
       return `${relay.url}/r/${id}`;
     };
-    return { h, received, run: async (args) => runWsh(h, await connect(), args) };
+    return { h, received, run: async (args) => runWsh(h, await connect(), args), session: async () => startSession(h, await connect()) };
   }
 
   it('a host that did not state events: watch is refused locally, by name (exit 5), and works for what it does state', async () => {
@@ -464,6 +577,38 @@ describe('wsh --sealed objects against a host that does not state what is asked'
     assert.equal(watch.stdout, '');
     assert.ok(!received.includes('subscribe'), `the host was asked for events: ${received}`);
     assert.deepEqual([...new Set(received)].sort(), ['resolve', 'roots']);
+  });
+
+  it('a host before 0.51.0 states no types, no handle-events: each is refused locally, by name, and nothing is sent', async () => {
+    // 0.50.0 states events, callbacks and handles, but not `types` nor `handle-events`
+    const { run, session, received } = await oldHost({ features: ['events', 'callbacks', 'handles'] });
+    const types = await run(['types', 'window']);
+    assert.equal(types.code, 5, types.stderr);
+    assert.match(types.stderr, /\\"types\\"/);
+    assert.equal(types.stdout, '');
+    const s = await session();
+    const made = await s.ask({ op: 'get', path: 'window.thing' });
+    assert.equal(made.ok, true, JSON.stringify(made));
+    assert.equal(made.result.$handle.id, 'h1');
+    const watch = await s.ask({ op: 'watch', handle: 'h1', path: '', event: 'ping' });
+    assert.deepEqual([watch.ok, watch.error.kind], [false, 'unsupported']);
+    assert.match(watch.error.message, /handle-events/);
+    // the same host takes a watch by path: only the handle form is held back
+    assert.equal((await s.ask({ op: 'watch', path: 'window.bus', event: 'ping' })).ok, true);
+    await s.end();
+    assert.deepEqual([...new Set(received)].sort(), ['resolve', 'roots', 'subscribe']);
+    assert.equal(received.filter((m) => m === 'subscribe').length, 1, `only the by-path subscribe reached the host: ${received}`);
+  });
+
+  it('a host that does not state callbacks: a function is refused locally, by name, and the host never sees a null where it was', async () => {
+    const { session, received } = await oldHost({ features: ['events'] });
+    const s = await session();
+    await s.ask({ op: 'callback' });
+    const r = await s.ask({ op: 'call', path: 'window.f', args: [null], callbacks: [[0, 'c1']] });
+    assert.deepEqual([r.ok, r.error.kind], [false, 'unsupported']);
+    assert.match(r.error.message, /callbacks/);
+    await s.end();
+    assert.ok(!received.includes('resolve'), `the host was sent the call: ${received}`);
   });
 
   it('a handle from a host that did not state handles is refused (exit 5), never made into something', async () => {

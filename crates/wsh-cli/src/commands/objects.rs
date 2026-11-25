@@ -27,8 +27,9 @@ use std::time::Duration;
 use serde_json::Value as Json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use wsh_client::objects::{
-    Chain, Description, ErrorKind, Event, Handle, ObjectsClient, ObjectsError, OpenOptions, Path,
-    Reply, SnapshotOptions, SubscribeOptions, Target, Value,
+    Arg, Callback, CallbackCall, Chain, Description, ErrorKind, Event, Handle, ObjectsClient,
+    ObjectsError, OpenOptions, Path, Reply, SnapshotOptions, SubscribeOptions, Subscription,
+    Target, Value,
 };
 
 use crate::commands::common::{
@@ -70,6 +71,9 @@ pub enum Op {
         fields: Vec<String>,
         count: Option<u64>,
         capacity: usize,
+    },
+    Types {
+        root: String,
     },
     Session,
 }
@@ -453,6 +457,7 @@ enum Plan {
         count: Option<u64>,
         capacity: usize,
     },
+    Types(String),
     Session,
 }
 
@@ -526,6 +531,12 @@ impl Plan {
                     count: *count,
                     capacity: *capacity,
                 }
+            }
+            Op::Types { root } => {
+                if root.is_empty() || root.contains('.') {
+                    return Err(format!("{root:?}: types takes a root's name (no path)"));
+                }
+                Plan::Types(root.clone())
             }
             Op::Session => Plan::Session,
         })
@@ -614,6 +625,9 @@ impl Plan {
                     }
                 }
             }
+            Plan::Types(root) => {
+                out(&render_value(&objects.root_description(&root).await?));
+            }
             Plan::Session => session(objects).await?,
         }
         Ok(())
@@ -650,8 +664,7 @@ async fn shutdown_signal() {
 ///
 /// The answer is `{"ok":true,"result":..}` or `{"ok":false,"error":{"kind","reason","message"}}`.
 async fn session(objects: &ObjectsClient) -> Result<(), Stop> {
-    let mut handles: HashMap<String, Handle> = HashMap::new();
-    let mut next_alias = 1u64;
+    let mut state = SessionState::default();
     let mut lines = BufReader::new(tokio::io::stdin());
     let mut buf = Vec::new();
     loop {
@@ -676,7 +689,7 @@ async fn session(objects: &ObjectsClient) -> Result<(), Stop> {
             continue;
         }
         let answer = match serde_json::from_str::<Json>(&text) {
-            Ok(request) => match step(objects, &mut handles, &mut next_alias, &request).await {
+            Ok(request) => match step(objects, &mut state, &request).await {
                 Ok(result) => format!("{{\"ok\":true,\"result\":{result}}}"),
                 Err(e) => format!("{{\"ok\":false,\"error\":{}}}", render_error_json(&e)),
             },
@@ -733,10 +746,66 @@ fn bad(message: impl Into<String>) -> ObjectsError {
     )
 }
 
+/// What a `session` holds between lines, by the names it gave out (`h1`, `c1`, `s1`).
+#[derive(Default)]
+struct SessionState {
+    handles: HashMap<String, Handle>,
+    callbacks: HashMap<String, Callback>,
+    subscriptions: HashMap<String, Subscription>,
+    /// How many names of each kind were given out (`h`, `c`, `s`): each kind counts from 1.
+    given: HashMap<char, u64>,
+}
+
+/// How many callbacks and subscriptions a session holds (the host's own bound is 16 of each per channel).
+const MAX_SESSION_THINGS: usize = 16;
+/// How long `next` waits unless `timeoutMs` says otherwise, and the most it may be told to wait.
+const DEFAULT_NEXT_MS: u64 = 10_000;
+const MAX_NEXT_MS: u64 = 300_000;
+
+impl SessionState {
+    fn alias(&mut self, prefix: char) -> String {
+        let n = self.given.entry(prefix).or_insert(0);
+        *n += 1;
+        format!("{prefix}{n}")
+    }
+}
+
+fn render_call(c: &CallbackCall) -> String {
+    let args: Vec<String> = c.args.iter().map(render_value).collect();
+    format!(
+        "{{\"seq\":{},\"dropped\":{},\"dropped_here\":{},\"args\":[{}]}}",
+        c.seq,
+        c.dropped_by_host,
+        c.dropped_here,
+        args.join(",")
+    )
+}
+
+fn timed_out(what: &str, ms: u64) -> ObjectsError {
+    ObjectsError::from_rpc(
+        -32000,
+        format!("no {what} in {ms} ms"),
+        Some(Value::Object(vec![(
+            "reason".into(),
+            Value::Text("timeout".into()),
+        )])),
+    )
+}
+
+fn ended(what: &str) -> ObjectsError {
+    ObjectsError::from_rpc(
+        -32000,
+        format!("the {what} ended"),
+        Some(Value::Object(vec![(
+            "reason".into(),
+            Value::Text("closed".into()),
+        )])),
+    )
+}
+
 async fn step(
     objects: &ObjectsClient,
-    handles: &mut HashMap<String, Handle>,
-    next_alias: &mut u64,
+    state: &mut SessionState,
     request: &Json,
 ) -> Result<String, ObjectsError> {
     let field = |name: &str| request.get(name);
@@ -747,15 +816,96 @@ async fn step(
         let roots: Vec<String> = objects.roots().iter().map(|r| json_string(r)).collect();
         return Ok(format!("{{\"roots\":[{}]}}", roots.join(",")));
     }
+    if op == "types" {
+        let root = field("root")
+            .and_then(Json::as_str)
+            .ok_or_else(|| bad("types needs a \"root\""))?;
+        return Ok(render_value(&objects.root_description(root).await?));
+    }
     if op == "release" {
+        if let Some(name) = field("callback") {
+            let name = name
+                .as_str()
+                .ok_or_else(|| bad("\"callback\" is the name a callback answer gave"))?;
+            let callback = state
+                .callbacks
+                .remove(name)
+                .ok_or_else(|| bad("no such callback in this session"))?;
+            callback.release().await?;
+            return Ok("{\"ok\":true}".into());
+        }
         let id = field("handle")
             .and_then(Json::as_str)
-            .ok_or_else(|| bad("release needs a \"handle\""))?;
-        let handle = handles
+            .ok_or_else(|| bad("release needs a \"handle\" or a \"callback\""))?;
+        let handle = state
+            .handles
             .remove(id)
             .ok_or_else(|| bad("no such handle in this session"))?;
         handle.release().await?;
         return Ok("{\"ok\":true}".into());
+    }
+    if op == "callback" {
+        if state.callbacks.len() >= MAX_SESSION_THINGS {
+            return Err(ObjectsError::from_rpc(
+                -32002,
+                format!("at most {MAX_SESSION_THINGS} callbacks in a session"),
+                Some(Value::Object(vec![(
+                    "reason".into(),
+                    Value::Text("limit".into()),
+                )])),
+            ));
+        }
+        let capacity = field("capacity")
+            .and_then(Json::as_u64)
+            .map_or(Ok(64), |c| usize::try_from(c.clamp(1, 4096)))
+            .map_err(|_| bad("\"capacity\" is a whole number"))?;
+        let callback = objects.callback(capacity)?;
+        let name = state.alias('c');
+        state.callbacks.insert(name.clone(), callback);
+        return Ok(format!("{{\"callback\":{}}}", json_string(&name)));
+    }
+    if op == "next" || op == "unwatch" {
+        let wait_ms = field("timeoutMs")
+            .and_then(Json::as_u64)
+            .unwrap_or(DEFAULT_NEXT_MS)
+            .clamp(1, MAX_NEXT_MS);
+        if let Some(name) = field("callback").and_then(Json::as_str) {
+            if op != "next" {
+                return Err(bad(
+                    "unwatch ends a subscription (\"release\" ends a callback)",
+                ));
+            }
+            let callback = state
+                .callbacks
+                .get(name)
+                .ok_or_else(|| bad("no such callback in this session"))?;
+            return match tokio::time::timeout(Duration::from_millis(wait_ms), callback.recv()).await
+            {
+                Ok(Some(call)) => Ok(render_call(&call)),
+                Ok(None) => Err(ended("callback")),
+                Err(_) => Err(timed_out("call", wait_ms)),
+            };
+        }
+        let name = field("subscription")
+            .and_then(Json::as_str)
+            .ok_or_else(|| bad(format!("{op} needs a \"subscription\" (or a \"callback\")")))?;
+        if op == "unwatch" {
+            let sub = state
+                .subscriptions
+                .remove(name)
+                .ok_or_else(|| bad("no such subscription in this session"))?;
+            let dropped = sub.unsubscribe().await?;
+            return Ok(format!("{{\"dropped\":{dropped}}}"));
+        }
+        let sub = state
+            .subscriptions
+            .get_mut(name)
+            .ok_or_else(|| bad("no such subscription in this session"))?;
+        return match tokio::time::timeout(Duration::from_millis(wait_ms), sub.recv()).await {
+            Ok(Some(event)) => Ok(render_event(&event)),
+            Ok(None) => Err(ended("subscription")),
+            Err(_) => Err(timed_out("event", wait_ms)),
+        };
     }
     // Where it starts, and the path below that.
     let path_text = field("path").and_then(Json::as_str).unwrap_or("");
@@ -764,7 +914,8 @@ async fn step(
             let id = h
                 .as_str()
                 .ok_or_else(|| bad("\"handle\" is the id a $handle answer gave"))?;
-            let handle = handles
+            let handle = state
+                .handles
                 .get(id)
                 .ok_or_else(|| bad("no such handle in this session"))?;
             (handle.target(), Path::parse(path_text))
@@ -774,20 +925,81 @@ async fn step(
             (objects.root(&root)?, path)
         }
     };
-    let args = || -> Result<Vec<Value>, ObjectsError> {
-        match field("args") {
-            None => Ok(Vec::new()),
-            Some(Json::Array(a)) => Ok(a.iter().cloned().map(Value::from).collect()),
-            Some(_) => Err(bad("\"args\" is an array")),
+    // The arguments, with the session's callbacks at the places `callbacks: [[index, "c1"], ...]` names.
+    let args = || -> Result<Vec<Arg>, ObjectsError> {
+        let mut args: Vec<Arg> = match field("args") {
+            None => Vec::new(),
+            Some(Json::Array(a)) => a
+                .iter()
+                .cloned()
+                .map(|v| Arg::Value(Value::from(v)))
+                .collect(),
+            Some(_) => return Err(bad("\"args\" is an array")),
+        };
+        match field("callbacks") {
+            None => {}
+            Some(Json::Array(list)) => {
+                for entry in list {
+                    let (Some(index), Some(name)) = (
+                        entry.get(0).and_then(Json::as_u64),
+                        entry.get(1).and_then(Json::as_str),
+                    ) else {
+                        return Err(bad("\"callbacks\" is [[argument index, \"c1\"], ...]"));
+                    };
+                    let callback = state
+                        .callbacks
+                        .get(name)
+                        .ok_or_else(|| bad("no such callback in this session"))?;
+                    let slot = args.get_mut(index as usize).ok_or_else(|| {
+                        bad("a callback takes the place of an argument that is there")
+                    })?;
+                    *slot = Arg::Callback(callback.clone());
+                }
+            }
+            Some(_) => return Err(bad("\"callbacks\" is [[argument index, \"c1\"], ...]")),
         }
+        Ok(args)
     };
     let reply = match op {
         "get" => target.get(path).await?,
-        "call" => target.resolve(Chain::new().call(path, args()?)).await?,
+        "call" => target.resolve(Chain::new().call_with(path, args()?)).await?,
         "construct" => {
             target
-                .resolve(Chain::new().construct(path, args()?))
+                .resolve(Chain::new().construct_with(path, args()?))
                 .await?
+        }
+        "watch" => {
+            if state.subscriptions.len() >= MAX_SESSION_THINGS {
+                return Err(ObjectsError::from_rpc(
+                    -32002,
+                    format!("at most {MAX_SESSION_THINGS} subscriptions in a session"),
+                    Some(Value::Object(vec![(
+                        "reason".into(),
+                        Value::Text("limit".into()),
+                    )])),
+                ));
+            }
+            let event = field("event")
+                .and_then(Json::as_str)
+                .ok_or_else(|| bad("watch needs an \"event\""))?;
+            let fields = match field("fields") {
+                None => Vec::new(),
+                Some(Json::Array(a)) => a
+                    .iter()
+                    .map(|f| f.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| bad("\"fields\" is an array of names"))?,
+                Some(_) => return Err(bad("\"fields\" is an array of names")),
+            };
+            let capacity = field("capacity")
+                .and_then(Json::as_u64)
+                .map_or(64, |c| c.clamp(1, 4096) as usize);
+            let sub = target
+                .subscribe(path, event, SubscribeOptions { capacity, fields })
+                .await?;
+            let name = state.alias('s');
+            state.subscriptions.insert(name.clone(), sub);
+            return Ok(format!("{{\"subscription\":{}}}", json_string(&name)));
         }
         "set" => {
             let value = field("value")
@@ -806,17 +1018,16 @@ async fn step(
         }
         other => {
             return Err(bad(format!(
-                "no such op: {} (roots, get, call, construct, set, describe, snapshot, release)",
+                "no such op: {} (roots, types, get, call, construct, set, describe, snapshot, watch, next, unwatch, callback, release)",
                 json_string(other)
             )))
         }
     };
     Ok(match reply {
         Reply::Handle(h) => {
-            let alias = format!("h{next_alias}");
-            *next_alias += 1;
+            let alias = state.alias('h');
             let rendered = render_handle(&h, Some(&alias));
-            handles.insert(alias, h);
+            state.handles.insert(alias, h);
             rendered
         }
         other => render_reply(&other, None),
