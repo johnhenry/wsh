@@ -1305,8 +1305,11 @@ export class WshTransport {
   /** Callback for server-initiated streams. */
   onStreamOpen: ((stream: WshStream) => void) | null;
 
-  /** Callback when transport closes. */
-  onClose: (() => void) | null;
+  /** Callback when transport closes; the argument, when the transport knows why, is the close info (#240). */
+  onClose: ((info?: WshCloseInfo) => void) | null;
+
+  /** Why the connection closed, when the peer or the network ended it; `null` before a close and after a close this side made. */
+  readonly closeInfo: WshCloseInfo | null;
 
   /** Callback on transport error. */
   onError: ((err: Error) => void) | null;
@@ -2274,7 +2277,36 @@ export const GATEWAY_CREDIT_FEATURE: 'gateway-credit';
 /** Credit, in bytes, each direction of a gateway connection starts with. */
 export const GATEWAY_CREDIT_WINDOW: 262144;
 
+/**
+ * Why a connection closed (#240), as `WshClient.onClose` is given it and `WshClient.closeInfo` keeps it. `source`: `'websocket'` (the socket's
+ * close code and reason, such as a pipe relay's limit text), `'qmux'` (the peer's CONNECTION_CLOSE frame and its error code),
+ * `'webtransport'` (the session's close code and reason, or the error text when it failed), or `'transport'` (a custom transport that did not
+ * say; `code` is `null`). `reason` is at most 256 characters. `wasClean`: the peer ended it with a close handshake.
+ */
+export interface WshCloseInfo {
+  readonly source: 'websocket' | 'qmux' | 'webtransport' | 'transport' | (string & {});
+  readonly code: number | null;
+  readonly reason: string;
+  readonly wasClean: boolean;
+}
+
+/** Options of `new WshClient()`. */
+export interface WshClientOptions {
+  /**
+   * Build the transport for each rung of the ladder: `ws` for WebSocket URLs, `wt` for WebTransport. Giving the object REPLACES the
+   * defaults, so a kind you leave out is unsupported (`connect()` with that transport fails). Use it for a custom `WebSocket`
+   * (`new WebSocketTransport({ WebSocket })`), a test double, or a transport of your own.
+   */
+  transportFactories?: { ws?: () => WshTransport; wt?: () => WshTransport };
+  /** How often the client pings the host, in milliseconds. */
+  pingIntervalMs?: number;
+  /** How long it waits for a pong before it treats the connection as dead, in milliseconds. */
+  pongTimeoutMs?: number;
+}
+
 export class WshClient {
+  constructor(options?: WshClientOptions);
+
   /** Current client state. */
   readonly state: 'disconnected' | 'connecting' | 'connected' | 'authenticated' | 'closed';
 
@@ -2311,8 +2343,14 @@ export class WshClient {
    */
   readonly _transport: WshTransport | null;
 
-  /** Called when the connection is closed (intentionally or otherwise). */
-  onClose: (() => void) | null;
+  /**
+   * Called when the peer or the network closes the connection (not for a `disconnect()` / `close()` this side made). The argument says
+   * why (#240) and is also kept as `closeInfo`; a handler that takes none works as before.
+   */
+  onClose: ((info: WshCloseInfo) => void) | null;
+
+  /** Why the last connection closed (the object `onClose` got); `null` before a close, after a close this side made, and at the next `connect()`. */
+  readonly closeInfo: WshCloseInfo | null;
 
   /** Called on connection-level errors. */
   onError: ((err: Error) => void) | null;
@@ -2514,6 +2552,9 @@ export class WshClient {
    * Gracefully disconnect: close all sessions and the transport.
    */
   disconnect(): Promise<void>;
+
+  /** The same as `disconnect()` (#240). */
+  close(): Promise<void>;
 
   /**
    * One-shot command execution: connect, authenticate, run a command,
