@@ -295,7 +295,21 @@ callback runs between ServerHello and Challenge, where the client's own `timeout
 waits, so a client on defaults gives up first, and an application that waits for a person inside `onHostKey` or a signer and raises its
 `timeout` for that up to about a minute is not cut off; raise `loginTimeoutMs` (or set 0) for a longer wait. Nothing changes on the wire
 (an ordinary `AuthFail`, which every released peer reads), and a connection that logs in in time is untouched: the deadline is dropped
-at `AuthOk`. A connection attached as already authenticated (a relay bridge) has no login here to bound. Other bounds on this path, for
+at `AuthOk`. A connection attached as already authenticated (a relay bridge) has no login here to bound.
+*When the clock starts, for each kind of host (#253; 0.54.0 started it too early for the last two).* The deadline counts from the moment the far
+side is **there**, because that is when a login can begin:
+`createWshServer` over its own listener (`listen()`), WebTransport, and `host.accept(socket)` of a socket someone upgraded (a connection a client opened):
+**at the accept**, so a peer that connects and says nothing is closed at the deadline (this is what #248 is for);
+a **half held before its partner has arrived** (`host.accept(socket, { waitForPeer })`, below), and the **page host** (`createPageHost`, which holds one at all times):
+**when the far side arrives**: the relay's paired signal, or the first byte the far side sends, whichever comes first; until then the half is neither
+refused nor closed however long it waits, so a page waiting for its operator does not redial every minute and an operator who arrives late is not dropped by a clock
+that ran while nobody was there. A far side that has arrived and does not log in is closed at the deadline, counted from its arrival.
+A **dial-out page host** (`connect`) has no paired signal: its clock starts at the first byte the listener sends, so a listener that accepts the page and never sends
+anything holds that one outgoing connection until it goes away (the page redials after a close). A **reverse host** (`createReverseHost`) is logged in by the
+relay and each bridged operator is attached as already authenticated, so it has no login clock; a duplex host (`serveWshOverDuplex`) is a plain `accept()` unless you pass
+`waitForPeer`. The sealed-session deadline (`sealTimeoutMs`, 30 s) starts at the login, so it is unaffected by any of this. The Rust `wsh-server` counts from the TCP accept of
+the direct connection (the far side has just arrived, as above); the Rust CLI has no host that waits at a relay, so nothing there started a clock early.
+Other bounds on this path, for
 the record: a Node `http` server gives a request 60 s to send its headers (`headersTimeout`) and a TLS handshake 120 s (`handshakeTimeout`),
 so `createWshServer` was bounded before the upgrade and unbounded after it; the pipe relay (`createPipeRelay`) ends a pipe nobody joins
 after `rendezvousTimeoutMs` (120 s) and one idle for `idleTimeoutMs` (300 s), which a peer that sends one byte now and then
@@ -810,7 +824,8 @@ instead of waiting behind a relay: `createPageHost({ window, connect: 'wss://ope
 there is no `operatorUrl` and no rendezvous id, both are `null`). The URL is dialled **exactly as written** (no role or rendezvous id is added), must be `ws://` or `wss://` with
 no user name, password or fragment in it, and is **never logged** (its query may hold a secret). Everything after the socket opens is what it is behind a relay: key login only
 (`authorizedKeys`), a sealed session, `onSession`, the person's approval for consequential tools, the visible indicator and **Stop** (which also refuses that key), the
-`mcp` and `wsh-objects` channels, closing when the window leaves its origin, and dialling again after a session or a failed attempt (`reconnect`, with the same backoff). The operator
+`mcp` and `wsh-objects` channels, closing when the window leaves its origin, and dialling again after a session or a failed attempt (`reconnect`, with the same backoff). The login
+deadline (`loginTimeoutMs`, default 60 s, also an option of `createPageHost`, behind a relay as well) counts from the first byte the listener sends, not from the dial (above). The operator
 is the wsh *client* on what it accepts, for example in Node:
 
 ```js
@@ -1549,7 +1564,7 @@ const id = newRendezvousId();                                  // 128 bits; hand
 // host (behind NAT): dial out, wait for the socket to open, serve it like any accepted connection
 const ws = new WebSocket(pipeUrl('wss://relay.example', id, 'host'));
 await new Promise((r) => ws.addEventListener('open', r, { once: true }));
-await server.accept(ws);                                       // createWshServer / createMemoryHost
+await server.accept(ws, { waitForPeer: true });                // createWshServer / createMemoryHost; the login clock starts when the operator does
 // operator: the stock client, any URL form
 await client.connect(pipeUrl('wss://relay.example', id), { username, keyPair, expectHostKey });
 ```
@@ -1567,9 +1582,17 @@ wrap the socket, and await the promise:
 const ws = new WebSocket(pipeUrl('wss://relay.example', id, 'host', { notifyPaired: true }));
 await new Promise((r) => ws.addEventListener('open', r, { once: true }));
 const { socket, paired } = watchPairing(ws);                   // before anything else is attached
-await server.accept(socket);                                   // the wsh host never sees the signal frame
+await server.accept(socket, { waitForPeer: paired });         // the wsh host never sees the signal frame
 await paired;                                                  // the operator is here (rejects if the socket closes first)
 ```
+
+**`accept(socket, { waitForPeer })`: a half that waits (#253).** `accept()` starts the login clock (`loginTimeoutMs`, 60 s) at once, which is right for a socket
+whose peer just connected and wrong for the half you dialled to a relay before any operator has: it would be refused and closed 60 s after you dialled, with nobody there.
+Say so: `waitForPeer: true` starts the clock at the first byte the far side sends; `waitForPeer: paired` (the promise above) starts it when the relay says the operator arrived
+(or at the first byte, if that is first). Both `createMemoryHost().accept` and `createWshServer().accept`, and `serveWshOverDuplex(host, { waitForPeer })`, take it; the default
+is unchanged (the clock starts at the accept), and `createWshServer`'s own connections never wait. **If you call `host.accept` behind a relay without it, your half is closed
+after `loginTimeoutMs` of waiting** (as 0.54.0's page host was): add `waitForPeer`, or set `loginTimeoutMs: 0` on the host. Without the paired signal a far side that arrives
+and sends nothing is not bounded by the login deadline (the relay's `idleTimeoutMs` still ends it); use `notifyPaired` where the relay supports it.
 
 The relay sends the host ONE text frame, `wsh-pipe/1 paired`, when the operator arrives and before anything the operator said; everything else on a pipe is
 binary, so it cannot be mistaken for wsh bytes. It is opt-in per host and costs nothing otherwise: a relay older than this ignores `paired=1` and never sends it (then

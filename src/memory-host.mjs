@@ -71,7 +71,12 @@ class MemorySocket extends EventTarget {
 
   send(data) {
     if (this.readyState !== OPEN) throw new Error('WebSocket is not open');
-    if (typeof data === 'string') return; // wsh frames are binary
+    if (typeof data === 'string') {
+      // wsh frames are binary; a text frame is what a pipe relay sends a host that asked: its paired signal (#253). It reaches the other end as text, as on a real WebSocket.
+      const peer = this.peer;
+      queueMicrotask(() => { if (peer.readyState === OPEN) peer.dispatchEvent(event('message', { data })); });
+      return;
+    }
     const view = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     const copy = view.slice().buffer;
     const peer = this.peer;
@@ -118,6 +123,9 @@ function createRegistry(sessions, log) {
 }
 
 /**
+ * `host.accept(socket, { waitForPeer })` (#253): `true`, or a promise (a relay's paired signal), for a half held before its partner has arrived; the login deadline
+ * (`loginTimeoutMs`) then starts when the far side does (its first byte, or the promise) instead of at the accept.
+ *
  * @param {object} [options]
  * @param {object | Function} [options.auth] - As for `createWshServer`. Omitted = refuse everyone.
  * @param {Function | { run: Function, timeoutMs?: number, clientEnv?: boolean | string[] | Function }} [options.exec]

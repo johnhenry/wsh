@@ -34,7 +34,7 @@ export function createDuplexSocket(options: WshDuplexOptions): {
  */
 export function serveWshOverDuplex(
   host: { accept(socket: object, options?: object): Promise<{ close(): void }> },
-  options: WshDuplexOptions & { allowUnsealed?: boolean; remote?: { address?: string } },
+  options: WshDuplexOptions & { allowUnsealed?: boolean; remote?: { address?: string }; waitForPeer?: boolean | Promise<unknown> },
 ): {
   receive(data: Uint8Array | ArrayBuffer): void;
   end(reason?: string): void;

@@ -143,9 +143,11 @@ export function createDuplexSocket({ send, close, maxMessageBytes = DUPLEX_DEFAU
  * @param {object} options as `createDuplexSocket` (`send`, `close`, `maxMessageBytes`, `maxBufferedBytes`), and
  * @param {boolean} [options.allowUnsealed=false] serve a client that does not seal: nothing a hop does is then caught. Refused by default.
  * @param {object} [options.remote] what the host knows of the far side (`{ address }`, for its rate limiting of password failures)
+ * @param {boolean | Promise<unknown>} [options.waitForPeer=false] the far side of this duplex is not there yet (#253): the host's login deadline starts at the first byte
+ *   it sends (or when the promise resolves) rather than when `serveWshOverDuplex` is called. Leave it off when the duplex is made because a peer arrived.
  * @returns {{ receive(data: Uint8Array | ArrayBuffer): void, end(reason?: string): void, ready: Promise<{ close(): void }>, close(): void }}
  */
-export function serveWshOverDuplex(host, { allowUnsealed = false, remote, ...duplexOptions } = {}) {
+export function serveWshOverDuplex(host, { allowUnsealed = false, remote, waitForPeer, ...duplexOptions } = {}) {
   if (typeof host?.accept !== 'function') throw new TypeError('serveWshOverDuplex: host must have accept(socket, options) (createMemoryHost(), createWshServer())');
   if (typeof allowUnsealed !== 'boolean') throw new TypeError('serveWshOverDuplex: allowUnsealed must be true or false');
   const link = createDuplexSocket(duplexOptions);
@@ -153,6 +155,7 @@ export function serveWshOverDuplex(host, { allowUnsealed = false, remote, ...dup
     dataStreams: false,
     ...(allowUnsealed ? {} : { sealSession: 'require' }),
     ...(remote ? { remote } : {}),
+    ...(waitForPeer ? { waitForPeer } : {}),
   })).catch((e) => { link.socket.close(1011, 'this host cannot serve this duplex'); throw e; });
   ready.catch(() => {});
   return {

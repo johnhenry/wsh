@@ -28,7 +28,8 @@
 import { createMemoryHost } from './memory-host.mjs';
 import { resolveHostKey } from './host-backends.mjs';
 import { generateKeyPair } from './auth.mjs';
-import { pipeUrl } from './pipe-relay.mjs';
+import { pipeUrl, watchPairing } from './pipe-relay.mjs';
+import { assertLoginTimeoutMs } from './server/connection.mjs';
 import { webmcpTools, captureWebMcp, createDomPrompt, timersOf, WEBMCP_DEFAULT_LIMITS } from './webmcp.mjs';
 import { exposeObjects } from './objects.mjs';
 import { OBJECTS_PROTOCOL } from './objects-core.mjs';
@@ -208,10 +209,13 @@ function createDomIndicator(window, { name }) {
  * @param {object} [options.timers] - `{ setTimeout, clearTimeout, setInterval, clearInterval }` of the realm that runs this code, when it is not
  *   the window's own (an opener serving a popup, a parent serving an iframe: the window's timers die with its document)
  * @param {boolean} [options.reconnect=true] - dial the relay again after a session or a failed attempt, so another operator can arrive
+ * @param {number} [options.loginTimeoutMs=60000] - how long an operator may take, from the moment it ARRIVES, to complete its login (#248). The clock does not run while the
+ *   page waits for an operator (behind a relay: until the relay says one arrived, or its first byte; dialling out: until the listener's first byte), so a page can wait for a
+ *   person's operator as long as it likes. At the deadline the half is closed and reported as `login-timeout` (`onRefused`). 0 = no deadline.
  * @param {(line: string) => void} [options.onLog]
  */
 export async function createPageHost(options = {}) {
-  const { window, relay, connect, name, authorizedKeys, mcp, expose, indicator = true, unattended = false, hostKey, hostKeyStore, onSession, onSessionEnd, onRefused, onClose, reconnect = true, onLog = () => {} } = options;
+  const { window, relay, connect, name, authorizedKeys, mcp, expose, indicator = true, unattended = false, hostKey, hostKeyStore, onSession, onSessionEnd, onRefused, onClose, reconnect = true, loginTimeoutMs, onLog = () => {} } = options;
   if (!window || (typeof window !== 'object' && typeof window !== 'function')) {
     throw new TypeError('createPageHost: window is required: it is the realm served and the only thing this reads (pass `window`, an iframe\'s contentWindow, or a worker\'s self)');
   }
@@ -236,6 +240,7 @@ export async function createPageHost(options = {}) {
   if ((mcp || exposed?.mcp) && (mcp?.approve ?? 'consequential') !== 'never' && !doc && !mcp?.prompt && !unattended) {
     throw new TypeError("createPageHost: this window has no document to ask the person in: supply mcp.prompt, mcp.approve: 'never', or unattended: true");
   }
+  if (loginTimeoutMs !== undefined) assertLoginTimeoutMs(loginTimeoutMs, 'createPageHost');
   if (typeof window.WebSocket !== 'function') throw new TypeError('createPageHost: window.WebSocket is needed to dial the relay');
   for (const [k, fn] of Object.entries({ onSession, onSessionEnd, onRefused, onClose })) if (fn !== undefined && typeof fn !== 'function') throw new TypeError(`createPageHost: ${k} must be a function`);
   if (hostKeyStore !== undefined && (typeof hostKeyStore?.load !== 'function' || typeof hostKeyStore?.save !== 'function')) throw new TypeError('createPageHost: hostKeyStore needs load() and save(keyPair)');
@@ -256,7 +261,7 @@ export async function createPageHost(options = {}) {
     const relayOptions = typeof relay === 'string' ? { url: relay } : relay;
     if (!isObj(relayOptions) || typeof relayOptions.url !== 'string') throw new TypeError('createPageHost: relay is required: the ws:// or wss:// URL of a pipe relay (or { url, id }), or connect: the URL of an operator that listens');
     rendezvousId = relayOptions.id ?? randomRendezvousId(window.crypto);
-    hostUrl = pipeUrl(relayOptions.url, rendezvousId, 'host');
+    hostUrl = pipeUrl(relayOptions.url, rendezvousId, 'host', { notifyPaired: true }); // the relay says when an operator arrives (#253); one that predates it ignores this
     operatorUrl = pipeUrl(relayOptions.url, rendezvousId, 'operator');
   }
 
@@ -327,6 +332,7 @@ export async function createPageHost(options = {}) {
     hostKey: keyOption,
     dataStreams: false,
     sealSession: 'require',
+    loginTimeoutMs,
     rpc: { ...(mcpHandler ? { mcp: mcpHandler } : {}), ...(objectsHandler ? { [OBJECTS_PROTOCOL]: objectsHandler } : {}) },
     onRefused,
     onLog,
@@ -361,7 +367,10 @@ export async function createPageHost(options = {}) {
     halfSocket = socket;
     onLog(operatorUrl === null ? 'dialed the operator endpoint, waiting for it to log in' : 'dialed the relay, waiting for an operator');
     let served = false;
-    void memory.accept(socket, { remote: { address: 'relay' } }).catch((e) => onLog(`accept failed: ${e?.message ?? e}`));
+    // Nobody is on the other side yet, and may not be for hours: the login clock (`loginTimeoutMs`) starts when an operator is (#253), not now. Behind a relay
+    // that is the relay's paired signal, or the operator's first byte on a relay that does not send one; dialling out, the first byte the listener sends.
+    const watched = operatorUrl === null ? null : watchPairing(socket);
+    void memory.accept(watched?.socket ?? socket, { remote: { address: 'relay' }, waitForPeer: watched?.paired ?? true }).catch((e) => onLog(`accept failed: ${e?.message ?? e}`));
     const onEnd = () => {
       if (halfSocket === socket) halfSocket = null;
       served = current?.socket === socket;
