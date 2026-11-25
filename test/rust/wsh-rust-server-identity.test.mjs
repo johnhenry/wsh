@@ -10,7 +10,6 @@ import { describe, it, before, after } from 'node:test';
 import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import net from 'node:net';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -23,6 +22,7 @@ import { WebSocketTransport } from '../../src/transport-ws.mjs';
 import { signChallenge } from '../../src/auth.mjs';
 import { hello as helloMsg, auth as authMsg, MSG, AUTH_METHOD } from '../../src/messages.gen.mjs';
 import { computeChannelBinding } from '../../src/channel-binding.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -44,9 +44,6 @@ after(() => {
 });
 
 const cleanEnv = (home, extra = {}) => ({ PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester', TERM: 'xterm', ...extra });
-const freePort = () => new Promise((resolve) => {
-  const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
-});
 
 /** A server whose HOME holds an authorized key (`authorizedKey`) and the given `[server]` lines. */
 async function startServer({ serverToml = '', authorizedKey, hostKeyAt = 'host_key' } = {}) {
@@ -175,8 +172,9 @@ describe('Rust wsh-server host key (JS client)', () => {
     const pem = execFileSync(process.execPath, ['-e', "const {generateKeyPairSync}=require('node:crypto');process.stdout.write(generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'pem'}))"], { encoding: 'utf8' });
     writeFileSync(keyFile, pem, { mode: 0o644 });
     writeFileSync(path.join(home, '.wsh', 'config.toml'), `[server]\nhost_key = ${JSON.stringify(keyFile)}\n`);
+    const port = await freePort();
     const out = await new Promise((resolve) => {
-      const proc = spawn(SERVER_BIN, ['--port', String(await0()), '--generate-cert', '--config', path.join(home, '.wsh', 'config.toml')], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn(SERVER_BIN, ['--port', String(port),'--generate-cert', '--config', path.join(home, '.wsh', 'config.toml')], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
       let logs = ''; proc.stdout.on('data', (d) => { logs += d; }); proc.stderr.on('data', (d) => { logs += d; });
       proc.once('exit', (code) => resolve({ code, logs }));
       setTimeout(() => { proc.kill(); resolve({ code: null, logs }); }, 8000);
@@ -185,7 +183,6 @@ describe('Rust wsh-server host key (JS client)', () => {
     assert.match(out.logs, /readable by other users/);
   });
 });
-function await0() { return 20000 + Math.floor(Math.random() * 20000); }
 
 describe('Rust wsh-server host key (Rust CLI)', { skip: !existsSync(WSH_BIN) && `no wsh at ${WSH_BIN}` }, () => {
   function makeHome() {

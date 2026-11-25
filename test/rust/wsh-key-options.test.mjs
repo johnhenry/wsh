@@ -15,8 +15,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import net from 'node:net';
 import { WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint } from '../../src/index.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -27,7 +27,6 @@ const stripAnsi = (s) => s.replace(/\u001b\[[0-9;]*m/g, '');
 const CHUNK = 3;
 
 const ORIGINAL_TLS_REJECT = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
 
 before(() => {
   assert.ok(existsSync(SERVER_BIN), `expected the built wsh-server at ${SERVER_BIN}`);

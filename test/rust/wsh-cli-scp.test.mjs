@@ -9,7 +9,6 @@ import { describe, it, before, after, afterEach } from 'node:test';
 import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import net from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,6 +18,7 @@ import { WebSocket as WsClient } from 'ws';
 
 import { createPipeRelay, newRendezvousId, pipeUrl } from '@johnhenry/wsh/pipe-relay';
 import { createWshServer } from '@johnhenry/wsh/server';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -76,7 +76,7 @@ async function nodeHostViaRelay(h) {
 
 /** The Rust wsh-server on a fresh port, serving the real filesystem. */
 async function rustServer(h) {
-  const port = await new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
+  const port = await freePort();
   const serverHome = mkdtempSync(path.join(tmpdir(), 'wsh-cli-scp-server-'));
   scratch.push(serverHome);
   mkdirSync(path.join(serverHome, '.wsh'));

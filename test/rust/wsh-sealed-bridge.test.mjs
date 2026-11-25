@@ -12,7 +12,6 @@ import { describe, it, before, after, afterEach } from 'node:test';
 import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import net from 'node:net';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -22,6 +21,7 @@ import { createWshServer, createReverseHost } from '@johnhenry/wsh/server';
 import { createReverseHost as createBrowserSafeReverseHost } from '@johnhenry/wsh/reverse';
 import { WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint, MSG, cborEncode, cborDecode, open as openMsg, relayForward } from '@johnhenry/wsh';
 import { hostileRelay } from '../helpers/hostile-relay.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -50,7 +50,6 @@ async function until(cond, what, ms = 10_000) {
   const t0 = Date.now();
   for (;;) { const v = await cond(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`); await sleep(20); }
 }
-const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
 const cleanEnv = (home, extra = {}) => ({ PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester', TERM: 'xterm', ...extra });
 const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
@@ -134,7 +133,6 @@ const login = async (relay, id) => {
 
 /** A scratch directory the host's commands write their marker files in. */
 const markerDir = () => { const d = mkdtempSync(path.join('/tmp', 'wsh-seal-')); scratch.push(d); return d; };
-const sleepMs = sleep;
 /** The types of every RelayForward's inner message that crossed a hostile hop, and the whole traffic as bytes. */
 const innerType = (m) => { try { return cborDecode(m.inner).type; } catch { return undefined; } };
 const wire = (mitm) => Buffer.concat(mitm.seen.map((x) => Buffer.from(cborEncode(x.msg)))).toString('latin1');
@@ -198,9 +196,11 @@ for (const relayKind of ['js', 'rust']) {
       await until(async () => (await op.listPeers()).length, 'the host in the peer list');
       const res = await op.reverseConnect(host.fp, 8000); // proves, does not seal
       assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
-      const s = op.openSession({ type: 'exec', command: `touch ${dir}/plain`, timeout: 2000 });
-      await s.catch(() => {});
-      await sleepMs(500);
+      const s = op.openSession({ type: 'exec', command: `touch ${dir}/plain`, timeout: 2000 }).catch(() => null);
+      // No positive event exists here: the host's gate drops a plain message without a log line or an answer, and the only later event
+      // (the host giving up the unsealed bridge) comes after 10 s. So the one wait left is the open's own 2 s timeout, which is an answer
+      // that did not come (a host that ran the Open answers in milliseconds); nothing is slept on top of it.
+      assert.equal(await s, null, 'the plain Open was not answered');
       assert.equal(existsSync(path.join(dir, 'plain')), false, 'a plain Open on a bridge that must be sealed does not run');
     });
   });
@@ -300,12 +300,12 @@ describe('a hostile relay in front of a sealed Rust host', () => {
     const w = await world();
     const plain = relayForward({ fromFingerprint: w.bob.fp, inner: cborEncode(openMsg({ kind: 'exec', command: `touch ${w.dir}/INJECTED` })) });
     await w.state.ctx.injectToClient(plain);
-    await sleepMs(600);
-    assert.equal(existsSync(path.join(w.dir, 'INJECTED')), false, 'the plain Open did not run');
-    // and the genuine operator still works: the injection did not end the bridge
+    // The genuine operator's command is the marker: its frame reaches the host after the injected message on the same connection, so by
+    // the time it has run the injected Open was already handled; and it shows the injection did not end the bridge.
     const s = await w.op.openSession({ type: 'exec', command: `touch ${w.dir}/legit` });
     await collectExec(s);
     await until(() => existsSync(path.join(w.dir, 'legit')), 'the genuine command to run');
+    assert.equal(existsSync(path.join(w.dir, 'INJECTED')), false, 'the plain Open did not run');
   });
 
   it('a replayed sealed frame is not run again, and closes the bridge', async () => {
@@ -316,21 +316,22 @@ describe('a hostile relay in front of a sealed Rust host', () => {
     const openFrame = w.state.frames[0];
     assert.ok(openFrame, 'a sealed frame crossed the hop');
     await w.state.ctx.injectToClient(openFrame);
-    await until(() => /did not open|ending the bridge/.test(w.h.err()), `the host to end the bridge: ${w.h.err()}`);
-    await sleepMs(400);
+    // The host says so when the replayed frame has not opened and it has ended the bridge: that, not a stretch of time, is when "not run again" can be judged.
+    await until(() => /ending the bridge/.test(w.h.err()), `the host to end the bridge: ${w.h.err()}`);
     assert.equal(readFileSync(path.join(w.dir, 'count'), 'utf8').trim().split('\n').length, 1, 'the replay did not run the command again');
+    // No positive event exists for a request on an ended bridge (the host drops it without a log line or an answer, shown only at its debug
+    // level), so the one wait left is the open's own 1.5 s timeout: an answer that did not come (a host that served it answers in milliseconds).
     const after = await w.op.openSession({ type: 'exec', command: `touch ${w.dir}/after`, timeout: 1500 }).catch(() => null);
-    if (after) await collectExec(after).catch(() => {});
-    await sleepMs(400);
+    assert.equal(after, null, 'a request on an ended bridge was not answered');
     assert.equal(existsSync(path.join(w.dir, 'after')), false, 'a closed bridge runs nothing more');
   });
 
   it('a flipped bit in a sealed frame closes the bridge and the command does not run', async () => {
     const w = await world();
     w.state.tamper = true;
-    await w.op.openSession({ type: 'exec', command: `touch ${w.dir}/tampered`, timeout: 1500 }).catch(() => null);
-    await until(() => /did not open|ending the bridge/.test(w.h.err()), `the host to end the bridge: ${w.h.err()}`);
-    await sleepMs(400);
+    void w.op.openSession({ type: 'exec', command: `touch ${w.dir}/tampered`, timeout: 1500 }).catch(() => null); // not waited for: its answer is not the event
+    // The host says so when the tampered frame has not opened and it has ended the bridge: that, not a stretch of time, is when "did not run" can be judged.
+    await until(() => /ending the bridge/.test(w.h.err()), `the host to end the bridge: ${w.h.err()}`);
     assert.equal(existsSync(path.join(w.dir, 'tampered')), false);
   });
 });

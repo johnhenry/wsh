@@ -10,7 +10,6 @@ import { describe, it, before, after, afterEach } from 'node:test';
 import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import dgram from 'node:dgram';
 import net from 'node:net';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 
 import { WshClient, generateKeyPair, exportPublicKeySSH } from '../../src/index.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -40,20 +40,6 @@ after(() => {
 afterEach(async () => { for (const c of closers.splice(0).reverse()) await c().catch(() => {}); });
 
 const cleanEnv = (home) => ({ PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester', TERM: 'xterm' });
-/** A port free for TCP and for UDP: the server binds the number for both (WebSocket and WebTransport), and a TCP-only check can hand out one UDP holds. */
-const udpFree = (port) => new Promise((resolve) => {
-  const s = dgram.createSocket('udp4');
-  s.once('error', () => { try { s.close(); } catch { /* not open */ } resolve(false); });
-  s.bind(port, '0.0.0.0', () => s.close(() => resolve(true)));
-});
-const freePort = async () => {
-  for (;;) {
-    const port = await new Promise((resolve) => {
-      const s = net.createServer().listen(0, '0.0.0.0', () => { const { port: p } = s.address(); s.close(() => resolve(p)); });
-    });
-    if (await udpFree(port)) return port;
-  }
-};
 
 /** A wsh-server whose HOME holds an authorized key and `[server] login_timeout_secs = <loginTimeoutSecs>` (left out when undefined). */
 async function startServer({ loginTimeoutSecs } = {}) {

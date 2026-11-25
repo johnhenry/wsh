@@ -159,6 +159,7 @@ import {
 } from '../../src/index.mjs';
 import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-components/webtransport';
 import WebSocket from 'ws';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -168,12 +169,6 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
 
 const STARTUP_GRACE_MS = 1200;
-const PORT_BASE = 19400; // arbitrary high range unlikely to collide
-
-let nextPort = PORT_BASE;
-function allocPort() {
-  return nextPort++;
-}
 
 // Preserve/restore NODE_TLS_REJECT_UNAUTHORIZED — the Rust server always
 // wraps its WebSocket listener in TLS (self-signed cert via --generate-cert),
@@ -240,7 +235,7 @@ async function startServer(sshLines, extraArgs = [], { config } = {}) {
     writeFileSync(configPath, config(homeDir));
   }
 
-  const port = allocPort();
+  const port = await freePort();
   const logs = [];
   const proc = spawn(
     SERVER_BIN,

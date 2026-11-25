@@ -11,13 +11,13 @@ import { describe, it, before, after } from 'node:test';
 import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import net from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, openSync } from 'node:fs';
 import { tmpdir, homedir, platform } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { generateSelfSignedCertificate } from '../../src/server/self-signed.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -230,9 +230,7 @@ const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 
 
 /** A `wsh-server` with a scratch HOME that authorizes `h`'s key. Its generated dev certificate is a leaf (wsh #145), so the CLI trusts it through SSL_CERT_FILE and no WSH_INSECURE_LOOPBACK_TLS is needed. */
 async function startRustServer(h) {
-  const port = await new Promise((resolve) => {
-    const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
-  });
+  const port = await freePort();
   const serverHome = mkdtempSync(path.join(tmpdir(), 'wsh-cli-server-'));
   scratch.push(serverHome);
   mkdirSync(path.join(serverHome, '.wsh'));

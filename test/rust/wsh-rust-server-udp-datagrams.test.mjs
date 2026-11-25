@@ -11,7 +11,6 @@ import './helpers/guard.mjs';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import dgram from 'node:dgram';
-import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -20,6 +19,7 @@ import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-component
 
 import { WshClient, generateKeyPair, exportPublicKeySSH } from '../../src/index.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../../src/gateway-datagram.mjs';
+import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -28,7 +28,6 @@ async function until(cond, what, ms = 8000) {
   const t0 = Date.now();
   for (;;) { const v = await cond(); if (v) return v; if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`); await sleep(20); }
 }
-const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
 
 // `WebTransportTransport` calls the bare global `new WebTransport(url)`: install the native one, pinned to the certificate of the server
 // the current test started (the WebTransport spec's serverCertificateHashes; the dev certificate is valid for 13 days, as that needs).

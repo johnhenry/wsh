@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Tests: one port helper for every `wsh-server` test, and sealing tests that wait for an event instead of a stretch of time (#248; tests only, nothing shipped changes)
+
+- **One port helper.** `wsh-server` binds the port it is given twice (TCP for the WebSocket listener, UDP for WebTransport), and a port that was only checked for TCP could be held for UDP by another socket on the machine. `test/helpers/free-port.mjs` (TCP and UDP) is now the only port helper under `test/rust/`: the 17 TCP-only copies, the login-deadline test's own TCP-and-UDP check, a counter that started at 19400 in `wsh-rust-server.test.mjs` and a random number in `wsh-rust-server-identity.test.mjs` are gone. A small window remains between the check and the server's own bind (the time it takes to start a process). `wsh-server` cannot be told to take any free port and report it: `--port 0` would give TCP and UDP each a number of its own, and the start-up log prints the number it was given, so the tests do not use port 0 for the server.
+- **No fixed waits before a "nothing happened" check in the sealing tests.** `wsh-session-seal-server`, `wsh-session-seal` and `wsh-sealed-bridge` slept for 300 to 1500 ms and then checked that something had not happened. Each now waits for the event that shows it was handled: the server's or host's log line, the client's `onDrop` callback, a close, or a message sent after the injected one (it is answered only after the injected one was read). Each was broken once in the product code to see its test fail. The ones that still wait on a time (a request on a bridge that is closed, or that must be sealed and is not) have no log line or answer to wait for and keep the request's own 1.5 to 2 s timeout.
+
 ## 0.54.0 / Rust `rust-v0.21.0`
 
 ### Tests: no colliding temp folders in the `wsh-server` config tests, and a port the server can bind in the sealing tests (#248; tests only, nothing shipped changes)
