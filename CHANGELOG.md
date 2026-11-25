@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Rust `rust-v0.21.2`
 
 ### The Rust `wsh-server` gateway accepts only the destination addresses the Node gateway accepts (a tightening; Rust, #260)
 
