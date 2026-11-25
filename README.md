@@ -279,6 +279,30 @@ ends every authenticated connection `n` ms after login and advertises it
 limit and sends `ttl: 0`. Before 0.36 it sent an unenforced 3600. The Rust
 `wsh-server` still sends its `session_ttl` setting unenforced.
 
+**Login deadline (`loginTimeoutMs`, #248).** A connection that is accepted and never completes its login (Hello and Auth) -- one that
+says nothing, or stops half way -- used to hold its connection (and, on a relay, its pipe) for as long as it liked. Every JS host
+(`createWshServer`, `createMemoryHost`, `createConnectionFactory`; a page host and a duplex host are memory hosts and take the default) now ends it
+**`loginTimeoutMs`** after the host accepted it (default **60000**, `0` = no deadline; a negative or non-numeric value is a `TypeError`):
+the host sends an `AuthFail` ending "(login-timeout)", reports `onRefused` reason `login-timeout` (with `who.username` when the peer had
+said who it was) and closes the connection. The Rust `wsh-server` has **`[server] login_timeout_secs`** (default **60**, `0` = none) with
+the same `AuthFail` text; it also counts the TLS handshake and the WebSocket upgrade, which a Rust connection would otherwise sit in
+unbounded (a TCP connection that never starts TLS is closed too), and it applies to WebTransport as well.
+*Why 60 s, counted from the accept.* The clients give each of the three login steps (ServerHello, Challenge, AuthOk) 10 s, so a
+login on defaults is over, or has failed on the client, within about 30 s whatever the link. The things a person does happen outside the
+connection or inside one of those steps: a password is asked for before the connection is opened (`connect({ password })`; `wsh copy-id`
+prompts first), the Rust CLI asks about an unknown host key after the connection is closed and dials again, and a JS `onHostKey`
+callback runs between ServerHello and Challenge, where the client's own `timeout` (10 s) bounds it. 60 s is twice what the client
+waits, so a client on defaults gives up first, and an application that waits for a person inside `onHostKey` or a signer and raises its
+`timeout` for that up to about a minute is not cut off; raise `loginTimeoutMs` (or set 0) for a longer wait. Nothing changes on the wire
+(an ordinary `AuthFail`, which every released peer reads), and a connection that logs in in time is untouched: the deadline is dropped
+at `AuthOk`. A connection attached as already authenticated (a relay bridge) has no login here to bound. Other bounds on this path, for
+the record: a Node `http` server gives a request 60 s to send its headers (`headersTimeout`) and a TLS handshake 120 s (`handshakeTimeout`),
+so `createWshServer` was bounded before the upgrade and unbounded after it; the pipe relay (`createPipeRelay`) ends a pipe nobody joins
+after `rendezvousTimeoutMs` (120 s) and one idle for `idleTimeoutMs` (300 s), which a peer that sends one byte now and then
+defeats; the Rust server had no bound at any step. What it does not do: it limits how long one connection may take, not how many a
+peer may open (a host that wants that needs a limit in front of it), and a peer that logs in and does nothing is bounded only by the
+host's other limits (`connectionTtlMs`, `sealTimeoutMs` where sealing is required).
+
 ### Authorized-key options (#122)
 
 `auth.authorizedKeys` takes `authorized_keys` lines with options, and reads them the way the Rust `wsh-server` does: **the same
@@ -1460,7 +1484,7 @@ that is not a keepalive is refused (`onRefused` reason `not-sealed`, one per con
 `createWshServer`). A client that connects, logs in and then says nothing at all is closed at a deadline (#244): **`sealTimeoutMs`** (`createMemoryHost`, `createWshServer`, `createConnectionFactory`; default **30000**,
 0 = no deadline) after the login, if the session is not sealed by then, the host sends an `Error` ending "(seal-timeout)", reports `onRefused` reason `seal-timeout` and closes the connection (and so
 the relay pipe it held). 30 s is three times the 10 s the JS client gives each login step and its own key exchange, so a client on defaults gives up long before the host does and a slow link or a longer
-client `timeout` is not cut off; the deadline starts at the login, not at the connection (the handshake itself has no host-side bound here). It applies only where sealing is required: with `'offer'` or no
+client `timeout` is not cut off; the deadline starts at the login, not at the connection (the connection has its own, earlier one: the login deadline `loginTimeoutMs`, described under "Login deadline" near the top of this file). It applies only where sealing is required: with `'offer'` or no
 `sealSession` a connection is never closed for not sealing, and a client that seals promptly is untouched; nothing changes on the wire. The Rust `wsh-server` with
 `seal_session = "require"` has the same order: a password login is refused first, a key login is checked against `authorized_keys` as usual (the seal is only begun after `AuthOk`), and only then does it
 refuse every message but the keepalive and the key exchange and close the connection on the first one; it has the same deadline, **`[server] seal_timeout_secs`** (default **30**, 0 = no deadline), with the same
@@ -1502,7 +1526,7 @@ connection the host turned away, so an embedder can tell the user why a terminal
 is a stable code, the list is exported as `REFUSAL_REASONS` from `@johnhenry/wsh/host`: `not-sealed` (a plain client on a
 host that requires a sealed session, or a password login there), `unauthorized` (a key the host does not allow, a wrong
 password, or an operator a reverse host's `accept` turned down), `binding-required`, `bad-signature`, `method-disabled`,
-`rate-limited`, `bad-request`, `seal-failed` (a sealed session's key exchange failed or a frame did not open), `seal-timeout` (a host that requires sealing and a client that logged in and did not seal within `sealTimeoutMs`, #244), and for a reverse
+`rate-limited`, `bad-request`, `seal-failed` (a sealed session's key exchange failed or a frame did not open), `seal-timeout` (a host that requires sealing and a client that logged in and did not seal within `sealTimeoutMs`, #244), `login-timeout` (a connection that did not complete its login within `loginTimeoutMs`, #248), and for a reverse
 host `busy`, `proof-required`, `proof-failed`. `who` holds what is known: `username`, `fingerprint` (a key login), `address` (when
 the transport gives one); a refusal before the login names no one. `detail` is human text and not stable. New codes may be added;
 none is renamed. It reports only what this host decided: it does not say what a relay in the middle dropped, a client
@@ -2539,6 +2563,7 @@ than left to be found.
 | Sealed session: any authenticated connection incl. gateway/endpoint data (#155) | host `sealSession: 'offer' \| 'require'` (stage b); client `connect(url, { sealSession: false \| 'auto' \| true })` (stage c) | `wsh --sealed ...` (or automatic against `e2e-session-required`) seals a direct or pipe-relayed session; `wsh-server` offers or requires it on WebSocket (`[server] seal_session = "off" \| "offer" \| "require"`, needs `host_key`; `require` refuses WebTransport, WISP tunnels and password logins, and closes a connection that logged in and did not seal within `[server] seal_timeout_secs`, default 30, 0 = none, #244 -- the JS hosts' `sealTimeoutMs`, default 30000; with it on, the typed rpc channels (`wsh-host`, and `wsh-fs` when `[rpc] fs_root` is set) are offered in virtual data mode, #191: stated `rpc-virtual` instead of `rpc`, riding `SessionData` inside the seal, with the same credit accounting and the same per-key capability checks as stream-mode rpc) | **Wire-unified, negotiated** (`e2e-session`, `e2e-session-required`, `KeyExchange` for the connection's session id, `EncryptedFrame` channel 0) |
 | Refusal event with stable reason codes (`onRefused`, #163) | `onRefused({ reason, who, detail })` on `createMemoryHost` / `createWshServer` / `createReverseHost`; `REFUSAL_REASONS` from `@johnhenry/wsh/host` | none: `wsh-server` and `wsh reverse` log a refusal, they have no callback (an embedding process has none) | **JS-only** -- a host-side callback of the embedding API, no wire change |
 | `AuthOk.ttl` enforced, `token` opaque (#125) | `connectionTtlMs`; `client.authTtl` | `wsh-server` sends `ttl: 0` (no lifetime promised; `session_ttl` is the lifetime of a *detached* session) and an HMAC token that nothing accepts back | **Wire-compatible**: both fields are still sent (released peers require them). **Changed in the Rust server after `rust-v0.6.0`**: it used to send `session_ttl` (86400), which nothing enforced. The Rust client ignores `ttl` |
+| A connection that never completes its login is closed (#248) | host `loginTimeoutMs` (`createWshServer`, `createMemoryHost`, `createConnectionFactory`; default 60000, 0 = none); `onRefused` reason `login-timeout` | `wsh-server` `[server] login_timeout_secs` (default 60, 0 = none): also counts the TLS handshake and WebSocket upgrade, and covers WebTransport; sends the same `AuthFail` text | **Wire-compatible**: an ordinary `AuthFail`, which every released peer reads; nothing negotiated. **A default that now ends connections**: a login that takes longer than 60 s from the accept (a client with a raised `timeout` waiting on a person) is closed; raise it or set 0 |
 | `clientEnv` allow-list (#126) | default `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*` | `wsh-server`: the same default; `[server] client_env = true` (everything, the old behaviour), `false` (nothing) or a list of names / `PREFIX*` (replaces the default) | **Both hosts**; wire unchanged. **Breaking default in the Rust server**, see the CHANGELOG |
 | `authorized_keys` options (#122): `restrict`, `permit-*`, `no-pty`, `command=`, `max-sessions=` | `auth.authorizedKeys` lines with options on `createWshServer` / `createMemoryHost`; `parseAuthorizedKeyEntries()` | `wsh-server` reads `~/.wsh/authorized_keys` (then `~/.ssh/authorized_keys`) | **Same rules and the same vectors on both hosts** (`spec/key-options.vectors.json`, run by the JS suite and a Rust test); an option that is not understood keeps the key out, on both. See [Authorized-key options](#authorized-key-options-122) for the per-host column |
 | Per-key capabilities and expiry (#122): `capabilities="..."`, `expires="..."`; `authorize()` may return a set | every entry the host has: `Open` kinds, `FileOp` read vs write, gateway TCP/UDP/unix/endpoint open and listen, MCP discovery and calls, targets, rpc channels, relay; refusals through `onRefused` (`not-permitted`, `key-expired`) | the same, except **no endpoints and no targets** (`endpoint:` / `target:` parse and grant nothing; such requests are refused); refusals are logged, there is no callback; no `authorize` | **Same grammar, same vectors, same refusal codes on both hosts**; default-deny only for a key whose line has `capabilities`. Neither covers sessions already open, see [Security model](#security-model). The notation is written in `spec/capabilities.md` and its vectors (`spec/capabilities.vectors.json`, `version` 1) ship in the npm package and are run by both; the Rust server's subset is stated by refusal: a key line with an `objects:` capability is refused at load (`unknown-capability`) |
@@ -2639,6 +2664,12 @@ out explicitly below rather than left to be discovered.
 - **`AuthOk.ttl` and `token`.** The token is an opaque per-connection value
   with no authority; `ttl` is enforced when `connectionTtlMs` is set (else 0:
   no limit) -- do not read either as a session credential.
+- **A login deadline bounds one connection's time to log in, not how many connections a peer opens (#248).** `loginTimeoutMs` /
+  `[server] login_timeout_secs` (default 60 s from the accept) closes a connection that has not completed Hello and Auth, so a silent
+  or stalled one does not hold a connection, a relay pipe or a login slot for ever. It does NOT limit the number of connections a
+  peer may hold open at once (each lives up to the deadline; put a connection limit in front of a host that needs one), and it says
+  nothing about a peer that has logged in and then idles (`connectionTtlMs`, `sealTimeoutMs` and the session limits do). A peer that
+  trickles bytes is closed at the deadline all the same: it bounds the whole login, not the gaps in it.
 - **Client environment is an allow-list** (`clientEnv`, default `TERM`,
   `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`): a client cannot set `PATH`,
   `LD_PRELOAD` or `BASH_ENV` for a command your host runs through a shell

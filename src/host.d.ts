@@ -115,6 +115,12 @@ export interface WshConnectionConfig extends Partial<WshResolvedBackends> {
    * sealing is not required.
    */
   sealTimeoutMs?: number;
+  /**
+   * #248: how long a connection may take, from the moment `attach()` accepts it, to complete its login (Hello and Auth), default 60000.
+   * At the deadline the host reports `login-timeout` (`onRefused`), sends an `AuthFail` naming it and closes the connection.
+   * 0 = no deadline. A connection attached with `authenticated` (already logged in by something else) has none.
+   */
+  loginTimeoutMs?: number;
   /** Folders the operator offers (`wsh --share`, #159): called once per share; listing it makes the host state `shares`. */
   onShare?: WshOnShare;
   /** Told once per connection this host turned away, with a stable reason code (#163). */

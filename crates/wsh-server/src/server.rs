@@ -457,6 +457,13 @@ impl WshServer {
         })
     }
 
+    /// How long a connection may take, from the moment it is accepted, to complete its login
+    /// (`[server] login_timeout_secs`, wsh #248); `None` = no deadline.
+    fn login_timeout(&self) -> Option<std::time::Duration> {
+        (self.config.login_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.config.login_timeout_secs))
+    }
+
     /// Start listening on both WebTransport and WebSocket.
     pub async fn run(self, tls_config: Arc<rustls::ServerConfig>) -> WshResult<()> {
         let server = Arc::new(self);
@@ -484,7 +491,7 @@ impl WshServer {
             mut ws_rx,
             mut wisp_guest_rx,
             mut wisp_connect_rx,
-        } = websocket::start_listener(ws_addr, tls_config).await?;
+        } = websocket::start_listener(ws_addr, tls_config, server.login_timeout()).await?;
 
         // Start session GC + idle warning task
         let gc_sessions = server.sessions.clone();
@@ -718,15 +725,27 @@ impl WshServer {
             return Ok(());
         }
 
+        // The login (the control stream, Hello and Auth) is held to one clock from the moment the connection was accepted (wsh #248).
+        let login_deadline = self.login_timeout().map(|t| conn.accepted_at + t);
+
         // Accept the first bidirectional stream as the control channel.
-        let (mut send, mut recv) = conn
-            .connection
-            .accept_bi()
-            .await
-            .map_err(|e| WshError::Transport(format!("WebTransport accept failed: {e}")))?;
+        let (mut send, mut recv) = within_login_deadline(login_deadline, async {
+            conn.connection
+                .accept_bi()
+                .await
+                .map_err(|e| WshError::Transport(format!("WebTransport accept failed: {e}")))
+        })
+        .await?;
 
         // Read HELLO
-        let hello_bytes = read_webtransport_frame(&mut recv).await?;
+        let hello_bytes =
+            match within_login_deadline(login_deadline, read_webtransport_frame(&mut recv)).await {
+                Err(e) if is_login_timeout(&e) => {
+                    refuse_login_timeout(&mut send).await;
+                    return Err(e);
+                }
+                other => other?,
+            };
         let envelope = decode_envelope(&hello_bytes)?;
 
         let hello = match (&envelope.msg_type, &envelope.payload) {
@@ -779,7 +798,14 @@ impl WshServer {
             .map_err(|e| WshError::Transport(format!("WebTransport write failed: {e}")))?;
 
         // Read AUTH
-        let auth_bytes = read_webtransport_frame(&mut recv).await?;
+        let auth_bytes =
+            match within_login_deadline(login_deadline, read_webtransport_frame(&mut recv)).await {
+                Err(e) if is_login_timeout(&e) => {
+                    refuse_login_timeout(&mut send).await;
+                    return Err(e);
+                }
+                other => other?,
+            };
         let auth_envelope = decode_envelope(&auth_bytes)?;
 
         let auth = match (&auth_envelope.msg_type, &auth_envelope.payload) {
@@ -1581,8 +1607,12 @@ impl WshServer {
         // `peer_senders`, so this simply never fires before then.
         let (peer_tx, mut peer_rx) = mpsc::channel::<Envelope>(64);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // The login (Hello and Auth) is due `login_timeout_secs` after the connection was accepted, the TLS and WebSocket
+        // handshakes included (wsh #248); once the connection is `Authenticated` there is nothing left to wait for.
+        let login_deadline = self.login_timeout().map(|t| conn.accepted_at + t);
 
         let loop_result: WshResult<()> = 'session: loop {
+            let login_due = login_deadline.filter(|_| !matches!(state, ConnState::Authenticated));
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     debug!("shutdown signal received, notifying WebSocket client");
@@ -1599,6 +1629,23 @@ impl WshServer {
                         }
                     }
                     break 'session Ok(());
+                }
+
+                // A login that was not completed in time (wsh #248): say so, once, and close.
+                _ = async {
+                    match login_due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    warn!(
+                        login_timeout_secs = self.config.login_timeout_secs,
+                        "closed a connection that did not complete its login in time (login-timeout)"
+                    );
+                    if let Ok(frame) = frame_encode(&handshake::build_auth_fail(LOGIN_TIMEOUT_REASON)) {
+                        let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
+                    }
+                    break 'session Err(WshError::AuthFailed(LOGIN_TIMEOUT_REASON.into()));
                 }
 
                 // A required seal that was not established in time (wsh #244): say so, once, and close.
@@ -5149,6 +5196,38 @@ impl WshServer {
 }
 
 /// Read a length-prefixed frame from a WebTransport recv stream.
+/// What a peer is told when its login is not done by the deadline (wsh #248). The same words as the
+/// JS hosts' `AuthFail`; the parenthesised name is the reason a JS host reports to `onRefused`.
+const LOGIN_TIMEOUT_REASON: &str = "the login was not completed in time (login-timeout)";
+
+/// Wait for one step of the login until `deadline` (`None` = no deadline); a step still running
+/// then is dropped and fails with [`LOGIN_TIMEOUT_REASON`].
+async fn within_login_deadline<T>(
+    deadline: Option<tokio::time::Instant>,
+    step: impl std::future::Future<Output = WshResult<T>>,
+) -> WshResult<T> {
+    match deadline {
+        None => step.await,
+        Some(at) => match tokio::time::timeout_at(at, step).await {
+            Ok(result) => result,
+            Err(_) => Err(WshError::AuthFailed(LOGIN_TIMEOUT_REASON.into())),
+        },
+    }
+}
+
+/// Whether `e` is the failure [`within_login_deadline`] reports.
+fn is_login_timeout(e: &WshError) -> bool {
+    matches!(e, WshError::AuthFailed(m) if m == LOGIN_TIMEOUT_REASON)
+}
+
+/// Best effort: tell a WebTransport peer why its login ended.
+async fn refuse_login_timeout(send: &mut wtransport::SendStream) {
+    warn!("closed a connection that did not complete its login in time (login-timeout)");
+    if let Ok(frame) = frame_encode(&handshake::build_auth_fail(LOGIN_TIMEOUT_REASON)) {
+        let _ = send.write_all(&frame).await;
+    }
+}
+
 async fn read_webtransport_frame(recv: &mut wtransport::RecvStream) -> WshResult<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
@@ -5430,6 +5509,7 @@ mod wisp_reverse_connect_e2e_tests {
             require_channel_binding: false,
             seal_session: crate::config::SealSession::Off,
             seal_timeout_secs: 30,
+            login_timeout_secs: 60,
         }
     }
 
@@ -5529,7 +5609,7 @@ mod wisp_reverse_connect_e2e_tests {
             ws_rx: _ws_rx,
             mut wisp_guest_rx,
             mut wisp_connect_rx,
-        } = websocket::start_listener(bound_addr, tls_config)
+        } = websocket::start_listener(bound_addr, tls_config, None)
             .await
             .unwrap();
 

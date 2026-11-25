@@ -28,6 +28,8 @@ pub struct WebSocketConnection {
     pub ws_stream: WebSocketStream<BoxedWsIo>,
     /// Remote address.
     pub remote_addr: SocketAddr,
+    /// When the TCP connection was accepted: the clock of the login deadline (wsh #248) starts here.
+    pub accepted_at: tokio::time::Instant,
 }
 
 /// A guest's outbound WISP tunnel connection (`/wisp/<fingerprint>`), #38
@@ -109,14 +111,38 @@ pub struct ListenerChannels {
     pub wisp_connect_rx: mpsc::Receiver<WispConnectRequest>,
 }
 
+/// Run a handshake step under the login deadline (wsh #248): `None` = no deadline. A step that
+/// is not done by then fails with a timed-out I/O error, and dropping it closes the connection.
+async fn within_login<T, E: From<std::io::Error>>(
+    deadline: Option<tokio::time::Instant>,
+    step: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    match deadline {
+        None => step.await,
+        Some(at) => match tokio::time::timeout_at(at, step).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the login was not completed in time (login-timeout)",
+            )
+            .into()),
+        },
+    }
+}
+
 /// Start the WebSocket listener.
 ///
 /// Returns receivers that yield accepted connections, routed by request
 /// path into the wsh Envelope protocol, a guest's WISP tunnel, or an
 /// external WISP reverse-connect bridge request (#38 Phase 2).
+///
+/// `login_timeout` (`[server] login_timeout_secs`, wsh #248) bounds the TLS handshake and the
+/// WebSocket upgrade of each connection, counted from the TCP accept; `None` = no bound. The
+/// accept time travels with a wsh connection so the login that follows is held to the same clock.
 pub async fn start_listener(
     bind_addr: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
+    login_timeout: Option<std::time::Duration>,
 ) -> WshResult<ListenerChannels> {
     let tcp_listener = TcpListener::bind(bind_addr)
         .await
@@ -138,7 +164,10 @@ pub async fn start_listener(
                     let wisp_connect_tx = wisp_connect_tx.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     tokio::spawn(async move {
-                        match tls_acceptor.accept(stream).await {
+                        // One clock for the TLS handshake, the WebSocket upgrade and (in `handle_websocket`) the login (wsh #248).
+                        let accepted_at = tokio::time::Instant::now();
+                        let deadline = login_timeout.map(|t| accepted_at + t);
+                        match within_login(deadline, tls_acceptor.accept(stream)).await {
                             Ok(tls_stream) => {
                                 let boxed_stream: BoxedWsIo = Box::new(tls_stream);
                                 let path_slot: Arc<StdMutex<String>> =
@@ -151,8 +180,11 @@ pub async fn start_listener(
                                         }
                                         Ok(resp)
                                     };
-                                match tokio_tungstenite::accept_hdr_async(boxed_stream, callback)
-                                    .await
+                                match within_login(
+                                    deadline,
+                                    tokio_tungstenite::accept_hdr_async(boxed_stream, callback),
+                                )
+                                .await
                                 {
                                     Ok(ws_stream) => {
                                         let path =
@@ -189,6 +221,7 @@ pub async fn start_listener(
                                                 let conn = WebSocketConnection {
                                                     ws_stream,
                                                     remote_addr: addr,
+                                                    accepted_at,
                                                 };
                                                 if tx.send(conn).await.is_err() {
                                                     warn!("WebSocket connection channel closed");

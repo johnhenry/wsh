@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Hosts close a connection that never completes its login (#248; JS and Rust)
+
+- **A deadline for the login.** A connection that was accepted and never completed Hello and Auth (it said nothing, or stopped half way) used to hold its connection, and on a relay its pipe, for as long as it liked. Every JS host (`createWshServer`, `createMemoryHost`, `createConnectionFactory`; a page host and a duplex host are memory hosts and take the default) now ends it `loginTimeoutMs` after accepting it: it sends an `AuthFail` ending "(login-timeout)", reports `onRefused` reason `login-timeout` (new, in `REFUSAL_REASONS`; `who.username` when the peer had said who it was) and closes the connection. Default **60000** ms; `loginTimeoutMs: 0` turns it off; a negative or non-numeric value is a `TypeError`. The deadline is dropped at `AuthOk`, and a connection attached as already authenticated (a relay bridge) has none.
+- **Why 60 s.** The clients give each of the three login steps 10 s, so a login on defaults is over, or has failed on the client, within about 30 s. A password is asked for before the connection is opened, the Rust CLI asks about an unknown host key after the connection is closed, and a JS `onHostKey` runs inside a step the client's own `timeout` bounds. 60 s is twice what the client waits; an application that raises its `timeout` to wait for a person inside `onHostKey` or a signer beyond a minute must raise `loginTimeoutMs` too.
+- **Rust `wsh-server`:** `[server] login_timeout_secs` (default **60**, `0` = no deadline), the same behaviour and the same `AuthFail` text. It counts from the TCP accept, so it also bounds the TLS handshake and the WebSocket upgrade (a connection that never starts TLS is closed; the Rust server had no bound there) and it covers WebTransport.
+- **Other bounds on this path:** a Node `http` server already gives a request 60 s for its headers and a TLS handshake 120 s, so `createWshServer` was bounded before the WebSocket upgrade and unbounded after it; a pipe relay ends a pipe nobody joins after 120 s and an idle one after 300 s (a peer that sends a byte now and then defeats the latter). Neither covers a connection that is joined and silent.
+- **Compatibility:** nothing on the wire (an ordinary `AuthFail`, which every released JS peer (0.45.0) and Rust peer (rust-v0.16.0, `deny_unknown_fields`) reads as it reads any refused login; no field or feature string is added). A client that logs in in time is unaffected; `onRefused` callbacks that switch over the reason see one new value. **A default that now ends connections:** a login that takes longer than 60 s from the accept is closed; raise `loginTimeoutMs` / `login_timeout_secs` (or set 0) for such a deployment.
+- Not done: this bounds one connection's time to log in, not how many connections a peer holds open at once.
+- Tests: `test/login-deadline.test.mjs` (a mocked clock, no real wait; one real-socket test waits for a close event), `test/rust/wsh-login-deadline.test.mjs` (the Rust server against a JS socket, waiting for the close event), config tests in `crates/wsh-server/src/config.rs`.
+
 ## 0.53.0 / Rust `rust-v0.20.0`
 
 ### Docs: how wsh and browsermesh fit together (`spec/wsh-and-browsermesh.md`)
