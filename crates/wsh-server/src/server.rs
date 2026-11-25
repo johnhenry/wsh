@@ -1569,6 +1569,9 @@ impl WshServer {
         // leaves as an `EncryptedFrame` and arrives as one, and a frame that does not open ends the connection.
         let seal = SealGate::default();
         let must_seal = self.config.seal_session == SealSession::Require;
+        // With `require`, the key exchange follows the login and nothing is served before it: when it must be done by (wsh #244).
+        // Set at login, only for a server that requires the seal and has not turned the deadline off (`seal_timeout_secs = 0`).
+        let mut seal_deadline: Option<tokio::time::Instant> = None;
         // Typed rpc channels of this connection (#86); features are filled in at Hello.
         let mut rpc_sessions = RpcSessions::new(self.rpc.clone(), Vec::new());
 
@@ -1596,6 +1599,34 @@ impl WshServer {
                         }
                     }
                     break 'session Ok(());
+                }
+
+                // A required seal that was not established in time (wsh #244): say so, once, and close.
+                _ = async {
+                    match seal_deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if seal.is_sealed() {
+                        seal_deadline = None;
+                        continue;
+                    }
+                    warn!(
+                        seal_timeout_secs = self.config.seal_timeout_secs,
+                        "closed a connection whose session was not sealed in time (seal-timeout)"
+                    );
+                    let refusal = Envelope {
+                        msg_type: MsgType::Error,
+                        payload: Payload::Error(ErrorPayload {
+                            code: 1,
+                            message: "the sealed session was not established in time (seal-timeout)".into(),
+                        }),
+                    };
+                    if let Ok(frame) = frame_encode(&refusal) {
+                        let _ = qmux.write_stream(CONTROL_STREAM_ID, &frame).await;
+                    }
+                    break 'session Err(WshError::AuthFailed("the sealed session was not established in time".into()));
                 }
 
                 // Peer push messages (e.g. forwarded ReverseConnect)
@@ -2024,6 +2055,12 @@ impl WshServer {
                                                             "sealed session: no login key to authenticate the key exchange with".into(),
                                                         )),
                                                     }
+                                                }
+                                                if must_seal && self.config.seal_timeout_secs > 0 {
+                                                    seal_deadline = Some(
+                                                        tokio::time::Instant::now()
+                                                            + std::time::Duration::from_secs(self.config.seal_timeout_secs),
+                                                    );
                                                 }
                                                 state = ConnState::Authenticated;
                                             }
@@ -5392,6 +5429,7 @@ mod wisp_reverse_connect_e2e_tests {
             host_key_path: None,
             require_channel_binding: false,
             seal_session: crate::config::SealSession::Off,
+            seal_timeout_secs: 30,
         }
     }
 

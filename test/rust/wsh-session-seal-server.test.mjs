@@ -66,7 +66,7 @@ async function echoServer() {
 }
 
 /** A wsh-server whose HOME holds an authorized key and `[server] seal_session = <seal>` (and a host key, and the gateway). */
-async function startServer({ seal, authorizedKey, extraToml = '' } = {}) {
+async function startServer({ seal, sealTimeoutSecs, authorizedKey, extraToml = '' } = {}) {
   const kp = await generateKeyPair(true);
   const home = mkdtempSync(path.join(tmpdir(), 'wsh-seal-srv-'));
   scratch.push(home);
@@ -74,7 +74,7 @@ async function startServer({ seal, authorizedKey, extraToml = '' } = {}) {
   writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${authorizedKey ?? await exportPublicKeySSH(kp.publicKey)}\n`);
   const hostKeyPath = path.join(home, '.wsh', 'host_key');
   const configPath = path.join(home, '.wsh', 'config.toml');
-  writeFileSync(configPath, `[server]\nhost_key = ${JSON.stringify(hostKeyPath)}\n${seal ? `seal_session = "${seal}"\n` : ''}\n[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1"]\n${extraToml}`);
+  writeFileSync(configPath, `[server]\nhost_key = ${JSON.stringify(hostKeyPath)}\n${seal ? `seal_session = "${seal}"\n` : ''}${sealTimeoutSecs === undefined ? '' : `seal_timeout_secs = ${sealTimeoutSecs}\n`}\n[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1"]\n${extraToml}`);
   const port = await freePort();
   const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(proc);
@@ -325,6 +325,34 @@ describe('seal_session = "require"', () => {
     await until(() => closed, 'the server to close the connection');
     assert.equal(echo.seen(), 0, 'nothing was served');
     assert.match(s.logs(), /requires a sealed session/);
+  });
+
+  it('#244: a client that logs in and never seals is closed at seal_timeout_secs, the server says why; a client that sealed, and a server that only offers, are not touched', async () => {
+    // 1 s, the smallest the key takes: every wait below is for an event (the close), never for a count of milliseconds.
+    const req = await startServer({ seal: 'require', sealTimeoutSecs: 1 });
+    const offer = await startServer({ seal: 'offer', sealTimeoutSecs: 1 });
+    const echo = await echoServer();
+    const offered = await login(offer, undefined, { sealSession: false });
+    const sealed = await login(req);
+    assert.equal(sealed.sessionSealed, true);
+    const silent = await login(req, undefined, { sealSession: false });
+    let closed = false; silent.onClose = () => { closed = true; };
+    await until(() => closed, 'the server to close the silent connection', 6000);
+    assert.match(req.logs(), /not sealed in time/);
+    // The other two outlived the deadline (they were connected before the silent one, so it has passed for them too).
+    assert.equal(await roundTrip(sealed, echo.port, MARKER), MARKER);
+    assert.equal((await execEcho(offered, 'still-here')).trim(), 'still-here');
+    assert.doesNotMatch(offer.logs(), /not sealed in time/);
+  });
+
+  it('#244: seal_timeout_secs = 0 turns the deadline off; a value that is not a whole number of seconds is refused at start', async () => {
+    const off = await startServer({ seal: 'require', sealTimeoutSecs: 0 });
+    const c = await login(off, undefined, { sealSession: false });
+    let closed = false; c.onClose = () => { closed = true; };
+    await sleep(1500); // one real wait, to show the key is not enforced: 0 must not mean "at once" either
+    assert.equal(closed, false);
+    assert.doesNotMatch(off.logs(), /not sealed in time/);
+    await assert.rejects(startServer({ seal: 'require', sealTimeoutSecs: -1 }), /seal_timeout_secs|invalid|exited/i);
   });
 
   it('a password login is refused (it has no key to authenticate the exchange with)', async () => {

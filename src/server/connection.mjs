@@ -83,6 +83,18 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   }
   return features;
 }
+/**
+ * How long a connection that logged in under `sealSession: 'require'` may stay unsealed (#244): 30 s. The JS client's default for
+ * each login step and for its own key exchange is 10 s, so a client on defaults gives up long before this and one on a slow link
+ * (or with a longer `timeout`) is not cut off; the host had no bound at all before.
+ */
+export const DEFAULT_SEAL_TIMEOUT_MS = 30_000;
+
+/** `sealTimeoutMs` must be a finite, non-negative number of milliseconds (0 = no deadline). */
+export function assertSealTimeoutMs(v, where) {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new TypeError(`${where}: sealTimeoutMs must be a non-negative number of milliseconds (0 = no deadline)`);
+}
+
 const MAX_PENDING_WRITES = 8;
 const MAX_RENAME_PATH_BYTES = 4096;
 const WRITE_IDLE_MS = 30_000;
@@ -123,6 +135,8 @@ const toBytes = (d) => (typeof d === 'string' ? enc.encode(d) : d);
  * @param {object | null} cfg.sessions - a SessionRegistry (see sessions.mjs); null = sessions die with their connection
  * @param {{ limiter: object, key: Function, failureDelayMs: number } | null} cfg.rateLimit - password throttle
  * @param {number} [cfg.bindTimeoutMs=3000] - how long exec output waits for the data stream
+ * @param {number} [cfg.sealTimeoutMs=30000] - with `sealSession: 'require'` (#244): how long after login the session may stay unsealed; at the deadline the
+ *   connection is refused as `seal-timeout` and closed. 0 = no deadline. Nothing changes where sealing is not required.
  * @param {(line: string) => void} [cfg.log]
  */
 export function createConnectionFactory(cfg) {
@@ -132,10 +146,12 @@ export function createConnectionFactory(cfg) {
     execOptions: cfg.execOptions ?? {},
     methods: cfg.methods ?? { pubkey: true, password: null },
     bindTimeoutMs: cfg.bindTimeoutMs ?? 3000,
+    sealTimeoutMs: cfg.sealTimeoutMs ?? DEFAULT_SEAL_TIMEOUT_MS,
     log: cfg.log ?? (() => {}),
     usernamePattern: resolveUsernamePattern(cfg.usernamePattern, 'createConnectionFactory'),
   };
   validateOnRefused(cfg.onRefused, 'createConnectionFactory');
+  assertSealTimeoutMs(cfg.sealTimeoutMs, 'createConnectionFactory');
   const notifyRefused = refusalNotifier(cfg.onRefused, cfg.log);
   let counter = 0;
   // What a client may put in `Open.env` (#126): an allow-list unless the host says otherwise.
@@ -257,6 +273,8 @@ export function createConnectionFactory(cfg) {
     let relayHandle = null;
     /** Ends the connection at `connectionTtlMs` after authentication (#125). */
     let ttlTimer = null;
+    /** Ends a connection that must seal and has not, `sealTimeoutMs` after login (#244). */
+    let sealTimer = null;
 
     // A sealed session (#155): after login, a signed KeyExchange for this connection's session id seals everything
     // that follows (control messages, gateway and endpoint data included) as EncryptedFrames on channel 0.
@@ -269,6 +287,8 @@ export function createConnectionFactory(cfg) {
     const sealRequired = sealOn && sealMode === 'require';
     /** @type {{ bridge: SealedBridge | null, responder: E2EResponder | null }} */
     const sealed = { bridge: null, responder: null };
+    // A peer something else already authenticated (`authenticated`) has no login here to count from: its deadline runs from attach.
+    if (authenticated) armSealDeadline();
 
     // The gateway needs Node sockets, so `gateway.mjs` is not imported here (a browser host must not pull it in):
     // the embedder that has them (`createWshServer`) passes `cfg.createGatewaySession` along with `cfg.gateway`; a
@@ -347,6 +367,7 @@ export function createConnectionFactory(cfg) {
       state.closed = true;
       liveConnections.delete(live);
       clearTimeout(ttlTimer);
+      clearTimeout(sealTimer);
       // A hosted session survives its connection (it is detached, then expires or is resumed);
       // everything else dies with it.
       for (const ch of [...channels.values()]) (ch.detach ?? ch.kill)?.call(ch);
@@ -490,6 +511,7 @@ export function createConnectionFactory(cfg) {
      * and released peers parse it, but nothing on this host accepts it back.
      */
     async function grantAuth() {
+      armSealDeadline();
       const ttlMs = cfg.connectionTtlMs ?? 0;
       if (ttlMs > 0) {
         ttlTimer = setTimeout(() => { log('connection ttl reached'); shutdownAfterQueue('connection ttl reached'); }, ttlMs);
@@ -504,6 +526,23 @@ export function createConnectionFactory(cfg) {
       if (refusalReported) return;
       refusalReported = true;
       notifyRefused(code, { username: state.username, fingerprint: state.fingerprint, address: remote.address, ...extra }, detail);
+    }
+
+    /**
+     * With `sealSession: 'require'` the key exchange follows the login and nothing is served before it; this bounds how long it may
+     * take (#244). At the deadline the peer is told why (an `Error`, as for a plain message), the embedder hears `seal-timeout`, and
+     * the connection ends. A sealed session, a closed connection, `sealTimeoutMs: 0` and a host that does not require sealing never reach it.
+     */
+    function armSealDeadline() {
+      if (!sealRequired || !(cfg.sealTimeoutMs > 0) || sealTimer) return;
+      sealTimer = setTimeout(async () => {
+        if (state.closed || sealed.bridge) return;
+        log('sealed session not established in time');
+        reportRefused('seal-timeout', `the session was not sealed within ${cfg.sealTimeoutMs} ms of login`);
+        await deliverRaw(errorMsg({ code: 1, message: 'the sealed session was not established in time (seal-timeout)' }));
+        setTimeout(() => { if (!sealed.bridge) shutdown('sealed session not established in time'); }, 50);
+      }, cfg.sealTimeoutMs);
+      sealTimer.unref?.();
     }
 
     async function refuse(reason, code = 'bad-request', who) {
@@ -644,6 +683,7 @@ export function createConnectionFactory(cfg) {
           const result = await sealed.responder.respond(m, (reply) => deliverRaw(reply));
           if (result.key) {
             sealed.bridge = new SealedBridge({ key: result.key, sessionId: state.sessionId, role: 'responder', scope: 'session' });
+            clearTimeout(sealTimer);
             log(`session sealed${result.hybrid ? ' (hybrid)' : ''}`);
             try { cfg.onSealed?.({ username: state.username, fingerprint: state.fingerprint }); } catch (e) { log(`onSealed threw: ${e.message}`); }
           }
