@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Hosts: a host key that is not Ed25519 is refused at creation; `auth` and `sealSession: 'require'` (#240; JS)
+
+- **`hostKey` of another algorithm fails at creation.** `createMemoryHost` and `createWshServer` (synchronously), `createPageHost` (its promise rejects, before any relay is dialled) and `resolveHostKey` throw a `TypeError` that names the algorithm (`ECDSA (P-256)`, `RSASSA-PKCS1-v1_5 (2048-bit)`, a raw key of 65 bytes) and says wsh host keys are Ed25519 only. Before, a P-256 key was accepted and the first `accept()` failed while the client waited out its timeout. An Ed25519 key (extractable or not), a signer with a 32-byte or Ed25519 `CryptoKey` public key, `true` and a `{ file }` are accepted as before; a `{ file }` is checked when the file is read, as before.
+- **`auth` runs before a client says whether it seals; this is documented, not changed.** With `sealSession: 'require'` the key exchange follows the login (it is signed with the login key and bound to the session the login created), so no host can know before `auth` that a client will not seal, and a change would need a wire change. Instead: `auth` is told `who.sealRequired: true` (typed), `onSealed` is where to count (it already existed on `createMemoryHost`; `createWshServer` now takes it too, and `sealSession` is typed there), and a client that does not seal is served nothing and refused at its first non-keepalive message (`onRefused` `not-sealed`). Tests run this against `createMemoryHost` and `createWshServer`. The Rust `wsh-server` has the same order (README, sealed session); nothing in Rust changed.
+- **Compatibility:** nothing on the wire; a host that was created with a valid key behaves as before. A caller that passed a key of another algorithm used to get a host that could not serve anyone and now gets the error at creation.
+
 ## 0.52.0 / Rust `rust-v0.19.0`
 
 ### Rust client reads every GatewayFail code (Rust)

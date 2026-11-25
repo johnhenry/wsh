@@ -34,6 +34,42 @@ const PROOF_TAG = 'wsh-host-key-proof-v1';
 
 const enc = new TextEncoder();
 
+/** The algorithm of a Web Crypto key, as a person reads it: `Ed25519`, `ECDSA (P-256)`, `RSASSA-PKCS1-v1_5 (2048-bit)`. */
+function describeAlgorithm(key) {
+  const a = key?.algorithm;
+  if (!a || typeof a.name !== 'string') return null;
+  if (typeof a.namedCurve === 'string') return `${a.name} (${a.namedCurve})`;
+  if (Number.isInteger(a.modulusLength)) return `${a.name} (${a.modulusLength}-bit)`;
+  return a.name;
+}
+
+/**
+ * Refuse, synchronously and by name, a `hostKey` wsh cannot use (#240): a host key is Ed25519 (the host signs the key-exchange proof,
+ * the login binding and the sealed session with it), so an ECDSA, RSA or other key would only fail later, at the first `accept()`,
+ * while the client waited out its timeout. Checks only what can be told without awaiting: the algorithm of a `CryptoKeyPair` or of a
+ * signer's `CryptoKey`, and the length of a signer's raw key (an Ed25519 public key is 32 bytes). `true` is accepted; so is a `{ file }`
+ * (the Node server reads that file and checks its key when it loads it). `who` is the prefix of the message (`createMemoryHost: hostKey`).
+ * @param {unknown} option
+ * @param {string} who
+ */
+export function assertEd25519HostKey(option, who = 'hostKey') {
+  if (option === true) return;
+  if (option !== null && typeof option === 'object' && typeof option.file === 'string') return;
+  const isPair = option !== null && typeof option === 'object' && option.privateKey && option.publicKey;
+  const isSigner = option !== null && typeof option === 'object' && typeof option.sign === 'function' && option.publicKey;
+  if (!isPair && !isSigner) throw new TypeError(`${who} must be true, a CryptoKeyPair, or a signer { publicKey, sign(data) }`);
+  const refuse = (what) => { throw new TypeError(`${who} must be an Ed25519 key, but this one is ${what}: wsh host keys are Ed25519 only (make one with generateKeyPair(), or pass hostKey: true for a throwaway key)`); };
+  for (const key of isPair ? [option.publicKey, option.privateKey] : [option.publicKey]) {
+    if (key instanceof Uint8Array) {
+      if (key.byteLength !== 32) refuse(`a raw public key of ${key.byteLength} bytes (an Ed25519 public key is 32)`);
+      continue;
+    }
+    const algorithm = describeAlgorithm(key);
+    if (algorithm === null) { if (!isPair) refuse('a public key that is neither raw bytes nor a CryptoKey'); continue; }
+    if (algorithm !== 'Ed25519') refuse(`${algorithm}`);
+  }
+}
+
 export function toHex(bytes) {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }

@@ -10,6 +10,7 @@ import { normalizeEndpoints } from './server/gateway-core.mjs';
 import { DEFAULT_MAX_FILE_BYTES } from './server/constants.mjs';
 import { RPC_PROTOCOL_NAME_RE } from './rpc.mjs';
 import { generateKeyPair, resolveSigner, fingerprint, exportPublicKeySSH, importPublicKeyRaw } from './auth.mjs';
+import { assertEd25519HostKey } from './host-key.mjs';
 
 /** The operations a file backend must have (`openRange` is optional: only the `wsh-fs` rpc built-in, which needs Node, reads it). */
 const FILE_OPERATIONS = ['operate', 'readWhole', 'writeWhole', 'writeAt'];
@@ -175,6 +176,7 @@ function resolveOwnBackends({ exec, pty, fs, mcp } = {}) {
  */
 export async function resolveHostKey(option, who = 'hostKey') {
   if (option === true) option = await generateKeyPair(false);
+  else assertEd25519HostKey(option, who);
   const isPair = option && typeof option === 'object' && option.privateKey && option.publicKey;
   const isSigner = option && typeof option === 'object' && typeof option.sign === 'function' && option.publicKey;
   if (!isPair && !isSigner) throw new TypeError(`${who} must be true, a CryptoKeyPair, or a signer { publicKey, sign(data) }`);

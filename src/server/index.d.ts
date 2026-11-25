@@ -12,6 +12,11 @@ export interface WshServerPrincipal {
   fingerprint: string;
   /** Raw 32-byte Ed25519 public key. */
   publicKey: Uint8Array;
+  /**
+   * `true` when the host has `sealSession: 'require'` (#240). The key exchange that seals the session comes AFTER the login, so `auth` runs
+   * for a client that never seals; it is told here, so a callback that counts or spends something can skip it and leave that to `onSealed`.
+   */
+  sealRequired?: true;
 }
 
 /** What `authorize()` may return instead of `true` (#122): a capability list, and/or an expiry. */
@@ -520,6 +525,13 @@ export interface WshServerOptions {
   onShare?: import('../host.js').WshOnShare;
   /** #163: told once per connection this host turned away (an operator, on a reverse host), with a stable reason code (`REFUSAL_REASONS`, from `@johnhenry/wsh/host`). */
   onRefused?: import('../host.js').WshOnRefused;
+  /**
+   * #155: seal the whole session end to end (needs `hostKey`; offered on a connection accepted with `dataStreams: false`). `'require'` serves
+   * nothing unsealed. With `'require'`, `auth` runs before the client has said whether it will seal (see `WshServerPrincipal.sealRequired`).
+   */
+  sealSession?: false | 'offer' | 'require';
+  /** #240: called once per connection when its session has been sealed (after login): count and audit here, not in `auth`, with `sealSession: 'require'`. */
+  onSealed?: (who: { username: string | null; fingerprint: string | null }) => void;
   /**
    * #121: execution targets (containers, VMs, workers, sandboxes), each with its own `exec` (`true` = a shell), `pty`, `fs`
    * (`{ root }` or operations) and `endpoints`, and an `authorize(who, { target, kind })`. A client names one in `Open`,

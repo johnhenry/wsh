@@ -33,6 +33,7 @@ import { WebSocketTransport } from './transport-ws.mjs';
 import { createConnectionFactory } from './server/connection.mjs';
 import { resolveUsernamePattern } from './server/username.mjs';
 import { buildAuthorizer, authMethods, FailureLimiter } from './server/auth.mjs';
+import { assertEd25519HostKey } from './host-key.mjs';
 import { resolveBackends, resolveHostKey, createRpcTable } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
 import { normalizeEndpointGateway, createEndpointGatewaySession } from './server/gateway-core.mjs';
@@ -190,6 +191,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
     throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
   }
   if (Array.isArray(requireChannelBinding) && requireChannelBinding.some((k) => k !== 'host')) throw new TypeError('createMemoryHost: requireChannelBinding can name only "host" (a memory host has no TLS connection or certificate to bind)');
+  if (hostKey !== undefined && hostKey !== null && hostKey !== false) assertEd25519HostKey(hostKey, 'createMemoryHost: hostKey');
   if (requireChannelBinding && !hostKey) throw new TypeError('createMemoryHost: requireChannelBinding needs a hostKey (the only thing a memory host can bind a login to)');
   if (sealSession !== false && sealSession !== 'offer' && sealSession !== 'require') throw new TypeError("createMemoryHost: sealSession must be false, 'offer' or 'require'");
   if (sealSession && !hostKey) throw new TypeError('createMemoryHost: sealSession needs a hostKey (the host signs its half of the key exchange with it)');
