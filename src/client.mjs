@@ -47,7 +47,7 @@ import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature, initiato
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, verifyReverseChallenge, createOperatorProof } from './operator-proof.mjs';
 import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
-import { GatewayConnections } from './gateway-client.mjs';
+import { GatewayConnections, assertHalfCloseIdleMs } from './gateway-client.mjs';
 import { GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from './gateway-datagram.mjs';
 import { RpcCreditLink, rpcCreditId, rpcChannelOfCredit } from './rpc-virtual.mjs';
@@ -394,6 +394,7 @@ export class WshClient {
 
   /** @type {GatewayConnections|null} Created by the first openUnix()/openEndpoint()/openTcp()/listenUnix(). */
   #gateway = null;
+  #gatewayHalfCloseIdleMs = undefined;
 
   /** @type {number|null} Ping interval handle. */
   #pingTimer = null;
@@ -681,9 +682,12 @@ export class WshClient {
    *   refused BEFORE a credential is sent; `false` never seals (a host that requires it then serves nothing). Only
    *   `true` is a guarantee: `'auto'` rests on a ServerHello feature that a relay can strip before login. Pin the host
    *   (`expectHostKey` / `knownHosts`) too: the exchange authenticates the key the host proved, not whose it is.
+   * @param {number} [opts.gatewayHalfCloseIdleMs=300000] - A gateway connection (`openTcp`, `openUnix`, `openEndpoint`, the
+   *   connections of a listener) that is half-closed -- one side sent GatewayClose, the other did not -- stays open while
+   *   anything moves in either direction, and is ended after this many milliseconds with nothing moving. `0` never.
    * @returns {Promise<string>} The server-assigned session ID
    */
-  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, requireChannelBinding = false, sealSession = 'auto', ...hostKeyOpts } = {}) {
+  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, requireChannelBinding = false, sealSession = 'auto', gatewayHalfCloseIdleMs, ...hostKeyOpts } = {}) {
     if (this.#state !== STATE_DISCONNECTED && this.#state !== STATE_CLOSED) {
       throw new Error(`Client already ${this.#state}`);
     }
@@ -691,6 +695,8 @@ export class WshClient {
       throw new Error('username is required');
     }
     assertSealSession(sealSession);
+    assertHalfCloseIdleMs(gatewayHalfCloseIdleMs, 'gatewayHalfCloseIdleMs');
+    this.#gatewayHalfCloseIdleMs = gatewayHalfCloseIdleMs;
     this.#closeInfo = null;
     const cred = await resolveSigner({ keyPair, signer });
     this.#signer = cred;
@@ -1701,6 +1707,7 @@ export class WshClient {
     return (this.#gateway ??= new GatewayConnections({
       send: (m) => this.sendControl(m),
       hasFeature: (f) => this.hasFeature(f),
+      halfCloseIdleMs: this.#gatewayHalfCloseIdleMs,
       // Datagrams for UDP flows: only on a transport that has them AND a host that listed "gateway-datagram".
       datagrams: () => {
         const t = this.#transport;

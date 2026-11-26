@@ -41,7 +41,7 @@
 
 import { MSG, gatewayOk, dnsResult, listenOk, listenFail, inboundOpen } from '../messages.gen.mjs';
 import {
-  GATEWAY_FAIL, HALF_CLOSE_GRACE_MS, gatewayFeatures, createGatewayCore, normalizeGatewayLimits, normalizeEndpoints,
+  GATEWAY_FAIL, gatewayFeatures, createGatewayCore, normalizeGatewayLimits, normalizeEndpoints,
 } from './gateway-core.mjs';
 import { parseCidr, parseIp } from './address-guard.mjs';
 import { checkAddress, resolveChecked, dialChecked, dialUdpChecked, AddressGuardError } from '../address-guard.mjs';
@@ -229,7 +229,7 @@ export function normalizeGateway(opts) {
     if (!c) throw new TypeError(`gateway.allowPrivate: ${JSON.stringify(r)} is not an address or CIDR block`);
     return c;
   });
-  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes } = normalizeGatewayLimits(opts);
+  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs } = normalizeGatewayLimits(opts);
   let unix = null;
   if (opts.unix !== undefined && opts.unix !== null && opts.unix !== false) {
     if (opts.unix === true || typeof opts.unix !== 'object') throw new TypeError('gateway.unix needs explicit paths (default deny): { connect: [...], listen: [...] }');
@@ -243,6 +243,7 @@ export function normalizeGateway(opts) {
     maxConnections,
     maxBufferedBytes,
     maxClientBufferedBytes,
+    halfCloseIdleMs,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     udpIdleMs: opts.udpIdleMs ?? DEFAULT_UDP_IDLE_MS,
     udp: normalizeUdp(opts.udp),
@@ -296,14 +297,17 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
   /** Attach a connected socket (TCP or unix) as gateway connection `id`. */
   function attachSocket(id, sock) {
     sock.setNoDelay?.(true);
+    // Whoever made the socket (the dialer, the SOCKS client, a listener) did not ask for half-open behaviour; the gateway
+    // does: an EOF from the origin is a half-close, and what the client sends after it must still reach the origin.
+    sock.allowHalfOpen = true;
     let tail = Promise.resolve();
-    let graceTimer = null;
     const channel = makeChannel(id, {
       writeAfterRemoteClose: true,
-      graceMs: HALF_CLOSE_GRACE_MS,
       onData: (bytes) => { sock.write(bytes, () => channel.consumed(bytes.byteLength)); },
-      onRemoteClose: () => { sock.end(); graceTimer = setTimeout(() => sock.destroy(), HALF_CLOSE_GRACE_MS); graceTimer.unref?.(); },
-      onClose: () => { clearTimeout(graceTimer); sock.destroy(); },
+      // The client will send no more: pass the EOF on to the origin and keep reading its answer for as long as it takes
+      // (the channel's idle rule, not a timer here, reaps a connection nothing moves on).
+      onRemoteClose: () => { sock.end(); },
+      onClose: () => { sock.destroy(); },
     });
     conns.set(id, { channel, sock });
     // Origin -> client: one chunk at a time. The socket is paused until the channel has taken the chunk (it waits for
@@ -313,6 +317,11 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       tail = channel.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => { sock.destroy(); });
     });
     sock.on('error', (e) => log(`gateway ${id}: ${e.message}`));
+    // The origin finished sending (its FIN): half-close towards the client once everything it sent has gone out, and keep
+    // the other direction open (the socket is half-open, so Node does not end our side for us).
+    const originEnded = () => { void tail.finally(() => channel.end()); };
+    sock.on('end', originEnded);
+    if (sock.readableEnded) originEnded(); // an accepted connection whose peer half-closed before it was taken
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
     sock.on('close', () => { void tail.finally(() => channel.destroy()); });
@@ -571,7 +580,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
         }
       }
       if (closed) return undefined;
-      server = net.createServer();
+      server = net.createServer({ allowHalfOpen: true }); // a connector that half-closes before it is accepted still gets its answer
       // Private from the first instant, and closing removes only the socket this listener made (never a file put at the
       // name since): see src/unix-listen.mjs.
       const bound = await unix.listenUnixSocket(server, chk.path);
@@ -608,7 +617,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       const net = await loadNet();
       const host = reverseBindAddress(rev, m.bind_addr);
       if (host !== m.bind_addr) log(`gateway: reverse listen: ignoring the client's bind address ${JSON.stringify(String(m.bind_addr).slice(0, 64))}, binding ${host}`);
-      server = net.createServer();
+      server = net.createServer({ allowHalfOpen: true }); // as above
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ port: m.port, host, backlog: rev.backlog }, () => { server.off('error', reject); resolve(); }); });
       if (closed) { server.close(); return undefined; }
       const addr = server.address();
@@ -637,7 +646,9 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     const channelId = ++nextInbound;
     const timer = setTimeout(() => { inbound.delete(channelId); entry.pendingChannels.delete(channelId); sock.destroy(); }, INBOUND_ACCEPT_TIMEOUT_MS);
     timer.unref?.();
-    if (tcp) { entry.open++; cfg.stats.reverse.accepted++; sock.once('close', () => { entry.open--; }); }
+    entry.open++;
+    sock.once('close', () => { entry.open--; });
+    if (tcp) cfg.stats.reverse.accepted++;
     sock.once('close', () => { if (inbound.get(channelId)?.sock === sock) { clearTimeout(timer); inbound.delete(channelId); entry.pendingChannels.delete(channelId); } });
     inbound.set(channelId, { sock, listenerId, timer });
     entry.pendingChannels.add(channelId);
@@ -674,8 +685,11 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     if (!l) return;
     listeners.delete(id);
     for (const ch of l.pendingChannels) { const p = inbound.get(ch); if (p) { clearTimeout(p.timer); inbound.delete(ch); p.sock.destroy(); } }
-    if (l.bound) await l.bound.close();
-    else await new Promise((r) => { l.server.close(() => r()); });
+    const closing = l.bound ? l.bound.close() : new Promise((r) => { l.server.close(() => r()); });
+    // A server finishes closing only when its connections have ended, and with half-closed connections that can need
+    // messages that arrive behind this one (the client's GatewayClose): do not hold the message loop for them.
+    if (l.open > 0) void closing.catch(() => {});
+    else await closing;
   }
 
   return {

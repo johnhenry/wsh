@@ -7,7 +7,7 @@
  */
 
 import { MSG, gatewayOk, gatewayFail, gatewayClose, gatewayData, gatewayCredit, listenFail } from '../messages.gen.mjs';
-import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW } from '../gateway-channel.mjs';
+import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, DEFAULT_HALF_CLOSE_IDLE_MS, assertHalfCloseIdleMs } from '../gateway-channel.mjs';
 
 import { GATEWAY_FAIL } from '../gateway-errors.mjs';
 
@@ -18,7 +18,6 @@ export const DEFAULT_MAX_CONNECTIONS = 32;
 export const DEFAULT_MAX_BUFFERED = 4 * 1024 * 1024;
 export const DEFAULT_MAX_CLIENT_BUFFERED = 32 * 1024 * 1024;
 export const MAX_DATA_BYTES = 1024 * 1024;
-export const HALF_CLOSE_GRACE_MS = 1000;
 export const ENDPOINT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /** The limits shared by every gateway (validated here so the Node and the in-page host agree). */
@@ -29,7 +28,8 @@ export function normalizeGatewayLimits(opts) {
   const maxClientBufferedBytes = opts.maxClientBufferedBytes ?? DEFAULT_MAX_CLIENT_BUFFERED;
   if (!Number.isInteger(maxBufferedBytes) || maxBufferedBytes < GATEWAY_CREDIT_WINDOW) throw new TypeError(`gateway.maxBufferedBytes must be an integer of at least ${GATEWAY_CREDIT_WINDOW}`);
   if (!Number.isInteger(maxClientBufferedBytes) || maxClientBufferedBytes < maxBufferedBytes) throw new TypeError('gateway.maxClientBufferedBytes must be an integer of at least maxBufferedBytes');
-  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes };
+  const halfCloseIdleMs = assertHalfCloseIdleMs(opts.halfCloseIdleMs, 'gateway.halfCloseIdleMs');
+  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs };
 }
 
 /** `{ name: handler | { open, authorize } }` -> a Map, or null when there are none. */
@@ -91,7 +91,7 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
   /** A channel wired to the wire; `extra` adds the sink (a socket's writer) and the close hooks. */
   function makeChannel(id, extra) {
     return new GatewayChannel({
-      id, credit, maxQueued: cfg.maxBufferedBytes, budget,
+      id, credit, maxQueued: cfg.maxBufferedBytes, budget, halfCloseIdleMs: cfg.halfCloseIdleMs ?? DEFAULT_HALF_CLOSE_IDLE_MS,
       sendData: (data) => reply(gatewayData({ gatewayId: id, data })),
       sendCredit: (n) => reply(gatewayCredit({ gatewayId: id, bytes: n })),
       sendClose: (reason) => reply(gatewayClose({ gatewayId: id, reason })),
@@ -124,7 +124,7 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
     } catch (e) { pending.delete(id); log(`gateway endpoint ${m.name} authorize threw: ${e.message}`); return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'endpoint refused this caller'); }
     pending.delete(id);
     if (closed) return undefined;
-    const channel = makeChannel(id, { writeAfterRemoteClose: true, graceMs: HALF_CLOSE_GRACE_MS });
+    const channel = makeChannel(id, { writeAfterRemoteClose: true });
     conns.set(id, { channel, sock: null });
     const { readable, writable } = channel.streams();
     const duplex = {

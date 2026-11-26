@@ -14,6 +14,9 @@
  *
  * GatewayClose is a half-close, as it always was for the host: the side that sends it sends no more data, and goes on
  * receiving until the peer's own GatewayClose arrives. The connection is over when both have been sent (or on `destroy()`).
+ * A half-closed connection stays open as long as anything moves: it is ended only when nothing has moved in EITHER
+ * direction (data either way, credit either way) for `halfCloseIdleMs`, so a peer that half-closed and never reads is
+ * reaped, and one that is merely slow to answer is not.
  *
  * Wire side: `receive(bytes)` for a GatewayData, `grant(n)` for a GatewayCredit, `remoteClosed(reason)` for a
  * GatewayClose. Application side: `write(bytes)`, `consumed(n)`, `end(reason)`, `destroy()`, or `streams()` for web streams.
@@ -23,6 +26,24 @@
 export const GATEWAY_CREDIT_WINDOW = 262144;
 /** Feature string: the client lists it in `Hello.features`, the host in `ServerHello.features`; both = credit is on. */
 export const GATEWAY_CREDIT_FEATURE = 'gateway-credit';
+/** A half-closed connection with nothing moving in either direction for this long is ended (`halfCloseIdleMs`; 0 turns it off). */
+export const DEFAULT_HALF_CLOSE_IDLE_MS = 300_000;
+
+/** `halfCloseIdleMs` as an option: a non-negative integer number of milliseconds (a timer cannot wait longer than 2^31 - 1). Undefined = the default. */
+export function assertHalfCloseIdleMs(v, what = 'halfCloseIdleMs') {
+  if (v === undefined) return DEFAULT_HALF_CLOSE_IDLE_MS;
+  if (!Number.isInteger(v) || v < 0 || v > 0x7fffffff) throw new TypeError(`${what} must be an integer number of milliseconds from 0 (never) to 2147483647`);
+  return v;
+}
+
+/**
+ * The reason a side puts on its GatewayClose when it has DISCARDED the connection (`destroy()` with no reason of its own: a
+ * local socket that closed or was reset, a stream that was dropped, an origin that is gone): it will read nothing more, so
+ * the peer ends its own direction too instead of waiting for the idle bound. A GatewayClose without it is a half-close. A
+ * peer that predates this just sees a reason string; one that sees it from an older peer is on the half-close rule.
+ */
+export const GATEWAY_DISCARDED = 'discarded';
+
 /** Largest GatewayData payload this implementation sends. */
 export const GATEWAY_MAX_FRAME = 65536;
 
@@ -34,7 +55,8 @@ export const GATEWAY_MAX_FRAME = 65536;
  * @property {number} [maxQueued=4194304] bytes received and not yet consumed before the connection is closed
  * @property {{ used: number, max: number }} [budget] shared by all of a client's connections (`used` is kept by the channel)
  * @property {boolean} [writeAfterRemoteClose=false] keep accepting `write()` after the peer's GatewayClose (the host's origin may still answer)
- * @property {number} [graceMs=0] after the peer's GatewayClose, end our side too once this long has passed (0 = never)
+ * @property {number} [halfCloseIdleMs=0] a connection that is half-closed (one GatewayClose sent or received, not both) and has
+ *   had no traffic in either direction for this long is destroyed with the reason "idle timeout" (0 = never)
  * @property {(bytes: Uint8Array) => Promise<unknown> | unknown} sendData
  * @property {(n: number) => unknown} sendCredit
  * @property {(reason?: string) => unknown} sendClose
@@ -55,14 +77,15 @@ export class GatewayChannel {
   #sentClose = false;
   #gotClose = false;
   #finished = false;
-  #graceTimer = null;
+  #idleTimer = null;
+  #lastActive = 0;
   #streams = null;
   #closedPromise;
   #resolveClosed;
 
   /** @param {GatewayChannelOptions} o */
   constructor(o) {
-    this.#o = { window: GATEWAY_CREDIT_WINDOW, maxQueued: 4 * 1024 * 1024, credit: false, writeAfterRemoteClose: false, graceMs: 0, ...o };
+    this.#o = { window: GATEWAY_CREDIT_WINDOW, maxQueued: 4 * 1024 * 1024, credit: false, writeAfterRemoteClose: false, halfCloseIdleMs: 0, ...o };
     this.#sendCredit = this.#o.credit ? this.#o.window : Infinity;
     this.#peerWindow = this.#o.credit ? this.#o.window : Infinity;
     this.#closedPromise = new Promise((r) => { this.#resolveClosed = r; });
@@ -93,6 +116,7 @@ export class GatewayChannel {
     if (this.#queued + n > this.#o.maxQueued || (budget && budget.used + n > budget.max)) return this.#violate('buffer limit exceeded');
     this.#queued += n;
     if (budget) budget.used += n;
+    this.#lastActive = Date.now();
     if (this.#o.onData) { this.#o.onData(bytes); return; }
     this.#queue.push(bytes);
     this.#waiter?.();
@@ -102,6 +126,7 @@ export class GatewayChannel {
   grant(n) {
     if (!this.#o.credit || this.#finished || !Number.isFinite(n) || n <= 0) return;
     this.#sendCredit = Math.min(this.#sendCredit + n, Number.MAX_SAFE_INTEGER);
+    this.#lastActive = Date.now();
     this.#wakeWriters();
   }
 
@@ -109,15 +134,33 @@ export class GatewayChannel {
   remoteClosed(reason) {
     if (this.#finished || this.#gotClose) return;
     this.#gotClose = true;
+    // The peer discarded the connection (it reads nothing more): our direction is over too. Anything already received can
+    // still be read; our writers fail; no GatewayClose goes back.
+    if (reason === GATEWAY_DISCARDED && !this.#sentClose) { this.#sentClose = true; this.#wakeWriters(); }
     this.#waiter?.();
     try { this.#o.onRemoteClose?.(reason); } catch { /* the application's problem */ }
     if (!this.#o.writeAfterRemoteClose) this.#wakeWriters();
     if (this.#sentClose) { if (this.#queue.length === 0) this.#finish(reason); return; }
-    if (this.#o.graceMs > 0) {
-      clearTimeout(this.#graceTimer);
-      this.#graceTimer = setTimeout(() => this.end('grace period over'), this.#o.graceMs);
-      this.#graceTimer.unref?.();
-    }
+    this.#watchIdle();
+  }
+
+  /**
+   * Half-closed: arm the idle rule. One timer; traffic only stamps `#lastActive`, and the timer re-arms for what is left
+   * of the bound when it fires, so a busy connection costs no timer churn.
+   */
+  #watchIdle() {
+    const ms = this.#o.halfCloseIdleMs;
+    this.#lastActive = Date.now();
+    if (!(ms > 0) || this.#idleTimer || this.#finished) return;
+    const check = () => {
+      this.#idleTimer = null;
+      if (this.#finished) return;
+      const left = this.#lastActive + ms - Date.now();
+      if (left > 0) { this.#idleTimer = setTimeout(check, left); this.#idleTimer.unref?.(); return; }
+      this.destroy('idle timeout');
+    };
+    this.#idleTimer = setTimeout(check, ms);
+    this.#idleTimer.unref?.();
   }
 
   // ── application side ───────────────────────────────────────────────
@@ -141,6 +184,7 @@ export class GatewayChannel {
         this.#sendCredit -= n;
       }
       await this.#o.sendData(bytes.subarray(off, off + n));
+      this.#lastActive = Date.now();
       off += n;
     }
   }
@@ -154,6 +198,7 @@ export class GatewayChannel {
     if (n <= 0) return;
     const taken = Math.min(n, this.#queued);
     this.#queued -= taken;
+    this.#lastActive = Date.now();
     if (this.#o.budget) this.#o.budget.used -= taken;
     if (this.#o.credit && !this.#finished && !this.#gotClose) {
       this.#unacked += taken;
@@ -173,17 +218,13 @@ export class GatewayChannel {
     try { void this.#o.sendClose(reason); } catch { /* transport gone */ }
     this.#wakeWriters();
     if (this.#gotClose && this.#queue.length === 0) this.#finish(reason);
-    else if (!this.#gotClose && this.#o.graceMs > 0) {
-      // The peer owes us its own GatewayClose; a peer that never sends it must not hold the slot forever.
-      this.#graceTimer = setTimeout(() => this.destroy('grace period over'), this.#o.graceMs);
-      this.#graceTimer.unref?.();
-    }
+    else if (!this.#gotClose) this.#watchIdle(); // the peer owes us its own GatewayClose; it may take as long as it likes while bytes move
   }
 
   /** Tear down at once; sends GatewayClose first if we had not. */
   destroy(reason) {
     if (this.#finished) return;
-    if (!this.#sentClose) { this.#sentClose = true; try { void this.#o.sendClose(reason); } catch { /* gone */ } }
+    if (!this.#sentClose) { this.#sentClose = true; try { void this.#o.sendClose(reason ?? GATEWAY_DISCARDED); } catch { /* gone */ } }
     this.#finish(reason);
   }
 
@@ -238,7 +279,8 @@ export class GatewayChannel {
   #finish(reason) {
     if (this.#finished) return;
     this.#finished = true;
-    clearTimeout(this.#graceTimer);
+    clearTimeout(this.#idleTimer);
+    this.#idleTimer = null;
     if (this.#o.budget) this.#o.budget.used -= this.#queued;
     this.#queued = 0;
     this.#queue = [];
