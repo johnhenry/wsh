@@ -465,6 +465,8 @@ describe('watchHalfClosed on a real socket pair: what it touches, and when', () 
       mine.resume();
       theirs.end();
       await until(() => halfCloseWatchCount() === 1, 'armed');
+      // The FIN must have been sent before the reset: libuv refuses to reset a stream whose shutdown is still in flight.
+      await until(() => theirs.writableFinished, 'the FIN to be sent');
       theirs.resetAndDestroy(); // gone, with a reset (a TCP peer that exited with nothing unread is only noticed after the kernel's minute)
       await until(() => reports.length > 0, 'the peer to be noticed');
       await until(() => mine.destroyed && halfCloseWatchCount() === 0, 'the socket to be destroyed and the probe released');
