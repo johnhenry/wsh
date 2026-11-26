@@ -99,7 +99,9 @@ describe('GatewayChannel: the half-closed idle rule on a mocked clock', () => {
     assert.equal(ch.closed, false, 'not sooner');
     mock.timers.tick(1);
     assert.equal(ch.closed, true);
-    assert.equal(sent.close.length, 1, 'our close went out once (at end())');
+    // Our close went out at end(); the peer has not closed and still holds its direction for us, so the bound's end is told
+    // to it as a second close saying "discarded" (before it was silent: with the peer's own bound at 0 it was held for ever).
+    assert.deepEqual(sent.close, [undefined, 'discarded']);
   });
 
   it('a peer that half-closed and never reads: our writes stall for credit, nothing moves, and the idle rule ends it', async () => {

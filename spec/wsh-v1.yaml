@@ -1323,6 +1323,34 @@ messages:
         so no field or feature string is added: a peer that does not know
         "discarded" treats it as a half-close, and the idle bound ends the
         connection.
+
+        A side that has ALREADY sent its GatewayClose and then loses its
+        reader (its local socket errored or was reset, the application
+        destroyed or cancelled the stream, the origin it was attached to
+        is gone, or its own idle bound ended the connection) while the
+        peer has not closed sends ONE more GatewayClose for the same
+        gateway_id, with the reason "discarded": as a TCP reset tells a
+        sender its reader is gone, it tells the peer to stop sending and
+        to free the connection at once, whatever idle bound it has (also
+        0 = never).  This is the only case in which a second GatewayClose
+        for one gateway_id is sent.  A receiver that had already received
+        the sender's first GatewayClose and now receives a second one with
+        the reason "discarded" ends its own direction too, drops what was
+        received and not yet read, and sends nothing back; a second
+        GatewayClose with any other reason, or none, is ignored.  Nothing
+        is sent once both sides have closed (the connection is over), and
+        nothing when the transport itself is gone.  No field or feature
+        string is added.  A peer that predates this wording ignores a
+        GatewayClose for a connection whose close it has already
+        received, and one for a connection it no longer knows; it neither
+        ends the session nor answers, so a sender that is newer than its
+        peer sees no change: the older peer's connection is ended by its
+        idle bound, or never if that is 0, exactly as before.  Notice
+        that the loss of a reader can be seen only when the transport says
+        so (an error, a reset, a close, or a failed write): a socket
+        whose peer half-closed and then vanished is silent until
+        something is written to it, and a peer that vanishes without its
+        transport noticing is bounded by the transport's own liveness.
       fields:
         gateway_id:
           type: u32
