@@ -35,3 +35,5 @@ rustix = { version = "1", features = ["fs"] }
 [dev-dependencies]
 assert_cmd = "2"
 tempfile = "3"
+# Paused time for the idle-bound tests of a reverse host's gateway connections (no sleeps, no wall clock).
+tokio = { version = "1", features = ["full", "test-util"] }
