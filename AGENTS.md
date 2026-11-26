@@ -34,7 +34,7 @@ cargo fmt --all -- --check
   **not** part of `npm test` so JS-only contributors never need a Rust
   toolchain; build the release binary first (`cargo build --release -p
   wsh-server`) or set `WSH_SERVER_BIN`.
-- `npm run examples` -- every file in `examples/0*.mjs` is self-verifying;
+- `npm run examples` -- every file in `examples/[0-9]*.mjs` is self-verifying;
   CI runs it as a smoke test.
 - A genuinely fresh clone before a release:
   `git clone . /tmp/wsh-verifyN && cd $_ && npm ci && npm test`.
