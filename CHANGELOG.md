@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.56.0
+## 0.56.1 / Rust `rust-v0.21.3`
 
 ### A local forward and a host's unix listener remove only the socket they made (#267; npm, Node) and a flaky Rust test (#268)
 
@@ -9,6 +9,8 @@
 - **Rust CLI.** It already bound through a private directory and a hard link, and never unlinked by name. Its cleanup and its stale-socket replacement now also move the file aside and check it again before removing it. The test `with_the_flag_only_a_stale_socket_is_replaced` could fail once in a while: its "stale" socket was a listener that had only been dropped, and a child forked by another test at that instant still held the descriptor, so the socket was briefly live; the test now binds a socket that never listens.
 - **Nothing changes on the wire.** No message, field or feature string.
 - Tests: `test/unix-listen.test.mjs` (the helper: foreign file and live socket survive, own files all gone, long paths, mode, 40 at once), additions to `test/forward-endpoint.test.mjs` and `test/gateway-unix.test.mjs`, and the Rust `unix_sockets` tests.
+
+## 0.56.0
 
 ### `client.forwardEndpoint()`: forward a local unix socket or TCP port to a named endpoint of the host (#264; npm, Node only)
 
