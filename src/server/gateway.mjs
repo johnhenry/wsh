@@ -284,7 +284,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
   // The connection table, credit negotiation, the per-client budget and the endpoint opcodes are the browser-safe core.
   const core = createGatewayCore(cfg, send, log, ctx);
   const { conns, pending, reply, fail, active, idInUse, makeChannel } = core;
-  /** @type {Map<number, { server: import('node:net').Server, path: string, abstract: boolean, stat: any, pendingChannels: Set<number> }>} */
+  /** @type {Map<number, { server: import('node:net').Server, path: string, abstract: boolean, bound?: { close: () => Promise<void> }, pendingChannels: Set<number> }>} */
   const listeners = new Map();
   const pendingListeners = new Set();
   /** Accepted inbound sockets waiting for InboundAccept: channel_id -> { sock, listenerId, timer }. */
@@ -572,19 +572,11 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       }
       if (closed) return undefined;
       server = net.createServer();
-      // Created private from the first instant: the mode of a socket is its umask at bind time.
-      const oldMask = (() => { try { return process.umask(0o177); } catch { return null; } })();
-      try {
-        await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ path: chk.path }, () => { server.off('error', reject); resolve(); }); });
-      } finally { if (oldMask !== null) { try { process.umask(oldMask); } catch { /* gone */ } } }
-      let stat = null;
-      if (!chk.abstract) {
-        const fsp = (await import('node:fs/promises')).default;
-        await fsp.chmod(chk.path, 0o600);
-        stat = await unix.statSocket(chk.path);
-      }
-      if (closed) { server.close(); if (stat) await unix.unlinkIfSocket(chk.path, stat); return undefined; }
-      const entry = { server, kind: 'unix', path: chk.path, abstract: chk.abstract, stat, pendingChannels: new Set(), open: 0 };
+      // Private from the first instant, and closing removes only the socket this listener made (never a file put at the
+      // name since): see src/unix-listen.mjs.
+      const bound = await unix.listenUnixSocket(server, chk.path);
+      if (closed) { await bound.close(); return undefined; }
+      const entry = { server, kind: 'unix', path: chk.path, abstract: chk.abstract, bound, pendingChannels: new Set(), open: 0 };
       listeners.set(id, entry);
       server.on('connection', (sock) => onInbound(id, entry, sock));
       server.on('error', (e) => log(`gateway listener ${id}: ${e.message}`));
@@ -620,7 +612,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ port: m.port, host, backlog: rev.backlog }, () => { server.off('error', reject); resolve(); }); });
       if (closed) { server.close(); return undefined; }
       const addr = server.address();
-      const entry = { server, kind: 'tcp', path: '', abstract: false, stat: null, pendingChannels: new Set(), open: 0 };
+      const entry = { server, kind: 'tcp', path: '', abstract: false, pendingChannels: new Set(), open: 0 };
       listeners.set(id, entry);
       server.on('connection', (sock) => onInbound(id, entry, sock));
       server.on('error', (e) => log(`gateway listener ${id}: ${e.message}`));
@@ -682,8 +674,8 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     if (!l) return;
     listeners.delete(id);
     for (const ch of l.pendingChannels) { const p = inbound.get(ch); if (p) { clearTimeout(p.timer); inbound.delete(ch); p.sock.destroy(); } }
-    await new Promise((r) => { l.server.close(() => r()); });
-    if (l.stat) await (await loadUnix()).unlinkIfSocket(l.path, l.stat);
+    if (l.bound) await l.bound.close();
+    else await new Promise((r) => { l.server.close(() => r()); });
   }
 
   return {

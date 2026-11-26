@@ -304,13 +304,84 @@ fn identity(_p: &Path) -> Option<(u64, u64)> {
     None
 }
 
+/// A fresh private (`0700`) directory next to `path`, for a socket being bound or a file being
+/// moved aside.
+#[cfg(unix)]
+fn scratch_dir(path: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let parent = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let dir = parent.join(format!(
+        ".w{:x}.{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
+/// Remove `path` only while it is the socket `id` names: checked, then moved into a private
+/// directory and checked again there before it is unlinked, so a file put at the name between the
+/// first check and the removal is not deleted (it is put back, never replacing anything newer).
+/// Returns whether `path` was removed.
+#[cfg(unix)]
+fn remove_if_identity(path: &Path, id: (u64, u64)) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let ours = |m: &std::fs::Metadata| m.file_type().is_socket() && (m.dev(), m.ino()) == id;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if ours(&m) => {}
+        _ => return false,
+    }
+    let Ok(aside) = scratch_dir(path) else {
+        return false;
+    };
+    let held = aside.join("x");
+    let removed = if std::fs::rename(path, &held).is_err() {
+        false
+    } else {
+        match std::fs::symlink_metadata(&held) {
+            Ok(m) if ours(&m) => {
+                let _ = std::fs::remove_file(&held);
+                true
+            }
+            Ok(_) => {
+                // A stranger took the name in that instant: give it back.
+                let back = std::fs::hard_link(&held, path).is_ok()
+                    || (std::fs::symlink_metadata(path).is_err()
+                        && std::fs::rename(&held, path).is_ok());
+                if back {
+                    let _ = std::fs::remove_file(&held);
+                } else {
+                    eprintln!(
+                        "wsh: {} was replaced while it was being removed; the replacement is kept at {}",
+                        path.display(),
+                        held.display()
+                    );
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    };
+    let _ = std::fs::remove_dir(&aside); // not empty only when something is being kept there
+    removed
+}
+
+#[cfg(not(unix))]
+fn remove_if_identity(_path: &Path, _id: (u64, u64)) -> bool {
+    false
+}
+
 /// Remove the local socket files this process created (and only those: the inode must still be
 /// ours). Called before every exit.
 pub fn cleanup() {
     let list = std::mem::take(&mut *created().lock().expect("created"));
     for (path, id) in list {
-        if id.is_some() && identity(&path) == id {
-            let _ = std::fs::remove_file(&path);
+        if let Some(id) = id {
+            remove_if_identity(&path, id);
         }
     }
 }
@@ -325,7 +396,7 @@ pub fn cleanup() {
 /// scheme as the server's `bind_private`.
 #[cfg(unix)]
 pub fn bind_local_unix(path: &str, replace: bool) -> Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let p = Path::new(path);
     match std::fs::symlink_metadata(p) {
         Ok(m) => {
@@ -339,42 +410,36 @@ pub fn bind_local_unix(path: &str, replace: bool) -> Result<tokio::net::UnixList
             if std::os::unix::net::UnixStream::connect(p).is_ok() {
                 bail!("{path} is in use by another process");
             }
-            std::fs::remove_file(p)
-                .with_context(|| format!("could not remove the stale socket {path}"))?;
+            // The socket that was looked at, not whatever is at the name by now.
+            use std::os::unix::fs::MetadataExt;
+            if !remove_if_identity(p, (m.dev(), m.ino())) {
+                bail!("{path} changed while it was being checked; not replacing it");
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("cannot look at {path}")),
     }
-    static STAGING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let parent = match p.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    let staging = parent.join(format!(
-        ".w{:x}{:x}",
-        std::process::id(),
-        STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&staging)
+    let staging = scratch_dir(p)
         .with_context(|| format!("cannot listen on {path}: no private directory next to it"))?;
     let inner = staging.join("s");
-    let bound = (|| -> Result<std::os::unix::net::UnixListener> {
+    let bound = (|| -> Result<(std::os::unix::net::UnixListener, Option<(u64, u64)>)> {
         let l = std::os::unix::net::UnixListener::bind(&inner)
             .with_context(|| format!("cannot listen on {path}"))?;
         std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("cannot restrict {path} to its owner"))?;
+        // The identity of the socket itself (read before it has a public name), so that what is
+        // recorded for removal can never be a file that took the name in between.
+        let id = identity(&inner);
         std::fs::hard_link(&inner, p).with_context(|| format!("cannot listen on {path}"))?;
-        Ok(l)
+        Ok((l, id))
     })();
     let _ = std::fs::remove_file(&inner);
     let _ = std::fs::remove_dir(&staging);
-    let l = bound?;
+    let (l, id) = bound?;
     created()
         .lock()
         .expect("created")
-        .push((p.to_path_buf(), identity(p)));
+        .push((p.to_path_buf(), id));
     l.set_nonblocking(true)?;
     Ok(tokio::net::UnixListener::from_std(l)?)
 }
@@ -864,6 +929,41 @@ mod tests {
             TURN.lock().unwrap_or_else(|e| e.into_inner())
         }
 
+        /// A socket file nothing can ever accept on: a stream socket that is bound and never put into
+        /// the listening state. (A listener that is merely dropped is not the same: a child forked by
+        /// another test in this binary at that instant holds a copy of the descriptor until it execs,
+        /// the socket stays listening meanwhile, and the liveness probe rightly finds it in use.)
+        fn stale_socket(p: &std::path::Path) {
+            use std::os::unix::ffi::OsStrExt;
+            let b = p.as_os_str().as_bytes();
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                assert!(fd >= 0);
+                let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                addr.sun_family = libc::AF_UNIX as _;
+                assert!(b.len() < addr.sun_path.len());
+                for (i, c) in b.iter().enumerate() {
+                    addr.sun_path[i] = *c as _;
+                }
+                let r = libc::bind(
+                    fd,
+                    &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                );
+                assert_eq!(r, 0, "bind");
+                libc::close(fd);
+            }
+        }
+
+        fn names(d: &std::path::Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
         fn dir() -> tempfile::TempDir {
             // Short, so the path fits a unix socket address.
             tempfile::Builder::new()
@@ -950,7 +1050,7 @@ mod tests {
             let _turn = turn();
             let d = dir();
             let stale = d.path().join("stale.sock");
-            drop(std::os::unix::net::UnixListener::bind(&stale).unwrap()); // file stays, nobody listens
+            stale_socket(&stale);
             assert!(stale.exists());
             let l = bind_local_unix(stale.to_str().unwrap(), true).unwrap();
             drop(l);
@@ -998,6 +1098,57 @@ mod tests {
                 p.exists(),
                 "a different socket at the same path is not ours to remove"
             );
+        }
+
+        #[tokio::test]
+        async fn cleanup_leaves_a_regular_file_someone_else_put_there_and_no_directory_behind() {
+            let _turn = turn();
+            let d = dir();
+            let p = d.path().join("f.sock");
+            drop(bind_local_unix(p.to_str().unwrap(), false).unwrap());
+            std::fs::remove_file(&p).unwrap();
+            std::fs::write(&p, b"not ours").unwrap();
+            cleanup();
+            assert_eq!(std::fs::read(&p).unwrap(), b"not ours");
+            assert_eq!(names(d.path()), ["f.sock"], "no scratch directory is left");
+        }
+
+        #[tokio::test]
+        async fn cleanup_removes_our_socket_and_leaves_nothing_else() {
+            let _turn = turn();
+            let d = dir();
+            let p = d.path().join("g.sock");
+            drop(bind_local_unix(p.to_str().unwrap(), false).unwrap());
+            assert_eq!(names(d.path()), ["g.sock"], "bound, no scratch directory");
+            cleanup();
+            assert!(names(d.path()).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_stale_socket_that_was_swapped_since_it_was_looked_at_is_not_removed() {
+            use std::os::unix::fs::MetadataExt;
+            let _turn = turn();
+            let d = dir();
+            let p = d.path().join("h.sock");
+            stale_socket(&p);
+            let looked_at = std::fs::symlink_metadata(&p).unwrap();
+            let id = (looked_at.dev(), looked_at.ino());
+            std::fs::rename(&p, d.path().join("moved.sock")).unwrap();
+            let _live = std::os::unix::net::UnixListener::bind(&p).unwrap();
+            assert!(
+                !remove_if_identity(&p, id),
+                "a different socket is not removed"
+            );
+            assert!(std::os::unix::net::UnixStream::connect(&p).is_ok());
+            std::fs::remove_file(&p).unwrap();
+            std::fs::write(&p, b"file").unwrap();
+            assert!(!remove_if_identity(&p, id));
+            assert_eq!(std::fs::read(&p).unwrap(), b"file");
+            assert_eq!(names(d.path()), ["h.sock", "moved.sock"]);
+            // and the one that was looked at is removed
+            let moved = d.path().join("moved.sock");
+            assert!(remove_if_identity(&moved, id));
+            assert_eq!(names(d.path()), ["h.sock"]);
         }
     }
 }

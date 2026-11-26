@@ -5,6 +5,7 @@
 
 import net from 'node:net';
 import fsp from 'node:fs/promises';
+import { listenUnixSocket, removeIfIdentity } from './unix-listen.mjs';
 
 /** A named endpoint: the CLI's rule (`valid_endpoint_name`): letters, digits, ".", "_", "-", starting with a letter or digit, at most 64. */
 export const ENDPOINT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -75,7 +76,7 @@ async function listenLocal(spec, { replace }) {
   const server = net.createServer({ pauseOnConnect: true, allowHalfOpen: true });
   if (spec.kind === 'tcp') {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ host: spec.host, port: spec.port }, () => { server.off('error', reject); resolve(); }); });
-    return { server, cleanup: async () => {} };
+    return { server, close: () => new Promise((res) => { server.close(() => res()); }) };
   }
   if (spec.path.startsWith('@')) throw new TypeError('forwardUnix: a local abstract socket is not supported; use a path');
   let existing = null;
@@ -89,18 +90,11 @@ async function listenLocal(spec, { replace }) {
       p.once('error', (e) => resolve(e.code !== 'ECONNREFUSED' && e.code !== 'ENOENT'));
     });
     if (live) throw new Error(`${spec.path} is in use`);
-    await fsp.unlink(spec.path);
+    // The socket that was looked at, not whatever is at the name now.
+    if (!(await removeIfIdentity(spec.path, { dev: existing.dev, ino: existing.ino }))) throw new Error(`${spec.path} changed while it was being checked; not replacing it`);
   }
-  const old = (() => { try { return process.umask(0o177); } catch { return null; } })();
-  try {
-    await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ path: spec.path }, () => { server.off('error', reject); resolve(); }); });
-  } finally { if (old !== null) process.umask(old); }
-  await fsp.chmod(spec.path, 0o600);
-  const st = await fsp.lstat(spec.path);
-  return {
-    server,
-    cleanup: async () => { try { const now = await fsp.lstat(spec.path); if (now.isSocket() && now.ino === st.ino) await fsp.unlink(spec.path); } catch { /* gone */ } },
-  };
+  const listening = await listenUnixSocket(server, spec.path);
+  return { server, close: () => listening.close() };
 }
 
 /**
@@ -150,7 +144,7 @@ export async function forward(client, { local, remote, reverse = false, replace 
   if (r.kind === 'endpoint' && !client.hasFeature('gateway-endpoints')) {
     throw new Error('forwardEndpoint: this host does not offer named endpoints (it did not advertise gateway-endpoints)');
   }
-  const { server, cleanup } = await listenLocal(l, { replace });
+  const { server, close: closeListener } = await listenLocal(l, { replace });
   const open = r.kind === 'unix' ? () => client.openUnix(r.path) : r.kind === 'endpoint' ? () => client.openEndpoint(r.name) : () => client.openTcp(r.host, r.port);
   const conns = new Set(); // a net.Server has no closeAllConnections(): keep our own list, so close() can end them
   server.on('connection', async (sock) => {
@@ -166,13 +160,15 @@ export async function forward(client, { local, remote, reverse = false, replace 
   });
   server.on('error', report);
   return {
-    local, remote, ...(r.kind === 'endpoint' ? { endpoint: r.name } : {}), address: server.address(),
+    // A unix socket reports the path that was asked for: the server itself knows the private name it was bound to.
+    local, remote, ...(r.kind === 'endpoint' ? { endpoint: r.name } : {}), address: l.kind === 'unix' ? l.path : server.address(),
     ...(limit === Infinity ? {} : { maxConnections: limit }),
     /** Connections open now (counted against `maxConnections`). */
     get connections() { return conns.size; },
     async close() {
-      await new Promise((res) => { server.close(() => res()); for (const s of conns) s.destroy(); });
-      await cleanup();
+      const closing = closeListener(); // stops accepting at once; resolves when the server is closed and what it made is removed
+      for (const s of conns) s.destroy();
+      await closing;
     },
   };
 }

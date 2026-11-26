@@ -651,7 +651,14 @@ await fwd.close();   // stops listening, ends every live connection, removes the
 The semantics are the CLI's. `local` is a socket path or `host:port` (a bare port, or `127.0.0.1:0`, binds loopback; give an
 address such as `0.0.0.0:8080` to listen elsewhere, and then anyone who can reach that address uses the forward). A unix socket
 is created owner-only (`0600`) and an existing path is refused, whatever it is, unless `replace: true`, which replaces only a
-stale socket (never one something is listening on, never a file that is not a socket). A connection whose endpoint does not
+stale socket (never one something is listening on, never a file that is not a socket). `close()` removes only what the forward
+made: the socket is bound inside a private `0700` directory next to the path and hard-linked to it (so the path is a real
+socket, `lstat` says so, and Node's own unlink-at-close never sees the path), and the path is removed only while it is still
+that same socket, so a file or socket someone else put there since is left alone. While the forward is up a hidden `.w…`
+directory sits next to the path; a killed process leaves its socket and that (empty) directory behind, as it left the socket
+before. A path too long to stage a directory next to (the address limit is 103 bytes on macOS, 107 on Linux), or a file system
+without hard links, is bound directly as before, and then a replacement made while the forward is up is still removed on
+`close()`. A connection whose endpoint does not
 exist, or refuses this caller, is closed and the reason (a `GatewayError`) goes to `onError`; the listener stays up. An end on
 either side is passed on as a half-close, so a request that closes its write side still gets its answer, and a reader that
 stops reading holds the peer back in both directions instead of buffering. A client that closes first is the end of that
@@ -689,7 +696,7 @@ max_client_buffered_bytes = 33554432
 ```
 
 The checks are the Node host's: paths judged after `realpath` of the parent, a `..` segment refused, the target must be a
-socket and not a symlink, created sockets are `0600` and unlinked on close, a socket that something still accepts on is
+socket and not a symlink, created sockets are `0600` and removed on close only while they are still the socket the host made, a socket that something still accepts on is
 never replaced, a file that is not a socket is never touched; a bad pattern (`/`, a relative path, `..`) stops the server
 at start-up. `GatewayCredit` is served with 256 KiB per direction when the client lists `gateway-credit`; without it the
 host closes a connection that has more than `max_buffered_bytes` of unconsumed client data (or the client more than
@@ -3052,7 +3059,7 @@ What this does **not** protect against:
   `max_connections`. `wsh -L` publishes a local port or socket to whoever can reach it: loopback by default, but an explicit
   `bind_addr` of `0.0.0.0` (the CLI warns) hands the forward to the network, and a local unix socket is `0600` only against
   other users, not against your own processes. A forwarded connection is as private as the wsh connection under it (a pipe
-  relay sees it unless the legs are TLS). The Rust host binds a created socket inside a private `0700` directory and links it into place, so it is never visible with a looser mode and the process umask is not touched.
+  relay sees it unless the legs are TLS). The Rust host binds a created socket inside a private `0700` directory and links it into place, so it is never visible with a looser mode and the process umask is not touched. The Node host and `client.forwardUnix` / `forwardEndpoint` do the same, and on close remove the path only while it is still their own socket; that last check is made, then the file is moved into a private directory and checked again before it is unlinked, so the only remaining gap is an instant in which a file put at the path is briefly out of sight (it is put back, never deleted). Not protected: a path too long to stage a directory next to, or on a file system without hard links, is bound directly, and a file another process put there is then removed when the forward closes.
 - **`wsh --share` hands a host a directory of YOUR machine, and the host is not trusted (#159).** What the host can do is
   exactly what the command line named: list and read everything under the directory (a read-only share still exposes every
   file in it, secrets included: share a directory made for the purpose, not `$HOME`), and with `:rw` change and delete all of it

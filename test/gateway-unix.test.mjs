@@ -233,6 +233,34 @@ describe('unix-domain socket forwarding', () => {
       await until(() => !exists(`${t}/r.sock`), 'socket file removed on close');
     });
 
+    it('ListenUnix: closing removes only the socket the host made: a file or socket put at the path since survives, and the private directory is gone', async () => {
+      const t = tmp();
+      const { client } = await fx.setup({ allow: [], unix: { listen: [`${t}/`] } });
+      const listen = (name) => client.listenUnix(`${t}/${name}`, { onConnection: () => {} });
+      // Nothing else is left behind by an ordinary listener.
+      const plain = await listen('p.sock');
+      assert.equal(fs.lstatSync(`${t}/p.sock`).isSocket(), true, 'the name is a socket, not a link');
+      await plain.close();
+      await until(() => fs.readdirSync(t).length === 0, 'the socket and its private directory removed');
+
+      // A regular file put at the path while the listener is up.
+      const a = await listen('a.sock');
+      fs.unlinkSync(`${t}/a.sock`); fs.writeFileSync(`${t}/a.sock`, 'not the host\'s');
+      await a.close();
+      await until(() => fs.readdirSync(t).join() === 'a.sock', 'only the stranger\'s file left');
+      assert.equal(fs.readFileSync(`${t}/a.sock`, 'utf8'), 'not the host\'s');
+
+      // Another listening socket put at the path.
+      const b = await listen('b.sock');
+      fs.unlinkSync(`${t}/b.sock`);
+      const other = net.createServer((s) => { s.on('error', () => {}); s.end('other'); }); fx.nets.push(other);
+      await listenUnix(other, `${t}/b.sock`);
+      await b.close();
+      await until(() => fs.readdirSync(t).join() === 'a.sock,b.sock', 'only the strangers\' files left');
+      const said = await new Promise((resolve, reject) => { const s = net.connect(`${t}/b.sock`); const cs = []; s.on('data', (d) => cs.push(d)); s.on('close', () => resolve(Buffer.concat(cs).toString())); s.on('error', reject); });
+      assert.equal(said, 'other');
+    });
+
     it('forwardUnix reverse: -R /remote.sock:127.0.0.1:PORT (the host listens, connections are made to a local TCP service)', async () => {
       const t = tmp();
       const svc = net.createServer((s) => { s.on('data', (d) => s.write(Buffer.concat([Buffer.from('svc:'), d]))); s.on('error', () => {}); });

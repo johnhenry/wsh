@@ -13,6 +13,8 @@
  */
 
 import path from 'node:path';
+import { removeIfIdentity } from '../unix-listen.mjs';
+export { listenUnixSocket } from '../unix-listen.mjs';
 
 let fsp = null;
 const loadFs = async () => (fsp ??= (await import('node:fs/promises')).default);
@@ -112,9 +114,11 @@ export async function statSocket(p) {
 export async function unlinkIfSocket(p, expect) {
   const fs = await loadFs();
   try {
+    // The socket that was looked at: checked, then moved aside and checked again (see removeIfIdentity), so a file put at the
+    // name in between is not removed.
+    if (expect) { await removeIfIdentity(p, expect); return; }
     const st = await fs.lstat(p);
     if (!st.isSocket()) return;
-    if (expect && (st.ino !== expect.ino || st.dev !== expect.dev)) return; // someone else's socket now
     await fs.unlink(p);
   } catch { /* already gone */ }
 }
