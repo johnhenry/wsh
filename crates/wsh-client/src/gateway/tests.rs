@@ -422,20 +422,139 @@ async fn pump_joins_a_local_stream_both_ways_and_passes_the_half_close_on() {
     assert_eq!((up, down), (5, 6));
 }
 
+// ── a half-close does not end the other direction (#271) ──────────
+
 #[tokio::test]
-async fn pump_ends_when_the_host_closes_even_if_the_local_side_stays_open() {
+async fn a_host_that_closed_first_does_not_stop_what_the_local_side_sends_later() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    let (local, mut app) = duplex(1 << 16);
+    let pump = tokio::spawn(s.pump(local));
+    h.data(id, b"bye").await;
+    h.close(id).await;
+    // The application reads the answer and its end of file, then (1.5 s later, past the old limits) sends.
+    let mut got = [0u8; 3];
+    app.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"bye");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!pump.is_finished(), "the exchange is still open");
+    app.write_all(b"late").await.unwrap();
+    let mut sent = Vec::new();
+    while sent.len() < 4 {
+        if let Payload::GatewayData(d) = h.sent().await.payload {
+            sent.extend(d.data);
+        }
+    }
+    assert_eq!(sent, b"late");
+    app.shutdown().await.unwrap();
+    let (up, down) = pump.await.unwrap().unwrap();
+    assert_eq!((up, down), (4, 3));
+}
+
+#[tokio::test]
+async fn a_host_that_discarded_the_connection_ends_our_direction_too_and_dropping_says_so() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    h.deliver(
+        Payload::GatewayClose(GatewayClosePayload {
+            gateway_id: s.id(),
+            reason: Some(GATEWAY_DISCARDED.into()),
+        }),
+        MsgType::GatewayClose,
+    )
+    .await;
+    assert!(s.write_all(b"x").await.is_err(), "nobody reads any more");
+    let t = open(&mut h).await;
+    let id = t.id();
+    drop(t);
+    match h.sent().await.payload {
+        Payload::GatewayClose(c) => {
+            assert_eq!(c.gateway_id, id);
+            assert_eq!(c.reason.as_deref(), Some(GATEWAY_DISCARDED));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_stream_can_still_write_after_the_hosts_close() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    h.close(s.id()).await;
+    let mut buf = [0u8; 4];
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0);
+    s.write_all(b"still here").await.unwrap();
+    match h.sent().await.payload {
+        Payload::GatewayData(d) => assert_eq!(d.data, b"still here"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_half_closed_pump_with_nothing_moving_is_ended_by_the_idle_bound_not_sooner() {
     let mut h = host(true);
     let s = open(&mut h).await;
     let id = s.id();
     let (local, app) = duplex(1 << 16);
-    let pump = tokio::spawn(s.pump(local));
-    h.data(id, b"bye").await;
+    let idle = Duration::from_millis(900);
+    let t0 = std::time::Instant::now();
+    let pump = tokio::spawn(s.pump_with_idle(local, Some(idle)));
+    h.close(id).await; // the host half-closes; the local side stays open and quiet
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!pump.is_finished(), "not sooner than the bound");
+    let result = tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("the idle bound must end a quiet half-closed exchange")
+        .unwrap();
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    assert!(t0.elapsed() >= idle);
+    drop(app);
+}
+
+#[tokio::test]
+async fn local_bytes_keep_a_half_closed_pump_alive_past_the_idle_bound() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    let (local, mut app) = duplex(1 << 16);
+    let pump = tokio::spawn(s.pump_with_idle(local, Some(Duration::from_millis(700))));
     h.close(id).await;
+    // A byte every 300 ms for 1.8 s: more than twice the bound, but never quiet for the bound.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        app.write_all(b"x").await.unwrap();
+        assert!(!pump.is_finished());
+    }
+    app.shutdown().await.unwrap();
+    let (up, _) = pump.await.unwrap().unwrap();
+    assert_eq!(up, 6);
+}
+
+#[tokio::test]
+async fn without_an_idle_bound_a_quiet_half_closed_pump_stays() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    let (local, app) = duplex(1 << 16);
+    let pump = tokio::spawn(s.pump_with_idle(local, None));
+    h.close(id).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!pump.is_finished());
+    pump.abort();
+    drop(app);
+}
+
+#[tokio::test]
+async fn a_pump_ends_when_the_connection_is_destroyed_whatever_the_local_side_does() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let (local, app) = duplex(1 << 16);
+    let victim = s.clone();
+    let pump = tokio::spawn(s.pump(local));
+    victim.destroy();
     let done = tokio::time::timeout(Duration::from_secs(3), pump).await;
-    assert!(
-        done.is_ok(),
-        "pump must not wait on a quiet local side forever"
-    );
+    assert!(done.is_ok(), "a destroyed connection has nobody to feed");
     drop(app);
 }
 

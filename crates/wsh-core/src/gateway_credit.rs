@@ -16,6 +16,10 @@ pub const GATEWAY_CREDIT_WINDOW: usize = 262_144;
 /// Feature string: the client lists it in `Hello.features`, the host in `ServerHello.features`;
 /// both = credit is on.
 pub const GATEWAY_CREDIT_FEATURE: &str = "gateway-credit";
+/// The reason on a `GatewayClose` from a side that has discarded the connection (it reads nothing
+/// more): the peer ends its own direction too instead of waiting for the half-closed idle bound. A
+/// `GatewayClose` without it is a half-close.
+pub const GATEWAY_DISCARDED: &str = "discarded";
 /// Largest `GatewayData` payload this implementation sends.
 pub const GATEWAY_MAX_FRAME: usize = 65_536;
 

@@ -513,6 +513,292 @@ async fn the_origin_closing_is_reported_once() {
     );
 }
 
+// ── a half-close does not end the other direction (#271) ──────────
+
+/// An origin that reads to the client's end of file, waits `delay`, and then answers with `reply`.
+async fn slow_answer_service(delay: Duration, reply: Vec<u8>) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let reply = reply.clone();
+            tokio::spawn(async move {
+                let mut all = Vec::new();
+                let _ = s.read_to_end(&mut all).await;
+                tokio::time::sleep(delay).await;
+                let _ = s.write_all(&reply).await;
+            });
+        }
+    });
+    port
+}
+
+fn policy_with_idle(idle: Option<Duration>) -> GatewayPolicy {
+    GatewayPolicy {
+        half_close_idle: idle,
+        ..loopback_policy()
+    }
+}
+
+/// Read until the host's GatewayClose, giving credit back as data arrives. Returns the bytes and the close reason.
+async fn read_to_close(r: &mut Rig, id: u32) -> (Vec<u8>, Option<String>) {
+    let mut body = Vec::new();
+    loop {
+        match r.next().await.payload {
+            Payload::GatewayData(d) => {
+                let n = d.data.len() as u32;
+                body.extend_from_slice(&d.data);
+                r.credit(id, n);
+            }
+            Payload::GatewayClose(c) => return (body, c.reason),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_answer_sent_two_and_a_half_seconds_after_the_clients_close_arrives_whole() {
+    let port = slow_answer_service(Duration::from_millis(2500), b"done\n".to_vec()).await;
+    let mut r = rig(CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    let t0 = std::time::Instant::now();
+    r.close(1);
+    let (body, _) = read_to_close(&mut r, 1).await;
+    assert_eq!(body, b"done\n");
+    assert!(t0.elapsed() >= Duration::from_millis(2400));
+}
+
+#[tokio::test]
+async fn a_twenty_mib_answer_after_the_close_arrives_whole_and_is_held_back_by_credit() {
+    let total = 20 * 1024 * 1024;
+    let port = slow_answer_service(Duration::from_millis(0), vec![9u8; total]).await;
+    let mut r = rig(CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    r.close(1);
+    // Nobody returns credit for 1.5 s (longer than the old one-second limit): only the window arrives.
+    let early = r.drain(1500).await;
+    assert!(
+        data_len(&early) <= GATEWAY_CREDIT_WINDOW,
+        "{} bytes arrived without credit",
+        data_len(&early)
+    );
+    assert!(got_close(&early).is_none());
+    // Now read it all.
+    let mut got = data_len(&early);
+    let mut returned = 0usize;
+    r.credit(1, got as u32);
+    returned += got;
+    while got < total {
+        match r.next().await.payload {
+            Payload::GatewayData(d) => {
+                got += d.data.len();
+                r.credit(1, d.data.len() as u32);
+                returned += d.data.len();
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(got, total);
+    assert_eq!(returned, total);
+}
+
+#[tokio::test]
+async fn the_origin_closing_first_does_not_stop_what_the_client_sends_later() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (tx, mut seen) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // Says goodbye and finishes its own side; it goes on reading.
+                let _ = s.write_all(b"bye").await;
+                let _ = s.shutdown().await;
+                let mut all = Vec::new();
+                let _ = s.read_to_end(&mut all).await;
+                let _ = tx.send(all);
+            });
+        }
+    });
+    let mut r = rig(CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    let early = r.drain(1500).await;
+    assert_eq!(data_len(&early), 3);
+    assert!(
+        got_close(&early).is_some(),
+        "the origin's end is a half-close towards the client"
+    );
+    r.data(1, b"late words".to_vec());
+    r.close(1);
+    let got = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .expect("the origin saw the client's end of file")
+        .unwrap();
+    assert_eq!(got, b"late words");
+}
+
+#[tokio::test]
+async fn both_sides_closing_ends_the_connection_at_once() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut all = Vec::new();
+                let _ = s.read_to_end(&mut all).await; // the client's end of file...
+                let _ = s.shutdown().await; // ...and ours at once
+            });
+        }
+    });
+    let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    let t0 = std::time::Instant::now();
+    r.close(1);
+    let (body, _) = read_to_close(&mut r, 1).await;
+    assert!(body.is_empty());
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    // The connection is gone: its id is free again.
+    let port = echo_service().await;
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+}
+
+#[tokio::test]
+async fn a_peer_that_half_closes_and_never_reads_is_ended_by_the_idle_rule_not_sooner() {
+    let idle = Duration::from_millis(1500);
+    let port = slow_answer_service(Duration::from_millis(0), vec![1u8; 4 * 1024 * 1024]).await;
+    let mut r = rig_with(policy_with_idle(Some(idle)), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    let t0 = std::time::Instant::now();
+    r.close(1);
+    // The window's worth arrives, then nothing moves (no credit is returned).
+    let early = r.drain(900).await;
+    assert!(
+        got_close(&early).is_none(),
+        "not sooner than the idle bound"
+    );
+    let mut reason = None;
+    while reason.is_none() {
+        if let Payload::GatewayClose(c) = r.next().await.payload {
+            reason = Some(c.reason);
+        }
+    }
+    assert_eq!(reason.unwrap().as_deref(), Some("idle timeout"));
+    assert!(t0.elapsed() >= idle - Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn a_half_closed_connection_that_is_quiet_but_alive_is_not_reaped() {
+    // Bytes from the origin every 400 ms for 2.4 s with a 1 s bound: each one restarts the clock.
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut all = Vec::new();
+                let _ = s.read_to_end(&mut all).await;
+                for _ in 0..6 {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = s.write_all(b"x").await;
+                }
+            });
+        }
+    });
+    let mut r = rig_with(policy_with_idle(Some(Duration::from_secs(1))), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    r.close(1);
+    let (body, reason) = read_to_close(&mut r, 1).await;
+    assert_eq!(body, b"xxxxxx");
+    assert_eq!(reason, None, "the origin ended it, not the idle rule");
+}
+
+#[tokio::test]
+async fn without_an_idle_bound_a_quiet_half_closed_connection_stays() {
+    let port = slow_answer_service(Duration::from_secs(3600), b"never".to_vec()).await;
+    let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    r.close(1);
+    let msgs = r.drain(1500).await;
+    assert!(got_close(&msgs).is_none());
+}
+
+#[tokio::test]
+async fn a_client_that_discarded_the_connection_ends_it_at_once_even_with_the_origin_still_writing()
+{
+    let port = firehose_service().await;
+    let mut r = rig(CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    let _ = r.drain(100).await; // the window's worth arrives, then the origin is held back by credit
+    r.send(
+        MsgType::GatewayClose,
+        Payload::GatewayClose(GatewayClosePayload {
+            gateway_id: 1,
+            reason: Some(GATEWAY_DISCARDED.into()),
+        }),
+    );
+    let t0 = std::time::Instant::now();
+    loop {
+        let conns = r.session.inner.conns.lock().unwrap().len();
+        if conns == 0 {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "still open");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_host_side_discard_says_so_and_a_half_close_does_not() {
+    // The origin resets/vanishes: a plain destroy carries the marker; the origin's FIN does not.
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let _ = s.write_all(b"x").await;
+                let _ = s.shutdown().await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+        }
+    });
+    let mut r = rig(CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    let msgs = r.drain(500).await;
+    assert_eq!(
+        got_close(&msgs),
+        Some(None),
+        "a FIN is a half-close: no reason"
+    );
+}
+
+#[tokio::test]
+async fn a_udp_flow_ends_at_the_clients_close() {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = sock.local_addr().unwrap().port();
+    let mut r = rig(CREDIT);
+    r.send(
+        MsgType::OpenUdp,
+        Payload::OpenUdp(OpenUdpPayload {
+            gateway_id: 1,
+            host: "127.0.0.1".into(),
+            port,
+        }),
+    );
+    r.expect_ok(1).await;
+    r.close(1);
+    let _ = r.drain(300).await;
+    assert!(r.session.inner.conns.lock().unwrap().is_empty());
+}
+
 // ── UDP ───────────────────────────────────────────────────────────
 
 #[tokio::test]

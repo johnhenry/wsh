@@ -23,8 +23,12 @@
 //! exceeds either is closed. The same numbers as the Node host.
 //!
 //! `GatewayClose` is a half-close: the side that sends it sends no more data and goes on receiving
-//! until the peer's own `GatewayClose` arrives (the origin gets 1 s after the client's before the
-//! connection is torn down), exactly as the Node host does.
+//! until the peer's own `GatewayClose` arrives, exactly as the Node host does. The client's close
+//! shuts the origin's write side; the origin's end of file is sent on as a `GatewayClose` and the
+//! client's data still reaches the origin. A connection is over when both have been sent, on an
+//! error, or when it is half-closed and nothing has moved in either direction for
+//! `[gateway] half_close_idle_secs` (default 300; 0 = never): a peer that half-closes and never
+//! reads is reaped by that, and a slow answer is not cut off by a fixed timer.
 
 use super::forwarder::GatewayForwarder;
 use super::policy::{ConnectionGuard, GatewayPolicyEnforcer};
@@ -33,7 +37,7 @@ use super::unix_policy::{self, SocketStat, UnixTarget};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -44,7 +48,9 @@ use tracing::{debug, info, warn};
 use wsh_core::messages::*;
 
 use wsh_core::gateway_credit::SendCredit;
-pub use wsh_core::gateway_credit::{GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW};
+pub use wsh_core::gateway_credit::{
+    GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED,
+};
 use wsh_core::gateway_datagram::{
     decode_datagram, encode_datagram, DATAGRAM_HEADER_BYTES, GATEWAY_DATAGRAM_FEATURE,
 };
@@ -94,8 +100,6 @@ struct UdpFlowHandle {
 const MAX_FRAME: usize = 65_536;
 /// Largest `GatewayData` payload this host accepts (a bigger one is ignored, as the Node host does).
 const MAX_DATA_BYTES: usize = 1024 * 1024;
-/// After the client's `GatewayClose`, how long the origin has to finish before the connection is dropped.
-const HALF_CLOSE_GRACE: Duration = Duration::from_secs(1);
 const MAX_PENDING_INBOUND: usize = 16;
 const INBOUND_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -208,12 +212,35 @@ struct Chan {
     sent_close: AtomicBool,
     /// The client sent GatewayClose: it sends no more.
     remote_closed: AtomicBool,
+    /// The origin's write side has been shut (the client's GatewayClose, passed on).
+    write_shut: AtomicBool,
+    /// A UDP flow: it has no half-close, the client's GatewayClose ends it.
+    is_udp: AtomicBool,
+    /// The half-closed idle watcher is running.
+    idle_armed: AtomicBool,
+    /// When a byte last moved in either direction, in milliseconds since `born`.
+    born: std::time::Instant,
+    last_active_ms: AtomicU64,
     write_tx: mpsc::UnboundedSender<WriteCmd>,
     tasks: Mutex<Vec<AbortHandle>>,
     guard: Mutex<Option<ConnectionGuard>>,
 }
 
 impl Chan {
+    /// Something moved (data or credit, either way): restart the half-closed idle clock.
+    fn touch(&self) {
+        self.last_active_ms
+            .store(self.born.elapsed().as_millis() as u64, Ordering::Release);
+    }
+
+    /// How long nothing has moved.
+    fn quiet(&self) -> Duration {
+        Duration::from_millis(
+            (self.born.elapsed().as_millis() as u64)
+                .saturating_sub(self.last_active_ms.load(Ordering::Acquire)),
+        )
+    }
+
     /// Take `n` bytes off `queued` (never below zero, whoever else is subtracting).
     fn release(&self, n: usize) -> usize {
         let mut cur = self.queued.load(Ordering::Acquire);
@@ -258,6 +285,8 @@ struct Inner {
     credit: bool,
     max_conn_bytes: usize,
     max_client_bytes: usize,
+    /// A half-closed connection with nothing moving for this long is closed (`None` = never).
+    half_close_idle: Option<Duration>,
     /// Bytes received from this client for its origins and not yet taken.
     budget: AtomicUsize,
     conns: Mutex<HashMap<u32, Arc<Chan>>>,
@@ -316,6 +345,7 @@ impl GatewaySession {
         datagrams: Option<Arc<dyn DatagramSink>>,
     ) -> Self {
         let (max_conn_bytes, max_client_bytes) = policy.buffer_limits();
+        let policy_idle = policy.half_close_idle();
         let credit = enabled && client_features.iter().any(|f| f == GATEWAY_CREDIT_FEATURE);
         let peer_datagrams = client_features
             .iter()
@@ -337,6 +367,7 @@ impl GatewaySession {
                 credit,
                 max_conn_bytes,
                 max_client_bytes,
+                half_close_idle: policy_idle,
                 budget: AtomicUsize::new(0),
                 conns: Mutex::new(HashMap::new()),
                 reserved: Mutex::new(HashSet::new()),
@@ -481,11 +512,12 @@ impl GatewaySession {
             Payload::GatewayCredit(p) => {
                 if inner.credit {
                     if let Some(chan) = inner.chan(p.gateway_id) {
+                        chan.touch();
                         chan.send.grant(p.bytes);
                     }
                 }
             }
-            Payload::GatewayClose(p) => inner.on_remote_close(p.gateway_id),
+            Payload::GatewayClose(p) => inner.on_remote_close(p.gateway_id, p.reason.as_deref()),
             _ => {}
         }
     }
@@ -678,6 +710,11 @@ impl Inner {
             finished: AtomicBool::new(false),
             sent_close: AtomicBool::new(false),
             remote_closed: AtomicBool::new(false),
+            write_shut: AtomicBool::new(false),
+            is_udp: AtomicBool::new(false),
+            idle_armed: AtomicBool::new(false),
+            born: std::time::Instant::now(),
+            last_active_ms: AtomicU64::new(0),
             write_tx,
             tasks: Mutex::new(Vec::new()),
             guard: Mutex::new(Some(guard)),
@@ -721,9 +758,14 @@ impl Inner {
     /// Origin -> client, one chunk at a time: the origin is read only while credit is held.
     async fn read_loop(self: Arc<Self>, chan: Arc<Chan>, mut rd: tokio::io::ReadHalf<BoxStream>) {
         let mut buf = vec![0u8; MAX_FRAME];
+        let mut eof = false;
         'outer: loop {
             let n = match rd.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Err(_) => break,
                 Ok(n) => n,
             };
             let mut off = 0;
@@ -737,11 +779,52 @@ impl Inner {
                 {
                     break 'outer;
                 }
+                chan.touch();
                 off += allowed;
             }
         }
-        // The origin is done: tell the client once everything it sent has gone out.
-        self.destroy(&chan, None);
+        if !eof || chan.finished.load(Ordering::Acquire) {
+            // The origin failed (or the client is gone): the connection is over.
+            self.destroy(&chan, None);
+            return;
+        }
+        // The origin finished sending (its end of file), everything it sent has gone out: a
+        // half-close towards the client. What the client sends after this still reaches the origin.
+        if !chan.sent_close.swap(true, Ordering::SeqCst) && !self.closed.load(Ordering::Acquire) {
+            self.send(close_msg(chan.id, None)).await;
+        }
+        chan.touch();
+        if chan.write_shut.load(Ordering::SeqCst) {
+            // The client had finished too: over.
+            self.destroy(&chan, None);
+        } else {
+            self.arm_idle(&chan);
+        }
+    }
+
+    /// A half-closed connection: close it after `half_close_idle` with nothing moving in either
+    /// direction (a peer that half-closed and never reads), never before.
+    fn arm_idle(self: &Arc<Self>, chan: &Arc<Chan>) {
+        let Some(idle) = self.half_close_idle else {
+            return;
+        };
+        if chan.finished.load(Ordering::Acquire) || chan.idle_armed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let inner = self.clone();
+        let c = chan.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                match idle.checked_sub(c.quiet()) {
+                    None => {
+                        inner.destroy(&c, Some("idle timeout"));
+                        return;
+                    }
+                    Some(left) => tokio::time::sleep(left).await,
+                }
+            }
+        });
+        chan.tasks.lock().expect("tasks").push(task.abort_handle());
     }
 
     /// Client -> origin. Credit goes back to the client as the origin takes the bytes.
@@ -763,6 +846,12 @@ impl Inner {
                 }
                 WriteCmd::Shutdown => {
                     let _ = wr.shutdown().await;
+                    chan.write_shut.store(true, Ordering::SeqCst);
+                    if chan.sent_close.load(Ordering::SeqCst) {
+                        // The origin had finished too: over (what was queued for it is written).
+                        self.destroy(&chan, None);
+                        return;
+                    }
                 }
             }
         }
@@ -771,6 +860,7 @@ impl Inner {
     /// The origin took `n` bytes: free them from the queue and the budget, and top up the client.
     async fn consumed(&self, chan: &Arc<Chan>, n: usize) {
         let freed = chan.release(n);
+        chan.touch();
         self.budget.fetch_sub(
             freed.min(self.budget.load(Ordering::Acquire)),
             Ordering::AcqRel,
@@ -841,6 +931,7 @@ impl Inner {
         flow_slot: Slot,
     ) -> Arc<Notify> {
         let (chan, mut write_rx) = self.new_chan(id, guard);
+        chan.is_udp.store(true, Ordering::Release);
         let socket = Arc::new(socket);
         let ready = Arc::new(Notify::new());
         let idle = self.policy.udp().idle;
@@ -962,7 +1053,10 @@ impl Inner {
             return;
         }
         if !chan.sent_close.swap(true, Ordering::AcqRel) && !self.closed.load(Ordering::Acquire) {
-            self.spawn_reply(close_msg(chan.id, reason));
+            self.spawn_reply(close_msg(
+                chan.id,
+                Some(reason.unwrap_or(GATEWAY_DISCARDED)),
+            ));
         }
         {
             let mut conns = self.conns.lock().expect("conns");
@@ -1017,23 +1111,35 @@ impl Inner {
             self.destroy(&chan, Some("buffer limit exceeded"));
             return;
         }
+        chan.touch();
         let _ = chan.write_tx.send(WriteCmd::Data(data));
     }
 
-    /// The client sent GatewayClose: it sends no more. The origin may still answer for a moment.
-    fn on_remote_close(self: &Arc<Self>, id: u32) {
+    /// The client sent GatewayClose: it sends no more. The origin's write side is shut (after what
+    /// is queued for it) and its answer is read for as long as it takes: the connection is over
+    /// when the origin has finished too, or by the idle rule.
+    fn on_remote_close(self: &Arc<Self>, id: u32, reason: Option<&str>) {
         let Some(chan) = self.chan(id) else { return };
         if chan.remote_closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        if chan.is_udp.load(Ordering::Acquire) {
+            // A datagram flow has no half-close.
+            self.destroy(&chan, None);
+            return;
+        }
+        chan.touch();
+        if reason == Some(GATEWAY_DISCARDED) {
+            // The client dropped the connection and reads nothing more: our side is over too, once
+            // what it had sent is written (the writer ends it after the shutdown); no close goes back.
+            chan.sent_close.store(true, Ordering::SeqCst);
+            let _ = chan.write_tx.send(WriteCmd::Shutdown);
+            self.arm_idle(&chan);
+            return;
+        }
         let _ = chan.write_tx.send(WriteCmd::Shutdown);
-        let inner = self.clone();
-        let grace = tokio::spawn(async move {
-            tokio::time::sleep(HALF_CLOSE_GRACE).await;
-            inner.destroy(&chan, Some("grace period over"));
-        });
-        if let Some(c) = self.chan(id) {
-            c.tasks.lock().expect("tasks").push(grace.abort_handle());
+        if !chan.sent_close.load(Ordering::SeqCst) {
+            self.arm_idle(&chan);
         }
     }
 

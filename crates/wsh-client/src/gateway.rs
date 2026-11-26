@@ -15,12 +15,14 @@
 //! (the same numbers as the Node client): a connection that exceeds either is closed.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
-use wsh_core::gateway_credit::{SendCredit, GATEWAY_CREDIT_WINDOW, GATEWAY_MAX_FRAME};
+use wsh_core::gateway_credit::{
+    SendCredit, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED, GATEWAY_MAX_FRAME,
+};
 use wsh_core::messages::*;
 use wsh_core::{frame_encode, WshError, WshResult};
 
@@ -37,6 +39,9 @@ pub use wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE as CREDIT_FEATURE;
 const MAX_QUEUED_PER_CONN: usize = 4 * 1024 * 1024;
 /// The same over all of a client's connections.
 const MAX_QUEUED_TOTAL: usize = 32 * 1024 * 1024;
+/// How long [`GatewayStream::pump`] lets a half-closed exchange sit with nothing moving in either
+/// direction before it closes it (five minutes, the same as the host's `half_close_idle_secs`).
+pub const DEFAULT_HALF_CLOSE_IDLE: Duration = Duration::from_secs(300);
 /// How long to wait for the host to answer an open.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -130,9 +135,14 @@ impl ConnShared {
     }
 
     /// The host sent GatewayClose: no more data comes (what is queued can still be read).
-    fn remote_closed(&self) {
+    /// `discarded`: the host has dropped the connection and reads nothing more, so our direction is
+    /// over too (writes fail; nothing is sent back).
+    fn remote_closed(&self, discarded: bool) {
         if self.remote_closed.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if discarded {
+            self.sent_close.store(true, Ordering::Release);
         }
         self.data_ready.notify_one();
         self.send.wake();
@@ -162,7 +172,7 @@ impl ConnShared {
                     msg_type: MsgType::GatewayClose,
                     payload: Payload::GatewayClose(GatewayClosePayload {
                         gateway_id: self.id,
-                        reason: reason.map(str::to_string),
+                        reason: Some(reason.unwrap_or(GATEWAY_DISCARDED).to_string()),
                     }),
                 });
             }
@@ -178,7 +188,8 @@ impl ConnShared {
                 Ordering::AcqRel,
             );
         }
-        let _ = self.closed_tx.send(true);
+        // `send_replace`: the value is kept even with no receiver now, so one that subscribes later still sees it.
+        self.closed_tx.send_replace(true);
         self.data_ready.notify_one();
         self.send.wake();
     }
@@ -311,11 +322,9 @@ impl GatewayStream {
         let mut closed_rx = s.closed_tx.subscribe();
         let mut off = 0;
         while off < data.len() {
-            let writable = || {
-                !(s.finished.load(Ordering::Acquire)
-                    || s.sent_close.load(Ordering::Acquire)
-                    || s.remote_closed.load(Ordering::Acquire))
-            };
+            // The host's GatewayClose is a half-close: it sends no more, and what we send still reaches its origin.
+            let writable =
+                || !(s.finished.load(Ordering::Acquire) || s.sent_close.load(Ordering::Acquire));
             if !writable() {
                 return Err(if s.finished.load(Ordering::Acquire) {
                     s.io_error()
@@ -386,78 +395,156 @@ impl GatewayStream {
     /// exchange that closes its write side after the request still gets its answer.
     ///
     /// Returns the bytes moved `(local -> host, host -> local)`.
+    ///
+    /// A half-closed exchange (one side has finished, the other has not) stays open for as long as
+    /// anything moves in either direction, so a request that closes its write side gets an answer
+    /// however late it comes, and a host that closes first does not stop what the local side goes
+    /// on to send. With nothing moving in either direction for [`DEFAULT_HALF_CLOSE_IDLE`] the
+    /// connection is closed and `pump` returns a `TimedOut` error; see
+    /// [`GatewayStream::pump_with_idle`] to choose the bound or turn it off.
     pub async fn pump<L>(self, local: L) -> std::io::Result<(u64, u64)>
     where
         L: AsyncRead + AsyncWrite + Send + 'static,
     {
+        self.pump_with_idle(local, Some(DEFAULT_HALF_CLOSE_IDLE))
+            .await
+    }
+
+    /// [`GatewayStream::pump`] with the bound on a half-closed exchange chosen (`None` = never).
+    pub async fn pump_with_idle<L>(
+        self,
+        local: L,
+        idle: Option<Duration>,
+    ) -> std::io::Result<(u64, u64)>
+    where
+        L: AsyncRead + AsyncWrite + Send + 'static,
+    {
         let (mut lr, mut lw) = tokio::io::split(local);
+        let started = std::time::Instant::now();
+        // When a byte last moved either way (milliseconds since `started`), the bytes moved each
+        // way, and whether either direction has finished (the exchange is half-closed).
+        let last = Arc::new(AtomicU64::new(0));
+        let up_bytes = Arc::new(AtomicU64::new(0));
+        let down_bytes = Arc::new(AtomicU64::new(0));
+        let half = Arc::new(watch::channel(false).0);
+        let touch = {
+            let last = last.clone();
+            move || last.store(started.elapsed().as_millis() as u64, Ordering::Release)
+        };
         let up = {
             let me = self.clone();
+            let touch = touch.clone();
+            let half = half.clone();
+            let up_bytes = up_bytes.clone();
             async move {
+                let mut closed = me.shared.closed_tx.subscribe();
                 let mut buf = vec![0u8; GATEWAY_MAX_FRAME];
-                let mut total = 0u64;
-                loop {
-                    match lr.read(&mut buf).await {
-                        Ok(0) => break,
+                let result = loop {
+                    let read = tokio::select! {
+                        r = lr.read(&mut buf) => r,
+                        // The connection is gone (reset, idle, dropped): there is nobody to feed.
+                        _ = closed.wait_for(|c| *c) => return Ok::<(), std::io::Error>(()),
+                    };
+                    match read {
+                        Ok(0) => break Ok(()),
                         Ok(n) => {
                             if me.write_all(&buf[..n]).await.is_err() {
                                 // The host is gone: nothing to feed, and nothing to wait for.
-                                return Ok(total);
+                                return Ok(());
                             }
-                            total += n as u64;
+                            up_bytes.fetch_add(n as u64, Ordering::AcqRel);
+                            touch();
                         }
                         Err(e) => {
                             me.destroy();
-                            return Err(e);
+                            break Err(e);
                         }
                     }
+                };
+                half.send_replace(true);
+                if result.is_ok() {
+                    me.shutdown().await;
                 }
-                me.shutdown().await;
-                Ok::<u64, std::io::Error>(total)
+                result
             }
         };
         let down = {
             let me = self.clone();
+            let touch = touch.clone();
+            let half = half.clone();
+            let down_bytes = down_bytes.clone();
             async move {
                 let mut buf = vec![0u8; GATEWAY_MAX_FRAME];
-                let mut total = 0u64;
-                loop {
+                let result = loop {
                     match me.read(&mut buf).await {
-                        Ok(0) => break,
+                        Ok(0) => break Ok(()),
                         Ok(n) => {
                             if lw.write_all(&buf[..n]).await.is_err() {
                                 me.destroy();
-                                return Ok(total);
+                                half.send_replace(true);
+                                return Ok::<(), std::io::Error>(());
                             }
-                            total += n as u64;
+                            down_bytes.fetch_add(n as u64, Ordering::AcqRel);
+                            touch();
                         }
-                        Err(e) => {
-                            let _ = lw.shutdown().await;
-                            return Err(e);
-                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+                half.send_replace(true);
+                let _ = lw.shutdown().await;
+                result
+            }
+        };
+        // The idle rule: once one direction has finished, nothing moving in either direction for
+        // `idle` ends the connection. (Not a fixed timer: a slow answer, or a local side that sends
+        // late, is not cut off.)
+        let watch_idle = {
+            let half = half.clone();
+            let last = last.clone();
+            async move {
+                let Some(idle) = idle else {
+                    return std::future::pending::<()>().await;
+                };
+                let mut rx = half.subscribe();
+                let _ = rx.wait_for(|h| *h).await;
+                loop {
+                    let quiet = Duration::from_millis(
+                        (started.elapsed().as_millis() as u64)
+                            .saturating_sub(last.load(Ordering::Acquire)),
+                    );
+                    match idle.checked_sub(quiet) {
+                        None => return,
+                        Some(left) => tokio::time::sleep(left).await,
                     }
                 }
-                let _ = lw.shutdown().await;
-                Ok::<u64, std::io::Error>(total)
             }
         };
-        // The host ending its side ends the exchange, even if the local side is still open and
-        // quiet (the OpenSSH behaviour): the local reader would otherwise wait for input forever.
         let mut up = Box::pin(up);
         let mut down = Box::pin(down);
-        let (u, d) = tokio::select! {
-            d = &mut down => {
-                // Give an in-flight write a moment to finish, then stop reading local input.
-                let u = tokio::time::timeout(Duration::from_millis(200), &mut up).await.unwrap_or(Ok(0));
-                (u, d)
+        let mut watch_idle = Box::pin(watch_idle);
+        let (mut up_done, mut down_done) = (false, false);
+        let mut down_result: std::io::Result<()> = Ok(());
+        let mut timed_out = false;
+        while !(up_done && down_done) {
+            tokio::select! {
+                _ = &mut up, if !up_done => up_done = true,
+                r = &mut down, if !down_done => { down_done = true; down_result = r; }
+                _ = &mut watch_idle => { timed_out = true; break; }
             }
-            u = &mut up => {
-                let d = (&mut down).await;
-                (u, d)
-            }
-        };
+        }
+        if timed_out {
+            self.destroy();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "a half-closed gateway connection had nothing moving in either direction",
+            ));
+        }
         drop(self);
-        Ok((u.unwrap_or(0), d?))
+        down_result?;
+        Ok((
+            up_bytes.load(Ordering::Acquire),
+            down_bytes.load(Ordering::Acquire),
+        ))
     }
 }
 
@@ -858,7 +945,7 @@ impl GatewayHub {
                     .cloned();
                 match conn {
                     Some(conn) => {
-                        conn.remote_closed();
+                        conn.remote_closed(c.reason.as_deref() == Some(GATEWAY_DISCARDED));
                         true
                     }
                     None => false,
