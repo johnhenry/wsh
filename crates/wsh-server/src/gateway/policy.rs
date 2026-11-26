@@ -72,8 +72,13 @@ pub struct GatewayPolicy {
     pub max_buffered_bytes: usize,
     /// The same, summed over one client's connections.
     pub max_client_buffered_bytes: usize,
+    /// A connection half-closed by one side (and not the other) is closed after this long with
+    /// nothing moving in either direction. `None` = never.
+    pub half_close_idle: Option<std::time::Duration>,
 }
 
+/// Default for [`GatewayPolicy::half_close_idle`], in seconds (the same as the Node host: five minutes).
+pub const DEFAULT_HALF_CLOSE_IDLE_SECS: u64 = 300;
 /// Default for [`GatewayPolicy::max_buffered_bytes`] (the same as the Node host).
 pub const DEFAULT_MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 /// Default for [`GatewayPolicy::max_client_buffered_bytes`] (the same as the Node host).
@@ -96,6 +101,7 @@ impl Default for GatewayPolicy {
             },
             max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
             max_client_buffered_bytes: DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
+            half_close_idle: Some(std::time::Duration::from_secs(DEFAULT_HALF_CLOSE_IDLE_SECS)),
         }
     }
 }
@@ -404,6 +410,11 @@ impl GatewayPolicyEnforcer {
             self.policy.max_buffered_bytes,
             self.policy.max_client_buffered_bytes,
         )
+    }
+
+    /// How long a half-closed connection may sit with nothing moving in either direction.
+    pub fn half_close_idle(&self) -> Option<std::time::Duration> {
+        self.policy.half_close_idle
     }
 
     /// Count a connection if the limit allows it: the check and the count are one step, so

@@ -134,7 +134,9 @@ describe('Rust wsh-server: reverse tunnels are bounded as on the Node host (#145
   it('limits connections per listener: the extra one is closed without being announced, and a slot frees when one ends', async () => {
     const { client } = await setup('reverse_max_connections_per_listener = 2\n');
     const opened = [];
-    const handle = await client.listenTcp(0, { onConnection: (d) => { opened.push(d); } });
+    // An application that finishes its own side at the connector's end of file: a half-closed connection is over when both have (#271).
+    const finishOnEof = async (d) => { const r = d.readable.getReader(); while (!(await r.read()).done); await d.writable.getWriter().close(); };
+    const handle = await client.listenTcp(0, { onConnection: (d) => { opened.push(d); void finishOnEof(d).catch(() => {}); } });
     const a = await dial(handle.port); const b = await dial(handle.port);
     sockets.push(a, b);
     await until(() => opened.length === 2, 'two announced');
@@ -150,7 +152,8 @@ describe('Rust wsh-server: reverse tunnels are bounded as on the Node host (#145
   it('a connection nobody accepts does not hold its slot for ever: the slot is given back when it is dropped', async () => {
     const { client } = await setup('reverse_max_connections_per_listener = 1\n');
     let seen = 0;
-    const handle = await client.listenTcp(0, { onConnection: () => { seen += 1; } });
+    const finishOnEof = async (d) => { const r = d.readable.getReader(); while (!(await r.read()).done); await d.writable.getWriter().close(); };
+    const handle = await client.listenTcp(0, { onConnection: (d) => { seen += 1; void finishOnEof(d).catch(() => {}); } });
     const a = await dial(handle.port); sockets.push(a);
     await until(() => seen === 1, 'first');
     a.destroy();

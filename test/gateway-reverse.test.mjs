@@ -181,7 +181,10 @@ describe('reverse tunnels: the Node host listens, the client serves (#98)', () =
     it('limits connections per listener: the extra one is closed without being announced, and a slot frees when one ends', async () => {
       const { client, server } = await fx.setup({ allow: [], reverse: { maxConnectionsPerListener: 2 } });
       const opened = [];
-      const handle = await client.listenTcp(0, { onConnection: (d) => { opened.push(d); } });
+      // An application that notices the connector's end of file and finishes its own side (a half-closed connection is
+      // over when both sides have; see #271), which is what frees the slot.
+      const finishOnEof = async (d) => { const r = d.readable.getReader(); while (!(await r.read()).done); await d.writable.getWriter().close(); };
+      const handle = await client.listenTcp(0, { onConnection: (d) => { opened.push(d); void finishOnEof(d).catch(() => {}); } });
       const a = await dial(handle.port); const b = await dial(handle.port);
       await until(() => opened.length === 2, 'two announced');
       const c = await dial(handle.port).catch(() => null);

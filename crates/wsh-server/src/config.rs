@@ -408,6 +408,15 @@ pub struct GatewaySection {
     /// Default: `33554432` (32 MiB).
     #[serde(default = "default_max_client_buffered_bytes")]
     pub max_client_buffered_bytes: usize,
+    /// A gateway connection one side of which has half-closed (sent `GatewayClose`; the other has
+    /// not) stays open while anything moves in either direction, so a client that half-closes and
+    /// keeps reading gets what the origin sends later. It is closed after this many seconds with
+    /// nothing moving in either direction, which reaps a peer that half-closes and never reads.
+    /// `0` turns the bound off.
+    ///
+    /// Default: `300` (five minutes).
+    #[serde(default = "default_half_close_idle_secs")]
+    pub half_close_idle_secs: u64,
 }
 
 impl Default for GatewaySection {
@@ -436,6 +445,7 @@ impl Default for GatewaySection {
             unix_max_listeners: default_unix_max_listeners(),
             max_buffered_bytes: default_max_buffered_bytes(),
             max_client_buffered_bytes: default_max_client_buffered_bytes(),
+            half_close_idle_secs: default_half_close_idle_secs(),
         }
     }
 }
@@ -478,6 +488,9 @@ fn default_max_buffered_bytes() -> usize {
 }
 fn default_max_client_buffered_bytes() -> usize {
     crate::gateway::policy::DEFAULT_MAX_CLIENT_BUFFERED_BYTES
+}
+fn default_half_close_idle_secs() -> u64 {
+    crate::gateway::policy::DEFAULT_HALF_CLOSE_IDLE_SECS
 }
 
 /// `[rpc]` section of the config TOML: typed RPC channels (`Open { kind: "rpc" }`, wsh #85 / #86).
@@ -627,6 +640,8 @@ pub struct ServerConfig {
     pub gateway_max_buffered_bytes: usize,
     /// See [`GatewaySection::max_client_buffered_bytes`].
     pub gateway_max_client_buffered_bytes: usize,
+    /// See [`GatewaySection::half_close_idle_secs`].
+    pub gateway_half_close_idle_secs: u64,
     /// Username → usable password hash, for password auth. Entries that could not be
     /// used (an unsalted `sha256:` without `allow_legacy_sha256`, anything unparsable)
     /// are logged at start-up and left out, so those users cannot log in.
@@ -838,6 +853,7 @@ impl ServerConfig {
             gateway_unix,
             gateway_max_buffered_bytes: max_buffered,
             gateway_max_client_buffered_bytes: max_client_buffered,
+            gateway_half_close_idle_secs: file_config.gateway.half_close_idle_secs,
             password_hashes,
             rpc_enabled: file_config.rpc.enabled,
             rpc_max_message_bytes: file_config.rpc.max_message_bytes,
@@ -1045,6 +1061,26 @@ mod tests {
         assert!(cfg.gateway_allowed_destinations.is_empty(), "default-deny");
         assert!(!cfg.gateway_enable_reverse_tunnels);
         assert_eq!(cfg.gateway_reverse_bind_addr.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_half_closed_connection_idle_bound_defaults_to_five_minutes_and_can_be_changed_or_turned_off(
+    ) {
+        assert_eq!(
+            load("[gateway]\nenabled = true\n").gateway_half_close_idle_secs,
+            300
+        );
+        assert_eq!(
+            load("[gateway]\nenabled = true\nhalf_close_idle_secs = 60\n")
+                .gateway_half_close_idle_secs,
+            60
+        );
+        assert_eq!(
+            load("[gateway]\nenabled = true\nhalf_close_idle_secs = 0\n")
+                .gateway_half_close_idle_secs,
+            0,
+            "0 turns the bound off"
+        );
     }
 
     #[test]

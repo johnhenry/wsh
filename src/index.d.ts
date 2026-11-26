@@ -1939,6 +1939,12 @@ export interface WshConnectOptions extends WshHostKeyOptions {
    */
   webTransport?: WshWebTransportOptions;
   timeout?: number;
+  /**
+   * A gateway connection (`openTcp`, `openUnix`, `openEndpoint`, a listener's connections) that is half-closed -- one side
+   * sent GatewayClose and the other has not -- stays open while anything moves in either direction, and is ended after
+   * this many milliseconds with nothing moving in either. Default 300000 (five minutes); `0` never.
+   */
+  gatewayHalfCloseIdleMs?: number;
 }
 
 /** Options for WshClient.openSession(). */

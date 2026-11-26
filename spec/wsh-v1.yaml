@@ -1295,6 +1295,34 @@ messages:
         Sent by either side to close an open gateway channel.  The client
         sends it to tear down a proxied connection; the server sends it
         when the remote peer disconnects or the connection is reset.
+        GatewayClose is a half-close: the sender sends no more GatewayData
+        on this gateway_id and goes on receiving, and the receiver may go
+        on sending (as a TCP or unix-socket peer may shut down its write
+        side and keep reading).  One in each direction ends the connection;
+        a peer's GatewayClose is not a reason to close the other direction.
+        A client that has nothing to send may therefore send GatewayClose
+        right after GatewayOk and still receive everything the origin sends
+        later, however late; an origin's end of file is sent to the client
+        as a GatewayClose while what the client sends afterwards still
+        reaches the origin.  A connection that has been half-closed by one
+        side and has moved no byte (GatewayData or GatewayCredit) in either
+        direction for an implementation-chosen idle bound (the Node host's
+        gateway.halfCloseIdleMs and wsh-server's [gateway]
+        half_close_idle_secs, both five minutes unless set, 0 = never) may
+        be ended by the side that holds it with GatewayClose carrying the
+        reason "idle timeout"; that bound is the only timer a conforming
+        peer applies to a half-closed connection.  A UDP flow (OpenUdp) has
+        no half-close: its GatewayClose ends it.  Peers that predate this
+        wording ended the connection at a fixed delay after the first
+        GatewayClose (one second on the host, five on the client).  A side
+        that has DISCARDED the connection (a local socket that closed or
+        was reset, a dropped stream, an origin that is gone) sends
+        GatewayClose with reason "discarded": it reads nothing more, so the
+        receiver ends its own direction too at once instead of waiting for
+        the idle bound, and sends nothing back.  A reason is optional text,
+        so no field or feature string is added: a peer that does not know
+        "discarded" treats it as a half-close, and the idle bound ends the
+        connection.
       fields:
         gateway_id:
           type: u32

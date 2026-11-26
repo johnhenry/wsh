@@ -13,14 +13,14 @@ import {
   listenClose as listenCloseMsg, inboundAccept as inboundAcceptMsg, inboundReject as inboundRejectMsg,
   gatewayData as gatewayDataMsg, gatewayCredit as gatewayCreditMsg, gatewayClose as gatewayCloseMsg,
 } from './messages.mjs';
-import { GatewayChannel, GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
+import { GatewayChannel, GATEWAY_CREDIT_FEATURE, assertHalfCloseIdleMs } from './gateway-channel.mjs';
 import { UdpFlow, decodeDatagram } from './gateway-datagram.mjs';
 import { GATEWAY_FAIL_FIVE_NOTE } from './gateway-errors.mjs';
 
 const ID_BASE = 0x40000000;
 const ID_LIMIT = 0xffffffff;
 const DEFAULT_TIMEOUT_MS = 30_000;
-const CLIENT_GRACE_MS = 5_000;
+export { assertHalfCloseIdleMs };
 
 /**
  * An Error from a GatewayFail / ListenFail: `.code` is the GatewayFail code (4 = refused by policy, 8 = timed out). A `5` is "the gateway is
@@ -59,13 +59,15 @@ export class GatewayConnections {
    * @param {(msg: object) => Promise<void>} o.send
    * @param {(feature: string) => boolean} o.hasFeature
    */
-  constructor({ send, hasFeature, datagrams = () => null }) {
+  constructor({ send, hasFeature, datagrams = () => null, halfCloseIdleMs }) {
+    this.#halfCloseIdleMs = assertHalfCloseIdleMs(halfCloseIdleMs);
     this.#send = send;
     this.#hasFeature = hasFeature;
     this.#datagrams = datagrams;
   }
 
   #datagrams;
+  #halfCloseIdleMs;
   /** @type {Map<number, UdpFlow>} */
   #udp = new Map();
 
@@ -89,9 +91,11 @@ export class GatewayConnections {
     const channel = new GatewayChannel({
       id,
       credit: this.#hasFeature(GATEWAY_CREDIT_FEATURE),
-      // After the peer's GatewayClose the application has this long to finish writing (a half-open connection) before
-      // our side closes too, so a connection nobody closes does not stay in the table forever.
-      graceMs: CLIENT_GRACE_MS,
+      // A GatewayClose from the host is a half-close: the application may keep writing, and may take as long as it likes
+      // to finish, while anything moves in either direction. A half-closed connection with nothing moving for
+      // `halfCloseIdleMs` is ended, so one nobody closes does not stay in the table forever.
+      writeAfterRemoteClose: true,
+      halfCloseIdleMs: this.#halfCloseIdleMs,
       onRemoteClose: datagram ? () => channel.destroy() : undefined,
       onData,
       sendData: (data) => this.#send(gatewayDataMsg({ gatewayId: id, data })),

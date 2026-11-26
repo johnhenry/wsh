@@ -156,6 +156,13 @@ export interface WshServerGatewayOptions {
   connectTimeoutMs?: number;
   /** A UDP flow with no datagram in either direction for this long is closed (default 60000). */
   udpIdleMs?: number;
+  /**
+   * A connection one side of which has half-closed (sent GatewayClose; the other has not) stays open while anything moves
+   * in either direction, so a client that half-closes and keeps reading gets what the far side sends later. It is ended
+   * after this many milliseconds with nothing moving in either direction, which reaps a peer that half-closes and never
+   * reads. Default 300000 (five minutes); `0` turns the bound off.
+   */
+  halfCloseIdleMs?: number;
   /** Bytes received from a client for one connection and not yet taken by its origin before it is closed (default 4 MiB; at least 262144). */
   maxBufferedBytes?: number;
   /** The same, summed over one client's connections (default 32 MiB). */
