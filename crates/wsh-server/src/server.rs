@@ -383,6 +383,8 @@ impl WshServer {
             max_client_buffered_bytes: config.gateway_max_client_buffered_bytes,
             half_close_idle: (config.gateway_half_close_idle_secs > 0)
                 .then(|| std::time::Duration::from_secs(config.gateway_half_close_idle_secs)),
+            half_close_probe: (config.gateway_half_close_probe_secs > 0)
+                .then(|| std::time::Duration::from_secs(config.gateway_half_close_probe_secs)),
         };
         let policy_enforcer = Arc::new(GatewayPolicyEnforcer::new(gateway_policy));
         let gateway_policy = policy_enforcer;
@@ -5549,6 +5551,7 @@ mod wisp_reverse_connect_e2e_tests {
             gateway_max_client_buffered_bytes:
                 crate::gateway::policy::DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
             gateway_half_close_idle_secs: crate::gateway::policy::DEFAULT_HALF_CLOSE_IDLE_SECS,
+            gateway_half_close_probe_secs: wsh_core::peer_watch::DEFAULT_HALF_CLOSE_PROBE.as_secs(),
             password_hashes: std::collections::HashMap::new(),
             rpc_enabled: true,
             rpc_max_message_bytes: crate::rpc::RPC_DEFAULT_MAX_MESSAGE,

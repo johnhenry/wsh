@@ -37,6 +37,20 @@ export function assertHalfCloseIdleMs(v, what = 'halfCloseIdleMs') {
 }
 
 /**
+ * How often a socket that this side holds, and whose peer has half-closed (sent its FIN), is checked for a peer that has gone
+ * away (`halfCloseProbeMs`; 0 turns it off). The kernel tells a socket nothing about a peer that half-closed and then died
+ * until something is written to it, so a Node socket is probed with a zero-length write (it delivers nothing to a live peer).
+ */
+export const DEFAULT_HALF_CLOSE_PROBE_MS = 2000;
+
+/** `halfCloseProbeMs` as an option: a non-negative integer number of milliseconds (a timer cannot wait longer than 2^31 - 1). Undefined = the default. */
+export function assertHalfCloseProbeMs(v, what = 'halfCloseProbeMs') {
+  if (v === undefined) return DEFAULT_HALF_CLOSE_PROBE_MS;
+  if (!Number.isInteger(v) || v < 0 || v > 0x7fffffff) throw new TypeError(`${what} must be an integer number of milliseconds from 0 (never) to 2147483647`);
+  return v;
+}
+
+/**
  * The reason a side puts on its GatewayClose when it has DISCARDED the connection (`destroy()` with no reason of its own: a
  * local socket that closed or was reset, a stream that was dropped, an origin that is gone): it will read nothing more, so
  * the peer ends its own direction too instead of waiting for the idle bound. A GatewayClose without it is a half-close. A

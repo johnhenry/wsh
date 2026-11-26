@@ -43,6 +43,8 @@ import { MSG, gatewayOk, dnsResult, listenOk, listenFail, inboundOpen } from '..
 import {
   GATEWAY_FAIL, gatewayFeatures, createGatewayCore, normalizeGatewayLimits, normalizeEndpoints,
 } from './gateway-core.mjs';
+import { DEFAULT_HALF_CLOSE_PROBE_MS } from '../gateway-channel.mjs';
+import { watchHalfClosed } from '../half-close-watch.mjs';
 import { parseCidr, parseIp } from './address-guard.mjs';
 import { checkAddress, resolveChecked, dialChecked, dialUdpChecked, AddressGuardError } from '../address-guard.mjs';
 import { normalizeReverse, reversePortAllowed, reversePortRefusal, reverseBindAddress } from './reverse-policy.mjs';
@@ -229,7 +231,7 @@ export function normalizeGateway(opts) {
     if (!c) throw new TypeError(`gateway.allowPrivate: ${JSON.stringify(r)} is not an address or CIDR block`);
     return c;
   });
-  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs } = normalizeGatewayLimits(opts);
+  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs } = normalizeGatewayLimits(opts);
   let unix = null;
   if (opts.unix !== undefined && opts.unix !== null && opts.unix !== false) {
     if (opts.unix === true || typeof opts.unix !== 'object') throw new TypeError('gateway.unix needs explicit paths (default deny): { connect: [...], listen: [...] }');
@@ -244,6 +246,7 @@ export function normalizeGateway(opts) {
     maxBufferedBytes,
     maxClientBufferedBytes,
     halfCloseIdleMs,
+    halfCloseProbeMs,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     udpIdleMs: opts.udpIdleMs ?? DEFAULT_UDP_IDLE_MS,
     udp: normalizeUdp(opts.udp),
@@ -295,7 +298,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
   const failListen = (listenerId, reason) => reply(listenFail({ listenerId, reason }));
 
   /** Attach a connected socket (TCP or unix) as gateway connection `id`. */
-  function attachSocket(id, sock) {
+  function attachSocket(id, sock, { watchPeer = false } = {}) {
     sock.setNoDelay?.(true);
     // Whoever made the socket (the dialer, the SOCKS client, a listener) did not ask for half-open behaviour; the gateway
     // does: an EOF from the origin is a half-close, and what the client sends after it must still reach the origin.
@@ -322,6 +325,13 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     const originEnded = () => { void tail.finally(() => channel.end()); };
     sock.on('end', originEnded);
     if (sock.readableEnded) originEnded(); // an accepted connection whose peer half-closed before it was taken
+    // A CALLER of a reverse listener that finished sending (its FIN) and then went away is not noticed by the kernel until
+    // something is written to it (#282): while it is half-closed, probe it. Gone = destroyed, which is the 'close' below (a second
+    // GatewayClose "discarded": the caller reads nothing more, so what the client's service still sends is wanted by nobody).
+    // An ORIGIN of the host is deliberately not watched: one that finished sending and then closed completely is the ordinary end
+    // of a response, and the client may still be reading what it sent; the discard drops what the client has received and not
+    // yet read, so it would cut the tail of the answer off.
+    if (watchPeer) watchHalfClosed(sock, cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS, (e) => log(`gateway ${id}: ${e.message}`));
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
     sock.on('close', () => { void tail.finally(() => channel.destroy()); });
@@ -663,7 +673,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     listeners.get(p.listenerId)?.pendingChannels.delete(m.channel_id);
     const id = m.gateway_id;
     if (!Number.isInteger(id) || idInUse(id) || p.sock.destroyed || active() >= cfg.maxConnections) { p.sock.destroy(); return; }
-    attachSocket(id, p.sock);
+    attachSocket(id, p.sock, { watchPeer: true });
     const rev = listeners.get(p.listenerId)?.kind === 'tcp' ? cfg.reverse : null;
     if (rev && rev.idleMs > 0) {
       // Inactivity in either direction ends the connection (the socket's own timeout counts reads and writes).

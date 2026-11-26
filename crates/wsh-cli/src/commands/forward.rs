@@ -27,7 +27,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{bail, Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use wsh_client::gateway::valid_endpoint_name;
+use wsh_client::gateway::{
+    valid_endpoint_name, WatchablePeer, DEFAULT_HALF_CLOSE_IDLE, DEFAULT_HALF_CLOSE_PROBE,
+};
 use wsh_client::{GatewayHandle, WshClient};
 
 /// How many forwarded connections may be open at once, per `wsh` process.
@@ -554,6 +556,28 @@ async fn start_local(
     Ok(())
 }
 
+/// Join a forwarded connection (`-L`) to the local socket of the program that dialled it. A
+/// local program that half-closed and then went away (killed, crashed) is noticed from the
+/// socket's hang-up and the host is told the connection is discarded, instead of holding it until
+/// the far side next sends (wsh #282); not covered on Windows, where this is a plain pump. Only for
+/// the program that CONNECTED and reads the answer: a `-R`'s local service is not watched, since a
+/// service that finished and closed completely is the normal end of a response.
+async fn pump_local<S>(
+    stream: wsh_client::gateway::GatewayStream,
+    local: S,
+) -> std::io::Result<(u64, u64)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static + WatchablePeer,
+{
+    stream
+        .pump_watched(
+            local,
+            Some(DEFAULT_HALF_CLOSE_IDLE),
+            Some(DEFAULT_HALF_CLOSE_PROBE),
+        )
+        .await
+}
+
 /// Open the remote end for an accepted local connection and join the two.
 fn spawn_forward<S>(
     handle: &GatewayHandle,
@@ -562,7 +586,7 @@ fn spawn_forward<S>(
     gate: &Arc<Semaphore>,
     local: S,
 ) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static + WatchablePeer,
 {
     let Ok(permit) = gate.clone().try_acquire_owned() else {
         eprintln!(
@@ -577,7 +601,7 @@ fn spawn_forward<S>(
         let _permit = permit;
         match open_target(&handle, &target).await {
             Ok(stream) => {
-                let _ = stream.pump(local).await;
+                let _ = pump_local(stream, local).await;
             }
             Err(e) => eprintln!("wsh: forward {spec} -> {}: {e}", describe_target(&target)),
         }
@@ -627,6 +651,9 @@ async fn start_remote(
             tokio::spawn(async move {
                 let _permit = permit;
                 match connect_local(&target).await {
+                    // The local end of a `-R` is a service that answers: it is not watched (a service that
+                    // finished and closed completely is the ordinary end of a response, and the caller may
+                    // still be reading it; see `pump_local`).
                     Ok(Local_::Tcp(sock)) => {
                         if let Ok(stream) = pending.accept().await {
                             let _ = stream.pump(sock).await;

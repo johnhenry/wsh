@@ -42,10 +42,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use wsh_core::messages::*;
+use wsh_core::peer_watch::PeerWatch;
 
 use wsh_core::gateway_credit::SendCredit;
 pub use wsh_core::gateway_credit::{
@@ -124,6 +125,9 @@ const FAIL_QUEUE_FULL: u32 = 7;
 pub trait RelayStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> RelayStream for T {}
 type BoxStream = Box<dyn RelayStream>;
+/// A connected origin and, where wanted, a watch on its peer's hang-up (wsh #282); origins the host
+/// dialled are not watched, so it is `None` for them (see `open_tcp`).
+type Origin = (BoxStream, Option<PeerWatch>);
 
 fn ok(gateway_id: u32, resolved_addr: Option<String>) -> Envelope {
     Envelope {
@@ -261,6 +265,8 @@ impl Chan {
 
 struct PendingInbound {
     stream: BoxStream,
+    /// A watch on the caller's hang-up, for when it half-closes (wsh #282).
+    watch: Option<PeerWatch>,
     listener_id: u32,
     timer: AbortHandle,
 }
@@ -287,6 +293,9 @@ struct Inner {
     max_client_bytes: usize,
     /// A half-closed connection with nothing moving for this long is closed (`None` = never).
     half_close_idle: Option<Duration>,
+    /// While a reverse listener's caller is half-closed, wait for the kernel's hang-up of it and
+    /// give a TCP socket keep-alive on this schedule (`None` = no watch). See [`PeerWatch`].
+    half_close_probe: Option<Duration>,
     /// Bytes received from this client for its origins and not yet taken.
     budget: AtomicUsize,
     conns: Mutex<HashMap<u32, Arc<Chan>>>,
@@ -346,6 +355,7 @@ impl GatewaySession {
     ) -> Self {
         let (max_conn_bytes, max_client_bytes) = policy.buffer_limits();
         let policy_idle = policy.half_close_idle();
+        let policy_probe = policy.half_close_probe();
         let credit = enabled && client_features.iter().any(|f| f == GATEWAY_CREDIT_FEATURE);
         let peer_datagrams = client_features
             .iter()
@@ -368,6 +378,7 @@ impl GatewaySession {
                 max_conn_bytes,
                 max_client_bytes,
                 half_close_idle: policy_idle,
+                half_close_probe: policy_probe,
                 budget: AtomicUsize::new(0),
                 conns: Mutex::new(HashMap::new()),
                 reserved: Mutex::new(HashSet::new()),
@@ -602,7 +613,10 @@ impl Inner {
         info!(gateway_id = id, addr = %format!("{host}:{port}"), "TCP connection established");
         // Register the connection BEFORE the client hears GatewayOk, and send nothing from the
         // origin before the Ok is queued.
-        let ready = self.attach_stream(id, Box::new(stream), guard);
+        // An origin is not watched for a peer that went away after its end of file (wsh #282): an origin that
+        // finished and then closed completely is the ordinary end of a response, and the client may still be
+        // reading what it sent; the discard would drop that. Only the callers of a reverse listener are watched.
+        let ready = self.attach_stream(id, Box::new(stream), guard, None);
         self.send(ok(id, Some(resolved))).await;
         ready.notify_one();
         Ok(())
@@ -644,7 +658,8 @@ impl Inner {
             UnixTarget::Abstract(name) => connect_unix_abstract(name).await?,
         };
         info!(gateway_id = id, path = %requested.chars().take(200).collect::<String>(), "unix connection established");
-        let ready = self.attach_stream(id, stream, guard);
+        let (stream, watch) = stream;
+        let ready = self.attach_stream(id, stream, guard, watch);
         self.send(ok(id, None)).await;
         ready.notify_one();
         Ok(())
@@ -730,17 +745,20 @@ impl Inner {
         id: u32,
         stream: BoxStream,
         guard: ConnectionGuard,
+        watch: Option<PeerWatch>,
     ) -> Arc<Notify> {
         let (chan, write_rx) = self.new_chan(id, guard);
         let (rd, wr) = tokio::io::split(stream);
         let ready = Arc::new(Notify::new());
+        // The origin's end of file starts the watch (see `watch_half_closed`).
+        let (eof_tx, eof_rx) = oneshot::channel::<()>();
         let reader = {
             let inner = self.clone();
             let chan = chan.clone();
             let ready = ready.clone();
             tokio::spawn(async move {
                 ready.notified().await;
-                inner.read_loop(chan, rd).await;
+                inner.read_loop(chan, rd, eof_tx).await;
             })
         };
         let writer = {
@@ -748,15 +766,57 @@ impl Inner {
             let chan = chan.clone();
             tokio::spawn(async move { inner.write_loop(chan, wr, write_rx).await })
         };
-        chan.tasks
-            .lock()
-            .expect("tasks")
-            .extend([reader.abort_handle(), writer.abort_handle()]);
+        let mut tasks = vec![reader.abort_handle(), writer.abort_handle()];
+        if let (Some(watch), Some(every)) = (watch, self.half_close_probe) {
+            let inner = self.clone();
+            let chan = chan.clone();
+            let watcher =
+                tokio::spawn(
+                    async move { inner.watch_half_closed(chan, watch, every, eof_rx).await },
+                );
+            tasks.push(watcher.abort_handle());
+        }
+        chan.tasks.lock().expect("tasks").extend(tasks);
         ready
     }
 
+    /// A caller of a reverse listener that has sent its end of file and then goes away (killed,
+    /// crashed) tells the read loop nothing, and the kernel tells a writer only: the connection
+    /// and its slot would be held until the client next sent something (wsh #282). So once the
+    /// caller is half-closed, wait for the kernel's hang-up of the socket (immediate for a unix
+    /// socket; for TCP once a short keep-alive schedule, applied only now, has the peer's kernel
+    /// answer with a reset) and end the connection as a destroyed one: the client is told
+    /// `GatewayClose` "discarded" (the caller reads nothing more, so what the client's service
+    /// still sends is wanted by nobody). Nothing is ever written to the caller. Only callers are
+    /// watched, never an origin the host dialled: an origin that finished and then closed
+    /// completely is the ordinary end of a response, and the client may still be reading it.
+    /// The task is one of the connection's tasks: ended with it.
+    async fn watch_half_closed(
+        self: Arc<Self>,
+        chan: Arc<Chan>,
+        watch: PeerWatch,
+        every: Duration,
+        eof: oneshot::Receiver<()>,
+    ) {
+        if eof.await.is_err() {
+            return; // the origin never half-closed (the read loop ended another way)
+        }
+        watch.arm(every);
+        watch.gone().await;
+        debug!(
+            gateway_id = chan.id,
+            "a caller that had half-closed went away"
+        );
+        self.destroy(&chan, None);
+    }
+
     /// Origin -> client, one chunk at a time: the origin is read only while credit is held.
-    async fn read_loop(self: Arc<Self>, chan: Arc<Chan>, mut rd: tokio::io::ReadHalf<BoxStream>) {
+    async fn read_loop(
+        self: Arc<Self>,
+        chan: Arc<Chan>,
+        mut rd: tokio::io::ReadHalf<BoxStream>,
+        eof_tx: oneshot::Sender<()>,
+    ) {
         let mut buf = vec![0u8; MAX_FRAME];
         let mut eof = false;
         'outer: loop {
@@ -798,6 +858,8 @@ impl Inner {
             // The client had finished too: over.
             self.destroy(&chan, None);
         } else {
+            // Half-closed: the idle rule, and a watch for an origin that goes away.
+            let _ = eof_tx.send(());
             self.arm_idle(&chan);
         }
     }
@@ -1266,10 +1328,12 @@ impl Inner {
                             info!(listener_id, %peer, "reverse listener is at its limit of {max_connections} connections: dropped one");
                             continue; // the stream is dropped: closed
                         };
+                        let watch = PeerWatch::tcp(&stream).ok();
                         inner
                             .announce_inbound(
                                 listener_id,
                                 Box::new(ReverseConn::new(stream, slot, idle)),
+                                watch,
                                 peer.ip().to_string(),
                                 peer.port(),
                             )
@@ -1413,8 +1477,15 @@ impl Inner {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let watch = PeerWatch::unix(&stream).ok();
                         inner
-                            .announce_inbound(listener_id, Box::new(stream), "unix".to_string(), 0)
+                            .announce_inbound(
+                                listener_id,
+                                Box::new(stream),
+                                watch,
+                                "unix".to_string(),
+                                0,
+                            )
                             .await;
                     }
                     Err(e) => {
@@ -1451,6 +1522,7 @@ impl Inner {
         self: &Arc<Self>,
         listener_id: u32,
         stream: BoxStream,
+        watch: Option<PeerWatch>,
         peer_addr: String,
         peer_port: u16,
     ) {
@@ -1469,6 +1541,7 @@ impl Inner {
                 channel_id,
                 PendingInbound {
                     stream,
+                    watch,
                     listener_id,
                     timer: timer.abort_handle(),
                 },
@@ -1540,7 +1613,7 @@ impl Inner {
             return;
         };
         info!(channel_id, gateway_id, "inbound connection relay started");
-        let ready = self.attach_stream(gateway_id, pending.stream, guard);
+        let ready = self.attach_stream(gateway_id, pending.stream, guard, pending.watch);
         ready.notify_one();
     }
 
@@ -1605,9 +1678,10 @@ impl Inner {
 // ── unix socket helpers ───────────────────────────────────────────────
 
 #[cfg(unix)]
-async fn connect_unix_path(path: &std::path::Path) -> Result<BoxStream, (u32, String)> {
+async fn connect_unix_path(path: &std::path::Path) -> Result<Origin, (u32, String)> {
     match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(path)).await {
-        Ok(Ok(s)) => Ok(Box::new(s)),
+        // Not watched: see `open_tcp` (an origin that finished and closed completely is a normal end).
+        Ok(Ok(s)) => Ok((Box::new(s), None)),
         Ok(Err(e)) => Err((
             if e.kind() == std::io::ErrorKind::ConnectionRefused {
                 FAIL_REFUSED
@@ -1621,7 +1695,7 @@ async fn connect_unix_path(path: &std::path::Path) -> Result<BoxStream, (u32, St
 }
 
 #[cfg(not(unix))]
-async fn connect_unix_path(_path: &std::path::Path) -> Result<BoxStream, (u32, String)> {
+async fn connect_unix_path(_path: &std::path::Path) -> Result<Origin, (u32, String)> {
     Err((
         FAIL_POLICY,
         "unix sockets are not available on this platform".into(),
@@ -1629,7 +1703,7 @@ async fn connect_unix_path(_path: &std::path::Path) -> Result<BoxStream, (u32, S
 }
 
 #[cfg(target_os = "linux")]
-async fn connect_unix_abstract(name: &str) -> Result<BoxStream, (u32, String)> {
+async fn connect_unix_abstract(name: &str) -> Result<Origin, (u32, String)> {
     use std::os::linux::net::SocketAddrExt;
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
         .map_err(|e| (FAIL_POLICY, e.to_string()))?;
@@ -1648,11 +1722,11 @@ async fn connect_unix_abstract(name: &str) -> Result<BoxStream, (u32, String)> {
         .map_err(|e| (FAIL_UNREACHABLE, e.to_string()))?;
     let s = tokio::net::UnixStream::from_std(std_stream)
         .map_err(|e| (FAIL_UNREACHABLE, e.to_string()))?;
-    Ok(Box::new(s))
+    Ok((Box::new(s), None))
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn connect_unix_abstract(_name: &str) -> Result<BoxStream, (u32, String)> {
+async fn connect_unix_abstract(_name: &str) -> Result<Origin, (u32, String)> {
     Err((
         FAIL_POLICY,
         "abstract unix sockets exist only on Linux".into(),

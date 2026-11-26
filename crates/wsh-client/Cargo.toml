@@ -29,3 +29,4 @@ wtransport = { version = "0.7", features = ["dangerous-configuration"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+socket2 = { version = "0.6", features = ["all"] }

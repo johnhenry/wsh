@@ -163,6 +163,19 @@ export interface WshServerGatewayOptions {
    * reads. Default 300000 (five minutes); `0` turns the bound off.
    */
   halfCloseIdleMs?: number;
+  /**
+   * How often the CALLER of one of this host's reverse listeners (a program that connected to a unix socket or TCP port the host
+   * listens on for a client) that has half-closed (sent its end of file) is checked for having gone away (#282). An origin the host
+   * dialled is not watched: one that sent its whole answer and then closed completely is the normal end of a response, and the
+   * discard a watch sends would drop what the client has not read yet. The kernel tells a socket nothing about a peer that half-closed and then died
+   * until something is written to it, so while (and only while) a socket is half-closed the host writes zero bytes to it every
+   * this many milliseconds: nothing reaches a live peer, and a dead one fails the write; the connection is then ended as a destroyed
+   * one (the client is sent `GatewayClose` with the reason `discarded`). A TCP socket is also given keep-alive on this schedule
+   * (rounded up to whole seconds, three probes) so its kernel learns of a peer that exited; that is bounded by the peer kernel's own
+   * timeout for such a socket (about a minute by default), not by this. Default 2000; `0` turns it off. A whole number of
+   * milliseconds from 0 to 2147483647, else a `TypeError`.
+   */
+  halfCloseProbeMs?: number;
   /** Bytes received from a client for one connection and not yet taken by its origin before it is closed (default 4 MiB; at least 262144). */
   maxBufferedBytes?: number;
   /** The same, summed over one client's connections (default 32 MiB). */

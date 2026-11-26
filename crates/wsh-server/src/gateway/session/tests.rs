@@ -1818,3 +1818,258 @@ async fn a_tcp_listener_hands_inbound_connections_to_the_client_and_relays_them(
         "a rejected connection is closed"
     );
 }
+
+// ── a caller that half-closed and then went away is noticed (wsh #282) ──
+//
+// A caller of a reverse listener sends its end of file (a half-close towards the client goes out), and is then
+// gone. The client says nothing: nothing is ever written to the caller. The host learns from the kernel's
+// hang-up of the socket and tells the client the connection is discarded. An ORIGIN the host dialled that
+// finished and then closed is NOT discarded (the client may still be reading what it sent).
+
+mod half_closed_origin {
+    use super::*;
+
+    /// How long the gone origin may take to be noticed: it is immediate; this only makes a
+    /// regression fail with a message. Never waited for in full.
+    const SEEN: Duration = Duration::from_secs(20);
+    /// How long a live half-closed origin is watched before it is called alive. Nothing can
+    /// happen in that time; the wait only gives a wrong answer a chance to show.
+    const QUIET_MS: u64 = 700;
+
+    fn reset(s: &TcpStream) {
+        socket2::SockRef::from(s)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+    }
+
+    async fn next_close(r: &mut Rig) -> Option<String> {
+        match tokio::time::timeout(SEEN, r.next()).await {
+            Ok(m) => match m.payload {
+                Payload::GatewayClose(c) => c.reason,
+                other => panic!("{other:?}"),
+            },
+            Err(_) => panic!("the host never told the client the connection was discarded"),
+        }
+    }
+
+    /// An ORIGIN that sent everything, half-closed and then closed completely is the ordinary end of
+    /// a response (an HTTP/1.0 server, `Connection: close`). The client may still be reading what it
+    /// sent: a second close saying "discarded" would drop that. So the host says nothing more than the
+    /// half-close it already sent, and holds the connection until the client closes (or the idle bound).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_origin_that_sent_everything_and_closed_completely_is_not_discarded() {
+        // A unix origin: its complete close is a hang-up at once (a TCP origin's is only seen a minute later).
+        use tokio::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!(
+            "wgo-{}-{}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let path = dir.join("o.sock").to_string_lossy().into_owned();
+        let l = UnixListener::bind(&path).unwrap();
+        const SIZE: usize = 600_000;
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let _ = s.write_all(&vec![7u8; SIZE]).await;
+                    let _ = s.shutdown().await;
+                    drop(s); // closed completely right after its last byte
+                });
+            }
+        });
+        let mut r = rig_with(
+            GatewayPolicy {
+                unix: UnixPolicy::new(vec![path.clone()], vec![], false, 4).unwrap(),
+                ..GatewayPolicy::default()
+            },
+            true,
+            CREDIT,
+        );
+        r.send(
+            MsgType::OpenUnix,
+            Payload::OpenUnix(OpenUnixPayload {
+                gateway_id: 1,
+                path: path.clone(),
+            }),
+        );
+        r.expect_ok(1).await;
+        // A slow reader: it takes what the host sent only after the origin is long gone.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mut got = 0;
+        let mut closes = Vec::new();
+        let t0 = std::time::Instant::now();
+        while closes.is_empty() && t0.elapsed() < Duration::from_secs(10) {
+            match r.next().await.payload {
+                Payload::GatewayData(d) => {
+                    got += d.data.len();
+                    r.credit(1, d.data.len() as u32);
+                }
+                Payload::GatewayClose(c) => closes.push(c.reason),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(got, SIZE, "everything it sent arrived");
+        assert_eq!(closes, vec![None], "a half-close, not a discard");
+        // And nothing more follows: the connection is held for the client, which closes when it is done reading.
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        assert_eq!(conns(&r).await, 1);
+        r.close(1);
+        wait_for_no_connections(&r).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Callers of a reverse listener are watched; with the watch off nothing notices one that went away.
+    #[tokio::test]
+    async fn with_the_watch_off_a_gone_caller_is_not_noticed_by_itself() {
+        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut r = rig_with(
+            GatewayPolicy {
+                half_close_probe: None,
+                ..reverse_policy(lo)
+            },
+            true,
+            CREDIT,
+        );
+        let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+            Payload::ListenOk(ok) => ok.actual_port,
+            other => panic!("{other:?}"),
+        };
+        let mut caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        caller.shutdown().await.unwrap();
+        assert_eq!(got_close(&[r.next().await]), Some(None));
+        reset(&caller);
+        drop(caller);
+        // Nothing can notice it; this bounds how long we look.
+        assert!(r.drain(1000).await.is_empty());
+        assert_eq!(conns(&r).await, 1);
+    }
+
+    /// The keep-alive schedule is for half-closed sockets only: a caller that has not sent its end of
+    /// file is an ordinary connection, whatever it does.
+    #[tokio::test]
+    async fn a_caller_that_has_not_half_closed_is_left_alone() {
+        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut r = rig_with(reverse_policy(lo), true, CREDIT);
+        let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+            Payload::ListenOk(ok) => ok.actual_port,
+            other => panic!("{other:?}"),
+        };
+        let caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        assert_eq!(conns(&r).await, 1);
+        drop(caller);
+    }
+
+    #[tokio::test]
+    async fn a_reverse_listeners_caller_that_half_closed_and_is_reset_is_told_to_the_client() {
+        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut r = rig_with(reverse_policy(lo), true, CREDIT);
+        let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+            Payload::ListenOk(ok) => ok.actual_port,
+            other => panic!("{other:?}"),
+        };
+        let mut caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        caller.shutdown().await.unwrap();
+        assert_eq!(got_close(&[r.next().await]), Some(None));
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        reset(&caller);
+        drop(caller);
+        assert_eq!(next_close(&mut r).await.as_deref(), Some(GATEWAY_DISCARDED));
+        wait_for_no_connections(&r).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_unix_listeners_caller_that_half_closed_and_is_gone_is_told_to_the_client_with_the_client_silent(
+    ) {
+        use tokio::net::UnixStream;
+        let dir = std::env::temp_dir().join(format!(
+            "wgh-{}-{}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let path = dir.join("l.sock").to_string_lossy().into_owned();
+        let mut r = rig_with(
+            GatewayPolicy {
+                unix: UnixPolicy::new(vec![], vec![path.clone()], false, 4).unwrap(),
+                ..GatewayPolicy::default()
+            },
+            true,
+            CREDIT,
+        );
+        r.send(
+            MsgType::ListenUnix,
+            Payload::ListenUnix(ListenUnixPayload {
+                listener_id: 5,
+                path: path.clone(),
+                replace: None,
+            }),
+        );
+        match r.next().await.payload {
+            Payload::ListenOk(ok) => assert_eq!(ok.listener_id, 5),
+            other => panic!("{other:?}"),
+        }
+        let mut caller = UnixStream::connect(&path).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        caller.shutdown().await.unwrap();
+        assert_eq!(got_close(&[r.next().await]), Some(None));
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        let t0 = std::time::Instant::now();
+        drop(caller);
+        assert_eq!(next_close(&mut r).await.as_deref(), Some(GATEWAY_DISCARDED));
+        eprintln!(
+            "unix caller: noticed {} ms after it went away",
+            t0.elapsed().as_millis()
+        );
+        wait_for_no_connections(&r).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
