@@ -40,16 +40,28 @@ pub struct RelaySection {
     /// leaves) is bridged to several, every other peer stays at one.
     #[serde(default = "default_relay_max_operators")]
     pub max_operators_per_peer: usize,
+    /// Carry a reverse host's gateway requests (`OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their
+    /// answers) between an operator and a peer whose owner turned its gateway on and said `relay-gateway` in its
+    /// `ReverseAccept` (wsh #289). Default `true`; the relay then lists `relay-gateway` in its `ServerHello.features`.
+    /// `false`: it does not and carries none of them. The relay opens nothing on a host by itself either way: the
+    /// host's own policy decides.
+    #[serde(default = "default_relay_carry_gateway")]
+    pub carry_gateway: bool,
 }
 
 fn default_relay_max_operators() -> usize {
     1
 }
 
+fn default_relay_carry_gateway() -> bool {
+    true
+}
+
 impl Default for RelaySection {
     fn default() -> Self {
         Self {
             max_operators_per_peer: default_relay_max_operators(),
+            carry_gateway: default_relay_carry_gateway(),
         }
     }
 }
@@ -634,6 +646,8 @@ pub struct ServerConfig {
     pub enable_relay: bool,
     /// See [`RelaySection::max_operators_per_peer`].
     pub relay_max_operators_per_peer: usize,
+    /// See [`RelaySection::carry_gateway`].
+    pub relay_carry_gateway: bool,
     /// Whether public-key authentication is accepted.
     pub allow_pubkey: bool,
     /// Whether password authentication is accepted.
@@ -862,6 +876,7 @@ impl ServerConfig {
             idle_timeout,
             enable_relay: cli_enable_relay,
             relay_max_operators_per_peer: file_config.relay.max_operators_per_peer,
+            relay_carry_gateway: file_config.relay.carry_gateway,
             allow_pubkey: file_config.auth.allow_pubkey,
             allow_password: file_config.auth.allow_password,
             gateway_enabled: file_config.gateway.enabled,

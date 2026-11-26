@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tokio::sync::Notify;
 use wsh_core::codec::{decode_envelope, frame_encode};
-use wsh_core::messages::{is_relay_forwardable, Envelope, MsgType, Payload};
+use wsh_core::messages::{
+    is_relay_forwardable, is_relay_gateway_forwardable, Envelope, MsgType, Payload,
+};
 
 use crate::bridge_seal::{Scope, SealedBridge};
 use crate::e2e::E2eResponder;
@@ -311,7 +313,10 @@ impl SealGate {
             if matches!(msg.msg_type, MsgType::Ping | MsgType::Pong) {
                 return Some(frame);
             }
-        } else if !is_relay_forwardable(msg.msg_type) || is_relay_level(msg.msg_type) {
+        } else if !(is_relay_forwardable(msg.msg_type)
+            || is_relay_gateway_forwardable(msg.msg_type))
+            || is_relay_level(msg.msg_type)
+        {
             return Some(frame);
         }
         match &mut *mode {
@@ -437,7 +442,7 @@ impl SealGate {
             Mode::Failed => true,
         };
         guarded
-            && is_relay_forwardable(msg.msg_type)
+            && (is_relay_forwardable(msg.msg_type) || is_relay_gateway_forwardable(msg.msg_type))
             && !is_relay_level(msg.msg_type)
             && !matches!(msg.msg_type, MsgType::RelayForward)
     }

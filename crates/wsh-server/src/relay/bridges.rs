@@ -68,6 +68,9 @@ pub struct Bridges {
     peer_operators: HashMap<u64, Vec<(u64, String)>>,
     /// peers that stated `relay-multi-operator` in their last `ReverseAccept`.
     multi: HashSet<u64>,
+    /// peers that stated `relay-gateway` in their last `ReverseAccept` (wsh #289): the gateway's requests
+    /// (`is_relay_gateway_forwardable`) cross THEIR bridges, and no other.
+    gateway: HashSet<u64>,
 }
 
 impl Bridges {
@@ -79,7 +82,33 @@ impl Bridges {
             operator_peer: HashMap::new(),
             peer_operators: HashMap::new(),
             multi: HashSet::new(),
+            gateway: HashSet::new(),
         }
+    }
+
+    /// `peer` stated (or did not state) `relay-gateway` in the `ReverseAccept` it just sent (wsh #289).
+    pub fn note_gateway(&mut self, peer: u64, stated: bool) {
+        if stated {
+            self.gateway.insert(peer);
+        } else {
+            self.gateway.remove(&peer);
+        }
+    }
+
+    /// Does the bridge `conn` is an end of carry the gateway's requests: is its PEER one that stated `relay-gateway`?
+    /// (`conn` is the peer itself, or an operator bridged to it.)
+    pub fn carries_gateway(&self, conn: u64) -> bool {
+        let peer = self.operator_peer.get(&conn).copied().unwrap_or(conn);
+        self.gateway.contains(&peer)
+    }
+
+    /// May a message of `msg_type` from `conn` cross as one of the gateway's (wsh #289)? Only when this relay carries them
+    /// (`carry_enabled`, `[relay] carry_gateway`), the type is one of `is_relay_gateway_forwardable`, and the bridge's peer stated
+    /// `relay-gateway`.
+    pub fn carries(&self, carry_enabled: bool, conn: u64, msg_type: wsh_core::MsgType) -> bool {
+        carry_enabled
+            && wsh_core::messages::is_relay_gateway_forwardable(msg_type)
+            && self.carries_gateway(conn)
     }
 
     /// An operator asks to be bridged to `peer`. `Err` carries the `ReverseReject` reason.
@@ -213,6 +242,7 @@ impl Bridges {
         self.peer_operators.remove(&conn);
         self.operator_peer.retain(|_, peer| *peer != conn);
         self.multi.remove(&conn);
+        self.gateway.remove(&conn);
         // conn as an operator
         self.pending.retain(|_, p| p.operator != conn);
         if let Some(peer) = self.operator_peer.remove(&conn) {
@@ -414,5 +444,90 @@ mod tests {
         assert_eq!(b.answer(OP_A, true, false), None);
         assert_eq!(b.answer(PEER2, true, false), None);
         assert!(!b.is_bridged(OP_A));
+    }
+
+    #[test]
+    fn the_gateway_crosses_only_the_bridge_of_a_peer_that_stated_it() {
+        let mut b = Bridges::new(1);
+        bridged(&mut b, OP_A, "fa", PEER, false);
+        // nothing stated: neither end of the bridge carries it
+        assert!(!b.carries_gateway(OP_A));
+        assert!(!b.carries_gateway(PEER));
+        b.note_gateway(PEER, true);
+        assert!(
+            b.carries_gateway(OP_A),
+            "the operator's messages go to a peer that stated it"
+        );
+        assert!(b.carries_gateway(PEER), "and the peer's answers come back");
+        assert!(
+            !b.carries_gateway(OP_B),
+            "a connection with no bridge carries nothing"
+        );
+        // the next accept replaces what the last one said
+        b.note_gateway(PEER, false);
+        assert!(!b.carries_gateway(OP_A));
+        // a peer that left is forgotten
+        b.note_gateway(PEER, true);
+        b.depart(PEER);
+        assert!(!b.carries_gateway(PEER));
+    }
+
+    #[test]
+    fn only_the_gateways_requests_cross_and_only_when_this_relay_carries_them() {
+        use wsh_core::MsgType;
+        let mut b = Bridges::new(1);
+        bridged(&mut b, OP_A, "fa", PEER, false);
+        b.note_gateway(PEER, true);
+        for t in [
+            MsgType::OpenTcp,
+            MsgType::OpenUdp,
+            MsgType::ResolveDns,
+            MsgType::DnsResult,
+            MsgType::ListenRequest,
+            MsgType::ListenOk,
+            MsgType::ListenFail,
+            MsgType::ListenClose,
+            MsgType::InboundOpen,
+            MsgType::InboundAccept,
+            MsgType::InboundReject,
+        ] {
+            assert!(
+                b.carries(true, OP_A, t),
+                "{t:?} crosses for a peer that stated it"
+            );
+            assert!(b.carries(true, PEER, t), "{t:?} crosses back");
+            assert!(
+                !b.carries(false, OP_A, t),
+                "{t:?} does not cross a relay that does not carry the gateway"
+            );
+        }
+        // what is not the gateway's (or was always forwardable) is not this rule's business
+        for t in [
+            MsgType::Open,
+            MsgType::GatewayData,
+            MsgType::OpenUnix,
+            MsgType::OpenEndpoint,
+            MsgType::ListenUnix,
+        ] {
+            assert!(
+                !b.carries(true, OP_A, t),
+                "{t:?} is not one of the gateway's requests"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_that_stated_it_carries_for_each_of_its_operators_and_for_no_other_peer() {
+        let mut b = Bridges::new(2);
+        bridged(&mut b, OP_A, "fa", PEER, true);
+        bridged(&mut b, OP_B, "fb", PEER, true);
+        bridged(&mut b, OP_C, "fc", PEER2, false);
+        b.note_gateway(PEER, true);
+        assert!(b.carries_gateway(OP_A) && b.carries_gateway(OP_B));
+        assert!(
+            !b.carries_gateway(OP_C),
+            "another peer's operator is not carried for"
+        );
+        assert!(!b.carries_gateway(PEER2));
     }
 }

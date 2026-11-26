@@ -15,7 +15,7 @@ pub mod ls;
 pub mod mcp;
 pub mod objects;
 pub mod relay;
-mod reverse_gateway;
+pub(crate) mod reverse_gateway;
 pub mod reverse_host;
 pub mod scp;
 pub mod sessions;

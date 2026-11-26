@@ -226,6 +226,12 @@ fn in_cidr(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
     }
 }
 
+/// Does `text` parse as a destination rule? The enforcer ignores a rule it cannot parse (which only narrows the policy); a caller that
+/// takes rules from a command line can use this to refuse a typo instead.
+pub fn parse_rule_check(text: &str) -> Result<(), String> {
+    Rule::parse(text).map(|_| ())
+}
+
 /// An address a rule that does not name it may not reach: anything but global unicast.
 ///
 /// This is `!is_public_address(ip)`: the gateway accepts only what the classifier in

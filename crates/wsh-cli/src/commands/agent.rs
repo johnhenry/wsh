@@ -664,6 +664,28 @@ fn startup_command_arguments(
         args.push("--capability".to_string());
         args.push(capability.clone());
     }
+    // The gateway for an operator behind the relay (wsh #289) is the host's own decision, so the installed agent carries exactly
+    // what `install` was given; without these flags it serves none.
+    let policy = crate::commands::common::identity_policy();
+    for rule in &policy.relay_gateway_allow {
+        args.push("--relay-gateway-allow".to_string());
+        args.push(rule.clone());
+    }
+    if !policy.relay_gateway_allow.is_empty() {
+        for (on, flag) in [
+            (policy.relay_gateway_udp, "--relay-gateway-udp"),
+            (policy.relay_gateway_dns, "--relay-gateway-dns"),
+            (policy.relay_gateway_listen, "--relay-gateway-listen"),
+        ] {
+            if on {
+                args.push(flag.to_string());
+            }
+        }
+        if policy.relay_gateway_max_connections != 0 {
+            args.push("--relay-gateway-max-connections".to_string());
+            args.push(policy.relay_gateway_max_connections.to_string());
+        }
+    }
     args
 }
 

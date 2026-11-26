@@ -166,6 +166,30 @@ struct Cli {
     #[arg(long = "max-operators", global = true, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=64))]
     max_operators: u64,
 
+    /// Reverse host (`wsh reverse`, `wsh agent run`): let an operator behind the relay use THIS machine's network, to the
+    /// destinations this rule names (`host`, `host:port`, `10.0.0.0/8:5432`, `*`). Repeatable. OFF without it, and then the host does not
+    /// say `relay-gateway`. Needs `--capability gateway`. Nothing is reachable that no rule names, and no loopback, private or
+    /// otherwise non-public address unless a rule names it. Only on a relay that carries it (`relay-gateway`).
+    #[arg(long = "relay-gateway-allow", global = true, value_name = "RULE", action = clap::ArgAction::Append)]
+    relay_gateway_allow: Vec<String>,
+
+    /// Reverse host: with `--relay-gateway-allow`, also answer UDP flows (off by default).
+    #[arg(long = "relay-gateway-udp", global = true)]
+    relay_gateway_udp: bool,
+
+    /// Reverse host: with `--relay-gateway-allow`, also answer name lookups (off by default).
+    #[arg(long = "relay-gateway-dns", global = true)]
+    relay_gateway_dns: bool,
+
+    /// Reverse host: with `--relay-gateway-allow`, also let an operator open a listening port on this machine (loopback, ports 0 and
+    /// 1024-65535) and receive its connections (off by default).
+    #[arg(long = "relay-gateway-listen", global = true)]
+    relay_gateway_listen: bool,
+
+    /// Reverse host: connections (TCP, UDP flows, listeners) one operator may hold open at once (default 32, at most 1024).
+    #[arg(long = "relay-gateway-max-connections", global = true, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1024))]
+    relay_gateway_max_connections: u64,
+
     /// `wsh reverse-connect`: always offer to prove this operator's identity to the peer (needed
     /// for a peer that does not advertise `operator-proof`, such as a JS host).
     #[arg(long = "operator-proof", global = true)]
@@ -609,6 +633,11 @@ async fn main() {
         require_operator_proof: cli.require_operator_proof,
         allow_operators: cli.allow_operators.clone(),
         max_operators: cli.max_operators as usize,
+        relay_gateway_allow: cli.relay_gateway_allow.clone(),
+        relay_gateway_udp: cli.relay_gateway_udp,
+        relay_gateway_dns: cli.relay_gateway_dns,
+        relay_gateway_listen: cli.relay_gateway_listen,
+        relay_gateway_max_connections: cli.relay_gateway_max_connections as usize,
         operator_proof: if cli.operator_proof {
             commands::common::OperatorProofMode::Always
         } else if cli.no_operator_proof {
