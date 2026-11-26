@@ -278,6 +278,15 @@ pub fn is_relay_forwardable(t: MsgType) -> bool {
     )
 }
 
+/// Message types a relay carries only for a bridge whose peer stated `relay-gateway` (and only on a relay that lists it).
+/// Not part of [`is_relay_forwardable`]: a peer or relay that predates the feature must never be sent them.
+pub fn is_relay_gateway_forwardable(t: MsgType) -> bool {
+    matches!(
+        t,
+        MsgType::OpenTcp | MsgType::OpenUdp | MsgType::ResolveDns | MsgType::DnsResult | MsgType::ListenRequest | MsgType::ListenOk | MsgType::ListenFail | MsgType::ListenClose | MsgType::InboundOpen | MsgType::InboundAccept | MsgType::InboundReject
+    )
+}
+
 /// ChannelKind enum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

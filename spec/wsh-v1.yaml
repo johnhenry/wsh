@@ -993,6 +993,23 @@ messages:
             and understands ReverseClose. Only then does a relay configured
             for more than one operator per peer admit a second one.
 
+            Another is addressed to the relay and the operator:
+            "relay-gateway" says this peer, whose owner turned it on, answers
+            the gateway's requests (OpenTcp, OpenUdp, ResolveDns,
+            ListenRequest) from operators behind the relay, under its own
+            destination policy and bounds, and that every such connection is
+            metered by GatewayCredit whether or not "gateway-credit" is
+            listed (the feature implies it). A relay that lists
+            "relay-gateway" in its ServerHello.features carries
+            relay.gateway_forwardable messages (both directions) for this
+            peer's bridges, and only for them; for any other peer the
+            messages are not forwardable, as they always were. An operator
+            sends them only when the relay AND this field state the
+            feature. A peer states it only on a relay that lists it
+            (a relay that does not would answer the messages itself).
+            The peer's other gateway features ("gateway", "gateway-credit")
+            are stated alongside it, in the vocabulary of ServerHello.
+
     ReverseReject:
       code: 0x55
       description: >
@@ -1126,7 +1143,9 @@ messages:
         Wraps a message the relay is forwarding between two peers over an
         established reverse connection (post-handshake channel/session/
         tool traffic -- Open, Close, McpCall, SessionData, etc; see each
-        message's relay_forwardable flag for the full set). from_fingerprint
+        message's relay_forwardable flag for the full set; the gateway's
+        requests only under "relay-gateway", see relay.gateway_forwardable).
+        from_fingerprint
         is the ORIGINATING peer's authenticated identity, set by the relay
         server -- never trust a client-supplied value. inner is the
         complete CBOR-encoded envelope bytes of the forwarded message,
@@ -1966,7 +1985,8 @@ messages:
             KeyExchange whose session_id is the ReverseChallenge.session_id
             of the bridge, sent right after ReverseAccept, establishes a key
             for the whole bridge. From then on every message that would
-            cross it (the relay forwardable list, KeyExchange aside) travels
+            cross it (the relay forwardable list, plus the gateway's requests
+            where "relay-gateway" is in force, KeyExchange aside) travels
             as an EncryptedFrame with channel_id 0 and that session_id,
             sealed with the same AES-256-GCM framing as session data
             (counters, role tags, session_id as AAD), the CBOR of the
@@ -2840,3 +2860,13 @@ relay:
   # substitutes keys; peers who need that must authenticate the derived key
   # themselves (see the README's Security model).
   forwardable: [Open, OpenOk, OpenFail, Close, Exit, Resize, Signal, SessionData, GatewayData, GatewayCredit, GatewayOk, GatewayFail, GatewayClose, McpDiscover, McpTools, McpCall, McpResult, McpCancel, ReverseAccept, ReverseReject, GuestJoin, GuestRevoke, CopilotAttach, CopilotDetach, FileOp, FileResult, FileChunk, PolicyEval, EchoAck, EchoState, TermSync, TermDiff, KeyExchange, EncryptedFrame]
+
+  # The messages a relay carries ONLY for a bridge whose peer stated the feature "relay-gateway" in
+  # ReverseAccept.features (and only if the relay itself lists "relay-gateway" in its ServerHello.features):
+  # the gateway's requests and their answers, so an operator behind a relay can use a reverse host's gateway.
+  # These are NOT on `forwardable` above on purpose: that list is what every relay and client has always carried,
+  # and a released peer (the Rust types deny unknown fields) must never be sent anything it would mis-handle.
+  # Generated as RELAY_GATEWAY_FORWARDABLE / isRelayGatewayForwardable (JS) and is_relay_gateway_forwardable (Rust);
+  # the bridge's other gateway messages (GatewayData, GatewayCredit, GatewayOk, GatewayFail, GatewayClose) are on
+  # `forwardable` and need nothing negotiated. OpenUnix, OpenEndpoint and ListenUnix are not carried.
+  gateway_forwardable: [OpenTcp, OpenUdp, ResolveDns, DnsResult, ListenRequest, ListenOk, ListenFail, ListenClose, InboundOpen, InboundAccept, InboundReject]

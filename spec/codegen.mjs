@@ -375,6 +375,22 @@ function emitJS(schema) {
   out.push('  return RELAY_FORWARDABLE.has(typeNum);');
   out.push('}');
   out.push('');
+  out.push('// Message types a relay carries only for a bridge whose peer stated "relay-gateway" (and only on a relay that lists it).');
+  out.push('// Not part of RELAY_FORWARDABLE: a peer or relay that predates the feature must never be sent them.');
+  out.push('export const RELAY_GATEWAY_FORWARDABLE = new Set([');
+  for (const name of schema.relay.gateway_forwardable) {
+    out.push(`  MSG.${toScreamingSnake(name)},`);
+  }
+  out.push(']);');
+  out.push('');
+  out.push('/**');
+  out.push(' * @param {number} typeNum');
+  out.push(' * @returns {boolean}');
+  out.push(' */');
+  out.push('export function isRelayGatewayForwardable(typeNum) {');
+  out.push('  return RELAY_GATEWAY_FORWARDABLE.has(typeNum);');
+  out.push('}');
+  out.push('');
 
   // Utility functions
   out.push('// ── Utility ───────────────────────────────────────────────────────────');
@@ -609,6 +625,18 @@ function emitRust(schema) {
   out.push(
     '        ' +
       schema.relay.forwardable.map(name => `MsgType::${name}`).join(' | ')
+  );
+  out.push('    )');
+  out.push('}');
+  out.push('');
+  out.push('/// Message types a relay carries only for a bridge whose peer stated `relay-gateway` (and only on a relay that lists it).');
+  out.push('/// Not part of [`is_relay_forwardable`]: a peer or relay that predates the feature must never be sent them.');
+  out.push('pub fn is_relay_gateway_forwardable(t: MsgType) -> bool {');
+  out.push('    matches!(');
+  out.push('        t,');
+  out.push(
+    '        ' +
+      schema.relay.gateway_forwardable.map(name => `MsgType::${name}`).join(' | ')
   );
   out.push('    )');
   out.push('}');

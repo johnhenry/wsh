@@ -254,6 +254,13 @@ export const EXEC_PIPES_FEATURE: 'exec-pipes';
 /** ServerHello feature (#121): the host has execution targets; `Open`, `FileOp` and `OpenEndpoint` take `target`. */
 export const TARGETS_FEATURE: 'targets';
 
+/**
+ * Relay and reverse-host feature: the gateway's requests (`OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their answers) cross
+ * the relay bridge. A relay lists it in `ServerHello.features`; a reverse host whose owner turned its gateway on lists it in
+ * `ReverseAccept.features`. Implies `gateway-credit`.
+ */
+export const RELAY_GATEWAY_FEATURE: 'relay-gateway';
+
 // ── Typed (object-mode) RPC channels -- wsh #85 ────────────────────────
 
 /** ServerHello feature: the host serves `rpc` sessions (`openSession({ type: 'rpc', protocol })`). */
@@ -659,6 +666,14 @@ export function reverseClose(opts?: {
 export const RELAY_FORWARDABLE: ReadonlySet<number>;
 
 export function isRelayForwardable(typeNum: number): boolean;
+
+/**
+ * Message types a relay carries only for a bridge whose peer stated `relay-gateway` (and only on a relay that lists it): the gateway's
+ * requests and their answers. Not part of `RELAY_FORWARDABLE`.
+ */
+export const RELAY_GATEWAY_FORWARDABLE: ReadonlySet<number>;
+
+export function isRelayGatewayForwardable(typeNum: number): boolean;
 
 // -- Message constructors (gateway) --
 
@@ -2036,6 +2051,12 @@ export interface WshConnectReverseOptions {
     exec?: boolean;
     fs?: boolean;
     tools?: boolean;
+    /**
+     * This peer's owner turned its gateway on for operators behind the relay (#289): lists the `gateway` capability in the record and
+     * delivers the gateway's requests of each operator to `onRelayMessage(msg, from)`, on a relay that lists `relay-gateway`.
+     * `createReverseHost` of `@johnhenry/wsh/server` sets it from its `gateway` option; a custom reverse handler answers them itself.
+     */
+    gateway?: boolean;
   };
   /** List `operator-proof` in the registered capabilities (key logins only; default true): this peer can answer an operator's challenge. */
   operatorProof?: boolean;
