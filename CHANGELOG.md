@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.58.0
 
 ### The half-close idle bound on every host, and backpressure through a sealed session pinned by a test (#275; npm, JS only)
 
