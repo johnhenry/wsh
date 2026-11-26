@@ -54,17 +54,23 @@ function drained(sock) {
  * still sends. Never for a service that answers (a reverse forward's local end): its complete close after its last byte is the
  * normal end of a response, and the discard would drop what the caller has not read yet.
  */
-function pipe(sock, duplex, { probeMs, onGone } = {}) {
+export function pipe(sock, duplex, { probeMs, onGone } = {}) {
   const writer = duplex.writable.getWriter();
   const reader = duplex.readable.getReader();
   watchHalfClosed(sock, probeMs, onGone);
+  // The write of the chunk last read from the socket. The connection is destroyed only after it has settled: a chunk the socket
+  // already handed over is part of what it said, and destroying the connection drops it while it waits for credit. A socket that
+  // closes completely (or is reset, as one is when the caller's request reaches a service that has already closed) right after its
+  // last bytes would otherwise cost the caller the tail of the answer.
+  let tail = Promise.resolve();
+  const destroyAfterTail = () => { void tail.finally(() => duplex.destroy()); };
   sock.on('data', (d) => {
     sock.pause();
-    writer.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => sock.destroy());
+    tail = writer.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => sock.destroy());
   });
   sock.on('end', () => { void writer.close().catch(() => {}); });
   sock.on('error', () => {});
-  sock.on('close', () => { duplex.destroy(); });
+  sock.on('close', destroyAfterTail);
   (async () => {
     try {
       for (;;) {
@@ -75,7 +81,7 @@ function pipe(sock, duplex, { probeMs, onGone } = {}) {
         if (sock.destroyed) break;
       }
       if (!sock.destroyed) sock.end();
-      else duplex.destroy();
+      else destroyAfterTail();
     } catch { sock.destroy(); }
   })();
   duplex.closed.then(() => { if (!sock.destroyed) sock.end(); });
