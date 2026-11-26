@@ -755,6 +755,152 @@ async fn a_client_that_discarded_the_connection_ends_it_at_once_even_with_the_or
     }
 }
 
+// ── a destroy after a half-close is told to the peer ──────────────
+
+fn discard(r: &Rig, id: u32) {
+    r.send(
+        MsgType::GatewayClose,
+        Payload::GatewayClose(GatewayClosePayload {
+            gateway_id: id,
+            reason: Some(GATEWAY_DISCARDED.into()),
+        }),
+    );
+}
+
+async fn conns(r: &Rig) -> usize {
+    r.session.inner.conns.lock().unwrap().len()
+}
+
+/// Poll until the host holds no connection (a state, not a time).
+async fn wait_for_no_connections(r: &Rig) {
+    let t0 = std::time::Instant::now();
+    while conns(r).await > 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "still open");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_half_closed_and_then_discards_frees_the_connection_with_the_bound_off() {
+    let (port, _held) = mute_service().await;
+    let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    r.close(1); // the client half-closes; the origin never answers
+    let msgs = r.drain(300).await;
+    assert!(got_close(&msgs).is_none());
+    assert_eq!(
+        conns(&r).await,
+        1,
+        "a half-closed silent connection is held (the bound is off)"
+    );
+    discard(&r, 1); // its reader is gone
+    wait_for_no_connections(&r).await;
+    let after = r.drain(200).await;
+    assert!(
+        got_close(&after).is_none(),
+        "it reads nothing more: nothing goes back"
+    );
+}
+
+#[tokio::test]
+async fn a_second_close_without_the_reason_does_not_end_a_half_closed_connection() {
+    let (port, _held) = mute_service().await;
+    let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    r.close(1);
+    r.close(1);
+    r.send(
+        MsgType::GatewayClose,
+        Payload::GatewayClose(GatewayClosePayload {
+            gateway_id: 1,
+            reason: Some("idle timeout".into()),
+        }),
+    );
+    let _ = r.drain(300).await;
+    assert_eq!(conns(&r).await, 1);
+}
+
+#[tokio::test]
+async fn a_second_discard_for_a_connection_that_is_gone_is_ignored() {
+    let port = echo_service().await;
+    let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    r.close(1);
+    let _ = read_to_close(&mut r, 1).await;
+    wait_for_no_connections(&r).await;
+    discard(&r, 1);
+    discard(&r, 99);
+    // The session is untouched: a new connection with that id works.
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+}
+
+#[tokio::test]
+async fn an_origin_that_half_closed_and_is_then_gone_is_told_to_the_client_once_the_client_writes()
+{
+    // The origin sends its end of file and goes away. A half-close towards the client already went out; the connection
+    // then fails on the next write to the origin, and the client must hear that its direction is over.
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let _ = s.shutdown().await;
+            drop(s);
+        }
+    });
+    let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    assert_eq!(
+        got_close(&[r.next().await]),
+        Some(None),
+        "the FIN is a half-close"
+    );
+    let mut second = None;
+    let t0 = std::time::Instant::now();
+    while second.is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(5), "never told");
+        r.data(1, vec![1u8; 16]);
+        for m in r.drain(40).await {
+            if let Payload::GatewayClose(c) = m.payload {
+                second = Some(c.reason);
+            }
+        }
+    }
+    assert_eq!(second.unwrap().as_deref(), Some(GATEWAY_DISCARDED));
+}
+
+#[tokio::test]
+async fn the_idle_bound_on_a_connection_the_origin_half_closed_ends_with_a_discard_for_the_client()
+{
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let _ = s.shutdown().await;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            });
+        }
+    });
+    let mut r = rig_with(
+        policy_with_idle(Some(Duration::from_millis(300))),
+        true,
+        CREDIT,
+    );
+    r.open_tcp(1, port);
+    r.expect_ok(1).await;
+    assert_eq!(got_close(&[r.next().await]), Some(None));
+    match r.next().await.payload {
+        Payload::GatewayClose(c) => assert_eq!(c.reason.as_deref(), Some(GATEWAY_DISCARDED)),
+        other => panic!("{other:?}"),
+    }
+    wait_for_no_connections(&r).await;
+}
+
 #[tokio::test]
 async fn a_host_side_discard_says_so_and_a_half_close_does_not() {
     // The origin resets/vanishes: a plain destroy carries the marker; the origin's FIN does not.

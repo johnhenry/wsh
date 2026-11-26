@@ -1052,11 +1052,20 @@ impl Inner {
         if chan.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        if !chan.sent_close.swap(true, Ordering::AcqRel) && !self.closed.load(Ordering::Acquire) {
-            self.spawn_reply(close_msg(
-                chan.id,
-                Some(reason.unwrap_or(GATEWAY_DISCARDED)),
-            ));
+        // Not closed on our side yet: the close goes out now. Closed on our side already (the
+        // origin's end of file went out as a half-close) while the client has not closed: it still
+        // holds its direction open for us, so a SECOND close saying "discarded" tells it we read
+        // nothing more. When the client had closed too the connection is over: nothing more.
+        let already = chan.sent_close.swap(true, Ordering::AcqRel);
+        if !self.closed.load(Ordering::Acquire)
+            && (!already || !chan.remote_closed.load(Ordering::Acquire))
+        {
+            let said = if already {
+                GATEWAY_DISCARDED
+            } else {
+                reason.unwrap_or(GATEWAY_DISCARDED)
+            };
+            self.spawn_reply(close_msg(chan.id, Some(said)));
         }
         {
             let mut conns = self.conns.lock().expect("conns");
@@ -1121,6 +1130,13 @@ impl Inner {
     fn on_remote_close(self: &Arc<Self>, id: u32, reason: Option<&str>) {
         let Some(chan) = self.chan(id) else { return };
         if chan.remote_closed.swap(true, Ordering::AcqRel) {
+            // A SECOND close saying "discarded": the client had half-closed and has now lost its
+            // reader. It reads nothing more, so the connection is over at once, as after a reset
+            // (what it sent and the origin has not taken is dropped); nothing goes back. Any other
+            // repeated close is ignored, as it always was.
+            if reason == Some(GATEWAY_DISCARDED) && !chan.sent_close.swap(true, Ordering::AcqRel) {
+                self.destroy(&chan, None);
+            }
             return;
         }
         if chan.is_udp.load(Ordering::Acquire) {

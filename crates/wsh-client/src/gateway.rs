@@ -139,6 +139,13 @@ impl ConnShared {
     /// over too (writes fail; nothing is sent back).
     fn remote_closed(&self, discarded: bool) {
         if self.remote_closed.swap(true, Ordering::AcqRel) {
+            // A SECOND close saying "discarded": the host had half-closed and has now lost its
+            // reader. It reads nothing more, so the connection is over at once, as after a reset
+            // (what it sent and nothing here has read is dropped); nothing goes back. Any other
+            // repeated close is ignored, as it always was.
+            if discarded && !self.sent_close.swap(true, Ordering::AcqRel) {
+                self.destroy(None);
+            }
             return;
         }
         if discarded {
@@ -167,12 +174,22 @@ impl ConnShared {
             *self.error.lock().expect("error") = Some(r.to_string());
         }
         if let Some(hub) = self.hub() {
-            if !self.sent_close.swap(true, Ordering::AcqRel) {
+            // Not closed on our side yet: the close goes out now. Closed on our side already (a
+            // half-close) while the host has not closed: it still holds its direction open for
+            // us, so a SECOND close saying "discarded" tells it we read nothing more. When the
+            // host had closed too the connection is over and nothing more is sent.
+            let already = self.sent_close.swap(true, Ordering::AcqRel);
+            if !already || !self.remote_closed.load(Ordering::Acquire) {
+                let said = if already {
+                    GATEWAY_DISCARDED
+                } else {
+                    reason.unwrap_or(GATEWAY_DISCARDED)
+                };
                 hub.send_nowait(Envelope {
                     msg_type: MsgType::GatewayClose,
                     payload: Payload::GatewayClose(GatewayClosePayload {
                         gateway_id: self.id,
-                        reason: Some(reason.unwrap_or(GATEWAY_DISCARDED).to_string()),
+                        reason: Some(said.to_string()),
                     }),
                 });
             }

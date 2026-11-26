@@ -41,6 +41,8 @@ export function assertHalfCloseIdleMs(v, what = 'halfCloseIdleMs') {
  * local socket that closed or was reset, a stream that was dropped, an origin that is gone): it will read nothing more, so
  * the peer ends its own direction too instead of waiting for the idle bound. A GatewayClose without it is a half-close. A
  * peer that predates this just sees a reason string; one that sees it from an older peer is on the half-close rule.
+ * A side that had ALREADY sent its close (half-closed) and is then destroyed sends it as a second GatewayClose, while the
+ * peer has not closed; a peer that predates this ignores a repeated close.
  */
 export const GATEWAY_DISCARDED = 'discarded';
 
@@ -132,7 +134,14 @@ export class GatewayChannel {
 
   /** A GatewayClose arrived: no more data comes (queued data can still be read). */
   remoteClosed(reason) {
-    if (this.#finished || this.#gotClose) return;
+    if (this.#finished) return;
+    if (this.#gotClose) {
+      // A SECOND GatewayClose with "discarded": the peer had half-closed and has now lost its reader. It reads nothing
+      // more, so the connection is over at once, as after a reset: what it sent and nothing here has read is dropped (an
+      // application that never reads must not keep the slot). Anything else repeated is ignored, as it always was.
+      if (reason === GATEWAY_DISCARDED && !this.#sentClose) { this.#sentClose = true; this.#finish(reason); }
+      return;
+    }
     this.#gotClose = true;
     // The peer discarded the connection (it reads nothing more): our direction is over too. Anything already received can
     // still be read; our writers fail; no GatewayClose goes back.
@@ -221,10 +230,15 @@ export class GatewayChannel {
     else if (!this.#gotClose) this.#watchIdle(); // the peer owes us its own GatewayClose; it may take as long as it likes while bytes move
   }
 
-  /** Tear down at once; sends GatewayClose first if we had not. */
+  /**
+   * Tear down at once; sends GatewayClose first if we had not. If we HAD half-closed and the peer has not, the peer is
+   * still holding its direction open for us: a second GatewayClose with "discarded" tells it we read nothing more (as a
+   * reset tells a sender its reader is gone). When the peer had closed too, the connection is over and nothing is sent.
+   */
   destroy(reason) {
     if (this.#finished) return;
     if (!this.#sentClose) { this.#sentClose = true; try { void this.#o.sendClose(reason ?? GATEWAY_DISCARDED); } catch { /* gone */ } }
+    else if (!this.#gotClose) { try { void this.#o.sendClose(GATEWAY_DISCARDED); } catch { /* gone */ } }
     this.#finish(reason);
   }
 

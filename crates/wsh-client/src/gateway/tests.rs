@@ -477,6 +477,119 @@ async fn a_host_that_discarded_the_connection_ends_our_direction_too_and_droppin
     }
 }
 
+// ── a destroy after our own half-close is told to the host ────────
+
+/// A GatewayClose the host sends for `id`, with a reason or none.
+async fn host_close(h: &Host, id: u32, reason: Option<&str>) {
+    h.deliver(
+        Payload::GatewayClose(GatewayClosePayload {
+            gateway_id: id,
+            reason: reason.map(str::to_string),
+        }),
+        MsgType::GatewayClose,
+    )
+    .await;
+}
+
+/// The next frame must be a GatewayClose for `id` with this reason.
+async fn expect_close(h: &mut Host, id: u32, reason: Option<&str>) {
+    match h.sent().await.payload {
+        Payload::GatewayClose(c) => {
+            assert_eq!(c.gateway_id, id);
+            assert_eq!(c.reason.as_deref(), reason);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn destroying_after_a_half_close_sends_a_second_close_saying_discarded_once() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    s.shutdown().await;
+    expect_close(&mut h, id, None).await;
+    s.destroy();
+    expect_close(&mut h, id, Some(GATEWAY_DISCARDED)).await;
+    s.destroy();
+    drop(s);
+    assert!(h.sent_within(100).await.is_none(), "only once");
+}
+
+#[tokio::test]
+async fn dropping_a_half_closed_stream_says_discarded() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    s.shutdown().await;
+    expect_close(&mut h, id, None).await;
+    drop(s);
+    expect_close(&mut h, id, Some(GATEWAY_DISCARDED)).await;
+}
+
+#[tokio::test]
+async fn destroying_after_both_sides_closed_sends_nothing_more() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    s.shutdown().await;
+    expect_close(&mut h, id, None).await;
+    host_close(&h, id, None).await;
+    s.destroy();
+    drop(s);
+    assert!(h.sent_within(100).await.is_none());
+}
+
+#[tokio::test]
+async fn a_second_discarded_close_from_the_host_ends_the_connection_and_nothing_goes_back() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    host_close(&h, id, None).await; // a plain half-close: we may go on sending
+    s.write_all(b"x").await.unwrap();
+    let _ = h.sent().await;
+    assert!(!s.is_closed());
+    host_close(&h, id, Some(GATEWAY_DISCARDED)).await; // its reader is gone
+    assert!(s.is_closed());
+    assert!(s.write_all(b"y").await.is_err());
+    let mut buf = [0u8; 4];
+    assert_eq!(s.read(&mut buf).await.unwrap(), 0);
+    drop(s);
+    assert!(
+        h.sent_within(100).await.is_none(),
+        "it reads nothing more: no answer"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_close_without_the_reason_changes_nothing() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    host_close(&h, id, None).await;
+    host_close(&h, id, None).await;
+    host_close(&h, id, Some("idle timeout")).await;
+    assert!(!s.is_closed());
+    s.write_all(b"still open").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_local_stream_that_goes_away_after_the_half_close_is_told_to_the_host() {
+    let mut h = host(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    let (local, mut app) = duplex(1 << 16);
+    let pump = tokio::spawn(s.pump_with_idle(local, None));
+    // The application sends its request, half-closes and goes away without reading.
+    app.shutdown().await.unwrap();
+    expect_close(&mut h, id, None).await;
+    drop(app);
+    // The host's answer finds nobody: the write to the local side fails, and the host is told.
+    h.data(id, b"answer").await;
+    expect_close(&mut h, id, Some(GATEWAY_DISCARDED)).await;
+    let _ = pump.await.unwrap();
+}
+
 #[tokio::test]
 async fn a_stream_can_still_write_after_the_hosts_close() {
     let mut h = host(true);
