@@ -7,7 +7,7 @@ export type { WshReverseHost } from './server/index.js';
  * Options of the browser-safe `createReverseHost`: those of `@johnhenry/wsh/server`'s, with the backends that need
  * Node taken out (`exec: true` and `fs: { root }`).
  */
-export interface WshBrowserReverseHostOptions extends Omit<WshReverseHostOptions, 'exec' | 'fs' | 'pty' | 'mcp'> {
+export interface WshBrowserReverseHostOptions extends Omit<WshReverseHostOptions, 'exec' | 'fs' | 'pty' | 'mcp' | 'gateway'> {
   /** `run(command, io)` or `{ run }`: there is no shell in a browser to run `true` with. */
   exec?: WshExecRunner | { run: WshExecRunner; timeoutMs?: number; clientEnv?: WshClientEnv };
   /** `node-pty`-shaped `{ spawn }`, injected. Input arrives at `write` as a `Uint8Array`. */

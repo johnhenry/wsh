@@ -6,7 +6,8 @@
 mod auth;
 mod client_env;
 mod config;
-mod gateway;
+// The gateway lives in `wsh-core` (the CLI's reverse host serves the same one); `crate::gateway::...` paths keep working.
+use wsh_core::gateway;
 mod handshake;
 mod host_key;
 mod mcp;

@@ -3,10 +3,15 @@
 //! Provides CBOR message types, codec, identity/fingerprint management,
 //! authorized_keys parsing, HMAC session tokens, and abstract transport traits.
 
+// The gateway code (moved here from `wsh-server` so the CLI's reverse host serves the same gateway under the same policy)
+// names this crate as `wsh_core::...`; that path works inside the crate too.
+extern crate self as wsh_core;
+
 pub mod channel_binding;
 pub mod codec;
 pub mod e2e_exchange;
 pub mod error;
+pub mod gateway;
 pub mod gateway_credit;
 pub mod gateway_datagram;
 pub mod host_key;
@@ -28,6 +33,11 @@ pub mod transport;
 /// `ReverseAccept.features` of a peer that does: it addresses each message to one operator with
 /// `RelayForward.to_fingerprint` and understands `ReverseClose` (wsh #89, #93).
 pub const RELAY_MULTI_OPERATOR_FEATURE: &str = "relay-multi-operator";
+
+/// `ServerHello.features` of a relay that carries a reverse host's gateway requests (`OpenTcp`, `OpenUdp`, `ResolveDns`,
+/// `ListenRequest` and their answers: `is_relay_gateway_forwardable`), and `ReverseAccept.features` of a peer whose owner turned its
+/// gateway on for operators behind the relay. Implies `gateway-credit` on every connection opened that way (wsh #289).
+pub const RELAY_GATEWAY_FEATURE: &str = "relay-gateway";
 
 // Re-export commonly used items at crate root.
 pub use codec::{cbor_decode, cbor_encode, decode_envelope, frame_encode, FrameDecoder};

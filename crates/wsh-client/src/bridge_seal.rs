@@ -129,7 +129,8 @@ impl SealedBridge {
         let inner = decode_envelope(&plain)?;
         if matches!(inner.msg_type, MsgType::RelayForward)
             || (self.scope == Scope::Bridge
-                && !wsh_core::messages::is_relay_forwardable(inner.msg_type))
+                && !wsh_core::messages::is_relay_forwardable(inner.msg_type)
+                && !wsh_core::messages::is_relay_gateway_forwardable(inner.msg_type))
         {
             return Err(WshError::Other(
                 "sealed message of a type that may not cross a bridge".into(),

@@ -8,7 +8,7 @@
  * reverse mode (client registers as a peer for incoming connections).
  */
 
-import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE } from './features.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE, RELAY_GATEWAY_FEATURE } from './features.mjs';
 import { WebTransportTransport, normalizeWebTransportOptions, normalizeCloseInfo } from './transport.mjs';
 import { clientChannelBinding, offeredKinds, TLS_EXPORTER_LABEL, TLS_EXPORTER_LENGTH } from './channel-binding.mjs';
 import { WebSocketTransport } from './transport-ws.mjs';
@@ -39,7 +39,7 @@ import {
   listTargets as listTargetsMsg,
   gatewayCredit as gatewayCreditMsg,
   sessionGrant as sessionGrantMsg, sessionRevoke as sessionRevokeMsg,
-  isRelayForwardable,
+  isRelayForwardable, isRelayGatewayForwardable,
 } from './messages.mjs';
 import { resolveSigner, signChallengeWith, signPeerRecordWith, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
 import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
@@ -47,7 +47,7 @@ import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature, initiato
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, verifyReverseChallenge, createOperatorProof } from './operator-proof.mjs';
 import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
-import { GatewayConnections, assertHalfCloseIdleMs } from './gateway-client.mjs';
+import { GatewayConnections, GatewayError, assertHalfCloseIdleMs } from './gateway-client.mjs';
 import { GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from './gateway-datagram.mjs';
 import { RpcCreditLink, rpcCreditId, rpcChannelOfCredit } from './rpc-virtual.mjs';
@@ -81,7 +81,7 @@ const DEFAULT_OPEN_TIMEOUT   = 10_000;  // ms
 const FS_RPC_OPS = new Set(['stat', 'list', 'read', 'write', 'mkdir', 'remove', 'rename']);
 
 // The feature strings live in features.mjs (a host names them without importing this file); re-exported here.
-export { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE };
+export { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE, RELAY_GATEWAY_FEATURE };
 
 /** `target` must be a non-empty string, and only a host that advertises `targets` may be sent one (#121). */
 function assertTargetUsable(client, target, who) {
@@ -356,6 +356,8 @@ export class WshClient {
    * @type {Set<string>}
    */
   #acceptedRelayPeers = new Set();
+  /** A reverse host whose owner turned its gateway on (`connectReverse({ expose: { gateway: true } })`, #289): it hears the gateway's requests inside a RelayForward, on a relay that lists `relay-gateway`. */
+  #relayGatewayHost = false;
 
   /**
    * Observers registered through addControlListener() — see that method
@@ -1399,6 +1401,10 @@ export class WshClient {
     if (expose.exec) capabilities.push('exec');
     if (expose.fs) capabilities.push('fs');
     if (expose.tools) capabilities.push('tools');
+    // #289: this peer's owner turned its gateway on for bridged operators (`relay-gateway`); the record says so, and this
+    // client then hears the gateway's requests inside a RelayForward (when the relay lists the feature too).
+    // Only on a relay that lists the feature: any other would answer those messages itself, or not at all.
+    if (expose.gateway && this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE)) { capabilities.push('gateway'); this.#relayGatewayHost = true; }
 
     // Export public key for peer identification.
     const cred = await resolveSigner({ keyPair, signer });
@@ -1546,7 +1552,9 @@ export class WshClient {
     if (sealOpts) {
       this.#sealState = { sessionId: null, bridge: null };
       transport.sendControl = async (msg) => {
-        if (!isRelayForwardable(msg.type)) return plainSend(msg);
+        // What the bridge carries is sealed: the relay forwardable list, and the gateway's requests (#289), which a sealed bridge
+        // carries inside its frames like everything else (a plain one would be dropped by a host that sealed the bridge).
+        if (!isRelayForwardable(msg.type) && !isRelayGatewayForwardable(msg.type)) return plainSend(msg);
         if (bridge) return plainSend(await bridge.seal(msg));
         if (msg.type === MSG.KEY_EXCHANGE && sealing && msg.session_id === sealing.sessionId) return plainSend(msg);
         throw new Error('sealed bridge: nothing is sent over it before the key exists');
@@ -1702,10 +1710,41 @@ export class WshClient {
   // Streams with backpressure over the gateway messages (`gateway-unix`, `gateway-endpoints`, `gateway`; credit-based
   // flow control when both ends offer `gateway-credit`). See `gateway-client.mjs`.
 
+  /**
+   * Does the bridge carry the gateway's requests (#289)? The relay AND the host behind it must have stated `relay-gateway`
+   * (a reverse host that has its gateway turned on hears them whatever it is told: its owner decided).
+   */
+  #carriesRelayGateway() {
+    if (!this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE)) return false;
+    return this.#relayGatewayHost || (this.#bridgedFeatures?.includes(RELAY_GATEWAY_FEATURE) ?? false);
+  }
+
+  /**
+   * A gateway message from this client. Bridged to a host that stated its features, the gateway's requests go only through a relay
+   * and to a host that said `relay-gateway`: anything else would be answered by the relay's own gateway (or not at all), not by
+   * the host the caller means, so it is refused here and nothing is sent. With no bridge, or a host that stated no features,
+   * nothing changes.
+   */
+  #sendGateway(m) {
+    if (this.#acceptedRelayPeers.size > 0) {
+      // Bridged: a request is for the HOST behind the bridge, or it is not sent. (What the relay would do with one it does not carry is
+      // answer it with ITS gateway, if it has one: a network the caller did not mean. The relay's own gateway is for a client that is
+      // not bridged.)
+      if (isRelayGatewayForwardable(m.type) && !this.#carriesRelayGateway()) {
+        const who = this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE) ? 'the host behind this bridge' : 'this relay';
+        return Promise.reject(new GatewayError(`${who} does not state "${RELAY_GATEWAY_FEATURE}", so the gateway is not carried over this bridge -- nothing was sent`, 4));
+      }
+      if (m.type === MSG.OPEN_UNIX || m.type === MSG.OPEN_ENDPOINT || m.type === MSG.LISTEN_UNIX) {
+        return Promise.reject(new GatewayError('unix sockets and named endpoints are not carried over a relay bridge -- nothing was sent', 4));
+      }
+    }
+    return this.sendControl(m);
+  }
+
   #gw() {
     this.#assertAuthenticated('gateway');
     return (this.#gateway ??= new GatewayConnections({
-      send: (m) => this.sendControl(m),
+      send: (m) => this.#sendGateway(m),
       hasFeature: (f) => this.hasFeature(f),
       halfCloseIdleMs: this.#gatewayHalfCloseIdleMs,
       // Datagrams for UDP flows: only on a transport that has them AND a host that listed "gateway-datagram".
@@ -3293,7 +3332,7 @@ export class WshClient {
         console.error('[wsh:client] failed to decode RelayForward inner envelope:', err);
         return;
       }
-      if (!isRelayForwardable(inner.type)) {
+      if (!isRelayForwardable(inner.type) && !(isRelayGatewayForwardable(inner.type) && this.#carriesRelayGateway())) {
         console.warn('[wsh:client] dropping RelayForward wrapping a non-forwardable type:', inner.type);
         return;
       }
@@ -3459,6 +3498,17 @@ export class WshClient {
     // Credit for an rpc channel in virtual data mode (#191) is a GatewayCredit in a number space of its own.
     if (type === MSG.GATEWAY_CREDIT && rpcChannelOfCredit(msg.gateway_id) !== undefined) {
       this.#rpcLinks.get(rpcChannelOfCredit(msg.gateway_id))?.grant(msg.bytes);
+      return;
+    }
+
+    // A reverse host whose owner turned its gateway on (#289) hears the gateway's messages of each operator, by the operator they
+    // came from (the bridge's own gateway session answers them); only on a relay that lists `relay-gateway`.
+    if (this.#relayGatewayHost && from !== undefined && this.onRelayMessage && type >= 0x70 && type <= 0x7f && this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE)) {
+      try {
+        this.onRelayMessage(msg, from);
+      } catch (err) {
+        console.error('[wsh:client] onRelayMessage handler error:', err);
+      }
       return;
     }
 

@@ -101,7 +101,7 @@ describe('GATEWAY_FAIL: the codes of GatewayFail', () => {
   });
 
   it('covers every code the Rust server sends (read from its source)', () => {
-    const source = readFileSync(new URL('../crates/wsh-server/src/gateway/session.rs', import.meta.url), 'utf8');
+    const source = readFileSync(new URL('../crates/wsh-core/src/gateway/session.rs', import.meta.url), 'utf8');
     const sent = [...source.matchAll(/^const FAIL_[A-Z_]+: u32 = (\d+);/gm)].map((m) => Number(m[1]));
     assert.ok(sent.length >= 5, 'the constants were found');
     for (const code of sent) assert.ok(GATEWAY_FAIL_TABLE.some((r) => r.code === code), `the Rust server sends ${code}`);

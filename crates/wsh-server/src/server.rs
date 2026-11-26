@@ -903,7 +903,8 @@ impl WshServer {
                     "WebTransport auth OK"
                 );
 
-                let (peer_tx, peer_rx) = mpsc::channel::<Envelope>(64);
+                let (peer_tx, peer_rx) =
+                    mpsc::channel::<Envelope>(crate::relay::bridges::PEER_QUEUE_DEPTH);
                 // Assign a unique conn_id and register in peer_senders/conn_session_map
                 // so E2E relay, CopilotSuggest, and idle warnings are session-scoped.
                 let conn_id = self.alloc_conn_id();
@@ -1616,7 +1617,8 @@ impl WshServer {
         // be a plain, unconditional `select!` arm: nothing holds a clone of
         // `peer_tx` until auth succeeds and it's registered in
         // `peer_senders`, so this simply never fires before then.
-        let (peer_tx, mut peer_rx) = mpsc::channel::<Envelope>(64);
+        let (peer_tx, mut peer_rx) =
+            mpsc::channel::<Envelope>(crate::relay::bridges::PEER_QUEUE_DEPTH);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         // The login (Hello and Auth) is due `login_timeout_secs` after the connection was accepted, the TLS and WebSocket
         // handshakes included (wsh #248); once the connection is `Authenticated` there is nothing left to wait for.
@@ -2622,6 +2624,11 @@ impl WshServer {
             if self.config.relay_max_operators_per_peer > 1 {
                 features.push(wsh_core::RELAY_MULTI_OPERATOR_FEATURE.to_string());
             }
+            // The gateway's requests (`is_relay_gateway_forwardable`) cross the bridge of a peer that states the
+            // same feature in its ReverseAccept (wsh #289). `[relay] carry_gateway = false` turns it off.
+            if self.config.relay_carry_gateway {
+                features.push(wsh_core::RELAY_GATEWAY_FEATURE.to_string());
+            }
         }
         if self.recording_dir.is_some() {
             features.push("recording".to_string());
@@ -2725,6 +2732,17 @@ impl WshServer {
                         }
                         _ => false,
                     };
+                    // ... and one whose owner turned its gateway on says `relay-gateway` (wsh #289): the relay
+                    // carries the gateway's requests for its bridge, if it carries them at all.
+                    let gateway = self.config.relay_carry_gateway
+                        && match &envelope.payload {
+                            Payload::ReverseAccept(a) => {
+                                Self::bounded_features(a.features.as_deref(), 64, 128).is_some_and(
+                                    |f| f.iter().any(|f| f == wsh_core::RELAY_GATEWAY_FEATURE),
+                                )
+                            }
+                            _ => false,
+                        };
                     let senders = self.peer_senders.read().await;
                     if let Some(sender) = senders.get(&partner_id) {
                         let _ = sender.try_send(envelope);
@@ -2742,7 +2760,11 @@ impl WshServer {
                     drop(senders);
 
                     let accepted = matches!(msg_type, MsgType::ReverseAccept);
-                    self.bridges.write().await.answer(conn_id, accepted, multi);
+                    {
+                        let mut bridges = self.bridges.write().await;
+                        bridges.answer(conn_id, accepted, multi);
+                        bridges.note_answer_gateway(conn_id, accepted, gateway);
+                    }
                     if accepted {
                         info!(
                             requester = partner_id,
@@ -2763,7 +2785,14 @@ impl WshServer {
         // them locally. This creates a transparent bidirectional bridge between
         // CLI client and browser peer.
         if let Some(conn_id) = ctx.conn_id {
-            let forwardable = is_relay_forwardable(envelope.msg_type);
+            // The gateway's requests cross only a bridge whose PEER stated `relay-gateway` (and only on a relay
+            // that carries them): a peer or relay that predates the feature never sees one (wsh #289).
+            let carries_gateway = self.bridges.read().await.carries(
+                self.config.relay_carry_gateway,
+                conn_id,
+                envelope.msg_type,
+            );
+            let forwardable = is_relay_forwardable(envelope.msg_type) || carries_gateway;
             // A peer that serves several operators writes its own `RelayForward` to address one
             // (`to_fingerprint`); the relay checks the inner, then re-wraps it with the sender's
             // authenticated key, so the field is never delivered (wsh #93).
@@ -2783,6 +2812,7 @@ impl WshServer {
                     Route::To(partner_id) => {
                         // What is delivered: this message wrapped (a plain forwardable one) or the
                         // inner of the forward the connection wrote, once it has been checked.
+                        let mut inner_type = envelope.msg_type;
                         let inner = match &envelope.payload {
                             Payload::RelayForward(p) => {
                                 if p.inner.len() > MAX_RELAY_FORWARD_BYTES {
@@ -2790,7 +2820,15 @@ impl WshServer {
                                     return Ok(None);
                                 }
                                 match wsh_core::decode_envelope(&p.inner) {
-                                    Ok(decoded) if is_relay_forwardable(decoded.msg_type) => {
+                                    Ok(decoded)
+                                        if is_relay_forwardable(decoded.msg_type)
+                                            || self.bridges.read().await.carries(
+                                                self.config.relay_carry_gateway,
+                                                conn_id,
+                                                decoded.msg_type,
+                                            ) =>
+                                    {
+                                        inner_type = decoded.msg_type;
                                         Ok(p.inner.clone())
                                     }
                                     Ok(decoded) => {
@@ -2826,7 +2864,17 @@ impl WshServer {
                                             to_fingerprint: None,
                                         }),
                                     };
-                                    let _ = sender.try_send(wrapped);
+                                    // A gateway connection's frame is never skipped: if the queue of the connection it goes to is
+                                    // full, THIS connection ends (a clean error), instead of a hole in a byte stream.
+                                    if let Err(why) = crate::relay::bridges::queue_forward(
+                                        sender, wrapped, inner_type,
+                                    ) {
+                                        warn!(
+                                            conn_id,
+                                            partner_id, "relay: {why}; ending this connection"
+                                        );
+                                        return Err(WshError::Other(why));
+                                    }
                                 }
                                 Err(err) => {
                                     warn!(conn_id, %err, "failed to encode relay-forwarded envelope");
@@ -5537,6 +5585,7 @@ mod wisp_reverse_connect_e2e_tests {
             idle_timeout: 3600,
             enable_relay: true,
             relay_max_operators_per_peer: 1,
+            relay_carry_gateway: true,
             allow_pubkey: true,
             allow_password: false,
             gateway_enabled: false,

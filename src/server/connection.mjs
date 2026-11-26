@@ -25,7 +25,7 @@ import {
   generateNonce, verifyChallenge, fingerprint, importPublicKeyRaw,
 } from '../auth.mjs';
 import { FILE_CHUNK_BYTES, MAX_ATTACHMENTS } from './constants.mjs';
-import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE, TARGETS_FEATURE } from '../features.mjs';
+import { MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, RELAY_GATEWAY_FEATURE, SESSION_SEAL_FEATURE, SESSION_SEAL_REQUIRED_FEATURE, TARGETS_FEATURE } from '../features.mjs';
 import { TARGET_NAME_RE } from '../host-backends.mjs';
 import { RpcChannel, RPC_FEATURE, RPC_VIRTUAL_FEATURE, RPC_MAX_MESSAGE_PREFIX, rpcProtocolFeature } from '../rpc.mjs';
 import { RpcCreditLink, rpcChannelOfCredit, rpcCreditId } from '../rpc-virtual.mjs';
@@ -33,6 +33,7 @@ import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
 import { gatewayFeatures, GATEWAY_FAIL } from './gateway-core.mjs';
+import { GATEWAY_CREDIT_FEATURE } from '../gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
@@ -70,7 +71,9 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
   // A relay carries a signed KeyExchange untouched, and (when configured) several operators per peer: peers read
   // these from its ServerHello before relying on either, since an older relay would drop the connection on them.
   if (cfg.relay) {
+    // #289: this relay carries a reverse host's gateway requests for a bridge whose peer asked for it (`relay-gateway`); `relay.carryGateway: false` turns that off.
     features.push(E2E_SIGN_FEATURE, OPERATOR_PROOF_FEATURE);
+    if (cfg.relay.carryGateway !== false) features.push(RELAY_GATEWAY_FEATURE);
     if (cfg.relay.maxOperatorsPerPeer > 1) features.push(MULTI_OPERATOR_FEATURE);
   }
   if (cfg.e2e && !dataStreams) features.push(E2E_FEATURE, ...(cfg.e2e.signKey ? [E2E_SIGN_FEATURE] : []));
@@ -198,7 +201,7 @@ export function createConnectionFactory(cfg) {
    *  - bytes (the normal one): `{ send(bytes), remote, closeTransport() }` -> `{ receive(bytes), close() }`, speaking QMux.
    *  - messages: `{ sendMessage(msg), authenticated, dataStreams }` -> `{ receiveMessage(msg), bindStream(s), close() }`,
    *    for a transport that already frames messages itself (a relay bridge, WebTransport). `authenticated`
-   *    (`{ username, fingerprint }`) skips the handshake for a peer something else has already authenticated;
+   *    (`{ username, fingerprint, grant? }`; `grant` is a `grantPermissions().permissions` object narrowing what the peer may do) skips the handshake for a peer something else has already authenticated;
    *    `dataStreams: false` means there are no client-opened streams to bind, so exec output rides SessionData.
    *    `e2e` overrides `cfg.e2e` for this connection.
    *
@@ -213,7 +216,7 @@ export function createConnectionFactory(cfg) {
       sessionId: randomUUID(), nonce: null, username: authenticated?.username ?? null, authed: !!authenticated,
       closed: false, nextChannel: 0, fingerprint: authenticated?.fingerprint ?? null,
       /** What `authorize()` granted, when it returned a capability set instead of `true` (#122). */
-      grant: null,
+      grant: authenticated?.grant ?? null,
     };
     /** @type {Map<number, any>} */
     const channels = new Map();
@@ -279,7 +282,16 @@ export function createConnectionFactory(cfg) {
         case MSG.LISTEN_UNIX: req = { kind: 'listen-unix', path: m.path }; listener = true; break;
         default: return null;
       }
-      const refusal = keyRefusal(req);
+      // A reverse host's gateway (#289) is used only by an operator that was GRANTED a capability list covering the request
+      // (`accept()` returned `{ capabilities }`): the host's own `gateway` policy decides what is reachable, the grant who may ask.
+      const refusal = cfg.gatewayNeedsGrant && !Array.isArray(state.grant?.capabilities)
+        ? (() => {
+          const reason = 'this host serves its gateway only to an operator it granted a gateway capability (accept() returned none)';
+          log(`gateway refused for ${state.username ?? '?'}: no capability granted`);
+          notifyRefused('not-permitted', { username: state.username, fingerprint: state.fingerprint, address: remote.address }, `capability-missing: ${reason}`);
+          return { reason };
+        })()
+        : keyRefusal(req);
       if (!refusal) return null;
       return listener ? listenFail({ listenerId: m.listener_id, reason: refusal.reason }) : gatewayFail({ gatewayId: m.gateway_id, code: GATEWAY_FAIL.POLICY_DENIED, message: refusal.reason });
     }
@@ -335,6 +347,9 @@ export function createConnectionFactory(cfg) {
         requireTarget: () => requireTarget,
       })
       : null;
+    // A reverse host's gateway (#289): connections opened through a relay bridge are always metered (`relay-gateway` implies `gateway-credit`),
+    // whatever the operator listed: there is no Hello on a bridge to read it from.
+    if (gateway && cfg.gatewayCredit && authenticated) gateway.setPeerFeatures([GATEWAY_CREDIT_FEATURE]);
 
     // Operator-side shared folders (#159): created with the connection, used only after the client's ShareOffer.
     const shares = cfg.onShare

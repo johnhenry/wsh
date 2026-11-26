@@ -1087,6 +1087,30 @@ export function isRelayForwardable(typeNum) {
   return RELAY_FORWARDABLE.has(typeNum);
 }
 
+// Message types a relay carries only for a bridge whose peer stated "relay-gateway" (and only on a relay that lists it).
+// Not part of RELAY_FORWARDABLE: a peer or relay that predates the feature must never be sent them.
+export const RELAY_GATEWAY_FORWARDABLE = new Set([
+  MSG.OPEN_TCP,
+  MSG.OPEN_UDP,
+  MSG.RESOLVE_DNS,
+  MSG.DNS_RESULT,
+  MSG.LISTEN_REQUEST,
+  MSG.LISTEN_OK,
+  MSG.LISTEN_FAIL,
+  MSG.LISTEN_CLOSE,
+  MSG.INBOUND_OPEN,
+  MSG.INBOUND_ACCEPT,
+  MSG.INBOUND_REJECT,
+]);
+
+/**
+ * @param {number} typeNum
+ * @returns {boolean}
+ */
+export function isRelayGatewayForwardable(typeNum) {
+  return RELAY_GATEWAY_FORWARDABLE.has(typeNum);
+}
+
 // ── Utility ───────────────────────────────────────────────────────────
 
 /**

@@ -109,7 +109,17 @@ class QMuxStream {
    * transport is reliable, so that's sufficient).
    * @param {Uint8Array} bytes
    */
-  async write(bytes) {
+  write(bytes) {
+    // One write at a time, in the order they were called: a write that waits for the window must not have another's chunks slipped in
+    // between its own (a relay or a host with many connections writes to one control stream from many tasks at once).
+    const run = this.#writeChain.then(() => this.#writeNow(bytes));
+    this.#writeChain = run.catch(() => {});
+    return run;
+  }
+
+  #writeChain = Promise.resolve();
+
+  async #writeNow(bytes) {
     if (this.#sendState === SEND_STATE.RESET_SENT) {
       throw new Error(`Cannot write to stream ${this.id}: already reset`);
     }
@@ -163,6 +173,8 @@ class QMuxStream {
 
   /** Half-close the send side: send FIN. No more write() calls after this. */
   async close() {
+    // After the writes already asked for (their bytes come before the FIN).
+    await this.#writeChain;
     if (this.#sendState === SEND_STATE.RESET_SENT || this.#sendState === SEND_STATE.DATA_SENT) return;
     this.#conn._sendFrame(encodeStream({
       streamId: this.id,

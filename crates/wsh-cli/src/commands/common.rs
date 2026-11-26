@@ -363,6 +363,20 @@ pub struct IdentityPolicy {
     pub allow_operators: Vec<String>,
     /// Reverse host: how many operators it serves at once (0 = unset = 1).
     pub max_operators: usize,
+    /// Reverse host (wsh #289): the destination rules of the gateway for an operator behind the relay (`--relay-gateway-allow`).
+    /// Empty = no gateway, and the host does not say `relay-gateway`.
+    pub relay_gateway_allow: Vec<String>,
+    /// Reverse host: also answer `OpenUdp` (`--relay-gateway-udp`).
+    pub relay_gateway_udp: bool,
+    /// Reverse host: also answer `ResolveDns` (`--relay-gateway-dns`).
+    pub relay_gateway_dns: bool,
+    /// Reverse host: also answer `ListenRequest` (`--relay-gateway-listen`).
+    pub relay_gateway_listen: bool,
+    /// Reverse host: take who an operator is from the relay's word (`--relay-gateway-trust-relay`); required for a gateway unless
+    /// `--require-operator-proof` makes operators prove themselves.
+    pub relay_gateway_trust_relay: bool,
+    /// Reverse host: connections one operator may hold open (0 = unset = the default).
+    pub relay_gateway_max_connections: usize,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
     pub operator_proof: OperatorProofMode,
     /// Reverse operator: seal the bridge (`--sealed` on `wsh reverse-connect`).
@@ -448,10 +462,75 @@ pub fn apply_host_policy(
         .iter()
         .map(|a| a.to_ascii_lowercase())
         .collect();
+    options.gateway = relay_gateway_from_policy(&p, options)?;
     options.identity = Some(crate::commands::reverse_host::IdentityKey(
         std::sync::Arc::new(key.clone()),
     ));
     Ok(())
+}
+
+/// The gateway for an operator behind the relay that the command line asked for (wsh #289), or `None`: off unless
+/// `--relay-gateway-allow` named a destination, and then only for a host that also exposes the `gateway` capability. The other
+/// `--relay-gateway-*` flags without a rule are an error, not silently ignored.
+fn relay_gateway_from_policy(
+    p: &IdentityPolicy,
+    options: &crate::commands::reverse_host::ReverseHostOptions,
+) -> Result<Option<crate::commands::reverse_host::RelayGateway>> {
+    use crate::commands::reverse_gateway::DEFAULT_MAX_CONNECTIONS;
+    if p.relay_gateway_allow.is_empty() {
+        if p.relay_gateway_udp
+            || p.relay_gateway_dns
+            || p.relay_gateway_listen
+            || p.relay_gateway_trust_relay
+            || p.relay_gateway_max_connections != 0
+        {
+            anyhow::bail!(
+                "--relay-gateway-udp, --relay-gateway-dns, --relay-gateway-listen, --relay-gateway-trust-relay and \
+                 --relay-gateway-max-connections need at least one --relay-gateway-allow rule (the gateway is off, and default deny, without one)"
+            );
+        }
+        return Ok(None);
+    }
+    // Who may use it: the owner names the operators. Proof says WHO an operator is (and seals the bridge); it does not say whether that
+    // key should reach this machine's network, so it does not replace the list.
+    if p.allow_operators.is_empty() {
+        anyhow::bail!(
+            "--relay-gateway-allow needs --allow-operator FINGERPRINT (at least 8 hex digits, repeatable): the gateway is for the operators \
+             you name, not for whoever the relay lets through"
+        );
+    }
+    // How an operator's identity is taken: with proof (and the sealed bridge it brings) a relay cannot speak for an operator; without it
+    // the relay's word is all there is, so the owner says so.
+    if !p.require_operator_proof && !p.relay_gateway_trust_relay {
+        anyhow::bail!(
+            "--relay-gateway-allow needs --require-operator-proof (operators prove themselves and the bridge is sealed) or \
+             --relay-gateway-trust-relay (you trust the relay's word about who is asking: it can then open what an accepted operator could)"
+        );
+    }
+    if p.max_operators > 1 && !p.relay_gateway_trust_relay {
+        anyhow::bail!(
+            "--relay-gateway-allow with --max-operators above 1 needs --relay-gateway-trust-relay: a host serving several operators cannot \
+             seal its bridges (one seal per connection), so the relay's word is all there is"
+        );
+    }
+    if !options.has_capability("gateway") {
+        anyhow::bail!(
+            "--relay-gateway-allow needs `--capability gateway`: the gateway is a capability this host exposes on purpose"
+        );
+    }
+    let gateway = crate::commands::reverse_host::RelayGateway {
+        allow: p.relay_gateway_allow.clone(),
+        udp: p.relay_gateway_udp,
+        dns: p.relay_gateway_dns,
+        listen: p.relay_gateway_listen,
+        max_connections: if p.relay_gateway_max_connections == 0 {
+            DEFAULT_MAX_CONNECTIONS
+        } else {
+            p.relay_gateway_max_connections
+        },
+    };
+    gateway.validate().map_err(|why| anyhow::anyhow!(why))?;
+    Ok(Some(gateway))
 }
 
 /// Put the process-wide identity policy into a connection config.
@@ -1074,7 +1153,7 @@ pub fn redact_rendezvous(url: &str) -> String {
 
 #[cfg(test)]
 mod redact_tests {
-    use super::redact_rendezvous;
+    use super::{redact_rendezvous, relay_gateway_from_policy, IdentityPolicy};
 
     #[test]
     fn the_rendezvous_id_is_shortened_and_the_rest_kept() {
@@ -1087,5 +1166,168 @@ mod redact_tests {
             !redact_rendezvous("ws://127.0.0.1:9/r/SECRETSECRETSECRETSECRET")
                 .contains("SECRETSECRET")
         );
+    }
+
+    // ── The gateway for an operator behind a relay (wsh #289) ────────────
+
+    fn host_with(capabilities: &[&str]) -> crate::commands::reverse_host::ReverseHostOptions {
+        crate::commands::reverse_host::ReverseHostOptions {
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_relay_gateway_is_off_without_a_rule() {
+        let g = relay_gateway_from_policy(
+            &IdentityPolicy::default(),
+            &host_with(&["shell", "gateway"]),
+        );
+        assert_eq!(
+            g.unwrap(),
+            None,
+            "no flag, no gateway, even with the capability"
+        );
+    }
+
+    /// A rule, with the owner having named an operator and chosen to trust the relay's word.
+    fn chosen(rule: &str) -> IdentityPolicy {
+        IdentityPolicy {
+            relay_gateway_allow: vec![rule.into()],
+            allow_operators: vec!["0123456789abcdef".into()],
+            relay_gateway_trust_relay: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_gateway_needs_the_owner_to_name_who_may_use_it() {
+        let mut p = chosen("db.example.com:5432");
+        p.allow_operators.clear();
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--allow-operator"), "{err}");
+        // proof says who an operator IS, not that it should reach this network: it does not replace the list
+        p.relay_gateway_trust_relay = false;
+        p.require_operator_proof = true;
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--allow-operator"), "{err}");
+    }
+
+    #[test]
+    fn a_gateway_needs_proof_or_the_explicit_trust_of_the_relays_word() {
+        let mut p = chosen("db.example.com:5432");
+        p.relay_gateway_trust_relay = false;
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(
+            err.to_string().contains("--require-operator-proof")
+                && err.to_string().contains("--relay-gateway-trust-relay"),
+            "{err}"
+        );
+        p.require_operator_proof = true;
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_ok());
+        let mut t = chosen("db.example.com:5432");
+        t.relay_gateway_trust_relay = true;
+        assert!(relay_gateway_from_policy(&t, &host_with(&["gateway"])).is_ok());
+    }
+
+    #[test]
+    fn several_operators_cannot_seal_so_they_always_need_the_trust() {
+        let mut p = chosen("db.example.com:5432");
+        p.relay_gateway_trust_relay = false;
+        p.require_operator_proof = true;
+        p.max_operators = 2;
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--max-operators"), "{err}");
+        p.relay_gateway_trust_relay = true;
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_ok());
+    }
+
+    #[test]
+    fn a_rule_needs_the_gateway_capability() {
+        let policy = chosen("db.example.com:5432");
+        let err = relay_gateway_from_policy(&policy, &host_with(&["shell"])).unwrap_err();
+        assert!(err.to_string().contains("--capability gateway"), "{err}");
+    }
+
+    #[test]
+    fn the_other_relay_gateway_flags_without_a_rule_are_an_error_not_ignored() {
+        for policy in [
+            IdentityPolicy {
+                relay_gateway_udp: true,
+                ..Default::default()
+            },
+            IdentityPolicy {
+                relay_gateway_dns: true,
+                ..Default::default()
+            },
+            IdentityPolicy {
+                relay_gateway_listen: true,
+                ..Default::default()
+            },
+            IdentityPolicy {
+                relay_gateway_trust_relay: true,
+                ..Default::default()
+            },
+            IdentityPolicy {
+                relay_gateway_max_connections: 4,
+                ..Default::default()
+            },
+        ] {
+            let err = relay_gateway_from_policy(&policy, &host_with(&["gateway"])).unwrap_err();
+            assert!(err.to_string().contains("--relay-gateway-allow"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_rule_turns_on_tcp_only_with_the_default_bound() {
+        let policy = chosen("db.example.com:5432");
+        let g = relay_gateway_from_policy(&policy, &host_with(&["gateway"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.allow, vec!["db.example.com:5432".to_string()]);
+        assert!(
+            !g.udp && !g.dns && !g.listen,
+            "UDP, DNS and listening are each off unless asked for"
+        );
+        assert_eq!(
+            g.max_connections,
+            crate::commands::reverse_gateway::DEFAULT_MAX_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn the_switches_are_separate() {
+        let base = chosen("*");
+        let host = host_with(&["gateway"]);
+        let udp = relay_gateway_from_policy(
+            &IdentityPolicy {
+                relay_gateway_udp: true,
+                ..base.clone()
+            },
+            &host,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(udp.udp && !udp.dns && !udp.listen);
+        let dns = relay_gateway_from_policy(
+            &IdentityPolicy {
+                relay_gateway_dns: true,
+                ..base.clone()
+            },
+            &host,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!dns.udp && dns.dns && !dns.listen);
+        let listen = relay_gateway_from_policy(
+            &IdentityPolicy {
+                relay_gateway_listen: true,
+                ..base
+            },
+            &host,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!listen.udp && !listen.dns && listen.listen);
     }
 }

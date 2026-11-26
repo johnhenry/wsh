@@ -17,7 +17,7 @@ export {
   presence, controlChanged, metrics,
   mcpDiscover, mcpTools, mcpCall, mcpResult, mcpCancel,
   reverseRegister, reverseList, reversePeers, reverseConnect, reverseAccept, reverseReject,
-  relayForward, reverseClose, RELAY_FORWARDABLE, isRelayForwardable,
+  relayForward, reverseClose, RELAY_FORWARDABLE, isRelayForwardable, RELAY_GATEWAY_FORWARDABLE, isRelayGatewayForwardable,
   openTcp, openUdp, resolveDns, gatewayOk, gatewayFail, gatewayClose,
   inboundOpen, inboundAccept, inboundReject, dnsResult,
   listenRequest, listenOk, listenFail, listenClose, gatewayData,
@@ -76,7 +76,7 @@ export {
 // Session + Client
 export { WshSession } from './session.mjs';
 export { WshVirtualSessionBackend, normalizeSessionData } from './virtual-session.mjs';
-export { WshClient, MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE } from './client.mjs';
+export { WshClient, MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEATURE, EXEC_PIPES_FEATURE, TARGETS_FEATURE, RELAY_GATEWAY_FEATURE } from './client.mjs';
 // Gateway forwarding (unix sockets, named endpoints, flow control) -- wsh #120, #123
 export { GatewayError } from './gateway-client.mjs';
 export { GATEWAY_FAIL, GATEWAY_FAIL_TABLE, GATEWAY_FAIL_LOCAL, gatewayFailName } from './gateway-errors.mjs';

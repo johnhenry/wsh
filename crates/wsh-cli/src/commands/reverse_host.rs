@@ -7,7 +7,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -16,16 +15,15 @@ use ed25519_dalek::{Signer, SigningKey};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
-use wsh_client::gateway::DEFAULT_HALF_CLOSE_IDLE;
 use wsh_client::WshClient;
 use wsh_core::messages::*;
 use wsh_core::peer_record::{build_peer_record_transcript, PeerRecord};
 
-use super::reverse_gateway::{spawn_datagram, spawn_stream, GatewaySink, ReverseGatewayConnection};
+pub use super::reverse_gateway::RelayGateway;
+use super::reverse_gateway::{GatewayLink, OperatorGateway};
 
 const DEFAULT_PTY_REPLAY_LIMIT: usize = 256 * 1024;
 /// How long an exited child's output reader may take to reach the pty's EOF before Exit goes out.
@@ -80,7 +78,8 @@ impl PeerLink {
     }
 
     async fn send_fire_and_forget(&self, envelope: Envelope) -> wsh_core::WshResult<()> {
-        let crosses_bridge = is_relay_forwardable(envelope.msg_type)
+        let crosses_bridge = (is_relay_forwardable(envelope.msg_type)
+            || is_relay_gateway_forwardable(envelope.msg_type))
             && !matches!(
                 envelope.msg_type,
                 MsgType::ReverseAccept | MsgType::ReverseReject
@@ -166,6 +165,9 @@ pub struct ReverseHostOptions {
     pub identity: Option<IdentityKey>,
     /// Offer X25519+ML-KEM-768 to an operator that asks for it (it may still seal with X25519 alone).
     pub hybrid: bool,
+    /// The gateway for an operator behind the relay (wsh #289): `None` (the default) serves none, and the host does not say
+    /// `relay-gateway`. Set by `--relay-gateway-allow`; needs the `gateway` capability.
+    pub gateway: Option<RelayGateway>,
 }
 
 impl Default for ReverseHostOptions {
@@ -183,6 +185,7 @@ impl Default for ReverseHostOptions {
             allowed_operators: Vec::new(),
             identity: None,
             hybrid: true,
+            gateway: None,
         }
     }
 }
@@ -268,8 +271,18 @@ impl ReverseHostOptions {
         request: ReverseConnectPayload,
         sealable: bool,
         multi: bool,
+        gateway: bool,
     ) -> ReverseAcceptPayload {
         let mut features = Vec::new();
+        // `gateway`: the owner turned the gateway on AND the relay carries it (wsh #289): this bridge's operator may use it.
+        // `relay-gateway` implies `gateway-credit`; the two others say what a client would read from a ServerHello.
+        if gateway {
+            features.extend([
+                wsh_core::RELAY_GATEWAY_FEATURE.to_string(),
+                "gateway".to_string(),
+                wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE.to_string(),
+            ]);
+        }
         if sealable {
             features.extend([
                 wsh_core::e2e_exchange::E2E_FEATURE.to_string(),
@@ -296,7 +309,7 @@ impl ReverseHostOptions {
         }
     }
 
-    fn has_capability(&self, capability: &str) -> bool {
+    pub fn has_capability(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
     }
 
@@ -761,7 +774,8 @@ struct ReverseHostRuntime {
     /// A request whose operator has been challenged and has not answered yet (wsh #117).
     pending_proof: Option<PendingProof>,
     sessions: HashMap<u32, ReverseHostSession>,
-    gateway_connections: HashMap<u32, ReverseGatewayConnection>,
+    /// This operator's gateway (wsh #289): present only when the owner turned it on and the relay carries it.
+    gateway: Option<OperatorGateway>,
     mcp: LocalMcpBridge,
     next_channel_id: u32,
 }
@@ -778,7 +792,7 @@ impl ReverseHostRuntime {
             sealing: None,
             pending_proof: None,
             sessions: HashMap::new(),
-            gateway_connections: HashMap::new(),
+            gateway: None,
             mcp: LocalMcpBridge::default(),
             next_channel_id: 1,
         }
@@ -807,10 +821,8 @@ impl ReverseHostRuntime {
         for session in self.sessions.values_mut() {
             session.set_notifier(None);
         }
-        let gateway_ids: Vec<u32> = self.gateway_connections.keys().copied().collect();
-        for gateway_id in gateway_ids {
-            self.close_gateway_connection(gateway_id).await;
-        }
+        // Dropping the gateway closes every connection and listener it opened.
+        self.gateway = None;
     }
 
     fn client(&self) -> Result<PeerLink> {
@@ -854,6 +866,7 @@ impl ReverseHostRuntime {
                 client
                     .trust_relay_peer(request.from_fingerprint.clone())
                     .await;
+                let gateway = self.prepare_gateway(false).await?;
                 client
                     .send_fire_and_forget(Envelope {
                         msg_type: MsgType::ReverseAccept,
@@ -861,6 +874,7 @@ impl ReverseHostRuntime {
                             request,
                             false,
                             client.is_multi(),
+                            gateway,
                         )),
                     })
                     .await
@@ -980,6 +994,8 @@ impl ReverseHostRuntime {
             }
             _ => false,
         };
+        // A new operator gets a gateway of its own (and the one of the last is gone with its connections).
+        let gateway = self.prepare_gateway(true).await?;
         client
             .send_fire_and_forget(Envelope {
                 msg_type: MsgType::ReverseAccept,
@@ -987,11 +1003,30 @@ impl ReverseHostRuntime {
                     request,
                     sealable,
                     client.is_multi(),
+                    gateway,
                 )),
             })
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(())
+    }
+
+    /// Is the gateway on for the bridge being accepted (wsh #289)? Only when the owner turned it on (`--relay-gateway-allow`) AND the
+    /// relay carries it (it lists `relay-gateway`): any other relay would answer the requests itself. `fresh`: a new operator, so a
+    /// new gateway (and none of the last operator's connections); otherwise the one this bridge already has is kept.
+    async fn prepare_gateway(&mut self, fresh: bool) -> Result<bool> {
+        let Some(options) = self.options.gateway.clone() else {
+            return Ok(false);
+        };
+        let client = self.client()?;
+        if !client.has_feature(wsh_core::RELAY_GATEWAY_FEATURE).await {
+            self.gateway = None;
+            return Ok(false);
+        }
+        if fresh || self.gateway.is_none() {
+            self.gateway = Some(OperatorGateway::new(&options, client));
+        }
+        Ok(true)
     }
 
     /// Resolves when the bridge being set up is sealed; never when none is.
@@ -1035,6 +1070,8 @@ impl ReverseHostRuntime {
         for id in ids {
             self.drop_session(id).await;
         }
+        // This operator's connections and listeners go with it.
+        self.gateway = None;
         self.active_request = None;
         self.bridged = false;
         Ok(())
@@ -1128,14 +1165,16 @@ impl ReverseHostRuntime {
             Payload::Close(close) => self.handle_close(close).await,
             Payload::McpDiscover(_) => self.handle_mcp_discover().await,
             Payload::McpCall(call) => self.handle_mcp_call(call).await,
-            Payload::OpenTcp(open) => self.handle_open_tcp(open).await,
-            Payload::OpenUdp(open) => self.handle_open_udp(open).await,
-            Payload::ResolveDns(resolve) => self.handle_resolve_dns(resolve).await,
-            Payload::GatewayData(data) => self.handle_gateway_data(data).await,
-            Payload::GatewayClose(close) => self.handle_gateway_close(close).await,
-            Payload::ListenRequest(request) => self.handle_listen_request(request).await,
-            Payload::InboundAccept(accept) => self.handle_inbound_accept(accept).await,
-            Payload::InboundReject(reject) => self.handle_inbound_reject(reject).await,
+            Payload::OpenTcp(_)
+            | Payload::OpenUdp(_)
+            | Payload::ResolveDns(_)
+            | Payload::ListenRequest(_)
+            | Payload::ListenClose(_)
+            | Payload::InboundAccept(_)
+            | Payload::InboundReject(_)
+            | Payload::GatewayData(_)
+            | Payload::GatewayCredit(_)
+            | Payload::GatewayClose(_) => self.handle_gateway_message(envelope).await,
             other => {
                 debug!(
                     "ignoring unsupported reverse-host relay message: {:?}",
@@ -1449,233 +1488,45 @@ impl ReverseHostRuntime {
         Ok(())
     }
 
-    async fn handle_open_tcp(&mut self, open: OpenTcpPayload) -> Result<()> {
-        if !self.options.has_capability("gateway") {
-            return self
-                .send_gateway_fail(
-                    open.gateway_id,
-                    5,
-                    "gateway access not permitted for this reverse host",
-                )
-                .await;
-        }
-        if self.gateway_id_in_use(open.gateway_id) {
-            return self
-                .send_gateway_fail(open.gateway_id, 4, "gateway id already in use")
-                .await;
-        }
-
-        match TcpStream::connect((open.host.as_str(), open.port)).await {
-            Ok(stream) => {
-                let resolved_addr = stream.peer_addr().ok().map(|addr| addr.to_string());
-                let connection = spawn_stream(
-                    self.client()?,
-                    open.gateway_id,
-                    stream,
-                    Some(DEFAULT_HALF_CLOSE_IDLE),
-                );
-                self.gateway_connections.insert(open.gateway_id, connection);
-                self.client()?
-                    .send_fire_and_forget(Envelope {
-                        msg_type: MsgType::GatewayOk,
-                        payload: Payload::GatewayOk(GatewayOkPayload {
-                            gateway_id: open.gateway_id,
-                            resolved_addr,
-                        }),
-                    })
-                    .await
-                    .map_err(|err| anyhow::anyhow!("{err}"))?;
-                Ok(())
-            }
-            Err(err) => {
-                self.send_gateway_fail(open.gateway_id, 1, &err.to_string())
-                    .await
-            }
-        }
-    }
-
-    async fn handle_open_udp(&mut self, open: OpenUdpPayload) -> Result<()> {
-        if !self.options.has_capability("gateway") {
-            return self
-                .send_gateway_fail(
-                    open.gateway_id,
-                    5,
-                    "gateway access not permitted for this reverse host",
-                )
-                .await;
-        }
-        if self.gateway_id_in_use(open.gateway_id) {
-            return self
-                .send_gateway_fail(open.gateway_id, 4, "gateway id already in use")
-                .await;
-        }
-
-        let bind_addr = if open.host.contains(':') {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = match UdpSocket::bind(bind_addr).await {
-            Ok(socket) => socket,
-            Err(err) => {
-                return self
-                    .send_gateway_fail(open.gateway_id, 1, &err.to_string())
-                    .await;
-            }
-        };
-        if let Err(err) = socket.connect((open.host.as_str(), open.port)).await {
-            return self
-                .send_gateway_fail(open.gateway_id, 1, &err.to_string())
-                .await;
-        }
-
-        let resolved_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
-        let connection = spawn_datagram(self.client()?, open.gateway_id, socket);
-        self.gateway_connections.insert(open.gateway_id, connection);
-        self.client()?
-            .send_fire_and_forget(Envelope {
-                msg_type: MsgType::GatewayOk,
-                payload: Payload::GatewayOk(GatewayOkPayload {
-                    gateway_id: open.gateway_id,
-                    resolved_addr,
-                }),
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
-        Ok(())
-    }
-
-    async fn handle_resolve_dns(&self, resolve: ResolveDnsPayload) -> Result<()> {
-        if !self.options.has_capability("gateway") {
-            return self
-                .send_gateway_fail(
-                    resolve.gateway_id,
-                    5,
-                    "gateway access not permitted for this reverse host",
-                )
-                .await;
-        }
-
-        match lookup_host((resolve.name.as_str(), 0)).await {
-            Ok(addresses) => {
-                let addresses =
-                    filter_dns_addresses(addresses.map(|addr| addr.ip()), &resolve.record_type);
-                self.client()?
-                    .send_fire_and_forget(Envelope {
-                        msg_type: MsgType::DnsResult,
-                        payload: Payload::DnsResult(DnsResultPayload {
-                            gateway_id: resolve.gateway_id,
-                            addresses,
-                            ttl: None,
-                        }),
-                    })
-                    .await
-                    .map_err(|err| anyhow::anyhow!("{err}"))?;
-                Ok(())
-            }
-            Err(err) => {
-                self.send_gateway_fail(resolve.gateway_id, 3, &err.to_string())
-                    .await
-            }
-        }
-    }
-
-    async fn handle_gateway_data(&mut self, data: GatewayDataPayload) -> Result<()> {
-        let Some(connection) = self.gateway_connections.get(&data.gateway_id) else {
+    /// A message of the gateway (wsh #289). Served only when this host's owner turned the gateway on and the relay carries it
+    /// (`self.gateway` exists); otherwise a request is refused, so an operator that sent one anyway (it should not have) is told.
+    async fn handle_gateway_message(&mut self, envelope: Envelope) -> Result<()> {
+        if let Some(gateway) = &self.gateway {
+            gateway.handle(envelope).await;
             return Ok(());
-        };
-        if !connection.data(data.data).await {
-            self.gateway_connections.remove(&data.gateway_id);
-            self.send_gateway_close(data.gateway_id, Some("gateway closed".to_string()))
-                .await?;
         }
-        Ok(())
-    }
-
-    /// The operator's `GatewayClose`: a half-close for a TCP connection (the origin still answers; see `reverse_gateway`), the end
-    /// of a UDP flow.
-    async fn handle_gateway_close(&mut self, close: GatewayClosePayload) -> Result<()> {
-        if let Some(connection) = self.gateway_connections.get(&close.gateway_id) {
-            connection.close(close.reason).await;
-            if connection.is_finished() {
-                self.gateway_connections.remove(&close.gateway_id);
-            }
-        }
-        Ok(())
-    }
-
-    /// Is `gateway_id` held by a connection that is still running? (One that has ended by itself is forgotten here.)
-    fn gateway_id_in_use(&mut self, gateway_id: u32) -> bool {
-        if self
-            .gateway_connections
-            .get(&gateway_id)
-            .is_some_and(ReverseGatewayConnection::is_finished)
-        {
-            self.gateway_connections.remove(&gateway_id);
-        }
-        self.gateway_connections.contains_key(&gateway_id)
-    }
-
-    async fn handle_listen_request(&self, request: ListenRequestPayload) -> Result<()> {
-        self.client()?
-            .send_fire_and_forget(Envelope {
+        let fail = match &envelope.payload {
+            Payload::OpenTcp(p) => Some(self.gateway_fail(p.gateway_id)),
+            Payload::OpenUdp(p) => Some(self.gateway_fail(p.gateway_id)),
+            Payload::ResolveDns(p) => Some(self.gateway_fail(p.gateway_id)),
+            Payload::ListenRequest(p) => Some(Envelope {
                 msg_type: MsgType::ListenFail,
                 payload: Payload::ListenFail(ListenFailPayload {
-                    listener_id: request.listener_id,
-                    reason: "reverse host listeners are not implemented yet".to_string(),
+                    listener_id: p.listener_id,
+                    reason: "the gateway is not enabled on this reverse host".to_string(),
                 }),
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
-        Ok(())
-    }
-
-    async fn handle_inbound_accept(&self, accept: InboundAcceptPayload) -> Result<()> {
-        debug!(
-            channel_id = accept.channel_id,
-            "ignoring inbound accept for unsupported reverse listener"
-        );
-        Ok(())
-    }
-
-    async fn handle_inbound_reject(&self, reject: InboundRejectPayload) -> Result<()> {
-        debug!(
-            channel_id = reject.channel_id,
-            "ignoring inbound reject for unsupported reverse listener"
-        );
-        Ok(())
-    }
-
-    async fn close_gateway_connection(&mut self, gateway_id: u32) {
-        if let Some(connection) = self.gateway_connections.remove(&gateway_id) {
-            connection.abort();
+            }),
+            _ => None,
+        };
+        if let Some(fail) = fail {
+            self.client()?
+                .send_fire_and_forget(fail)
+                .await
+                .map_err(|err| anyhow::anyhow!("{err}"))?;
         }
-    }
-
-    async fn send_gateway_fail(&self, gateway_id: u32, code: u32, message: &str) -> Result<()> {
-        self.client()?
-            .send_fire_and_forget(Envelope {
-                msg_type: MsgType::GatewayFail,
-                payload: Payload::GatewayFail(GatewayFailPayload {
-                    gateway_id,
-                    code,
-                    message: message.to_string(),
-                }),
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(())
     }
 
-    async fn send_gateway_close(&self, gateway_id: u32, reason: Option<String>) -> Result<()> {
-        self.client()?
-            .send_fire_and_forget(Envelope {
-                msg_type: MsgType::GatewayClose,
-                payload: Payload::GatewayClose(GatewayClosePayload { gateway_id, reason }),
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
-        Ok(())
+    fn gateway_fail(&self, gateway_id: u32) -> Envelope {
+        Envelope {
+            msg_type: MsgType::GatewayFail,
+            payload: Payload::GatewayFail(GatewayFailPayload {
+                gateway_id,
+                // GATEWAY_DISABLED
+                code: 5,
+                message: "the gateway is not enabled on this reverse host".to_string(),
+            }),
+        }
     }
 
     async fn send_open_fail(&self, reason: &str) -> Result<()> {
@@ -1715,10 +1566,7 @@ impl ReverseHostRuntime {
         for channel_id in channel_ids {
             self.drop_session(channel_id).await;
         }
-        let gateway_ids: Vec<u32> = self.gateway_connections.keys().copied().collect();
-        for gateway_id in gateway_ids {
-            self.close_gateway_connection(gateway_id).await;
-        }
+        self.gateway = None;
     }
 
     async fn notify_status(&self, event: ReverseHostStatusEvent) {
@@ -1734,9 +1582,9 @@ impl ReverseHostRuntime {
             && self.pending_proof.is_none()
             && self.sessions.is_empty()
             && self
-                .gateway_connections
-                .values()
-                .all(ReverseGatewayConnection::is_finished)
+                .gateway
+                .as_ref()
+                .is_none_or(|g| g.open_connections() == 0)
     }
 
     async fn emit_session_count(&self) {
@@ -2477,22 +2325,10 @@ fn try_parse_download_header(buf: &[u8]) -> Result<Option<(PathBuf, usize)>> {
     Ok(Some((PathBuf::from(path), 4 + path_len)))
 }
 
-impl GatewaySink for PeerLink {
+impl GatewayLink for PeerLink {
     async fn send(&self, envelope: Envelope) {
         let _ = self.send_fire_and_forget(envelope).await;
     }
-}
-
-fn filter_dns_addresses(addresses: impl Iterator<Item = IpAddr>, record_type: &str) -> Vec<String> {
-    let record_type = record_type.trim().to_ascii_uppercase();
-    addresses
-        .filter(|address| match record_type.as_str() {
-            "A" => address.is_ipv4(),
-            "AAAA" => address.is_ipv6(),
-            _ => true,
-        })
-        .map(|address| address.to_string())
-        .collect()
 }
 
 fn required_string_arg<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
@@ -2684,7 +2520,6 @@ fn default_shell() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, Mutex as StdMutex};
 
     use serde_json::json;
@@ -2692,9 +2527,9 @@ mod tests {
     use wsh_core::messages::{ChannelKind, ReverseConnectPayload};
 
     use super::{
-        append_replay, command_spec, filter_dns_addresses, same_reverse_request,
-        try_parse_download_header, try_parse_upload_header, LocalMcpBridge, LocalPty,
-        ReverseHostFileSession, ReverseHostOptions, ReverseHostPtySession, RuntimeEvent,
+        append_replay, command_spec, same_reverse_request, try_parse_download_header,
+        try_parse_upload_header, LocalMcpBridge, LocalPty, ReverseHostFileSession,
+        ReverseHostOptions, ReverseHostPtySession, RuntimeEvent,
     };
 
     #[test]
@@ -2879,21 +2714,5 @@ mod tests {
             })
             .await;
         assert_eq!(result.call_id, None);
-    }
-
-    #[test]
-    fn dns_filter_respects_record_type() {
-        let addresses = vec![
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ];
-        assert_eq!(
-            filter_dns_addresses(addresses.clone().into_iter(), "A"),
-            vec!["127.0.0.1"]
-        );
-        assert_eq!(
-            filter_dns_addresses(addresses.into_iter(), "AAAA"),
-            vec!["::1"]
-        );
     }
 }

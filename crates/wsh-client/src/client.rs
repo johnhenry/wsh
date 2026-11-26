@@ -2665,7 +2665,13 @@ impl WshClient {
                         return;
                     }
                     match decode_envelope(&p.inner) {
-                        Ok(inner) if is_relay_forwardable(inner.msg_type) => {
+                        // The gateway's requests (wsh #289) are heard only by a client that takes relay messages (a reverse host,
+                        // which hears them only if its owner turned its gateway on): nobody else is sent one by an honest relay.
+                        Ok(inner)
+                            if is_relay_forwardable(inner.msg_type)
+                                || (relay_message_tx.is_some()
+                                    && is_relay_gateway_forwardable(inner.msg_type)) =>
+                        {
                             // A sealed bridge (#117, #145): `from_fingerprint` is whatever the relay stamped, so
                             // plain traffic proves nothing -- only frames of the bridge (and, while it is being
                             // set up, its key exchange) are heard.
@@ -2699,6 +2705,17 @@ impl WshClient {
                                     }
                                     return;
                                 }
+                            }
+                            // A request of the gateway has no handler in this client: it goes to the host's own.
+                            if is_relay_gateway_forwardable(inner.msg_type)
+                                && !is_relay_forwardable(inner.msg_type)
+                            {
+                                if let Some(tx) = relay_message_tx {
+                                    if let Err(err) = tx.send(inner).await {
+                                        tracing::debug!("relay message channel closed: {err}");
+                                    }
+                                }
+                                return;
                             }
                             Self::handle_incoming(
                                 inner,

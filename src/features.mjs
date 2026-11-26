@@ -35,6 +35,15 @@ export const EXEC_PIPES_FEATURE = 'exec-pipes';
 export const TARGETS_FEATURE = 'targets';
 
 /**
+ * Relay and reverse-host feature (#289): the gateway's requests (`OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their
+ * answers: the spec's `relay.gateway_forwardable`) cross a relay bridge. A relay lists it in `ServerHello.features`; a reverse host
+ * whose owner turned its gateway on lists it in `ReverseAccept.features`. The relay carries those messages only for a bridge whose
+ * peer stated it, and an operator sends them only when the relay AND the host did. It implies `gateway-credit`: every connection
+ * opened this way is metered, whether or not the operator listed that feature.
+ */
+export const RELAY_GATEWAY_FEATURE = 'relay-gateway';
+
+/**
  * Host feature (#155): this host seals the whole session end to end when asked (a signed `KeyExchange` for the
  * connection's session id, then every message but the keepalive as an `EncryptedFrame` on channel 0).
  */
