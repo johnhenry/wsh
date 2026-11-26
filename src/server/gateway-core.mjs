@@ -7,7 +7,7 @@
  */
 
 import { MSG, gatewayOk, gatewayFail, gatewayClose, gatewayData, gatewayCredit, listenFail } from '../messages.gen.mjs';
-import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, DEFAULT_HALF_CLOSE_IDLE_MS, assertHalfCloseIdleMs } from '../gateway-channel.mjs';
+import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, DEFAULT_HALF_CLOSE_IDLE_MS, assertHalfCloseIdleMs, assertHalfCloseProbeMs } from '../gateway-channel.mjs';
 
 import { GATEWAY_FAIL } from '../gateway-errors.mjs';
 
@@ -29,7 +29,10 @@ export function normalizeGatewayLimits(opts) {
   if (!Number.isInteger(maxBufferedBytes) || maxBufferedBytes < GATEWAY_CREDIT_WINDOW) throw new TypeError(`gateway.maxBufferedBytes must be an integer of at least ${GATEWAY_CREDIT_WINDOW}`);
   if (!Number.isInteger(maxClientBufferedBytes) || maxClientBufferedBytes < maxBufferedBytes) throw new TypeError('gateway.maxClientBufferedBytes must be an integer of at least maxBufferedBytes');
   const halfCloseIdleMs = assertHalfCloseIdleMs(opts.halfCloseIdleMs, 'gateway.halfCloseIdleMs');
-  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs };
+  // How often a socket of this host (an origin, a listener's accepted connection) whose peer half-closed is checked for a peer
+  // that went away (#282). Only sockets use it; a host with none (the memory host) validates and ignores it.
+  const halfCloseProbeMs = assertHalfCloseProbeMs(opts.halfCloseProbeMs, 'gateway.halfCloseProbeMs');
+  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs };
 }
 
 /** `{ name: handler | { open, authorize } }` -> a Map, or null when there are none. */

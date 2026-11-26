@@ -2232,7 +2232,34 @@ export interface WshForwardEndpointOptions {
   replace?: boolean;
   /** Connections open at once; one more is closed and reported to `onError`. Default 128 (the CLI's). */
   maxConnections?: number;
-  /** Called for a connection that could not be served (no such endpoint, refused, over the bound), with the reason. The listener stays up. */
+  /** How often a local connection whose program has half-closed (sent its end of file) is checked for the program having gone away; see {@link WshForwardOptions.halfCloseProbeMs}. */
+  halfCloseProbeMs?: number;
+  /**
+   * Called for a connection that could not be served (no such endpoint, refused, over the bound), with the reason. The listener stays up.
+   * Also called, with `error.code === 'WSH_LOCAL_PEER_GONE'`, when a local program half-closed and then went away (killed, crashed)
+   * and the connection was ended because of it: informational, not a failure of the forward.
+   */
+  onError?: (err: Error) => void;
+}
+
+/** Options for `forwardUnix` (Node only); `forwardEndpoint` takes the same, with `endpoint` instead of `remote`. */
+export interface WshForwardOptions {
+  local: string;
+  remote: string;
+  reverse?: boolean;
+  replace?: boolean;
+  maxConnections?: number;
+  /**
+   * A local program that connected, half-closed (sent its end of file, still reading) and was then killed gives Node no event; the
+   * kernel reports it to a writer only. While (and only while) a local connection is half-closed the forward writes ZERO bytes to
+   * it every this many milliseconds: a live program is not touched (no byte, no wake-up), a dead one fails the write, and the
+   * connection is ended as a destroyed one (the host is sent `GatewayClose` with the reason `discarded`) and reported to `onError`
+   * with `code` `'WSH_LOCAL_PEER_GONE'`. A TCP socket is also given keep-alive on this schedule (rounded up to whole seconds,
+   * three probes): a TCP program that exited with nothing unread is noticed when ITS kernel drops the socket (about a minute by
+   * default), one killed with data unread at once. Default 2000; `0` turns it off. A whole number of milliseconds from 0 to
+   * 2147483647, else a `TypeError`.
+   */
+  halfCloseProbeMs?: number;
   onError?: (err: Error) => void;
 }
 
@@ -2245,7 +2272,7 @@ export interface WshForwardHandle {
   address?: { address: string; family: string; port: number } | string | null;
   /** Set when a bound on concurrent connections applies. */
   maxConnections?: number;
-  /** Local connections open now (what `maxConnections` counts); absent on a reverse forward. */
+  /** Local connections open now (what `maxConnections` counts; for a reverse forward, the host's callers being served by the local service). */
   readonly connections?: number;
   /** Stop listening, end every live connection and remove the socket file this forward created. Safe to call twice. */
   close(): Promise<void>;
@@ -2482,7 +2509,7 @@ export class WshClient {
    * `endpoint=NAME` (the CLI's spelling), a named endpoint of the host: see `forwardEndpoint`. `maxConnections` bounds the
    * connections open at once (default 128 for a named endpoint, unbounded otherwise).
    */
-  forwardUnix(opts: { local: string; remote: string; reverse?: boolean; replace?: boolean; maxConnections?: number; onError?: (err: Error) => void }): Promise<WshForwardHandle>;
+  forwardUnix(opts: WshForwardOptions): Promise<WshForwardHandle>;
   /**
    * Node only: listen on a local unix socket or TCP port and join every connection to the host's NAMED endpoint; the
    * JavaScript equivalent of the CLI's `wsh -L /tmp/d.sock:endpoint=NAME` (needs the host feature `gateway-endpoints`).

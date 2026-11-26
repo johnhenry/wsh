@@ -6,6 +6,8 @@
 import net from 'node:net';
 import fsp from 'node:fs/promises';
 import { listenUnixSocket, removeIfIdentity } from './unix-listen.mjs';
+import { watchHalfClosed } from './half-close-watch.mjs';
+import { assertHalfCloseProbeMs } from './gateway-channel.mjs';
 
 /** A named endpoint: the CLI's rule (`valid_endpoint_name`): letters, digits, ".", "_", "-", starting with a letter or digit, at most 64. */
 export const ENDPOINT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -45,10 +47,14 @@ function drained(sock) {
  * `allowHalfOpen: true`: a local EOF closes only the write side towards the host (the answer still comes back), and the
  * host ending its side ends the local write side. A socket error (EPIPE or a reset when the local peer closed first) is
  * the end of that connection, not a failure of the forward.
+ *
+ * A local peer that half-closed and then went away (killed, crashed) is noticed by `watchHalfClosed` (#282): the socket is
+ * destroyed, which sends the host a second GatewayClose "discarded" (below), and `onGone` hears of it.
  */
-function pipe(sock, duplex) {
+function pipe(sock, duplex, { probeMs, onGone } = {}) {
   const writer = duplex.writable.getWriter();
   const reader = duplex.readable.getReader();
+  watchHalfClosed(sock, probeMs, onGone);
   sock.on('data', (d) => {
     sock.pause();
     writer.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => sock.destroy());
@@ -111,11 +117,12 @@ export async function forwardEndpoint(client, opts = {}) {
 
 /**
  * @param {import('./client.mjs').WshClient} client
- * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, maxConnections?: number, onError?: (err: Error) => void }} opts
+ * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, maxConnections?: number, halfCloseProbeMs?: number, onError?: (err: Error) => void }} opts
  */
-export async function forward(client, { local, remote, reverse = false, replace = false, maxConnections, onError = () => {} } = {}) {
+export async function forward(client, { local, remote, reverse = false, replace = false, maxConnections, halfCloseProbeMs, onError = () => {} } = {}) {
   const l = parseEndpoint(local);
   const r = parseEndpoint(remote);
+  const probeMs = assertHalfCloseProbeMs(halfCloseProbeMs, 'forwardUnix: halfCloseProbeMs');
   if (l.kind === 'endpoint') throw new TypeError('forwardUnix: the local end cannot be a named endpoint (a host offers those; it is the remote end)');
   if (maxConnections !== undefined && !(Number.isInteger(maxConnections) && maxConnections > 0)) throw new TypeError('forwardUnix: maxConnections must be a positive integer');
   // A bound on concurrent connections: the CLI's 128 for a named endpoint; the other forwards stay unbounded unless asked.
@@ -126,19 +133,27 @@ export async function forward(client, { local, remote, reverse = false, replace 
   if (reverse) {
     if (r.kind === 'endpoint') throw new TypeError('forwardUnix: a named endpoint is something a host offers; the host cannot listen on one');
     if (r.kind !== 'unix') throw new TypeError('forwardUnix: with reverse: true the remote end must be a socket path (the host listens on it)');
+    const rconns = new Set();
     const handle = await client.listenUnix(r.path, {
       replace,
       onConnection: (duplex) => {
         const sock = l.kind === 'unix' ? net.connect({ path: l.path, allowHalfOpen: true }) : net.connect({ host: l.host, port: l.port, allowHalfOpen: true });
+        rconns.add(sock);
+        sock.once('close', () => { rconns.delete(sock); });
         sock.pause();
-        sock.once('connect', () => { pipe(sock, duplex); sock.resume(); });
+        sock.once('connect', () => { pipe(sock, duplex, { probeMs, onGone: report }); sock.resume(); });
         // Only a failure to reach the local service is reported; a socket that ends later (EPIPE, a reset) is just the end of that connection.
         const failed = (e) => { sock.off('connect', failed); duplex.destroy(); report(e); };
         sock.once('error', failed);
         sock.once('connect', () => sock.off('error', failed));
       },
     });
-    return { local, remote, close: () => handle.close() };
+    return {
+      local, remote,
+      /** Connections open now (the host's callers that are being served by the local service). */
+      get connections() { return rconns.size; },
+      close: () => handle.close(),
+    };
   }
 
   if (r.kind === 'endpoint' && !client.hasFeature('gateway-endpoints')) {
@@ -155,7 +170,7 @@ export async function forward(client, { local, remote, reverse = false, replace 
     let duplex;
     try { duplex = await open(); } catch (e) { sock.destroy(); report(e); return; }
     if (sock.destroyed) { duplex.destroy(); return; }
-    pipe(sock, duplex);
+    pipe(sock, duplex, { probeMs, onGone: report });
     sock.resume();
   });
   server.on('error', report);

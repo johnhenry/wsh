@@ -43,6 +43,8 @@ import { MSG, gatewayOk, dnsResult, listenOk, listenFail, inboundOpen } from '..
 import {
   GATEWAY_FAIL, gatewayFeatures, createGatewayCore, normalizeGatewayLimits, normalizeEndpoints,
 } from './gateway-core.mjs';
+import { DEFAULT_HALF_CLOSE_PROBE_MS } from '../gateway-channel.mjs';
+import { watchHalfClosed } from '../half-close-watch.mjs';
 import { parseCidr, parseIp } from './address-guard.mjs';
 import { checkAddress, resolveChecked, dialChecked, dialUdpChecked, AddressGuardError } from '../address-guard.mjs';
 import { normalizeReverse, reversePortAllowed, reversePortRefusal, reverseBindAddress } from './reverse-policy.mjs';
@@ -229,7 +231,7 @@ export function normalizeGateway(opts) {
     if (!c) throw new TypeError(`gateway.allowPrivate: ${JSON.stringify(r)} is not an address or CIDR block`);
     return c;
   });
-  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs } = normalizeGatewayLimits(opts);
+  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs } = normalizeGatewayLimits(opts);
   let unix = null;
   if (opts.unix !== undefined && opts.unix !== null && opts.unix !== false) {
     if (opts.unix === true || typeof opts.unix !== 'object') throw new TypeError('gateway.unix needs explicit paths (default deny): { connect: [...], listen: [...] }');
@@ -244,6 +246,7 @@ export function normalizeGateway(opts) {
     maxBufferedBytes,
     maxClientBufferedBytes,
     halfCloseIdleMs,
+    halfCloseProbeMs,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     udpIdleMs: opts.udpIdleMs ?? DEFAULT_UDP_IDLE_MS,
     udp: normalizeUdp(opts.udp),
@@ -322,6 +325,9 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     const originEnded = () => { void tail.finally(() => channel.end()); };
     sock.on('end', originEnded);
     if (sock.readableEnded) originEnded(); // an accepted connection whose peer half-closed before it was taken
+    // An origin that finished sending and then went away is not noticed by the kernel until something is written to it (#282):
+    // while it is half-closed, probe it. Gone = destroyed, which is the 'close' below (a second GatewayClose "discarded").
+    watchHalfClosed(sock, cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS, (e) => log(`gateway ${id}: ${e.message}`));
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
     sock.on('close', () => { void tail.finally(() => channel.destroy()); });
