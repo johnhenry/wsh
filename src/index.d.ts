@@ -2214,6 +2214,35 @@ export interface WshGatewayOpenOptions {
   target?: string;
 }
 
+/** Options for `forwardEndpoint` (Node only). */
+export interface WshForwardEndpointOptions {
+  /** Where to listen: a socket path (`/tmp/d.sock`, `./d.sock`), `host:port`, or a bare port (loopback). Give an address (`0.0.0.0:8080`) to listen elsewhere. */
+  local: string;
+  /** The host's endpoint name: letters, digits, `.`, `_`, `-`, at most 64 (the CLI's rule). */
+  endpoint: string;
+  /** Replace a STALE socket at `local` (never a live one, never another kind of file). Default: an existing path is refused. */
+  replace?: boolean;
+  /** Connections open at once; one more is closed and reported to `onError`. Default 128 (the CLI's). */
+  maxConnections?: number;
+  /** Called for a connection that could not be served (no such endpoint, refused, over the bound), with the reason. The listener stays up. */
+  onError?: (err: Error) => void;
+}
+
+/** What the Node forwards (`forwardUnix`, `forwardEndpoint`) return. */
+export interface WshForwardHandle {
+  local: string;
+  /** What the other end is: the `remote` given, or `endpoint=NAME`. */
+  remote: string;
+  /** Where it listens (not for a reverse forward). */
+  address?: { address: string; family: string; port: number } | string | null;
+  /** Set when a bound on concurrent connections applies. */
+  maxConnections?: number;
+  /** Local connections open now (what `maxConnections` counts); absent on a reverse forward. */
+  readonly connections?: number;
+  /** Stop listening, end every live connection and remove the socket file this forward created. Safe to call twice. */
+  close(): Promise<void>;
+}
+
 /** One execution target a host shows this key (`ListTargets` / `TargetList`, #121). */
 export interface WshTargetInfo {
   /** What to pass as `target`. */
@@ -2441,9 +2470,18 @@ export class WshClient {
   /**
    * Node only: forward between a local endpoint and a remote one (`ssh -L` / `-R` with unix sockets and TCP ports mixed).
    * Each of `local` and `remote` is a socket path (starts with `/`, `./` or `@`) or `host:port`. With `reverse: true` the
-   * HOST listens on `remote` (a unix path) and connections are made to `local` from here.
+   * HOST listens on `remote` (a unix path) and connections are made to `local` from here. `remote` may also be
+   * `endpoint=NAME` (the CLI's spelling), a named endpoint of the host: see `forwardEndpoint`. `maxConnections` bounds the
+   * connections open at once (default 128 for a named endpoint, unbounded otherwise).
    */
-  forwardUnix(opts: { local: string; remote: string; reverse?: boolean; replace?: boolean; onError?: (err: Error) => void }): Promise<{ local: string; remote: string; address?: { address: string; family: string; port: number } | string | null; close(): Promise<void> }>;
+  forwardUnix(opts: { local: string; remote: string; reverse?: boolean; replace?: boolean; maxConnections?: number; onError?: (err: Error) => void }): Promise<WshForwardHandle>;
+  /**
+   * Node only: listen on a local unix socket or TCP port and join every connection to the host's NAMED endpoint; the
+   * JavaScript equivalent of the CLI's `wsh -L /tmp/d.sock:endpoint=NAME` (needs the host feature `gateway-endpoints`).
+   * A missing or refused endpoint closes that one connection and reports the reason to `onError`; the listener stays up.
+   * Half-close and backpressure work in both directions; a client that closes first is not an error.
+   */
+  forwardEndpoint(opts: WshForwardEndpointOptions): Promise<WshForwardHandle & { endpoint: string }>;
 
   /**
    * Open a typed (object-mode) RPC channel (wsh #85): JSON-RPC 2.0 over a CBOR sequence on one stream. Sugar over

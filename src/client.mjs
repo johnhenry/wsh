@@ -1773,7 +1773,8 @@ export class WshClient {
    *   - `{ local: '/tmp/x.sock', remote: 'db.internal:5432' }` the host's TCP egress, from a local socket.
    *   - `{ reverse: true, remote: '/run/app.sock', local: '127.0.0.1:8080' }` the HOST listens on `remote` (a unix path) and
    *     connections are made to `local` from here (`-R`).
-   * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, onError?: (err: Error) => void }} opts
+   *   - `{ local: '/tmp/d.sock', remote: 'endpoint=docker' }` a named endpoint of the host (see `forwardEndpoint`).
+   * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, maxConnections?: number, onError?: (err: Error) => void }} opts
    * @returns {Promise<{ local: string, remote: string, address?: object, close(): Promise<void> }>}
    */
   async forwardUnix(opts) {
@@ -1783,6 +1784,26 @@ export class WshClient {
     let mod;
     try { mod = await import(specifier); } catch (e) { throw new Error(`forwardUnix needs Node (${e?.message ?? e})`); }
     return mod.forward(this, opts);
+  }
+
+  /**
+   * Node only: listen on a local unix socket or TCP port and join every connection to the host's NAMED endpoint, the
+   * JavaScript equivalent of the CLI's `wsh -L /tmp/d.sock:endpoint=NAME`. Same semantics as the CLI:
+   *   - a connection whose endpoint does not exist or refuses this caller is closed and the reason goes to `onError`; the listener stays up;
+   *   - an end on either side is passed on as a half-close, and backpressure applies both ways;
+   *   - a local unix socket is created owner-only and removed on `close()`; an existing path is refused unless `replace: true`
+   *     and the path is a STALE socket (never a live one, never another kind of file);
+   *   - a local TCP port binds loopback unless the address is given (`'0.0.0.0:8080'`);
+   *   - at most `maxConnections` (default 128) at once; `close()` ends the listener and every live connection.
+   * @param {{ local: string, endpoint: string, replace?: boolean, maxConnections?: number, onError?: (err: Error) => void }} opts
+   *   `local`: a socket path (`/tmp/d.sock`, `./d.sock`) or `host:port` / a bare port. `endpoint`: the host's endpoint name.
+   * @returns {Promise<{ local: string, remote: string, endpoint: string, maxConnections: number, address?: object, close(): Promise<void> }>}
+   */
+  async forwardEndpoint(opts) {
+    const specifier = './forward-node.mjs'; // a variable on purpose: see forwardUnix
+    let mod;
+    try { mod = await import(specifier); } catch (e) { throw new Error(`forwardEndpoint needs Node (${e?.message ?? e})`); }
+    return mod.forwardEndpoint(this, opts);
   }
 
   /**
