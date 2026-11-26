@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.59.0 / Rust `rust-v0.23.0`
+
 ### A local peer that half-closed and then went away is noticed by itself (#282; npm and Rust)
 
 - **What was wrong.** 0.58.1 made a side that had finished sending and then discarded its connection tell the peer (a second `GatewayClose` with the reason `discarded`), but a local program that connected through a forward (`-L`, `forwardUnix`, `forwardEndpoint`), half-closed (its FIN, still reading) and was then killed produced no event: the kernel reports a vanished peer to a writer only. With a far side that stays quiet (an endpoint stream that is silent for hours) and `halfCloseIdleMs: 0`, the host held the connection, its slot and whatever the endpoint had attached to it until the far side next sent. The same held on a host for the caller of one of its reverse listeners that half-closed and went away.
