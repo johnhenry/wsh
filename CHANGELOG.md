@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.58.1 / Rust `rust-v0.22.1`
 
 ### A side that already half-closed and then loses its reader tells the peer (#279; npm and Rust)
 
