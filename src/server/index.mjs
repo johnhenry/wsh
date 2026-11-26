@@ -156,6 +156,7 @@ export function createWshServer({
   if (relay && relay.maxOperatorsPerPeer !== undefined && (!Number.isSafeInteger(relay.maxOperatorsPerPeer) || relay.maxOperatorsPerPeer < 1)) {
     throw new TypeError('createWshServer: relay.maxOperatorsPerPeer must be a positive integer');
   }
+  if (relay && relay.carryGateway !== undefined && typeof relay.carryGateway !== 'boolean') throw new TypeError('createWshServer: relay.carryGateway must be a boolean');
   const rpcHost = rpc ? createRpcHost(rpc, { files, maxMessageBytes: rpcMaxMessageBytes, maxInflight: rpcMaxInflight }) : null;
   let host_ = null;
   let registry = null;

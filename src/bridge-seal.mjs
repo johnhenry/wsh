@@ -14,7 +14,7 @@
 
 import { sealFrame, openFrame, ROLE_TAGS } from './e2e-frame.mjs';
 import { cborEncode, cborDecode } from './cbor.mjs';
-import { encryptedFrame, MSG, isRelayForwardable } from './messages.gen.mjs';
+import { encryptedFrame, MSG, isRelayForwardable, isRelayGatewayForwardable } from './messages.gen.mjs';
 
 /** `EncryptedFrame.channel_id` of a bridge-level frame. */
 export const BRIDGE_CHANNEL_ID = 0;
@@ -73,7 +73,9 @@ export class SealedBridge {
       const plain = await openFrame(this.#key, this.#sessionId, this.#recvCounter, { nonce: frame.nonce, ciphertext: frame.ciphertext, expectedRoleTag: this.#recvTag });
       this.#recvCounter += 1;
       const inner = cborDecode(plain);
-      if (!inner || typeof inner.type !== 'number' || inner.type === MSG.RELAY_FORWARD || (this.#scope === 'bridge' && !isRelayForwardable(inner.type))) throw new Error('sealed message of a type that may not cross a bridge');
+      // What a bridge carries: the relay forwardable list and, where `relay-gateway` is in force, the gateway's requests (#289).
+      // Whether it IS in force is for the receiver to decide; a peer that did not state it has no handler for them.
+      if (!inner || typeof inner.type !== 'number' || inner.type === MSG.RELAY_FORWARD || (this.#scope === 'bridge' && !isRelayForwardable(inner.type) && !isRelayGatewayForwardable(inner.type))) throw new Error('sealed message of a type that may not cross a bridge');
       return inner;
     });
     this.#inChain = run.catch(() => {});

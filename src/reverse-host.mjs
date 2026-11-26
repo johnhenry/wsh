@@ -18,6 +18,8 @@ import { WshClient } from './client.mjs';
 import { exportPublicKeyRaw, fingerprint } from './auth.mjs';
 import { MSG, reverseAccept, reverseReject, reverseChallenge } from './messages.gen.mjs';
 import { MULTI_OPERATOR_FEATURE } from './server/relay.mjs';
+import { RELAY_GATEWAY_FEATURE } from './features.mjs';
+import { grantPermissions } from './key-options.mjs';
 import { E2E_SIGN_FEATURE, E2EResponder } from './e2e-exchange.mjs';
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyOperatorProof } from './operator-proof.mjs';
 import { SealedBridge, BRIDGE_CHANNEL_ID } from './bridge-seal.mjs';
@@ -85,6 +87,9 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost(options = {}) {
+  if (options.gateway !== undefined && options.gateway !== null && options.gateway !== false) {
+    throw new TypeError('createReverseHost: gateway dials sockets, so it needs createReverseHost from @johnhenry/wsh/server (this one is browser-safe)');
+  }
   const rpc = options.rpc === undefined || options.rpc === null ? null
     : createRpcTable(options.rpc, options.rpcMaxMessageBytes ?? RPC_DEFAULT_MAX_MESSAGE, options.rpcMaxInflight ?? 64, 'createReverseHost');
   return createReverseHostWith(options, { ...resolveBackends(options), rpc });
@@ -119,7 +124,8 @@ export function createReverseHostWith({
   if (e2e !== false && e2e.sign !== undefined && e2e.sign !== 'auto' && typeof e2e.sign !== 'boolean') throw new TypeError("createReverseHost: e2e.sign must be true, false or 'auto'");
   const e2eSign = e2e === false ? false : (e2e.sign ?? 'auto');
 
-  const expose = { shell: !!backends.pty, exec: !!backends.execRunner, fs: !!backends.files, tools: !!backends.mcp };
+  if (backends.gateway && !reportFeatures) throw new TypeError('createReverseHost: gateway needs reportFeatures (the operator learns "relay-gateway" and the gateway features from ReverseAccept.features)');
+  const expose = { shell: !!backends.pty, exec: !!backends.execRunner, fs: !!backends.files, tools: !!backends.mcp, gateway: !!backends.gateway };
   const capabilities = Object.entries(expose).filter(([, on]) => on).map(([k]) => k);
   const shellBackend = backends.pty ? 'pty' : 'exec-only';
   // What this host can do over a bridge, for the operator's feature gates (`ReverseAccept.features`).
@@ -130,14 +136,19 @@ export function createReverseHostWith({
     hybrid: e2e.hybrid !== false,
   });
   /** Features for `ReverseAccept` on this relay connection. */
+  // The gateway (#289) is served, and stated, only on a relay that lists `relay-gateway`: any other would answer the requests itself.
+  const gatewayOn = (c) => !!backends.gateway && c.hasFeature(RELAY_GATEWAY_FEATURE);
   const bridgeFeatures = (c, e2eConfig, manyOperators) => [
-    ...hostFeatures({ mcp: backends.mcp, files: backends.files, e2e: e2eConfig, onShare, rpc: backends.rpc ?? null }, { dataStreams: false }),
+    ...hostFeatures({ mcp: backends.mcp, files: backends.files, e2e: e2eConfig, onShare, rpc: backends.rpc ?? null, gateway: gatewayOn(c) ? backends.gateway.cfg : null }, { dataStreams: false }),
+    ...(gatewayOn(c) ? [RELAY_GATEWAY_FEATURE] : []),
     ...(manyOperators ? [MULTI_OPERATOR_FEATURE] : []),
   ];
   const factory = createConnectionFactory({
     authorize: async () => false, methods: { pubkey: false, password: null }, hostKey: null, rateLimit: null,
     execRunner: backends.execRunner, execOptions: backends.execOptions, pty: backends.pty, files: backends.files, mcp: backends.mcp, rpc: backends.rpc ?? null,
-    sessions: null, relay: null, e2e: null, bindTimeoutMs: 3000, log: (l) => onLog(`[reverse] ${l}`), onShare,
+    sessions: null, relay: null, e2e: null, bindTimeoutMs: 3000, log: (l) => onLog(`[reverse] ${l}`), onShare, onRefused,
+    // #289: the gateway is the host's own policy (`gateway`); an operator uses it only with a granted capability, every connection is metered.
+    gateway: backends.gateway?.cfg ?? null, createGatewaySession: backends.gateway?.createGatewaySession, gatewayNeedsGrant: true, gatewayCredit: true,
   });
 
   let client = null;
@@ -207,11 +218,22 @@ export function createReverseHostWith({
           if (proven.username !== String(req.username ?? '')) { await refuse('operator proof names another username than the relay asserted', 'proof-failed'); return; }
         }
         const who = { fingerprint: from, username: String(req.username ?? ''), proven: !!proven, ...(proven ? { publicKey: proven.publicKey } : {}) };
-        try { ok = (await accept?.(who)) === true; } catch (e) { onLog(`[reverse] accept threw: ${e.message}`); }
+        // `true`, or `{ capabilities, expires? }` (#289: the same grant `authorize()` may return; it narrows what this operator may do, and
+        // is what lets it use the gateway). Anything else is a refusal.
+        let grant = null;
+        try {
+          const verdict = await accept?.(who);
+          if (verdict === true) ok = true;
+          else if (verdict && typeof verdict === 'object' && !Array.isArray(verdict) && verdict.capabilities !== undefined) {
+            // A grant NAMES what the operator may do: an object without `capabilities` is no grant (it would otherwise mean "everything"), so it refuses, as an object always did.
+            const g = grantPermissions({ capabilities: verdict.capabilities, ...(verdict.expires !== undefined ? { expires: verdict.expires } : {}) });
+            if (g.ok) { ok = true; grant = g.permissions; } else onLog(`[reverse] accept returned a grant that does not parse: ${g.reason}`);
+          }
+        } catch (e) { onLog(`[reverse] accept threw: ${e.message}`); }
         if (!ok) { await refuse('not accepted', 'unauthorized'); return; }
         if (bridges.size >= operatorLimit()) { await refuse('not accepted'); return; }
         c.trustRelayPeer(from);
-        const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge);
+        const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge, grant);
         bridges.set(from, bridge);
         onLog(`[reverse] bridged to ${from.slice(0, 12)}${proven ? ' (operator proven)' : ''}${requireOperatorProof ? ', sealed' : ''}`);
         await answer(reverseAccept({
@@ -251,7 +273,7 @@ export function createReverseHostWith({
      * The connection for one bridged operator. A proven operator may seal the bridge (a signed `KeyExchange` for the
      * challenge's session id); with `requireOperatorProof` it must, and until it has the host hears nothing else.
      */
-    function makeBridge(conn, from, operatorName, proven, challenge) {
+    function makeBridge(conn, from, operatorName, proven, challenge, grant = null) {
       const to = () => (manyOperators() ? { to: from } : undefined);
       let sealed = null;
       const mustSeal = requireOperatorProof;
@@ -262,7 +284,7 @@ export function createReverseHostWith({
           if (mustSeal) return undefined; // nothing may leave a bridge that is not sealed yet
           return conn.sendRelayControl(m, to());
         },
-        authenticated: { username: operatorName, fingerprint: from },
+        authenticated: { username: operatorName, fingerprint: from, grant },
         dataStreams: false,
         e2e: e2eFor(conn),
       });

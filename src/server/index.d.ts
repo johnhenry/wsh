@@ -234,6 +234,23 @@ export interface WshServerGatewayOptions {
   };
 }
 
+/**
+ * The gateway of a reverse host (#289): the options of `createWshServer({ gateway })` minus what a relay does not carry (`unix`, `endpoints`,
+ * `tcp`), with `udp`, `dns` and `reverse` each off unless given. `udp: true` or its bounds; `dns: true` turns on `ResolveDns`;
+ * `reverse` is the reverse-tunnel policy of `createWshServer` (`ListenRequest`).
+ */
+export interface WshReverseHostGateway extends Omit<WshServerGatewayOptions, 'unix' | 'endpoints' | 'tcp' | 'udp'> {
+  udp?: boolean | NonNullable<WshServerGatewayOptions['udp']>;
+  dns?: boolean;
+}
+
+/**
+ * What a reverse host's `accept` may answer: `true` (accepted, no capability list: the gateway is then refused), `false`, or
+ * `{ capabilities, expires? }`, a grant in the notation of `spec/capabilities.md` that narrows what the operator may do (and, for the
+ * gateway, allows it: `gateway:tcp:HOST:PORT`, `gateway:udp:HOST:PORT`, `gateway:listen:tcp:PORT`).
+ */
+export type WshReverseGrant = boolean | { capabilities: string | string[]; expires?: string | Date | number };
+
 export interface WshServerPtyOptions {
   /** `node-pty`'s `spawn(file, args, options)`, or anything shaped like it. */
   spawn(file: string, args: string[], options: {
@@ -351,6 +368,13 @@ export interface WshServerRelayOptions {
    * `RelayForward.to_fingerprint` and is sent a `ReverseClose` when one operator leaves instead of being closed).
    */
   maxOperatorsPerPeer?: number;
+  /**
+   * Carry the gateway's requests (`OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their answers) between an operator and a
+   * reverse host that turned its gateway on and said `relay-gateway` (default true). The relay lists `relay-gateway` in its
+   * `ServerHello.features` then. `false`: it does not, and carries none of them (a host that asks is told nothing, as on a relay that
+   * predates the feature). Whatever this says, the relay opens nothing on a host itself: the host's own policy decides.
+   */
+  carryGateway?: boolean;
   /** How long a `ReverseConnect` waits for its peer to answer before the operator is rejected (default 8000). */
   connectTimeoutMs?: number;
 }
@@ -736,11 +760,23 @@ export interface WshReverseHostOptions {
     proven: boolean;
     /** The operator's raw Ed25519 key, when `proven`. */
     publicKey?: Uint8Array;
-  }) => boolean | Promise<boolean>;
+  }) => WshReverseGrant | Promise<WshReverseGrant>;
   exec?: true | WshServerExecOptions | WshExecRunner;
   pty?: WshServerPtyOptions;
   fs?: WshServerFsOptions;
   mcp?: WshServerMcpOptions;
+  /**
+   * The gateway for an operator behind the relay (#289), OFF unless given: this host opens TCP connections, and when you turn them on
+   * UDP flows, name lookups and reverse tunnels, from ITS network for an operator the relay bridges to it. The host states
+   * `relay-gateway` (and `gateway`, `gateway-credit`) in `ReverseAccept.features` only then, and only on a relay that lists
+   * `relay-gateway`. The policy is that of `createWshServer({ gateway })` (`allow`, `allowPrivate`, `maxConnections`,
+   * `maxBufferedBytes`, `maxClientBufferedBytes`, `connectTimeoutMs`, `halfCloseIdleMs`, `halfCloseProbeMs`, `socks`, `udpIdleMs`), default deny:
+   * nothing is reachable that no `allow` rule names, and no loopback, private or otherwise non-public address unless a rule or `allowPrivate`
+   * names it. `udp`, `dns` (ResolveDns) and `reverse` (ListenRequest) are each OFF unless given. `unix`, `endpoints` and `tcp` are refused:
+   * the relay carries none of them. An operator uses the gateway only if `accept` granted it a capability list covering the request
+   * (`{ capabilities: ['gateway:tcp:db.example.com:5432'] }`); every connection is metered by `gateway-credit`.
+   */
+  gateway?: WshReverseHostGateway;
   /** Typed rpc channels (#191), as for `createWshServer` (the `wsh-host` and `wsh-fs` built-ins included), served to the bridged operator in virtual data mode and stated as `rpc-virtual` in `ReverseAccept.features` (so it needs `reportFeatures`). */
   rpc?: Record<string, true | WshServerFsOptions | WshRpcHandler | false | null | undefined>;
   rpcMaxMessageBytes?: number;

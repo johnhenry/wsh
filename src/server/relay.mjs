@@ -27,8 +27,9 @@
 
 import { cborEncode, cborDecode } from '../cbor.mjs';
 import { fingerprint as fingerprintOf, importPublicKeyRaw, verifyPeerRecord } from '../auth.mjs';
-import { MSG, isRelayForwardable, relayForward, reversePeers, reverseReject, reverseClose } from '../messages.gen.mjs';
+import { MSG, isRelayForwardable, isRelayGatewayForwardable, relayForward, reversePeers, reverseReject, reverseClose } from '../messages.gen.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
+import { RELAY_GATEWAY_FEATURE } from '../features.mjs';
 
 export const DEFAULT_MAX_PEERS = 1024;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 8000;
@@ -74,12 +75,17 @@ export class RelayHub {
   #peerOperators = new Map();
   /** peers that stated `relay-multi-operator` in their last ReverseAccept. @type {WeakSet<RelayHandle>} */
   #multiPeers = new WeakSet();
+  /** peers that stated `relay-gateway` in their last ReverseAccept: the gateway's requests cross THEIR bridges (and no other). @type {WeakSet<RelayHandle>} */
+  #gatewayPeers = new WeakSet();
   /** target handle -> { operator, timer } while a ReverseConnect awaits its answer */
   #pending = new Map();
   /** fingerprint -> the highest record seq ever accepted (survives disconnects, bounded). */
   #lastSeq = new Map();
 
-  constructor({ canRegister, canConnect, maxPeers = DEFAULT_MAX_PEERS, maxOperatorsPerPeer = 1, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, onUnreachable, log = () => {} } = {}) {
+  constructor({ canRegister, canConnect, maxPeers = DEFAULT_MAX_PEERS, maxOperatorsPerPeer = 1, connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS, onUnreachable, carryGateway = true, log = () => {} } = {}) {
+    if (typeof carryGateway !== 'boolean') throw new TypeError('createWshServer: relay.carryGateway must be a boolean');
+    /** Does this relay carry a reverse host's gateway requests (`relay-gateway`)? Only for a peer that asks, whatever this says. */
+    this.carryGateway = carryGateway;
     for (const [name, fn] of [['canRegister', canRegister], ['canConnect', canConnect], ['onUnreachable', onUnreachable]]) {
       if (fn !== undefined && typeof fn !== 'function') throw new TypeError(`createWshServer: relay.${name} must be a function`);
     }
@@ -279,6 +285,8 @@ export class RelayHub {
     if (msg.type === MSG.REVERSE_ACCEPT) {
       if (Array.isArray(answer.features) && answer.features.includes(MULTI_OPERATOR_FEATURE)) this.#multiPeers.add(peer);
       else this.#multiPeers.delete(peer);
+      if (Array.isArray(answer.features) && answer.features.includes(RELAY_GATEWAY_FEATURE)) this.#gatewayPeers.add(peer);
+      else this.#gatewayPeers.delete(peer);
       this.#operatorPeer.set(p.operator, peer);
       let ops = this.#peerOperators.get(peer);
       if (!ops) this.#peerOperators.set(peer, ops = new Map());
@@ -349,18 +357,22 @@ export class RelayHub {
     const partner = this.#recipient(handle, msg);
     if (partner === undefined) return false;
     if (partner === null) return true; // bridged, but the message could not be addressed: dropped (and logged)
+    // The gateway's requests cross only a bridge whose PEER stated `relay-gateway` (the peer is `handle` itself, or the operator's partner).
+    const peer = this.#operatorPeer.get(handle) ?? handle;
+    const carriesGateway = this.carryGateway && this.#gatewayPeers.has(peer);
+    const crosses = (type) => isRelayForwardable(type) || (carriesGateway && isRelayGatewayForwardable(type));
     let inner;
     if (msg.type === MSG.RELAY_FORWARD) {
       if (!(msg.inner instanceof Uint8Array) || msg.inner.byteLength > MAX_FORWARD_BYTES) { this.log('relay: dropped an oversized or malformed RelayForward'); return true; }
       let decoded;
       try { decoded = cborDecode(msg.inner); } catch { this.log('relay: dropped a RelayForward with an undecodable inner'); return true; }
-      if (!decoded || typeof decoded.type !== 'number' || !isRelayForwardable(decoded.type)) {
+      if (!decoded || typeof decoded.type !== 'number' || !crosses(decoded.type)) {
         this.log(`relay: dropped a RelayForward wrapping a non-forwardable type ${decoded?.type}`);
         return true;
       }
       inner = msg.inner;
     } else {
-      if (!isRelayForwardable(msg.type)) return false;
+      if (!crosses(msg.type)) return false;
       inner = cborEncode(msg);
     }
     partner.send(relayForward({ fromFingerprint: handle.fingerprint, inner }));
