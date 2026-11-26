@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.57.0 / Rust `rust-v0.22.0`
 
 ### A half-closed gateway connection stays open: what the far side sends after a half-close is no longer lost (#271; npm and Rust)
 
