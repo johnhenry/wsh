@@ -94,7 +94,7 @@ describe('classifyAddress and isPublicAddress: every class, IPv4 and IPv6', () =
   });
 });
 
-// The vectors the Rust wsh-server runs too (crates/wsh-server/src/gateway/address_class.rs): the two implementations agree address by address.
+// The vectors the Rust wsh-server runs too (crates/wsh-core/src/gateway/address_class.rs): the two implementations agree address by address.
 const VECTORS = JSON.parse(readFileSync(new URL('../spec/address-class.vectors.json', import.meta.url), 'utf8'));
 
 describe('spec/address-class.vectors.json: the vectors shared with the Rust server', () => {
