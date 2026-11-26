@@ -517,6 +517,7 @@ fn build_startup_unit_spec(
         transport,
         reconnect_delay_secs,
         &options.capabilities,
+        &crate::commands::common::identity_policy(),
     );
 
     let contents = match platform {
@@ -643,6 +644,7 @@ fn startup_command_arguments(
     transport: Option<&str>,
     reconnect_delay_secs: u64,
     capabilities: &[String],
+    policy: &crate::commands::common::IdentityPolicy,
 ) -> Vec<String> {
     let mut args = vec![
         exe.display().to_string(),
@@ -664,27 +666,51 @@ fn startup_command_arguments(
         args.push("--capability".to_string());
         args.push(capability.clone());
     }
-    // The gateway for an operator behind the relay (wsh #289) is the host's own decision, so the installed agent carries exactly
-    // what `install` was given; without these flags it serves none.
-    let policy = crate::commands::common::identity_policy();
+    // What narrows who may be served, how the relay and its certificate are checked, and what an operator may reach is the owner's
+    // decision at install time: the installed agent carries exactly what `install` was given (a flag dropped here would leave the unit
+    // running with a weaker rule than the one asked for). Deliberately NOT written: `--accept-new-host-key` (a first-use acceptance is
+    // for that run only) and `--insecure-skip-cert-verification` (development only).
+    for (on, flag) in [
+        (policy.require_host_key, "--require-host-key"),
+        (policy.require_channel_binding, "--require-channel-binding"),
+        (policy.require_operator_proof, "--require-operator-proof"),
+    ] {
+        if on {
+            args.push(flag.to_string());
+        }
+    }
+    for hash in &policy.cert_hashes {
+        args.push("--cert-hash".to_string());
+        args.push(hash.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    }
+    for operator in &policy.allow_operators {
+        args.push("--allow-operator".to_string());
+        args.push(operator.clone());
+    }
+    if policy.max_operators > 1 {
+        args.push("--max-operators".to_string());
+        args.push(policy.max_operators.to_string());
+    }
     for rule in &policy.relay_gateway_allow {
         args.push("--relay-gateway-allow".to_string());
         args.push(rule.clone());
     }
-    if !policy.relay_gateway_allow.is_empty() {
-        for (on, flag) in [
-            (policy.relay_gateway_udp, "--relay-gateway-udp"),
-            (policy.relay_gateway_dns, "--relay-gateway-dns"),
-            (policy.relay_gateway_listen, "--relay-gateway-listen"),
-        ] {
-            if on {
-                args.push(flag.to_string());
-            }
+    for (on, flag) in [
+        (policy.relay_gateway_udp, "--relay-gateway-udp"),
+        (policy.relay_gateway_dns, "--relay-gateway-dns"),
+        (policy.relay_gateway_listen, "--relay-gateway-listen"),
+        (
+            policy.relay_gateway_trust_relay,
+            "--relay-gateway-trust-relay",
+        ),
+    ] {
+        if on {
+            args.push(flag.to_string());
         }
-        if policy.relay_gateway_max_connections != 0 {
-            args.push("--relay-gateway-max-connections".to_string());
-            args.push(policy.relay_gateway_max_connections.to_string());
-        }
+    }
+    if policy.relay_gateway_max_connections != 0 {
+        args.push("--relay-gateway-max-connections".to_string());
+        args.push(policy.relay_gateway_max_connections.to_string());
     }
     args
 }
@@ -1038,6 +1064,91 @@ mod tests {
         assert_eq!(
             systemd_quote(r#"/tmp/with "quotes"\and spaces"#),
             "\"/tmp/with \\\"quotes\\\"\\\\and spaces\""
+        );
+    }
+
+    /// Every flag that narrows who a reverse host serves, how it checks the relay, or what an operator may reach is written into
+    /// the unit, and reads back as the very policy it was written from (a flag dropped here is a weaker agent than the one asked for).
+    #[test]
+    fn the_unit_carries_every_security_flag_and_they_read_back() {
+        use clap::Parser;
+        let policy = crate::commands::common::IdentityPolicy {
+            require_host_key: true,
+            require_channel_binding: true,
+            require_operator_proof: true,
+            cert_hashes: vec![[0xab; 32], [0x01; 32]],
+            allow_operators: vec!["0123456789abcdef".into(), "fedcba9876543210".into()],
+            max_operators: 1,
+            relay_gateway_allow: vec!["db.example.com:5432".into(), "10.0.0.0/8".into()],
+            relay_gateway_udp: true,
+            relay_gateway_dns: true,
+            relay_gateway_listen: true,
+            relay_gateway_trust_relay: true,
+            relay_gateway_max_connections: 7,
+            ..Default::default()
+        };
+        let args = super::startup_command_arguments(
+            Path::new("/usr/bin/wsh"),
+            "default",
+            "relay.example",
+            4422,
+            Some("ws"),
+            3,
+            &["gateway".to_string(), "exec".to_string()],
+            &policy,
+        );
+        let cli = crate::Cli::try_parse_from(&args).expect("the unit's command line parses");
+        assert_eq!(cli.require_host_key, policy.require_host_key);
+        assert_eq!(cli.require_channel_binding, policy.require_channel_binding);
+        assert_eq!(cli.require_operator_proof, policy.require_operator_proof);
+        assert_eq!(cli.cert_hashes, policy.cert_hashes);
+        assert_eq!(cli.allow_operators, policy.allow_operators);
+        assert_eq!(cli.relay_gateway_allow, policy.relay_gateway_allow);
+        assert_eq!(cli.relay_gateway_udp, policy.relay_gateway_udp);
+        assert_eq!(cli.relay_gateway_dns, policy.relay_gateway_dns);
+        assert_eq!(cli.relay_gateway_listen, policy.relay_gateway_listen);
+        assert_eq!(
+            cli.relay_gateway_trust_relay,
+            policy.relay_gateway_trust_relay
+        );
+        assert_eq!(
+            cli.relay_gateway_max_connections as usize,
+            policy.relay_gateway_max_connections
+        );
+        // several operators: written too
+        let many = crate::commands::common::IdentityPolicy {
+            max_operators: 4,
+            ..Default::default()
+        };
+        let args = super::startup_command_arguments(
+            Path::new("/usr/bin/wsh"),
+            "default",
+            "relay.example",
+            4422,
+            None,
+            3,
+            &["exec".to_string()],
+            &many,
+        );
+        assert_eq!(crate::Cli::try_parse_from(&args).unwrap().max_operators, 4);
+        // and an agent installed with nothing asked carries nothing extra
+        let none = super::startup_command_arguments(
+            Path::new("/usr/bin/wsh"),
+            "default",
+            "relay.example",
+            4422,
+            None,
+            3,
+            &["exec".to_string()],
+            &crate::commands::common::IdentityPolicy::default(),
+        );
+        assert!(
+            !none.iter().any(|a| a.starts_with("--require")
+                || a.starts_with("--allow")
+                || a.starts_with("--relay-gateway")
+                || a == "--cert-hash"
+                || a == "--max-operators"),
+            "{none:?}"
         );
     }
 }

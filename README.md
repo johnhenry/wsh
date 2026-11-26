@@ -1561,13 +1561,26 @@ const s = await client.openSession({ type: 'exec', command: 'echo hello' });
   (`ListenRequest`, bound to loopback unless the policy says otherwise) are **each off unless given**; `unix`, `endpoints` and `tcp: false`
   are refused (the relay carries none of them). **Per operator:** `accept` must return `{ capabilities: ['gateway:tcp:db.example.com:5432'] }`
   (the notation of [`spec/capabilities.md`](spec/capabilities.md)); a plain `true` is accepted for everything else the host serves and
-  **refused for the gateway**, and a grant that does not cover a request refuses it. **Rust CLI host:** `wsh --relay-gateway-allow RULE
+  **refused for the gateway**, and a grant that does not cover a request refuses it (a grant's `expires` is checked at each request; a
+  connection already open when it passes is not cut). **Who an operator is, on a bridge that is not sealed, is whatever the relay
+  stamps**, so a gateway starts only when the owner has chosen: `requireOperatorProof: true` (operators prove themselves and the bridge
+  is sealed), or `gateway: { trustRelayIdentity: true }` in so many words; anything else is a `TypeError` at construction. **Rust CLI
+  host:** `wsh --relay-gateway-allow RULE --allow-operator FINGERPRINT (--require-operator-proof | --relay-gateway-trust-relay)
   [--relay-gateway-udp] [--relay-gateway-dns] [--relay-gateway-listen] [--relay-gateway-max-connections N] reverse RELAY --capability
-  gateway` (also `agent run`, and `agent install` carries them into the unit): the same gateway as `wsh-server`'s (it is the same code,
-  `wsh_core::gateway`: destination rules including CIDR blocks, the address check after resolution, credit, the half-close rule, reverse
-  tunnels), the same defaults, and it needs the `gateway` capability **and** at least one rule; the flags without a rule are an error.
-  The Rust host has one allow list for every operator `--allow-operator` lets in (no per-operator grant). **Not carried:** `OpenUnix`,
-  `OpenEndpoint`, `ListenUnix` (a unix socket or a named endpoint of the host) stay a direct-connection feature.
+  gateway` (also `agent run`; `agent install` writes them, and every other flag that narrows who is served or how the relay is
+  checked, into the unit): the same gateway as `wsh-server`'s (it is the same code, `wsh_core::gateway`: destination rules including CIDR
+  blocks, the address check after resolution, credit, the half-close rule, reverse tunnels), the same defaults. It needs the `gateway`
+  capability, at least one rule, **at least one `--allow-operator`** (proof says who an operator is, not that it should reach this
+  network, so proof does not replace the list) and either proof or `--relay-gateway-trust-relay`; a host serving several operators
+  (`--max-operators` above 1) cannot seal its bridges (one seal per connection), so it always needs the explicit trust. The flags
+  without a rule, a rule that does not parse, and any of the missing choices are errors at start. The Rust host has one allow list for
+  every operator `--allow-operator` lets in (no per-operator grant). **Not carried:** `OpenUnix`, `OpenEndpoint`, `ListenUnix` (a unix
+  socket or a named endpoint of the host) stay a direct-connection feature. **An operator is never answered by the wrong network:**
+  bridged to a host, a client sends the gateway's requests only to that host (`openTcp()` and the others reject locally, and say why,
+  when the relay or the host did not state `relay-gateway`, or when the host stated no features at all); the relay's own gateway is for
+  a client that is not bridged. The registered record lists `gateway` among a peer's capabilities when the host offers one (the JS host:
+  only on a relay that carries it; the Rust CLI: whenever `--capability gateway` is given): it says the host may offer a gateway, not
+  that one is on; what is on is in `ReverseAccept.features`.
 - **On the peer**, the bridged operator is served by the same connection code as
   a direct client, over an in-memory message pipe instead of a socket. Nothing a
   client opens can cross the relay but control messages, so exec sessions are
@@ -2978,9 +2991,17 @@ out explicitly below rather than left to be discovered.
   credit rule, not repaired), and the **destination** is seen by the relay on an unsealed bridge. It does NOT protect against: an
   operator you accepted using what you allowed (a rule for `*` is every public host; a rule that names a private range is that range),
   a host whose policy names a destination it should not, a destination that answers with something hostile, or a relay that decides
-  to stop carrying it. A Rust relay's frame queue to a slow peer is bounded and drops when full (the credit window, 256 KiB a
-  connection, keeps what one connection has in flight small, but many connections can still overrun it): nothing is buffered
-  without a bound, and a lost frame ends the connection.
+  to stop carrying it. **What the relay holds is bounded and never has a hole in it.** Credit keeps a connection to 256 KiB in flight
+  a direction; the relay delivers each recipient's forwards in order, one at a time (the JS relay queues at most 32 MiB for one
+  recipient; the Rust relay 512 messages), and if a recipient does not keep up past that, the relay ENDS the connection that was
+  forwarding to it (a clean close; the JS relay ends the bridge, so both sides) instead of skipping a frame: a gateway frame is
+  never dropped and nothing later is delivered after a gap. (The Rust relay still drops, as before, a full queue's frame of the
+  other forwarded traffic, terminal output for one; it does not drop the gateway's.) **A sealed bridge detects a relay that alters,
+  replays or reorders a frame**: the host does not act on it, says `seal-failed` (`onRefused`) and ends the bridge, and nothing more is
+  served over it; the operator's pending requests fail by timeout. **Who is asking:** the host chooses at start whether it takes an
+  operator's identity from proof (`requireOperatorProof`, `--require-operator-proof`) or from the relay's word
+  (`gateway.trustRelayIdentity`, `--relay-gateway-trust-relay`), and the Rust host also needs `--allow-operator`; several operators at
+  once cannot be sealed on the Rust host, so that case is always "the relay's word".
 - **Several operators per peer share one peer, and the relay decides who is who (#93).** Off unless both the relay
   (`maxOperatorsPerPeer`, `[relay] max_operators_per_peer`) and the peer (`maxOperators`, `--max-operators`) are
   set above 1. The relay stamps each message with its own record of the sender's authenticated key and removes

@@ -1726,9 +1726,17 @@ export class WshClient {
    * nothing changes.
    */
   #sendGateway(m) {
-    if (this.#acceptedRelayPeers.size > 0 && this.#bridgedFeatures !== null && isRelayGatewayForwardable(m.type) && !this.#carriesRelayGateway()) {
-      const who = this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE) ? 'the host behind this bridge' : 'this relay';
-      return Promise.reject(new GatewayError(`${who} does not state "${RELAY_GATEWAY_FEATURE}", so the gateway is not carried over this bridge -- nothing was sent`, 4));
+    if (this.#acceptedRelayPeers.size > 0) {
+      // Bridged: a request is for the HOST behind the bridge, or it is not sent. (What the relay would do with one it does not carry is
+      // answer it with ITS gateway, if it has one: a network the caller did not mean. The relay's own gateway is for a client that is
+      // not bridged.)
+      if (isRelayGatewayForwardable(m.type) && !this.#carriesRelayGateway()) {
+        const who = this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE) ? 'the host behind this bridge' : 'this relay';
+        return Promise.reject(new GatewayError(`${who} does not state "${RELAY_GATEWAY_FEATURE}", so the gateway is not carried over this bridge -- nothing was sent`, 4));
+      }
+      if (m.type === MSG.OPEN_UNIX || m.type === MSG.OPEN_ENDPOINT || m.type === MSG.LISTEN_UNIX) {
+        return Promise.reject(new GatewayError('unix sockets and named endpoints are not carried over a relay bridge -- nothing was sent', 4));
+      }
     }
     return this.sendControl(m);
   }

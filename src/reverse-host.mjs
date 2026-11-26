@@ -305,7 +305,9 @@ export function createReverseHostWith({
       const early = [];
       const MAX_EARLY_FRAMES = 16;
       const openSealed = (frame) => {
-        chain = chain.then(async () => base.receiveMessage(await sealed.open(frame))).catch((e) => onLog(`[reverse] dropped a sealed frame: ${e.message}`));
+        // A frame that does not open (altered, replayed, reordered, or not from this bridge's key) means whoever carries the bridge is not
+        // honest, or it is broken: nothing more is heard over it (a gap would otherwise leave a connection that never ends).
+        chain = chain.then(async () => base.receiveMessage(await sealed.open(frame))).catch((e) => fail(`a sealed frame did not open (${e.message})`));
       };
       const fail = (why) => { early.length = 0; onLog(`[reverse] sealed bridge with ${from.slice(0, 12)} failed: ${why}`); notifyRefused('seal-failed', who, why); endBridge(from); };
       if (mustSeal) {

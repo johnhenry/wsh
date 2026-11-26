@@ -114,7 +114,7 @@ peer does only when its owner gave it a gateway AND the relay lists the feature.
 
 | Operator | Relay | Reverse host | What happens |
 | --- | --- | --- | --- |
-| new | new | new, gateway on | The feature is stated at both ends; the requests cross; every connection is metered (credit is implied). |
+| new | new | new, gateway on | The feature is stated at both ends; the requests cross; every connection is metered (credit is implied). A host starts a gateway only when its owner chose how identities are taken (operator proof, or an explicit trust of the relay's word) and, on the Rust CLI, named the operators. |
 | new | new | new, gateway off (the default) | The host states nothing; the relay carries nothing; `openTcp()` rejects locally (`this host does not support TCP egress`); a request sent anyway is dropped by the relay, nothing is dialled. |
 | new | released | any | The relay does not list the feature, so the host (new) states no gateway and serves none, and the operator sends nothing (`openTcp()` rejects locally). Where the host stated features without the feature, the operator refuses with "does not state relay-gateway" and sends nothing. |
 | new | new (`carryGateway: false`, `carry_gateway = false`) | new | As the row above: the relay does not list the feature, nothing is stated or carried. |
@@ -122,6 +122,12 @@ peer does only when its owner gave it a gateway AND the relay lists the feature.
 | released JS | new | new, gateway on | A released JS client sends `OpenTcp` / `OpenUdp` (its own check is the host's `gateway` feature, which a new host states), the relay carries them, and **TCP and UDP flows work** (`GatewayOk`, data, credit and close were always forwardable). `ResolveDns` and `ListenRequest` are carried and answered, but the answers (`DnsResult`, `ListenOk`, `InboundOpen`) are not on the released client's list and are dropped there: they time out. A released client does not seal them, so on a sealed bridge the host drops its requests. Use a new client. |
 | released Rust | any | any | A released Rust operator has no way to open a gateway connection over a bridge (`wsh reverse-connect` has no forwarding), so nothing changes. |
 | any | released | new | Nothing changes for what the relay already carried. |
+
+A host that serves several operators at once cannot seal their bridges on the Rust side (one seal per connection), so a Rust CLI gateway
+for several operators is always "the relay's word about who is asking" and needs `--relay-gateway-trust-relay`. Ordering inside one
+stream: the JS QMux stream now writes one call at a time, in call order (concurrent writers used to interleave their chunks once a
+write waited for the window); a released JS peer that wrote concurrently could corrupt its own control stream, and a new peer reading
+it is unchanged.
 
 What is tested: both relays against both host implementations, a host that states the feature on a relay that does not carry it, a relay
 that carries it for a host that did not state it, sealed bridges, and an operator that sends where it is not carried

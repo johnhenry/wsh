@@ -15,7 +15,7 @@ import { MSG, gatewayFail } from '../messages.gen.mjs';
 
 const GATEWAY_OPTIONS = new Set([
   'allow', 'allowPrivate', 'maxConnections', 'maxBufferedBytes', 'maxClientBufferedBytes', 'connectTimeoutMs', 'halfCloseIdleMs',
-  'halfCloseProbeMs', 'socks', 'udp', 'dns', 'reverse', 'udpIdleMs', 'log',
+  'halfCloseProbeMs', 'socks', 'udp', 'dns', 'reverse', 'udpIdleMs', 'log', 'trustRelayIdentity',
 ]);
 
 /**
@@ -25,7 +25,7 @@ const GATEWAY_OPTIONS = new Set([
  * and `unix`, `endpoints` and `tcp: false` are refused (the relay carries none of them).
  * @param {unknown} opts
  */
-function buildGateway(opts) {
+function buildGateway(opts, hostOptions = {}) {
   if (opts === undefined || opts === null || opts === false) return null;
   if (opts === true || typeof opts !== 'object' || Array.isArray(opts)) throw new TypeError('createReverseHost: gateway needs an explicit allow list (default deny): { allow: ["host:port", ...] }');
   for (const k of Object.keys(opts)) {
@@ -33,9 +33,17 @@ function buildGateway(opts) {
     if (!GATEWAY_OPTIONS.has(k)) throw new TypeError(`createReverseHost: unknown gateway option "${k}"`);
   }
   if (opts.dns !== undefined && typeof opts.dns !== 'boolean') throw new TypeError('createReverseHost: gateway.dns must be a boolean');
+  if (opts.trustRelayIdentity !== undefined && typeof opts.trustRelayIdentity !== 'boolean') throw new TypeError('createReverseHost: gateway.trustRelayIdentity must be a boolean');
+  // Who an operator is, on a bridge that is not sealed, is whatever the relay stamps on its messages: a relay can open what any accepted
+  // operator could. So a gateway starts only when the owner either has operators PROVE themselves and seal the bridge (`requireOperatorProof`),
+  // or says in so many words that they trust the relay's word about who is asking.
+  if (hostOptions.requireOperatorProof !== true && opts.trustRelayIdentity !== true) {
+    throw new TypeError('createReverseHost: a gateway needs requireOperatorProof: true (operators prove themselves and the bridge is sealed), or gateway.trustRelayIdentity: true to say you trust the relay\'s word about who is asking (a relay can then open what an accepted operator could)');
+  }
   const udpOn = opts.udp !== undefined && opts.udp !== false && opts.udp !== null;
   const dnsOn = opts.dns === true;
-  const { udp, dns, ...rest } = opts;
+  const { udp, dns, trustRelayIdentity, ...rest } = opts;
+  void trustRelayIdentity;
   const cfg = normalizeGateway({ ...rest, ...(udpOn ? { udp: opts.udp } : {}) });
   /** The session of one bridged operator: the shared gateway session, with the owner's separate switches in front of it. */
   const session = (c, send, log, ctx) => {
@@ -57,5 +65,5 @@ export function createReverseHost(options = {}) {
   const backends = buildBackends(options);
   const rpc = options.rpc === undefined || options.rpc === null ? null
     : createRpcHost(options.rpc, { files: backends.files, maxMessageBytes: options.rpcMaxMessageBytes, maxInflight: options.rpcMaxInflight });
-  return createReverseHostWith(options, { ...backends, rpc, gateway: buildGateway(options.gateway) });
+  return createReverseHostWith(options, { ...backends, rpc, gateway: buildGateway(options.gateway, options) });
 }

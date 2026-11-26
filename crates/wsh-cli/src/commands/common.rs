@@ -372,6 +372,9 @@ pub struct IdentityPolicy {
     pub relay_gateway_dns: bool,
     /// Reverse host: also answer `ListenRequest` (`--relay-gateway-listen`).
     pub relay_gateway_listen: bool,
+    /// Reverse host: take who an operator is from the relay's word (`--relay-gateway-trust-relay`); required for a gateway unless
+    /// `--require-operator-proof` makes operators prove themselves.
+    pub relay_gateway_trust_relay: bool,
     /// Reverse host: connections one operator may hold open (0 = unset = the default).
     pub relay_gateway_max_connections: usize,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
@@ -478,14 +481,37 @@ fn relay_gateway_from_policy(
         if p.relay_gateway_udp
             || p.relay_gateway_dns
             || p.relay_gateway_listen
+            || p.relay_gateway_trust_relay
             || p.relay_gateway_max_connections != 0
         {
             anyhow::bail!(
-                "--relay-gateway-udp, --relay-gateway-dns, --relay-gateway-listen and --relay-gateway-max-connections need \
-                 at least one --relay-gateway-allow rule (the gateway is off, and default deny, without one)"
+                "--relay-gateway-udp, --relay-gateway-dns, --relay-gateway-listen, --relay-gateway-trust-relay and \
+                 --relay-gateway-max-connections need at least one --relay-gateway-allow rule (the gateway is off, and default deny, without one)"
             );
         }
         return Ok(None);
+    }
+    // Who may use it: the owner names the operators. Proof says WHO an operator is (and seals the bridge); it does not say whether that
+    // key should reach this machine's network, so it does not replace the list.
+    if p.allow_operators.is_empty() {
+        anyhow::bail!(
+            "--relay-gateway-allow needs --allow-operator FINGERPRINT (at least 8 hex digits, repeatable): the gateway is for the operators \
+             you name, not for whoever the relay lets through"
+        );
+    }
+    // How an operator's identity is taken: with proof (and the sealed bridge it brings) a relay cannot speak for an operator; without it
+    // the relay's word is all there is, so the owner says so.
+    if !p.require_operator_proof && !p.relay_gateway_trust_relay {
+        anyhow::bail!(
+            "--relay-gateway-allow needs --require-operator-proof (operators prove themselves and the bridge is sealed) or \
+             --relay-gateway-trust-relay (you trust the relay's word about who is asking: it can then open what an accepted operator could)"
+        );
+    }
+    if p.max_operators > 1 && !p.relay_gateway_trust_relay {
+        anyhow::bail!(
+            "--relay-gateway-allow with --max-operators above 1 needs --relay-gateway-trust-relay: a host serving several operators cannot \
+             seal its bridges (one seal per connection), so the relay's word is all there is"
+        );
     }
     if !options.has_capability("gateway") {
         anyhow::bail!(
@@ -1164,12 +1190,61 @@ mod redact_tests {
         );
     }
 
+    /// A rule, with the owner having named an operator and chosen to trust the relay's word.
+    fn chosen(rule: &str) -> IdentityPolicy {
+        IdentityPolicy {
+            relay_gateway_allow: vec![rule.into()],
+            allow_operators: vec!["0123456789abcdef".into()],
+            relay_gateway_trust_relay: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_gateway_needs_the_owner_to_name_who_may_use_it() {
+        let mut p = chosen("db.example.com:5432");
+        p.allow_operators.clear();
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--allow-operator"), "{err}");
+        // proof says who an operator IS, not that it should reach this network: it does not replace the list
+        p.relay_gateway_trust_relay = false;
+        p.require_operator_proof = true;
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--allow-operator"), "{err}");
+    }
+
+    #[test]
+    fn a_gateway_needs_proof_or_the_explicit_trust_of_the_relays_word() {
+        let mut p = chosen("db.example.com:5432");
+        p.relay_gateway_trust_relay = false;
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(
+            err.to_string().contains("--require-operator-proof")
+                && err.to_string().contains("--relay-gateway-trust-relay"),
+            "{err}"
+        );
+        p.require_operator_proof = true;
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_ok());
+        let mut t = chosen("db.example.com:5432");
+        t.relay_gateway_trust_relay = true;
+        assert!(relay_gateway_from_policy(&t, &host_with(&["gateway"])).is_ok());
+    }
+
+    #[test]
+    fn several_operators_cannot_seal_so_they_always_need_the_trust() {
+        let mut p = chosen("db.example.com:5432");
+        p.relay_gateway_trust_relay = false;
+        p.require_operator_proof = true;
+        p.max_operators = 2;
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--max-operators"), "{err}");
+        p.relay_gateway_trust_relay = true;
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_ok());
+    }
+
     #[test]
     fn a_rule_needs_the_gateway_capability() {
-        let policy = IdentityPolicy {
-            relay_gateway_allow: vec!["db.example.com:5432".into()],
-            ..Default::default()
-        };
+        let policy = chosen("db.example.com:5432");
         let err = relay_gateway_from_policy(&policy, &host_with(&["shell"])).unwrap_err();
         assert!(err.to_string().contains("--capability gateway"), "{err}");
     }
@@ -1190,6 +1265,10 @@ mod redact_tests {
                 ..Default::default()
             },
             IdentityPolicy {
+                relay_gateway_trust_relay: true,
+                ..Default::default()
+            },
+            IdentityPolicy {
                 relay_gateway_max_connections: 4,
                 ..Default::default()
             },
@@ -1201,10 +1280,7 @@ mod redact_tests {
 
     #[test]
     fn a_rule_turns_on_tcp_only_with_the_default_bound() {
-        let policy = IdentityPolicy {
-            relay_gateway_allow: vec!["db.example.com:5432".into()],
-            ..Default::default()
-        };
+        let policy = chosen("db.example.com:5432");
         let g = relay_gateway_from_policy(&policy, &host_with(&["gateway"]))
             .unwrap()
             .unwrap();
@@ -1221,10 +1297,7 @@ mod redact_tests {
 
     #[test]
     fn the_switches_are_separate() {
-        let base = IdentityPolicy {
-            relay_gateway_allow: vec!["*".into()],
-            ..Default::default()
-        };
+        let base = chosen("*");
         let host = host_with(&["gateway"]);
         let udp = relay_gateway_from_policy(
             &IdentityPolicy {

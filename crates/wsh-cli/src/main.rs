@@ -186,6 +186,12 @@ struct Cli {
     #[arg(long = "relay-gateway-listen", global = true)]
     relay_gateway_listen: bool,
 
+    /// Reverse host: with `--relay-gateway-allow` and without `--require-operator-proof`, say that you trust the relay's word about who
+    /// is asking (it can stamp an accepted operator's identity on a request, and then open what that operator could). Several operators
+    /// at once (`--max-operators` above 1) cannot seal their bridges, so they always need this.
+    #[arg(long = "relay-gateway-trust-relay", global = true)]
+    relay_gateway_trust_relay: bool,
+
     /// Reverse host: connections (TCP, UDP flows, listeners) one operator may hold open at once (default 32, at most 1024).
     #[arg(long = "relay-gateway-max-connections", global = true, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1024))]
     relay_gateway_max_connections: u64,
@@ -637,6 +643,7 @@ async fn main() {
         relay_gateway_udp: cli.relay_gateway_udp,
         relay_gateway_dns: cli.relay_gateway_dns,
         relay_gateway_listen: cli.relay_gateway_listen,
+        relay_gateway_trust_relay: cli.relay_gateway_trust_relay,
         relay_gateway_max_connections: cli.relay_gateway_max_connections as usize,
         operator_proof: if cli.operator_proof {
             commands::common::OperatorProofMode::Always

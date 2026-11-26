@@ -104,7 +104,8 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
     const url = `ws://127.0.0.1:${port}`;
     const h = createReverseHost({
       url, username: 'host', keyPair: keys.host.keyPair, exec: true, pty: false, reconnect: false, accept,
-      ...(gateway === undefined ? {} : { gateway }), reportFeatures: features, ...host,
+      // A gateway needs the owner to have chosen how identities are taken (proof, or trusting the relay's word): these tests trust it unless they seal.
+      ...(gateway === undefined ? {} : { gateway: { ...(host.requireOperatorProof ? {} : { trustRelayIdentity: true }), ...gateway } }), reportFeatures: features, ...host,
     });
     await h.start();
     hosts.push(h);
@@ -167,10 +168,20 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
     });
 
     it('gateway options a relay does not carry are refused at construction', () => {
+      const t = { trustRelayIdentity: true };
       for (const bad of [{ allow: [], unix: { connect: ['/tmp/x'] } }, { allow: [], endpoints: {} }, { allow: [], tcp: false }, true, { allow: [], bogus: 1 }]) {
-        assert.throws(() => createReverseHost({ url: 'ws://x', username: 'h', keyPair: keys.host.keyPair, gateway: bad }), TypeError);
+        assert.throws(() => createReverseHost({ url: 'ws://x', username: 'h', keyPair: keys.host.keyPair, gateway: bad === true ? bad : { ...t, ...bad } }), TypeError);
       }
-      assert.throws(() => createReverseHost({ url: 'ws://x', username: 'h', keyPair: keys.host.keyPair, gateway: { allow: [] }, reportFeatures: false }), /needs reportFeatures/);
+      assert.throws(() => createReverseHost({ url: 'ws://x', username: 'h', keyPair: keys.host.keyPair, gateway: { allow: [], ...t }, reportFeatures: false }), /needs reportFeatures/);
+    });
+
+    it('a gateway starts only when the owner chose how identities are taken: operator proof (sealed bridge) or an explicit trust of the relay\'s word', () => {
+      const base = { url: 'ws://x', username: 'h', keyPair: keys.host.keyPair };
+      assert.throws(() => createReverseHost({ ...base, gateway: { allow: ['127.0.0.1'] } }), /requireOperatorProof: true.*trustRelayIdentity: true/);
+      assert.throws(() => createReverseHost({ ...base, gateway: { allow: ['127.0.0.1'], trustRelayIdentity: false } }), /trustRelayIdentity/);
+      assert.throws(() => createReverseHost({ ...base, gateway: { allow: ['127.0.0.1'], trustRelayIdentity: 'yes' } }), /must be a boolean/);
+      assert.doesNotThrow(() => createReverseHost({ ...base, gateway: { allow: ['127.0.0.1'], trustRelayIdentity: true } }));
+      assert.doesNotThrow(() => createReverseHost({ ...base, gateway: { allow: ['127.0.0.1'] }, requireOperatorProof: true }));
     });
   });
 
@@ -348,6 +359,24 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
     });
   });
 
+  describe('what the relay holds for a recipient that does not keep up', () => {
+    it('delivers in order, one at a time, and past the bound refuses everything (nothing is delivered after a hole)', async () => {
+      const { ForwardQueue } = await import('../src/server/relay.mjs');
+      const q = new ForwardQueue(100);
+      const sent = []; let release;
+      const gate = new Promise((r) => { release = r; });
+      assert.ok(q.push(async () => { await gate; sent.push(1); }, 40));
+      assert.ok(q.push(() => { sent.push(2); }, 40), 'queued behind the first, not run beside it');
+      assert.deepEqual(sent, []);
+      assert.ok(!q.push(() => { sent.push(3); }, 40), 'over the bound: refused');
+      assert.ok(q.dead);
+      assert.ok(!q.push(() => { sent.push(4); }, 1), 'and everything after it');
+      release();
+      await sleep(20);
+      assert.deepEqual(sent, [], 'the queue is dead: nothing more is sent, not even what was queued (the recipient is being closed)');
+    });
+  });
+
   describe('the relay stays a carrier', () => {
     it('a request is carried only for a host that stated relay-gateway: a host that did not gets nothing, even when asked directly', async () => {
       const origin = await echoOrigin();
@@ -382,8 +411,8 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
 
   describe('an operator sends only where it is carried; a relay carries only what its host and it both state', () => {
     /** A peer that registers and answers a connect with exactly these features, recording what the relay delivers to it. */
-    async function fakeHost({ features, relay = {} }) {
-      const server = createWshServer({ auth: { authorizedKeys }, relay: { canRegister: (w) => w.username === 'host', canConnect: (f) => f.username !== 'host', ...relay } });
+    async function fakeHost({ features, relay = {}, serverGateway }) {
+      const server = createWshServer({ auth: { authorizedKeys }, ...(serverGateway ? { gateway: serverGateway } : {}), relay: { canRegister: (w) => w.username === 'host', canConnect: (f) => f.username !== 'host', ...relay } });
       const { port } = await server.listen(); servers.push(server);
       const url = `ws://127.0.0.1:${port}`;
       const fake = new WshClient();
@@ -407,6 +436,21 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
       assert.ok(accepted.features.includes('gateway') && !accepted.features.includes(RELAY_GATEWAY_FEATURE));
       await assert.rejects(c.openTcp('127.0.0.1', 1), (e) => e.code === 4 && /does not state "relay-gateway"/.test(e.message));
       assert.deepEqual(delivered, [], 'nothing reached the host');
+    });
+
+    it('bridged to a host that stated no features, the operator never reaches the RELAY\'s own gateway by accident: it refuses and says why', async () => {
+      const origin = await echoOrigin();
+      const { url, delivered } = await fakeHost({ features: undefined, serverGateway: { allow: ['127.0.0.1'] } });
+      const { c } = await operator(url);
+      await assert.rejects(c.openTcp('127.0.0.1', origin.port), (e) => e.code === 4 && /relay-gateway/.test(e.message));
+      assert.equal(origin.sockets.length, 0, 'the relay did not dial for it');
+      assert.deepEqual(delivered, []);
+      // The unbridged API: a client that is NOT bridged reaches the relay's own gateway, as always.
+      const direct = new WshClient();
+      await direct.connect(url, { username: 'op2', keyPair: keys.op2.keyPair });
+      clients.push(direct);
+      const d = await direct.openTcp('127.0.0.1', origin.port);
+      assert.equal(await roundTrip(d, 'direct'), 'echo:direct');
     });
 
     it('a host that states relay-gateway on a relay that does not (carryGateway: false) is still not sent them; the operator says why', async () => {
@@ -457,6 +501,31 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
       assert.ok(written > stalledAt);
     });
 
+    it('a saturated relay: twelve connections to an operator that reads nothing for a while, every one byte-exact and in order afterwards', async () => {
+      const CONNS = 12; const SIZE = 3 * 1024 * 1024;
+      let accepted = 0;
+      const origin = net.createServer((s) => {
+        accepted++; s.on('error', () => {});
+        const chunk = Buffer.alloc(64 * 1024); let n = 0;
+        const pump = () => { while (n < SIZE) { const piece = Buffer.alloc(65536, (n / 65536) % 251); n += piece.length; if (!s.write(piece)) { s.once('drain', pump); return; } } s.end(); };
+        pump();
+      });
+      const port = await listen(origin); nets.push(origin);
+      const { url } = await setup({ gateway: { allow: ['127.0.0.1'], maxConnections: CONNS } });
+      const { c } = await operator(url);
+      const ds = [];
+      for (let i = 0; i < CONNS; i++) ds.push(await c.openTcp('127.0.0.1', port));
+      await until(() => accepted === CONNS, 'every origin to be dialled');
+      await sleep(1500); // nobody reads: what is in flight piles up in the relay and the sockets, bounded by credit
+      const results = await Promise.all(ds.map(async (d) => {
+        const reader = d.readable.getReader();
+        let n = 0; let ordered = true;
+        for (;;) { const { value, done } = await reader.read(); if (done) break; for (let i = 0; i < value.length; i += 997) { if (value[i] !== Math.floor((n + i) / 65536) % 251) ordered = false; } n += value.length; }
+        return { n, ordered };
+      }));
+      for (const r of results) { assert.equal(r.n, SIZE); assert.ok(r.ordered, 'in order'); }
+    });
+
     it('half-close both ways: the operator half-closes first and still gets the whole large answer; the origin sees the end of file after the request', async () => {
       const SIZE = 3 * 1024 * 1024;
       let request = '';
@@ -497,6 +566,48 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
       await until(() => got === 'afterwards', 'what the operator sent after the origin finished');
       d.destroy();
     });
+  });
+
+  describe('a relay that tampers with a sealed bridge is detected, and the bridge ends', () => {
+    /** Patch the relay so the operator's sealed frames (bridge-level EncryptedFrames) are altered, replayed or reordered on their way. */
+    function tamper(mode) {
+      const original = RelayHub.prototype.forward;
+      let held = null; let n = 0;
+      RelayHub.prototype.forward = function patched(handle, msg) {
+        if (msg.type !== MSG.ENCRYPTED_FRAME || msg.channel_id !== 0 || handle.fingerprint !== keys.op.fp) return original.call(this, handle, msg);
+        const index = n++;
+        if (mode === 'alter' && index === 0) {
+          const ciphertext = Uint8Array.from(msg.ciphertext); ciphertext[0] ^= 1;
+          return original.call(this, handle, { ...msg, ciphertext });
+        }
+        if (mode === 'replay' && index === 0) { const r = original.call(this, handle, msg); original.call(this, handle, msg); return r; }
+        if (mode === 'reorder') {
+          if (index === 0) { held = msg; return true; }
+          const r = original.call(this, handle, msg);
+          if (index === 1) original.call(this, handle, held);
+          return r;
+        }
+        return original.call(this, handle, msg);
+      };
+      spies.push(() => { RelayHub.prototype.forward = original; });
+    }
+
+    for (const [mode, expectedDials] of [['alter', 0], ['replay', 1], ['reorder', 0]]) {
+      it(`${mode}: the host does not act on it, says seal-failed, and ends the bridge`, async () => {
+        const origin = await echoOrigin();
+        const refusals = [];
+        const { url, host } = await setup({ gateway: { allow: ['127.0.0.1'] }, host: { requireOperatorProof: true, proofTimeoutMs: 8000, onRefused: (r) => refusals.push(r.reason) } });
+        const { c } = await operator(url, { connectOptions: { sealed: true } });
+        tamper(mode);
+        // two requests at once, so a reorder has two frames to swap
+        const attempts = [c.openTcp('127.0.0.1', origin.port, { timeoutMs: 2000 }), c.openTcp('127.0.0.1', origin.port, { timeoutMs: 2000 })].map((p) => p.then((d) => { d.destroy(); return 'ok'; }, () => 'failed'));
+        await until(() => refusals.includes('seal-failed'), 'the host to notice');
+        await until(() => host.operators.length === 0, 'the bridge to end');
+        const results = await Promise.all(attempts);
+        assert.ok(origin.sockets.length <= expectedDials, `${origin.sockets.length} connections dialled for ${mode}`);
+        assert.ok(results.includes('failed'), `${results}`);
+      });
+    }
   });
 
   describe('a sealed bridge carries them as sealed frames', () => {

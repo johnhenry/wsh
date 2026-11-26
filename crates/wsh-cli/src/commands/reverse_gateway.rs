@@ -76,6 +76,7 @@ impl RelayGateway {
 
 /// One operator's gateway on this host.
 pub struct OperatorGateway {
+    pump: tokio::task::JoinHandle<()>,
     session: GatewaySession,
     udp: bool,
     dns: bool,
@@ -87,6 +88,13 @@ pub trait GatewayLink: Clone + Send + Sync + 'static {
     fn send(&self, envelope: Envelope) -> impl std::future::Future<Output = ()> + Send;
 }
 
+impl Drop for OperatorGateway {
+    fn drop(&mut self) {
+        // The session (declared after the pump, dropped after this) closes every connection; nothing it queued is sent.
+        self.pump.abort();
+    }
+}
+
 impl OperatorGateway {
     /// A session for one bridged operator; what it says goes to `link`. Every connection is metered (`relay-gateway` implies
     /// `gateway-credit`), whatever the operator listed.
@@ -94,12 +102,15 @@ impl OperatorGateway {
         let policy = Arc::new(GatewayPolicyEnforcer::new(gateway.policy()));
         // Bounded: a relay link that does not take what the gateway has to say slows the connections down, not the memory up.
         let (tx, mut rx) = mpsc::channel::<Envelope>(64);
-        tokio::spawn(async move {
+        // The forwarding task belongs to THIS bridge: it is stopped when the gateway is dropped, queue and all, so a frame this operator's
+        // connections left behind can never reach the link when it serves the next operator (whose `gateway_id`s may be the same).
+        let pump = tokio::spawn(async move {
             while let Some(envelope) = rx.recv().await {
                 link.send(envelope).await;
             }
         });
         Self {
+            pump,
             session: GatewaySession::new(
                 policy,
                 tx.clone(),
@@ -247,6 +258,48 @@ mod tests {
             f.message.contains("name resolution is not enabled"),
             "{}",
             f.message
+        );
+    }
+
+    /// A link that takes nothing until released: what is queued for the bridge sits behind it.
+    #[derive(Clone)]
+    struct HeldSink {
+        gate: Arc<tokio::sync::Notify>,
+        out: mpsc::UnboundedSender<Envelope>,
+    }
+    impl GatewayLink for HeldSink {
+        async fn send(&self, envelope: Envelope) {
+            self.gate.notified().await;
+            let _ = self.out.send(envelope);
+        }
+    }
+
+    #[tokio::test]
+    async fn what_a_bridge_had_queued_never_reaches_the_next_one() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (out, mut rx) = mpsc::unbounded_channel();
+        let g = OperatorGateway::new(
+            &gateway(&["db.example.com:5432"]),
+            HeldSink {
+                gate: gate.clone(),
+                out,
+            },
+        );
+        // three answers (refusals) pile up behind a link that is not taking anything
+        for id in 1..=3 {
+            g.handle(open_tcp(id, "other.example.com")).await;
+        }
+        tokio::task::yield_now().await;
+        // the bridge ends
+        drop(g);
+        // the link (now serving the NEXT operator) starts taking again: nothing of the old bridge may arrive, whatever gateway_id it had
+        for _ in 0..5 {
+            gate.notify_one();
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a frame of the ended bridge was delivered"
         );
     }
 

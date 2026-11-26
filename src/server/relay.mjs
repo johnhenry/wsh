@@ -34,6 +34,8 @@ import { RELAY_GATEWAY_FEATURE } from '../features.mjs';
 export const DEFAULT_MAX_PEERS = 1024;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 8000;
 const MAX_FORWARD_BYTES = 8 * 1024 * 1024;
+/** What the relay holds for one recipient that is slower than its senders (credit keeps one gateway connection to 256 KiB a direction, so this is more than a hundred of them). */
+export const MAX_QUEUED_FORWARD_BYTES = 32 * 1024 * 1024;
 const MAX_REMEMBERED_SEQS = 4096;
 const MAX_CAPABILITIES = 32;
 const MAX_FEATURES = 64;
@@ -66,6 +68,28 @@ const isStr = (v, max) => typeof v === 'string' && v.length <= max;
  * @property {string} username
  */
 
+/**
+ * What the relay holds for ONE recipient: sends run in the order they were pushed, one at a time (each waits for the transport to take
+ * the one before), and what is waiting is bounded by bytes. Past the bound the queue is dead: it refuses this push and every later one
+ * and sends nothing more, so the recipient never sees a message with a hole before it.
+ */
+export class ForwardQueue {
+  #chain = Promise.resolve();
+  #bytes = 0;
+  #dead = false;
+  constructor(limitBytes) { this.limitBytes = limitBytes; }
+  get bytes() { return this.#bytes; }
+  get dead() { return this.#dead; }
+  /** @param {() => unknown} send @param {number} size @returns {boolean} false: over the bound (the queue is dead from now on) */
+  push(send, size) {
+    if (this.#dead) return false;
+    if (this.#bytes + size > this.limitBytes) { this.#dead = true; return false; }
+    this.#bytes += size;
+    this.#chain = this.#chain.then(() => (this.#dead ? undefined : send())).catch(() => {}).then(() => { this.#bytes -= size; });
+    return true;
+  }
+}
+
 export class RelayHub {
   /** @type {Map<string, { handle: RelayHandle, meta: object }>} */
   #peers = new Map();
@@ -77,6 +101,8 @@ export class RelayHub {
   #multiPeers = new WeakSet();
   /** peers that stated `relay-gateway` in their last ReverseAccept: the gateway's requests cross THEIR bridges (and no other). @type {WeakSet<RelayHandle>} */
   #gatewayPeers = new WeakSet();
+  /** recipient handle -> what is queued for it (forwards are delivered in order, one at a time). @type {WeakMap<RelayHandle, ForwardQueue>} */
+  #queues = new WeakMap();
   /** target handle -> { operator, timer } while a ReverseConnect awaits its answer */
   #pending = new Map();
   /** fingerprint -> the highest record seq ever accepted (survives disconnects, bounded). */
@@ -375,8 +401,23 @@ export class RelayHub {
       if (!crosses(msg.type)) return false;
       inner = cborEncode(msg);
     }
-    partner.send(relayForward({ fromFingerprint: handle.fingerprint, inner }));
+    this.#deliver(partner, relayForward({ fromFingerprint: handle.fingerprint, inner }), inner.byteLength);
     return true;
+  }
+
+  /**
+   * Hand a forward to its recipient: in order, one at a time (the transport's own flow control is waited for, so a slow reader is not
+   * overrun and a later message cannot overtake an earlier one), with a bound on what is queued for it. A recipient that does not keep up
+   * past the bound is not given a hole in what it receives: its connection is ended, which ends the bridge and so both sides, each
+   * with a closed transport and no later frame.
+   */
+  #deliver(partner, message, size) {
+    let q = this.#queues.get(partner);
+    if (!q) this.#queues.set(partner, q = new ForwardQueue(MAX_QUEUED_FORWARD_BYTES));
+    if (!q.push(() => partner.send(message), size)) {
+      this.log(`relay: ${partner.fingerprint.slice(0, 12)} is not keeping up with what is forwarded to it; ending its connection`);
+      partner.close();
+    }
   }
 
   /**

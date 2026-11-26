@@ -193,6 +193,21 @@ describe('QMuxConnection: flow control', () => {
     assert.equal(Buffer.concat(received).byteLength, 64, 'all data eventually arrives once window updates catch up');
   });
 
+  it('concurrent write() calls on one stream do not interleave: each call\'s bytes arrive whole and in call order, even when each waits for the window (a relay forwarding many connections at once)', async () => {
+    const { client, server } = makeLinkedPair({ initialMaxStreamData: 16, initialMaxData: 10_000 });
+    client.sendHandshake();
+    server.sendHandshake();
+    await nextTick(2);
+    const received = [];
+    server.onStreamOpen = (s) => { s.onData = (d) => received.push(Buffer.from(d)); };
+    const stream = await client.openStream();
+    // three writers at once, each several windows long
+    const writes = [65, 66, 67].map((byte) => stream.write(new Uint8Array(48).fill(byte)));
+    await Promise.all(writes);
+    await nextTick(6);
+    assert.equal(Buffer.concat(received).toString('latin1'), 'A'.repeat(48) + 'B'.repeat(48) + 'C'.repeat(48));
+  });
+
   it('write() blocks on the connection-level window even when the stream-level window is generous', async () => {
     const { client, server } = makeLinkedPair({ initialMaxStreamData: 10_000, initialMaxData: 16 });
     client.sendHandshake();

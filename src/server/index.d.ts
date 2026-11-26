@@ -240,6 +240,12 @@ export interface WshServerGatewayOptions {
  * `reverse` is the reverse-tunnel policy of `createWshServer` (`ListenRequest`).
  */
 export interface WshReverseHostGateway extends Omit<WshServerGatewayOptions, 'unix' | 'endpoints' | 'tcp' | 'udp'> {
+  /**
+   * Required (true) unless the host has `requireOperatorProof: true`. On a bridge that is not sealed, who an operator is is whatever the
+   * relay says, so a relay can open what any accepted operator could; a gateway starts only when you have operators prove themselves and
+   * seal the bridge, or say here, in so many words, that you trust the relay's word.
+   */
+  trustRelayIdentity?: boolean;
   udp?: boolean | NonNullable<WshServerGatewayOptions['udp']>;
   dns?: boolean;
 }

@@ -39,6 +39,38 @@ struct Pending {
     since: Instant,
 }
 
+/// The depth of the queue each connection has for what other connections forward to it. Credit keeps what one gateway connection has in
+/// flight to 256 KiB a direction (four frames of 64 KiB), so this holds the in-flight data of more than a hundred of them.
+pub const PEER_QUEUE_DEPTH: usize = 512;
+
+/// Is `msg_type` part of a gateway connection's stream (its requests, answers, data, credit and close)? Losing one of these would leave
+/// a hole in a byte stream, or a slot held for ever, so a relay that cannot queue one does not skip it: it ends the connection of the
+/// sender (see [`queue_forward`]).
+pub fn is_gateway_traffic(msg_type: wsh_core::MsgType) -> bool {
+    use wsh_core::MsgType::*;
+    wsh_core::messages::is_relay_gateway_forwardable(msg_type)
+        || matches!(
+            msg_type,
+            GatewayOk | GatewayFail | GatewayData | GatewayCredit | GatewayClose
+        )
+}
+
+/// Queue `wrapped` for a connection. A full queue drops a message of the old kinds (as it always did; terminal output and the like are
+/// best effort), but never one of a gateway connection's: that is an `Err`, and the caller ends the connection that forwarded it, so
+/// nothing later of that connection is delivered after a hole and nothing is silently lost.
+pub fn queue_forward(
+    tx: &tokio::sync::mpsc::Sender<wsh_core::messages::Envelope>,
+    wrapped: wsh_core::messages::Envelope,
+    inner_type: wsh_core::MsgType,
+) -> Result<(), String> {
+    match tx.try_send(wrapped) {
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) if is_gateway_traffic(inner_type) => {
+            Err("the connection this was forwarded to is not keeping up with the relay (its queue is full)".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Where a message from a bridged connection goes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
@@ -92,6 +124,16 @@ impl Bridges {
             self.gateway.insert(peer);
         } else {
             self.gateway.remove(&peer);
+        }
+    }
+
+    /// `peer` answered a request: `accepted`, and whether its accept `stated` `relay-gateway`. Only an ACCEPT says anything about the
+    /// peer's gateway; a refusal of another operator leaves what the last accept said (it would otherwise stop the bridges the peer
+    /// already has from carrying, and the relay's own gateway would answer in the host's place). The flag is per peer connection:
+    /// it is the peer's own configuration, the same for every operator it serves, and is forgotten when the peer leaves.
+    pub fn note_answer_gateway(&mut self, peer: u64, accepted: bool, stated: bool) {
+        if accepted {
+            self.note_gateway(peer, stated);
         }
     }
 
@@ -470,6 +512,57 @@ mod tests {
         b.note_gateway(PEER, true);
         b.depart(PEER);
         assert!(!b.carries_gateway(PEER));
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_ends_the_forwarder_for_gateway_traffic_and_drops_the_rest_as_before() {
+        use wsh_core::messages::{ClosePayload, Envelope, Payload};
+        use wsh_core::MsgType;
+        let env = || Envelope {
+            msg_type: MsgType::Close,
+            payload: Payload::Close(ClosePayload { channel_id: 1 }),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert!(
+            queue_forward(&tx, env(), MsgType::GatewayData).is_ok(),
+            "room: queued"
+        );
+        for t in [
+            MsgType::GatewayData,
+            MsgType::GatewayCredit,
+            MsgType::GatewayOk,
+            MsgType::GatewayFail,
+            MsgType::GatewayClose,
+            MsgType::OpenTcp,
+            MsgType::DnsResult,
+            MsgType::InboundOpen,
+        ] {
+            assert!(
+                queue_forward(&tx, env(), t).is_err(),
+                "{t:?} is never skipped"
+            );
+        }
+        assert!(
+            queue_forward(&tx, env(), MsgType::SessionData).is_ok(),
+            "other traffic is best effort, as before"
+        );
+    }
+
+    #[test]
+    fn a_refusal_of_another_operator_does_not_change_what_the_peers_accept_said() {
+        let mut b = Bridges::new(2);
+        bridged(&mut b, OP_A, "fa", PEER, true);
+        b.note_answer_gateway(PEER, true, true);
+        assert!(b.carries_gateway(OP_A));
+        // a second operator's request is refused by the peer (its refusal states nothing)
+        b.begin_connect(OP_B, "fb", PEER, Instant::now()).unwrap();
+        b.answer(PEER, false, false);
+        b.note_answer_gateway(PEER, false, false);
+        assert!(
+            b.carries_gateway(OP_A),
+            "the first operator's bridge still carries"
+        );
+        assert!(b.carries_gateway(PEER));
     }
 
     #[test]

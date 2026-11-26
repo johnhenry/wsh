@@ -28,7 +28,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createWshServer } from '@johnhenry/wsh/server';
-import { WshClient, generateKeyPair, exportPublicKeySSH, fingerprint, MSG, RELAY_GATEWAY_FEATURE } from '@johnhenry/wsh';
+import { WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint, MSG, RELAY_GATEWAY_FEATURE } from '@johnhenry/wsh';
 import { openTcp, openUdp, resolveDns, listenRequest } from '../../src/messages.gen.mjs';
 import { freePort } from '../helpers/free-port.mjs';
 
@@ -97,7 +97,11 @@ async function rustRelay(authorizedKeys) {
 }
 
 /** Start `wsh reverse` against the relay with `extra` arguments; resolves once it registered. */
-async function startHost(relay, host, extra = []) {
+async function startHost(relay, host, extraIn = [], operatorKeyPair = null) {
+  // The owner's other two choices come with the gateway: the operator named, and the relay's word trusted (no proof here).
+  const extra = extraIn.includes('--relay-gateway-allow') && operatorKeyPair
+    ? [...extraIn, '--allow-operator', await fingerprint(await exportPublicKeyRaw(operatorKeyPair.publicKey)), '--relay-gateway-trust-relay']
+    : extraIn;
   const h = relay.host(host.home);
   const proc = spawn(WSH_BIN, ['-t', 'ws', '--accept-new-host-key', ...extra, 'reverse', h.target, '--capability', 'exec', '--capability', 'gateway'], { env: h.env, stdio: ['pipe', 'pipe', 'pipe'] });
   procs.push(proc);
@@ -160,7 +164,7 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       const origin = net.createServer((s) => { s.on('data', (d) => s.write(Buffer.concat([Buffer.from('echo:'), d]))); s.on('error', () => {}); });
       const originPort = await listen(origin);
       closers.push(async () => origin.close());
-      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1']);
+      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
       const { op, res } = await connectOperator(relay, host, keyPair);
       for (const f of [RELAY_GATEWAY_FEATURE, 'gateway', 'gateway-credit']) assert.ok(res.features.includes(f), `${f} in ${res.features}`);
       const d = await op.openTcp('127.0.0.1', originPort);
@@ -178,7 +182,7 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       const origin = net.createServer((s) => { s.on('error', () => {}); });
       const originPort = await listen(origin);
       closers.push(async () => origin.close());
-      await startHost(relay, host, ['--relay-gateway-allow', 'db.example.invalid:5432']);
+      await startHost(relay, host, ['--relay-gateway-allow', 'db.example.invalid:5432'], keyPair);
       const { op } = await connectOperator(relay, host, keyPair);
       await assert.rejects(op.openTcp('127.0.0.1', originPort), (e) => e.code === 4);
       await assert.rejects(op.openUdp('db.example.invalid', 5432), (e) => e.code === 4 && /UDP is not enabled/.test(e.message));
@@ -203,7 +207,7 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       });
       const originPort = await listen(origin);
       closers.push(async () => origin.close());
-      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1']);
+      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
       const { op } = await connectOperator(relay, host, keyPair);
       const d = await op.openTcp('127.0.0.1', originPort);
       const writer = d.writable.getWriter();
@@ -224,7 +228,7 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); s.on('data', (x) => { got += x; }); s.end('bye'); });
       const originPort = await listen(origin);
       closers.push(async () => origin.close());
-      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1']);
+      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
       const { op } = await connectOperator(relay, host, keyPair);
       const d = await op.openTcp('127.0.0.1', originPort);
       const reader = d.readable.getReader();
@@ -251,7 +255,7 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       });
       const originPort = await listen(origin);
       closers.push(async () => origin.close());
-      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1']);
+      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
       const { op } = await connectOperator(relay, host, keyPair);
       const d = await op.openTcp('127.0.0.1', originPort);
       let last = -1;

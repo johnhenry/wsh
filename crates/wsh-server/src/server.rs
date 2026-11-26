@@ -903,7 +903,8 @@ impl WshServer {
                     "WebTransport auth OK"
                 );
 
-                let (peer_tx, peer_rx) = mpsc::channel::<Envelope>(64);
+                let (peer_tx, peer_rx) =
+                    mpsc::channel::<Envelope>(crate::relay::bridges::PEER_QUEUE_DEPTH);
                 // Assign a unique conn_id and register in peer_senders/conn_session_map
                 // so E2E relay, CopilotSuggest, and idle warnings are session-scoped.
                 let conn_id = self.alloc_conn_id();
@@ -1616,7 +1617,8 @@ impl WshServer {
         // be a plain, unconditional `select!` arm: nothing holds a clone of
         // `peer_tx` until auth succeeds and it's registered in
         // `peer_senders`, so this simply never fires before then.
-        let (peer_tx, mut peer_rx) = mpsc::channel::<Envelope>(64);
+        let (peer_tx, mut peer_rx) =
+            mpsc::channel::<Envelope>(crate::relay::bridges::PEER_QUEUE_DEPTH);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         // The login (Hello and Auth) is due `login_timeout_secs` after the connection was accepted, the TLS and WebSocket
         // handshakes included (wsh #248); once the connection is `Authenticated` there is nothing left to wait for.
@@ -2761,7 +2763,7 @@ impl WshServer {
                     {
                         let mut bridges = self.bridges.write().await;
                         bridges.answer(conn_id, accepted, multi);
-                        bridges.note_gateway(conn_id, accepted && gateway);
+                        bridges.note_answer_gateway(conn_id, accepted, gateway);
                     }
                     if accepted {
                         info!(
@@ -2810,6 +2812,7 @@ impl WshServer {
                     Route::To(partner_id) => {
                         // What is delivered: this message wrapped (a plain forwardable one) or the
                         // inner of the forward the connection wrote, once it has been checked.
+                        let mut inner_type = envelope.msg_type;
                         let inner = match &envelope.payload {
                             Payload::RelayForward(p) => {
                                 if p.inner.len() > MAX_RELAY_FORWARD_BYTES {
@@ -2825,6 +2828,7 @@ impl WshServer {
                                                 decoded.msg_type,
                                             ) =>
                                     {
+                                        inner_type = decoded.msg_type;
                                         Ok(p.inner.clone())
                                     }
                                     Ok(decoded) => {
@@ -2860,7 +2864,17 @@ impl WshServer {
                                             to_fingerprint: None,
                                         }),
                                     };
-                                    let _ = sender.try_send(wrapped);
+                                    // A gateway connection's frame is never skipped: if the queue of the connection it goes to is
+                                    // full, THIS connection ends (a clean error), instead of a hole in a byte stream.
+                                    if let Err(why) = crate::relay::bridges::queue_forward(
+                                        sender, wrapped, inner_type,
+                                    ) {
+                                        warn!(
+                                            conn_id,
+                                            partner_id, "relay: {why}; ending this connection"
+                                        );
+                                        return Err(WshError::Other(why));
+                                    }
                                 }
                                 Err(err) => {
                                     warn!(conn_id, %err, "failed to encode relay-forwarded envelope");
