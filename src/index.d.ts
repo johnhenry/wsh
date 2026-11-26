@@ -2216,6 +2216,8 @@ export interface WshFileOperationResult {
 export interface WshGatewayOpenOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** The half-close idle bound (#271) for this one connection, instead of the client's `gatewayHalfCloseIdleMs`: a non-negative integer of milliseconds, `0` = never. */
+  halfCloseIdleMs?: number;
   /** `openEndpoint` only (#121): the host's execution target whose endpoint this is. Needs the `targets` feature. */
   target?: string;
 }

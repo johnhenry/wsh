@@ -56,7 +56,7 @@ export interface WshTargetOptions {
   /** Every call is also given `{ target }`. */
   fs?: WshFileBackend;
   /** Named virtual endpoints of this target; the handler's `duplex.target` is its name. */
-  endpoints?: Record<string, ((duplex: object, who: { username: string | null; fingerprint: string | null }) => void | Promise<void>) | { open: Function; authorize?: (who: object) => boolean | Promise<boolean> }>;
+  endpoints?: Record<string, ((duplex: object, who: { username: string | null; fingerprint: string | null }) => void | Promise<void>) | { open: Function; authorize?: (who: object) => boolean | Promise<boolean>; halfCloseIdleMs?: number }>;
 }
 
 export interface WshResolvedBackends {

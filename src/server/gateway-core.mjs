@@ -42,7 +42,9 @@ export function normalizeEndpoints(endpoints) {
     const open = typeof h === 'function' ? h : h?.open;
     if (typeof open !== 'function') throw new TypeError(`gateway.endpoints[${JSON.stringify(name)}] needs a handler function (duplex, who) => void, or { open, authorize }`);
     if (h?.authorize !== undefined && typeof h.authorize !== 'function') throw new TypeError(`gateway.endpoints[${JSON.stringify(name)}].authorize must be a function (who) => boolean`);
-    map.set(name, { open, authorize: h?.authorize ?? null });
+    // This endpoint's own half-close idle bound (an endpoint with long-lived quiet streams wants a longer one): beats the host's.
+    const halfCloseIdleMs = h?.halfCloseIdleMs === undefined || typeof h === 'function' ? undefined : assertHalfCloseIdleMs(h.halfCloseIdleMs, `gateway.endpoints[${JSON.stringify(name)}].halfCloseIdleMs`);
+    map.set(name, { open, authorize: h?.authorize ?? null, halfCloseIdleMs });
   }
   return map.size === 0 ? null : map;
 }
@@ -124,7 +126,7 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
     } catch (e) { pending.delete(id); log(`gateway endpoint ${m.name} authorize threw: ${e.message}`); return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'endpoint refused this caller'); }
     pending.delete(id);
     if (closed) return undefined;
-    const channel = makeChannel(id, { writeAfterRemoteClose: true });
+    const channel = makeChannel(id, { writeAfterRemoteClose: true, ...(ep.halfCloseIdleMs === undefined ? {} : { halfCloseIdleMs: ep.halfCloseIdleMs }) });
     conns.set(id, { channel, sock: null });
     const { readable, writable } = channel.streams();
     const duplex = {

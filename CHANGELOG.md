@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### The half-close idle bound on every host, and backpressure through a sealed session pinned by a test (#275; npm, JS only)
+
+- **The bound reaches every host.** 0.57.0 (#271) made the half-close idle bound configurable on the Node host (`gateway.halfCloseIdleMs`) and the client, but a host built with `createMemoryHost` could not set it. Now `createMemoryHost({ gatewayHalfCloseIdleMs })` takes it, with the same meaning and validation (a whole number of milliseconds from 0 to 2147483647, `0` = never, default 300000; anything else is a `TypeError`). A page host, a reverse host and a pipe-relay pairing serve no gateway and have no such clock.
+- **Per endpoint.** An endpoint given as `{ open, authorize, halfCloseIdleMs }` uses its own bound instead of the host's, on a Node server, a memory host and in a target's `endpoints`: an endpoint with long-lived quiet streams can have a long one or `0` while a request/response endpoint keeps a short one. An endpoint with no bound of its own takes the host's, so nothing changes for existing code.
+- **Per connection on the client.** `openEndpoint(name, { halfCloseIdleMs })` (and the other `open*` calls) bounds one connection instead of `connect()`'s `gatewayHalfCloseIdleMs`; a memory host's `host.connect({ ..., gatewayHalfCloseIdleMs })` passes the connect option through (now typed).
+- **Backpressure through a sealed session is a tested guarantee.** An endpoint's `readable` / `writable` pair is flow controlled end to end by the credit window, sealed or not. Pushing 32 MiB each way over a sealed memory host at a slow reader, the writer never got more than the window (256 KiB) ahead of the reader, live buffer memory grew by about 6 MiB, and every byte arrived in order; a 5 MiB `write()` stays pending until the reader has taken all but about the window. The README says how embedders keep it: `await writer.ready`, and do not buffer behind a callback with a bounded queue that discards.
+- No wire change, no default changed, nothing negotiated; `wsh-server` is unchanged (it keeps its single `half_close_idle_secs`, no per-endpoint form).
+- Tests: `test/gateway-half-close-option.test.mjs`, `test/gateway-sealed-backpressure.test.mjs`.
+
 ## 0.57.0 / Rust `rust-v0.22.0`
 
 ### A half-closed gateway connection stays open: what the far side sends after a half-close is no longer lost (#271; npm and Rust)

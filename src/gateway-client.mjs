@@ -87,7 +87,7 @@ export class GatewayConnections {
   }
 
   /** @param {{ datagram?: boolean, onData?: (bytes: Uint8Array) => void }} [kind] a datagram flow has no half-close: the peer's close ends it */
-  #makeChannel(id, { datagram = false, onData } = {}) {
+  #makeChannel(id, { datagram = false, onData, halfCloseIdleMs } = {}) {
     const channel = new GatewayChannel({
       id,
       credit: this.#hasFeature(GATEWAY_CREDIT_FEATURE),
@@ -95,7 +95,7 @@ export class GatewayConnections {
       // to finish, while anything moves in either direction. A half-closed connection with nothing moving for
       // `halfCloseIdleMs` is ended, so one nobody closes does not stay in the table forever.
       writeAfterRemoteClose: true,
-      halfCloseIdleMs: this.#halfCloseIdleMs,
+      halfCloseIdleMs: halfCloseIdleMs ?? this.#halfCloseIdleMs,
       onRemoteClose: datagram ? () => channel.destroy() : undefined,
       onData,
       sendData: (data) => this.#send(gatewayDataMsg({ gatewayId: id, data })),
@@ -116,11 +116,13 @@ export class GatewayConnections {
     return { readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise };
   }
 
-  async #open(build, { timeoutMs = DEFAULT_TIMEOUT_MS, signal } = {}, kind) {
+  async #open(build, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, halfCloseIdleMs } = {}, kind) {
     if (signal?.aborted) throw signal.reason ?? new DOMException('aborted', 'AbortError');
+    // A bound for this one connection (the client's own, `connect(url, { gatewayHalfCloseIdleMs })`, otherwise); same validation.
+    if (halfCloseIdleMs !== undefined) assertHalfCloseIdleMs(halfCloseIdleMs, 'halfCloseIdleMs');
     const id = this.#id();
     let flow;
-    const channel = this.#makeChannel(id, { ...kind, onData: kind?.udp ? (b) => flow.deliverReliable(b) : undefined });
+    const channel = this.#makeChannel(id, { ...kind, halfCloseIdleMs, onData: kind?.udp ? (b) => flow.deliverReliable(b) : undefined });
     if (kind?.udp) { flow = new UdpFlow({ id, channel, ...kind.udp }); this.#udp.set(id, flow); }
     const done = new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.#opening.delete(id); channel.abandon(); reject(new GatewayError('the host did not answer the open request in time', 5)); }, timeoutMs);
