@@ -164,8 +164,10 @@ export interface WshServerGatewayOptions {
    */
   halfCloseIdleMs?: number;
   /**
-   * How often an origin socket of this host (a TCP or unix origin, a reverse listener's caller) that has half-closed (sent its end
-   * of file) is checked for having gone away (#282). The kernel tells a socket nothing about a peer that half-closed and then died
+   * How often the CALLER of one of this host's reverse listeners (a program that connected to a unix socket or TCP port the host
+   * listens on for a client) that has half-closed (sent its end of file) is checked for having gone away (#282). An origin the host
+   * dialled is not watched: one that sent its whole answer and then closed completely is the normal end of a response, and the
+   * discard a watch sends would drop what the client has not read yet. The kernel tells a socket nothing about a peer that half-closed and then died
    * until something is written to it, so while (and only while) a socket is half-closed the host writes zero bytes to it every
    * this many milliseconds: nothing reaches a live peer, and a dead one fails the write; the connection is then ended as a destroyed
    * one (the client is sent `GatewayClose` with the reason `discarded`). A TCP socket is also given keep-alive on this schedule

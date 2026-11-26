@@ -44,6 +44,25 @@ async function handUnread(duplex) {
   await Promise.race([w.write(new Uint8Array(300_000)).catch(() => {}), sleep(3000)]);
 }
 
+/**
+ * A host that listens on a unix socket for callers, with room for ONE connection; and a client forwarding the callers to a local
+ * service (a reverse forward). `slotFree()` says whether the host's only slot is free (an open that reaches its TCP origin means it was).
+ */
+async function reverseHost({ fx, tmp, forwards }, hostOptions = {}) {
+  const hostSock = path.join(tmp(), `r${Math.random().toString(36).slice(2, 6)}.sock`);
+  const services = [];
+  // allowHalfOpen: the service keeps its side open after the caller's end of file, as a service that answers later does.
+  const service = net.createServer({ allowHalfOpen: true }, (s) => { services.push(s); fx.cleanups.push(async () => s.destroy()); s.on('error', () => {}); s.resume(); });
+  const servicePort = await listen(service); fx.nets.push(service);
+  const origin = net.createServer((s) => { s.on('error', () => {}); fx.cleanups.push(async () => s.destroy()); });
+  const originPort = await listen(origin); fx.nets.push(origin);
+  const { client } = await fx.setup({ allow: [`127.0.0.1:${originPort}`], unix: { listen: [hostSock] }, halfCloseIdleMs: 0, halfCloseProbeMs: 200, maxConnections: 1, ...hostOptions });
+  const fwd = await client.forwardUnix({ local: `127.0.0.1:${servicePort}`, remote: hostSock, reverse: true });
+  forwards.push(fwd);
+  const slotFree = async () => { try { (await client.openTcp('127.0.0.1', originPort)).destroy(); return true; } catch (e) { if (/too many/.test(e.message)) return false; throw e; } };
+  return { hostSock, services, fwd, slotFree };
+}
+
 describe('a half-closed local peer that is killed is noticed with the far side silent (idle bound 0)', () => {
   let dir; const procs = []; const forwards = [];
   const fx = fixture();
@@ -130,77 +149,63 @@ describe('a half-closed local peer that is killed is noticed with the far side s
     assert.equal(await killAndMeasure(t, 'tcp forward, unread data', child, seen[0].closed), 'discarded');
   });
 
-  it('a local TCP program and a host\'s TCP origin, each half-closed and killed with nothing unread: noticed when the kernel drops the socket (about a minute), then by a keep-alive probe', SLOW, async (t) => {
-    const results = {};
-    const scenarios = [];
-
-    // 1. a local TCP program through a forward to a named endpoint
-    scenarios.push((async () => {
-      const { client, seen } = await quietEndpointHost();
-      const fwd = await client.forwardUnix({ local: '127.0.0.1:0', remote: 'endpoint=quiet', halfCloseProbeMs: 1000 });
-      forwards.push(fwd);
-      const { child } = await start(['client', 'tcp', String(fwd.address.port)], 'half-closed');
-      await until(() => seen.length === 1, 'the endpoint to see the connection');
-      results.localTcp = await killAndMeasure(t, 'tcp forward, nothing unread', child, seen[0].closed, TCP_SLOW_BOUND_MS);
-    })());
-
-    // 2. an origin of the host: a TCP server (a child) that finished sending, then was killed
-    scenarios.push((async () => {
-      const { child, lines } = await start(['server', 'tcp'], 'listening');
-      const port = Number(lines.find((l) => l.startsWith('listening ')).split(' ')[1]);
-      const fx2 = fixture();
-      try {
-        const { client } = await fx2.setup({ allow: [`127.0.0.1:${port}`], halfCloseIdleMs: 0, halfCloseProbeMs: 1000, maxConnections: 1 });
-        const d = await client.openTcp('127.0.0.1', port);
-        await until(() => lines.includes('accepted'), 'the origin to accept');
-        await assert.rejects(client.openTcp('127.0.0.1', port), /too many/, 'the half-closed connection holds the only slot');
-        results.originTcp = await killAndMeasure(t, 'host tcp origin, nothing unread', child, d.closed, TCP_SLOW_BOUND_MS);
-        await until(async () => { try { (await client.openTcp('127.0.0.1', port)).destroy(); return false; } catch (e) { return !/too many/.test(e.message); } }, 'the slot to be free (the origin is gone, so the open now fails for another reason)');
-      } finally { await fx2.teardown(); }
-    })());
-
-    await Promise.all(scenarios);
-    assert.deepEqual(results, { localTcp: 'discarded', originTcp: 'discarded' });
-  });
-
-  it('a unix origin of the host that finished sending and was killed: the client\'s connection ends and the slot is freed', async (t) => {
-    const sock = path.join(tmp(), 'o.sock');
-    const { child, lines } = await start(['server', 'unix', sock], 'listening');
-    const { client } = await fx.setup({ allow: [], unix: { connect: [sock] }, halfCloseIdleMs: 0, halfCloseProbeMs: 200, maxConnections: 1 });
-    const d = await client.openUnix(sock);
-    await until(() => lines.includes('accepted'), 'the origin to accept');
-    assert.equal(await stateAfter(d.closed, 600), 'open', 'held while the origin is alive');
-    assert.equal(await killAndMeasure(t, 'host unix origin', child, d.closed), 'discarded');
-  });
-
-  it('a TCP origin of the host killed with data unread: ended within a probe interval', async (t) => {
-    const { child, lines } = await start(['server', 'tcp', 'paused'], 'listening');
-    const port = Number(lines.find((l) => l.startsWith('listening ')).split(' ')[1]);
-    const { client } = await fx.setup({ allow: [`127.0.0.1:${port}`], halfCloseIdleMs: 0, halfCloseProbeMs: 200, maxConnections: 1 });
-    const d = await client.openTcp('127.0.0.1', port);
-    await until(() => lines.includes('accepted'), 'the origin to accept');
-    await handUnread(d); // sits unread in the origin: its death is a reset
-    assert.equal(await killAndMeasure(t, 'host tcp origin, unread data', child, d.closed), 'discarded');
-  });
-
-  it('a reverse forward whose local service half-closed and was killed: the host\'s connection is ended and the forward lets go of it', async (t) => {
-    const { child, lines } = await start(['server', 'unix', path.join(tmp(), 'svc.sock')], 'listening');
-    const svc = lines.find((l) => l.startsWith('listening ')).slice('listening '.length);
-    const hostSock = path.join(tmp(), 'r.sock');
-    const { client } = await fx.setup({ allow: [], unix: { listen: [hostSock] }, halfCloseIdleMs: 0, halfCloseProbeMs: 200 });
-    const errors = [];
-    const fwd = await client.forwardUnix({ local: svc, remote: hostSock, reverse: true, halfCloseProbeMs: 200, onError: (e) => errors.push(e) });
+  it('a local TCP program half-closed and killed with nothing unread: noticed when the kernel drops the socket (about a minute), then by a keep-alive probe', SLOW, async (t) => {
+    const { client, seen } = await quietEndpointHost();
+    const fwd = await client.forwardUnix({ local: '127.0.0.1:0', remote: 'endpoint=quiet', halfCloseProbeMs: 1000 });
     forwards.push(fwd);
-    const caller = net.connect({ path: hostSock, allowHalfOpen: true });
-    caller.on('error', () => {});
-    caller.resume();
-    await until(() => lines.includes('accepted') && fwd.connections === 1, 'the service to take the connection');
+    const { child } = await start(['client', 'tcp', String(fwd.address.port)], 'half-closed');
+    await until(() => seen.length === 1, 'the endpoint to see the connection');
+    assert.equal(await killAndMeasure(t, 'tcp forward, nothing unread', child, seen[0].closed, TCP_SLOW_BOUND_MS), 'discarded');
+  });
+
+  it('a CALLER of the host\'s reverse listener that half-closed and was killed: the host frees its slot by itself', async (t) => {
+    const { hostSock, services, fwd, slotFree } = await reverseHost({ fx, tmp, forwards });
+    const { child } = await start(['client', 'unix', hostSock], 'half-closed');
+    await until(() => fwd.connections === 1 && services.length === 1, 'the service to take the connection');
+    assert.equal(await slotFree(), false, 'the caller holds the host\'s only slot');
     const t0 = Date.now();
     await kill(child);
-    await until(() => fwd.connections === 0, 'the forward to let go of the connection', BOUND_MS);
-    t.diagnostic(`reverse forward: connection released ${Date.now() - t0} ms after the kill`);
-    assert.equal(errors.length, 1);
-    assert.equal(errors[0].code, 'WSH_LOCAL_PEER_GONE');
+    await until(() => slotFree(), 'the host to free the slot', BOUND_MS);
+    t.diagnostic(`reverse caller: the host's slot was free ${Date.now() - t0} ms after the kill`);
+  });
+
+  // The two places where the DEAD party would be a data producer that finished (an origin the host dialled, the local service of a
+  // reverse forward) are deliberately not watched: a server that sends its whole answer and then closes completely is the normal end
+  // of a response, and the discard a watch would send drops what the reader has received and not yet read.
+  const SIZE = 3 * 1024 * 1024;
+  // A slow reader: a pause after every chunk, so that when the end of the answer reaches it a good part of what is left is still queued.
+  const readAll = async (d) => { const r = d.readable.getReader(); let n = 0; for (;;) { const { value, done } = await r.read(); if (done) return n; n += value.length; await sleep(10); } };
+
+  it('a unix ORIGIN of the host that sent everything and closed completely is not discarded: a slow client still gets all of it', async () => {
+    const sock = path.join(tmp(), 'o.sock');
+    const origin = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 5), () => s.destroy()); });
+    await new Promise((r) => origin.listen(sock, r)); fx.nets.push(origin);
+    const { client } = await fx.setup({ allow: [], unix: { connect: [sock] }, halfCloseIdleMs: 0, halfCloseProbeMs: 50 });
+    const d = await client.openUnix(sock);
+    await sleep(1000); // the origin is long gone; what it sent is mostly unread
+    assert.equal(await stateAfter(d.closed, 0), 'open', 'held for the reader');
+    assert.equal(await readAll(d), SIZE);
+    await d.writable.getWriter().close();
+    assert.notEqual(await d.closed, 'discarded');
+  });
+
+  it('the local service of a reverse forward that sent everything and closed completely is not discarded: a slow caller still gets all of it', async () => {
+    const hostSock = path.join(tmp(), 'r2.sock');
+    const service = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 6), () => s.destroy()); });
+    const servicePort = await listen(service); fx.nets.push(service);
+    const { client } = await fx.setup({ allow: [], unix: { listen: [hostSock] }, halfCloseIdleMs: 0, halfCloseProbeMs: 50 });
+    forwards.push(await client.forwardUnix({ local: `127.0.0.1:${servicePort}`, remote: hostSock, reverse: true, halfCloseProbeMs: 50 }));
+    const caller = net.connect({ path: hostSock, allowHalfOpen: true });
+    caller.on('error', () => {});
+    caller.pause();
+    await sleep(1000); // the service is long gone; what it sent is mostly unread by the caller
+    let n = 0;
+    // a slow reader (see readAll above)
+    caller.on('data', (b) => { n += b.length; caller.pause(); setTimeout(() => caller.resume(), 10); });
+    const ended = new Promise((r) => caller.once('end', r));
+    caller.resume();
+    await ended;
+    assert.equal(n, SIZE);
     caller.destroy();
   });
 
@@ -292,19 +297,17 @@ describe('a half-closed peer that is alive and reading is never cut by the probe
     });
   }
 
-  it('a host origin that is alive and half-closed (a child server that finished sending) keeps its connection and slot across many probes', async () => {
-    const child = spawn(process.execPath, [CHILD, 'server', 'tcp'], { stdio: ['ignore', 'pipe', 'inherit'] });
-    procs.push(child);
-    const lines = []; let buf = '';
-    child.stdout.on('data', (d) => { buf += d; for (let i = buf.indexOf('\n'); i >= 0; i = buf.indexOf('\n')) { lines.push(buf.slice(0, i)); buf = buf.slice(i + 1); } });
-    await until(() => lines.some((l) => l.startsWith('listening ')), 'the origin to listen');
-    const port = Number(lines.find((l) => l.startsWith('listening ')).split(' ')[1]);
-    const { client } = await fx.setup({ allow: [`127.0.0.1:${port}`], halfCloseIdleMs: 0, halfCloseProbeMs: 40, maxConnections: 1 });
-    const d = await client.openTcp('127.0.0.1', port);
-    await until(() => lines.includes('accepted'), 'the origin to accept');
+  it('a reverse listener\'s caller that is alive and half-closed keeps its connection across thirty of the host\'s probe intervals, then gets the answer whole', async () => {
+    const { hostSock, services, fwd, slotFree } = await reverseHost({ fx, tmp, forwards }, { halfCloseProbeMs: 40 });
+    const { lines } = await startClient(['unix', hostSock]);
+    await until(() => services.length === 1 && fwd.connections === 1, 'the service to take the connection');
     await sleep(30 * 40);
-    assert.equal(await stateAfter(d.closed, 0), 'open');
-    await assert.rejects(client.openTcp('127.0.0.1', port), /too many/, 'still holding the only slot');
+    assert.equal(await slotFree(), false, 'the live half-closed caller was not cut: it still holds the host\'s slot');
+    // (The service keeps its socket open: one that sends a large answer and closes completely while the caller has already half-closed
+    // loses the tail of it to the client's own teardown, which is older than this change and is not what is tested here.)
+    services[0].write(Buffer.alloc(400_000, 4));
+    await until(() => lines.includes('got 400000'), 'the whole answer');
+    assert.equal(lines.includes('end'), false, 'and the connection is still open for the caller');
   });
 });
 

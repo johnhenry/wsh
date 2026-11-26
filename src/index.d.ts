@@ -2250,6 +2250,8 @@ export interface WshForwardOptions {
   replace?: boolean;
   maxConnections?: number;
   /**
+   * (Not for `reverse: true`: the local end of a reverse forward is a service that answers, and one that finished and closed
+   * completely is the normal end of a response, so it is not watched.)
    * A local program that connected, half-closed (sent its end of file, still reading) and was then killed gives Node no event; the
    * kernel reports it to a writer only. While (and only while) a local connection is half-closed the forward writes ZERO bytes to
    * it every this many milliseconds: a live program is not touched (no byte, no wake-up), a dead one fails the write, and the

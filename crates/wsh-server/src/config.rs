@@ -417,9 +417,11 @@ pub struct GatewaySection {
     /// Default: `300` (five minutes).
     #[serde(default = "default_half_close_idle_secs")]
     pub half_close_idle_secs: u64,
-    /// An origin (or a reverse listener's caller) that has half-closed (sent its end of file) and
-    /// then goes away (killed, crashed) tells a plain read loop nothing, so the connection and its
-    /// slot would be held until the client next sent something (wsh #282). While a socket is
+    /// A caller of a reverse listener that has half-closed (sent its end of file) and then goes
+    /// away (killed, crashed) tells a plain read loop nothing, so the connection and its slot
+    /// would be held until the client next sent something (wsh #282). (An origin the host dialled
+    /// is not watched: one that sent its whole answer and closed completely is the normal end of
+    /// a response, and the client may still be reading it.) While a caller is
     /// half-closed the host waits for the kernel's hang-up of it, which a unix socket gives at
     /// once, and (TCP) gives it keep-alive on a schedule of this many seconds (first probe after
     /// this long, then one per this long, three in all). A peer that went away is handled as a

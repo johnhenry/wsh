@@ -556,10 +556,12 @@ async fn start_local(
     Ok(())
 }
 
-/// Join a forwarded connection to its local socket. A local program that half-closed and then
-/// went away (killed, crashed) is noticed from the socket's hang-up and the host is told the
-/// connection is discarded, instead of holding it until the far side next sends (wsh #282); not
-/// covered on Windows, where this is a plain pump.
+/// Join a forwarded connection (`-L`) to the local socket of the program that dialled it. A
+/// local program that half-closed and then went away (killed, crashed) is noticed from the
+/// socket's hang-up and the host is told the connection is discarded, instead of holding it until
+/// the far side next sends (wsh #282); not covered on Windows, where this is a plain pump. Only for
+/// the program that CONNECTED and reads the answer: a `-R`'s local service is not watched, since a
+/// service that finished and closed completely is the normal end of a response.
 async fn pump_local<S>(
     stream: wsh_client::gateway::GatewayStream,
     local: S,
@@ -649,15 +651,18 @@ async fn start_remote(
             tokio::spawn(async move {
                 let _permit = permit;
                 match connect_local(&target).await {
+                    // The local end of a `-R` is a service that answers: it is not watched (a service that
+                    // finished and closed completely is the ordinary end of a response, and the caller may
+                    // still be reading it; see `pump_local`).
                     Ok(Local_::Tcp(sock)) => {
                         if let Ok(stream) = pending.accept().await {
-                            let _ = pump_local(stream, sock).await;
+                            let _ = stream.pump(sock).await;
                         }
                     }
                     #[cfg(unix)]
                     Ok(Local_::Unix(sock)) => {
                         if let Ok(stream) = pending.accept().await {
-                            let _ = pump_local(stream, sock).await;
+                            let _ = stream.pump(sock).await;
                         }
                     }
                     Err(e) => {

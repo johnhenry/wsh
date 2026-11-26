@@ -478,6 +478,8 @@ impl GatewayStream {
         let (mut lr, mut lw) = tokio::io::split(local);
         // Whether the local side's end of file has been read: the exchange is half-closed by it.
         let local_eof = Arc::new(AtomicBool::new(false));
+        // Whether we have shut the local write side ourselves (the host's end reached us).
+        let local_shut = Arc::new(AtomicBool::new(false));
         let started = std::time::Instant::now();
         // When a byte last moved either way (milliseconds since `started`), the bytes moved each
         // way, and whether either direction has finished (the exchange is half-closed).
@@ -535,6 +537,7 @@ impl GatewayStream {
             let touch = touch.clone();
             let half = half.clone();
             let down_bytes = down_bytes.clone();
+            let local_shut = local_shut.clone();
             async move {
                 let mut buf = vec![0u8; GATEWAY_MAX_FRAME];
                 let result = loop {
@@ -553,6 +556,9 @@ impl GatewayStream {
                     }
                 };
                 half.send_replace(true);
+                // From here the socket's write side is shut BY US, which is also a hang-up of it:
+                // flagged first, so the watch does not take our own shutdown for the peer going away.
+                local_shut.store(true, Ordering::Release);
                 let _ = lw.shutdown().await;
                 result
             }
@@ -587,6 +593,7 @@ impl GatewayStream {
         // over from the host's side too (nothing then waits on the local program).
         let peer_gone = {
             let local_eof = local_eof.clone();
+            let local_shut = local_shut.clone();
             async move {
                 let Some((watch, every)) = watch else {
                     return std::future::pending::<()>().await;
@@ -597,7 +604,12 @@ impl GatewayStream {
                     return std::future::pending::<()>().await;
                 }
                 watch.arm(every);
-                watch.gone().await
+                watch.gone().await;
+                if local_shut.load(Ordering::Acquire) {
+                    // The hang-up is our own shutdown of the write side: the exchange is ending,
+                    // the peer did not go away.
+                    return std::future::pending::<()>().await;
+                }
             }
         };
         let mut up = Box::pin(up);

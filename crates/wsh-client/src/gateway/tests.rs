@@ -941,6 +941,50 @@ mod half_closed_peer {
         assert_eq!((up, down), (0, answer.len() as u64));
     }
 
+    /// The hang-up the watch waits for is ALSO what our own shutdown of the local write side
+    /// produces (a socket whose peer's end of file was read and whose write side we then shut is
+    /// shut both ways). An exchange that ends normally must never be taken for a peer that went away:
+    /// the pump returns Ok with both byte counts, and nothing but the one half-close goes to the host.
+    async fn a_normal_exchange<L, A>(local: L, mut app: A, what: &str)
+    where
+        L: AsyncRead + AsyncWrite + Send + Unpin + 'static + WatchablePeer,
+        A: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut h = host(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let pump = tokio::spawn(s.pump_watched(local, None, Some(Duration::from_secs(1))));
+        app.shutdown().await.unwrap(); // its request is done: half-closed, still reading
+        expect_close(&mut h, id, None).await;
+        h.data(id, b"the answer").await;
+        host_close(&h, id, None).await; // the host is done too: the pump shuts the local write side
+        let mut got = Vec::new();
+        tokio::time::timeout(SEEN, app.read_to_end(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, b"the answer", "{what}");
+        drop(app);
+        let r = tokio::time::timeout(SEEN, pump).await.unwrap().unwrap();
+        assert_eq!(r.unwrap_or_else(|e| panic!("{what}: {e}")), (0, 10));
+        assert!(
+            h.sent_within(30).await.is_none(),
+            "a normal end sends nothing more (no discard): {what}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exchange_that_ends_normally_is_never_taken_for_a_gone_peer() {
+        for round in 0..60 {
+            let (local, app) = UnixStream::pair().unwrap();
+            a_normal_exchange(local, app, &format!("unix, round {round}")).await;
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let app = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+            let (local, _) = l.accept().await.unwrap();
+            a_normal_exchange(local, app, &format!("tcp, round {round}")).await;
+        }
+    }
+
     #[tokio::test]
     async fn a_tcp_peer_reset_after_its_half_close_is_noticed_and_one_that_is_alive_is_not() {
         let mut h = host(true);

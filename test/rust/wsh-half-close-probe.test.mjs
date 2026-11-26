@@ -3,12 +3,14 @@
 //
 //   - the Rust `wsh -L` (a local unix socket and a local TCP port) forwarding to a named endpoint of a Node host: a child
 //     process connects, half-closes and is SIGKILLed by pid; the endpoint's stream must end as "discarded" by itself.
-//   - the Rust `wsh-server`: an origin (a TCP and a unix server, child processes) that finished sending and is SIGKILLed;
-//     the JS client's connection must end as "discarded" by itself and the host's slot must be freed.
+//   - the Rust `wsh-server`: a CALLER of its reverse listener (a unix socket and a TCP port) that half-closed and is SIGKILLed;
+//     the JS client's connection must end as "discarded" by itself. An ORIGIN the server dialled is deliberately not watched: one
+//     that sent everything and closed completely is the normal end of a response and must not cut the client's reading short.
 //
 // The measured detection times are printed. A unix peer is noticed at once (the kernel's hang-up). A TCP peer that exits
 // with nothing unread leaves a socket its kernel keeps for about a minute (60 s by default on Linux and macOS) and is
-// noticed then; one killed with data unread is reset, and noticed at once. Bounds below are generous for a loaded runner.
+// noticed then (the Node file covers that minute); one killed with data unread is reset, and noticed at once. Bounds below are
+// generous for a loaded runner.
 //
 // Nothing touches the user's home: every wsh / wsh-server runs with HOME, USERPROFILE and XDG_CONFIG_HOME in a scratch directory.
 // Prerequisite: `cargo build --release -p wsh-cli -p wsh-server` (or WSH_BIN and WSH_SERVER_BIN).
@@ -40,8 +42,6 @@ async function until(cond, what, ms = 10_000) {
 const stateAfter = (closed, ms) => Promise.race([closed, sleep(ms).then(() => 'open')]);
 // A loaded runner can stall a process for seconds; the expected time is a fraction of a second. Only so a regression fails by name.
 const BOUND_MS = 30_000;
-// A TCP peer killed with nothing unread: the kernel's own 60 s orphan timeout, the keep-alive schedule, and slack.
-const TCP_SLOW_BOUND_MS = 150_000;
 
 const scratch = [];
 const closers = [];
@@ -193,65 +193,75 @@ async function startServer(config) {
   return { client };
 }
 
-describe('the Rust wsh-server: an origin that finished sending and was killed is noticed with the client silent', () => {
+describe('the Rust wsh-server: a caller that finished sending and was killed is noticed with the client silent; an origin that finished and closed is not discarded', () => {
   const tls = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   before(() => { process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; }); // the dev certificate is self-signed
   after(() => { if (tls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED; else process.env.NODE_TLS_REJECT_UNAUTHORIZED = tls; });
 
-  const originPort = (lines) => Number(lines.find((l) => l.startsWith('listening ')).split(' ')[1]);
+  const callerConfig = (dir, extra = '') => `[gateway]\nenabled = true\nallowed_destinations = []\nunix_listen = [${JSON.stringify(`${dir}/`)}]\nhalf_close_idle_secs = 0\n${extra}`;
 
-  it('a unix origin', async (t) => {
-    const sock = path.join(scratchDir('hcs'), 'o.sock');
-    const { child, lines } = await startChild(['server', 'unix', sock], 'listening');
-    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = []\nunix_connect = ["${sock}"]\nhalf_close_idle_secs = 0\nmax_connections = 1\n`);
-    const d = await client.openUnix(sock);
-    await until(() => lines.includes('accepted'), 'the origin to accept');
-    assert.equal(await stateAfter(d.closed, 1500), 'open', 'held while the origin is alive');
+  it('a CALLER of the server\'s reverse unix listener that half-closed and was killed: the client\'s connection ends as "discarded"', async (t) => {
+    const dir = scratchDir('hcl');
+    const hostSock = path.join(dir, 'l.sock');
+    const { client } = await startServer(callerConfig(dir));
+    const seen = [];
+    await client.listenUnix(hostSock, { onConnection: (duplex) => { seen.push(duplex); } });
+    const { child } = await startChild(['client', 'unix', hostSock], 'half-closed');
+    await until(() => seen.length === 1, 'the client to be handed the caller');
+    assert.equal(await stateAfter(seen[0].closed, 1500), 'open', 'held while the caller is alive');
     const t0 = Date.now();
     await kill(child);
-    const state = await stateAfter(d.closed, BOUND_MS);
-    t.diagnostic(`wsh-server unix origin: ended as ${JSON.stringify(state)} ${Date.now() - t0} ms after the kill`);
-    assert.equal(state, 'discarded');
-    // The slot is free: another connection to the (restarted) origin is not refused for the limit.
-    await assert.rejects(client.openUnix(sock), (e) => !/too many|queue/i.test(e.message), 'the failure is "no such socket", not the connection limit');
-  });
-
-  it('a TCP origin killed with data unread (reset): noticed at once', async (t) => {
-    const { child, lines } = await startChild(['server', 'tcp', 'paused'], 'listening');
-    const port = originPort(lines);
-    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1"]\nhalf_close_idle_secs = 0\n`);
-    const d = await client.openTcp('127.0.0.1', port);
-    await until(() => lines.includes('accepted'), 'the origin to accept');
-    await handUnread(d);
-    const t0 = Date.now();
-    await kill(child);
-    const state = await stateAfter(d.closed, BOUND_MS);
-    t.diagnostic(`wsh-server tcp origin, unread data: ended as ${JSON.stringify(state)} ${Date.now() - t0} ms after the kill`);
+    const state = await stateAfter(seen[0].closed, BOUND_MS);
+    t.diagnostic(`wsh-server unix caller: ended as ${JSON.stringify(state)} ${Date.now() - t0} ms after the kill`);
     assert.equal(state, 'discarded');
   });
 
-  it('a TCP origin killed with nothing unread: noticed when the kernel drops the half-closed socket (about a minute) and a keep-alive probe is answered with a reset', async (t) => {
-    const { child, lines } = await startChild(['server', 'tcp'], 'listening');
-    const port = originPort(lines);
-    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1"]\nhalf_close_idle_secs = 0\n`);
-    const d = await client.openTcp('127.0.0.1', port);
-    await until(() => lines.includes('accepted'), 'the origin to accept');
+  it('a TCP caller of a reverse listener reset after half-closing is noticed at once', async (t) => {
+    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = ["*"]\nenable_reverse_tunnels = true\nhalf_close_idle_secs = 0\n`);
+    const seen = [];
+    const l = await client.listenTcp(0, { onConnection: (duplex) => { seen.push(duplex); } });
+    const { child } = await startChild(['client', 'tcp', String(l.port), 'paused'], 'half-closed');
+    await until(() => seen.length === 1, 'the client to be handed the caller');
+    await handUnread(seen[0]);
     const t0 = Date.now();
     await kill(child);
-    const state = await stateAfter(d.closed, TCP_SLOW_BOUND_MS);
-    t.diagnostic(`wsh-server tcp origin, nothing unread: ended as ${JSON.stringify(state)} ${Date.now() - t0} ms after the kill`);
+    const state = await stateAfter(seen[0].closed, BOUND_MS);
+    t.diagnostic(`wsh-server tcp caller, unread data: ended as ${JSON.stringify(state)} ${Date.now() - t0} ms after the kill`);
     assert.equal(state, 'discarded');
   });
 
-  it('with half_close_probe_secs = 0 the watch is off: a killed unix origin is not noticed by itself', async () => {
-    const sock = path.join(scratchDir('hco'), 'o.sock');
-    const { child, lines } = await startChild(['server', 'unix', sock], 'listening');
-    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = []\nunix_connect = ["${sock}"]\nhalf_close_idle_secs = 0\nhalf_close_probe_secs = 0\n`);
-    const d = await client.openUnix(sock);
-    await until(() => lines.includes('accepted'), 'the origin to accept');
+  it('with half_close_probe_secs = 0 the watch is off: a killed caller is not noticed by itself', async () => {
+    const dir = scratchDir('hco');
+    const hostSock = path.join(dir, 'l.sock');
+    const { client } = await startServer(callerConfig(dir, 'half_close_probe_secs = 0\n'));
+    const seen = [];
+    await client.listenUnix(hostSock, { onConnection: (duplex) => { seen.push(duplex); } });
+    const { child } = await startChild(['client', 'unix', hostSock], 'half-closed');
+    await until(() => seen.length === 1, 'the client to be handed the caller');
     await kill(child);
     // Nothing can notice it; this bounds how long we look.
-    assert.equal(await stateAfter(d.closed, 2000), 'open');
+    assert.equal(await stateAfter(seen[0].closed, 2000), 'open');
+  });
+
+  // An ORIGIN the server dialled is not watched: one that sent its whole answer and closed completely is the normal end of a response,
+  // and the client may still be reading it (the discard a watch would send drops what it has received and not yet read).
+  it('a unix origin that sent everything and closed completely is not discarded: a slow client still gets all of it', async () => {
+    const dir = scratchDir('hcs');
+    const sock = path.join(dir, 'o.sock');
+    const SIZE = 3 * 1024 * 1024;
+    const origin = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 5), () => s.destroy()); });
+    await new Promise((r) => origin.listen(sock, r));
+    closers.push(async () => origin.close());
+    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = []\nunix_connect = ["${sock}"]\nhalf_close_idle_secs = 0\n`);
+    const d = await client.openUnix(sock);
+    await sleep(1000); // the origin is long gone; what it sent is mostly unread
+    assert.equal(await stateAfter(d.closed, 0), 'open', 'held for the reader');
+    const r = d.readable.getReader();
+    let n = 0;
+    for (;;) { const { value, done } = await r.read(); if (done) break; n += value.length; await sleep(10); } // a slow reader
+    assert.equal(n, SIZE);
+    await d.writable.getWriter().close();
+    assert.notEqual(await d.closed, 'discarded');
   });
 });
 

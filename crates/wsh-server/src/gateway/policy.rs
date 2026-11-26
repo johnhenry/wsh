@@ -75,9 +75,10 @@ pub struct GatewayPolicy {
     /// A connection half-closed by one side (and not the other) is closed after this long with
     /// nothing moving in either direction. `None` = never.
     pub half_close_idle: Option<std::time::Duration>,
-    /// While an origin's socket is half-closed (it sent its end of file), watch it for a peer that
-    /// went away (wsh #282); for TCP, the keep-alive schedule it is given (first probe after this
-    /// long, then one per this long). `None` = no watch.
+    /// While a reverse listener's caller is half-closed (it sent its end of file), watch it for a
+    /// peer that went away (wsh #282); for TCP, the keep-alive schedule it is given (first probe
+    /// after this long, then one per this long). `None` = no watch. Origins the host dialled are
+    /// never watched.
     pub half_close_probe: Option<std::time::Duration>,
 }
 

@@ -48,8 +48,11 @@ function drained(sock) {
  * host ending its side ends the local write side. A socket error (EPIPE or a reset when the local peer closed first) is
  * the end of that connection, not a failure of the forward.
  *
- * A local peer that half-closed and then went away (killed, crashed) is noticed by `watchHalfClosed` (#282): the socket is
- * destroyed, which sends the host a second GatewayClose "discarded" (below), and `onGone` hears of it.
+ * A local peer that half-closed and then went away (killed, crashed) is noticed by `watchHalfClosed` (#282) when `probeMs` is
+ * given: the socket is destroyed, which sends the host a second GatewayClose "discarded" (below), and `onGone` hears of it. Only
+ * for a CONNECTOR (the program that dialled a `-L` listener, which reads the answer): when it is gone nobody reads what the host
+ * still sends. Never for a service that answers (a reverse forward's local end): its complete close after its last byte is the
+ * normal end of a response, and the discard would drop what the caller has not read yet.
  */
 function pipe(sock, duplex, { probeMs, onGone } = {}) {
   const writer = duplex.writable.getWriter();
@@ -141,7 +144,9 @@ export async function forward(client, { local, remote, reverse = false, replace 
         rconns.add(sock);
         sock.once('close', () => { rconns.delete(sock); });
         sock.pause();
-        sock.once('connect', () => { pipe(sock, duplex, { probeMs, onGone: report }); sock.resume(); });
+        // The local end of a REVERSE forward is a service (it answers): one that finished and closed completely is the ordinary end
+        // of a response, and the caller may still be reading it, so it is not watched (see `halfCloseProbeMs`).
+        sock.once('connect', () => { pipe(sock, duplex); sock.resume(); });
         // Only a failure to reach the local service is reported; a socket that ends later (EPIPE, a reset) is just the end of that connection.
         const failed = (e) => { sock.off('connect', failed); duplex.destroy(); report(e); };
         sock.once('error', failed);
