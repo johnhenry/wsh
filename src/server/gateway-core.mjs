@@ -101,7 +101,7 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
       sendCredit: (n) => reply(gatewayCredit({ gatewayId: id, bytes: n })),
       sendClose: (reason) => reply(gatewayClose({ gatewayId: id, reason })),
       ...extra,
-      onClose: (reason) => { conns.delete(id); extra?.onClose?.(reason); },
+      onClose: (reason, graceful) => { conns.delete(id); extra?.onClose?.(reason, graceful); },
     });
   }
 

@@ -278,6 +278,35 @@ function normalizeUnixShape(u) {
 }
 
 /**
+ * A connection both sides have finished (nothing discarded): end the socket's write side and close it once everything handed to it
+ * has been taken by its peer, instead of destroying it with that still queued. A peer that stops taking what is queued (it
+ * reads nothing, or too slowly to matter) is not waited for beyond `idleMs` without a single byte accepted (the half-close idle
+ * bound; 0 = never), after which the socket is destroyed as it always was.
+ */
+export function settleSocket(sock, idleMs) {
+  if (sock.destroyed) return;
+  sock.end();
+  if (sock.writableFinished) { sock.destroy(); return; }
+  sock.once('finish', () => { sock.destroy(); });
+  if (!(idleMs > 0)) return;
+  // Progress is what the socket has let go of: the bytes still queued on this side, in the stream and in the handle (the stream
+  // hands a batch of writes to libuv as one request, so its own count moves only when the whole batch is out). `bytesWritten` counts
+  // what is queued as written, so it shows nothing.
+  const queued = () => sock.writableLength + (sock._handle?.writeQueueSize ?? 0);
+  let seen = queued();
+  let timer = null;
+  const check = () => {
+    timer = null;
+    if (sock.destroyed) return;
+    if (queued() !== seen) { seen = queued(); timer = setTimeout(check, idleMs); timer.unref?.(); return; }
+    sock.destroy();
+  };
+  timer = setTimeout(check, idleMs);
+  timer.unref?.();
+  sock.once('close', () => { clearTimeout(timer); });
+}
+
+/**
  * The per-connection half: one instance per client connection, torn down with it.
  * @param {ReturnType<typeof normalizeGateway>} cfg
  * @param {(msg: object) => unknown} send
@@ -310,7 +339,10 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       // The client will send no more: pass the EOF on to the origin and keep reading its answer for as long as it takes
       // (the channel's idle rule, not a timer here, reaps a connection nothing moves on).
       onRemoteClose: () => { sock.end(); },
-      onClose: () => { sock.destroy(); },
+      // Both sides finished by themselves: what this side already handed to the socket still has to reach its peer (a caller that
+      // half-closed first and reads slowly), so the socket is ended and closed once it has taken it. Anything else (an error, a
+      // discard, the idle bound) is the end of the connection, as it was.
+      onClose: (_reason, graceful) => { if (graceful) settleSocket(sock, cfg.halfCloseIdleMs); else sock.destroy(); },
     });
     conns.set(id, { channel, sock });
     // Origin -> client: one chunk at a time. The socket is paused until the channel has taken the chunk (it waits for

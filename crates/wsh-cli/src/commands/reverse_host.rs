@@ -15,14 +15,17 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
+use wsh_client::gateway::DEFAULT_HALF_CLOSE_IDLE;
 use wsh_client::WshClient;
 use wsh_core::messages::*;
 use wsh_core::peer_record::{build_peer_record_transcript, PeerRecord};
+
+use super::reverse_gateway::{spawn_datagram, spawn_stream, GatewaySink, ReverseGatewayConnection};
 
 const DEFAULT_PTY_REPLAY_LIMIT: usize = 256 * 1024;
 /// How long an exited child's output reader may take to reach the pty's EOF before Exit goes out.
@@ -1456,7 +1459,7 @@ impl ReverseHostRuntime {
                 )
                 .await;
         }
-        if self.gateway_connections.contains_key(&open.gateway_id) {
+        if self.gateway_id_in_use(open.gateway_id) {
             return self
                 .send_gateway_fail(open.gateway_id, 4, "gateway id already in use")
                 .await;
@@ -1465,7 +1468,12 @@ impl ReverseHostRuntime {
         match TcpStream::connect((open.host.as_str(), open.port)).await {
             Ok(stream) => {
                 let resolved_addr = stream.peer_addr().ok().map(|addr| addr.to_string());
-                let connection = spawn_tcp_gateway(self.client()?, open.gateway_id, stream);
+                let connection = spawn_stream(
+                    self.client()?,
+                    open.gateway_id,
+                    stream,
+                    Some(DEFAULT_HALF_CLOSE_IDLE),
+                );
                 self.gateway_connections.insert(open.gateway_id, connection);
                 self.client()?
                     .send_fire_and_forget(Envelope {
@@ -1496,7 +1504,7 @@ impl ReverseHostRuntime {
                 )
                 .await;
         }
-        if self.gateway_connections.contains_key(&open.gateway_id) {
+        if self.gateway_id_in_use(open.gateway_id) {
             return self
                 .send_gateway_fail(open.gateway_id, 4, "gateway id already in use")
                 .await;
@@ -1522,7 +1530,7 @@ impl ReverseHostRuntime {
         }
 
         let resolved_addr = socket.peer_addr().ok().map(|addr| addr.to_string());
-        let connection = spawn_udp_gateway(self.client()?, open.gateway_id, socket);
+        let connection = spawn_datagram(self.client()?, open.gateway_id, socket);
         self.gateway_connections.insert(open.gateway_id, connection);
         self.client()?
             .send_fire_and_forget(Envelope {
@@ -1576,7 +1584,7 @@ impl ReverseHostRuntime {
         let Some(connection) = self.gateway_connections.get(&data.gateway_id) else {
             return Ok(());
         };
-        if connection.write_tx.send(data.data).await.is_err() {
+        if !connection.data(data.data).await {
             self.gateway_connections.remove(&data.gateway_id);
             self.send_gateway_close(data.gateway_id, Some("gateway closed".to_string()))
                 .await?;
@@ -1584,9 +1592,28 @@ impl ReverseHostRuntime {
         Ok(())
     }
 
+    /// The operator's `GatewayClose`: a half-close for a TCP connection (the origin still answers; see `reverse_gateway`), the end
+    /// of a UDP flow.
     async fn handle_gateway_close(&mut self, close: GatewayClosePayload) -> Result<()> {
-        self.close_gateway_connection(close.gateway_id).await;
+        if let Some(connection) = self.gateway_connections.get(&close.gateway_id) {
+            connection.close(close.reason).await;
+            if connection.is_finished() {
+                self.gateway_connections.remove(&close.gateway_id);
+            }
+        }
         Ok(())
+    }
+
+    /// Is `gateway_id` held by a connection that is still running? (One that has ended by itself is forgotten here.)
+    fn gateway_id_in_use(&mut self, gateway_id: u32) -> bool {
+        if self
+            .gateway_connections
+            .get(&gateway_id)
+            .is_some_and(ReverseGatewayConnection::is_finished)
+        {
+            self.gateway_connections.remove(&gateway_id);
+        }
+        self.gateway_connections.contains_key(&gateway_id)
     }
 
     async fn handle_listen_request(&self, request: ListenRequestPayload) -> Result<()> {
@@ -1621,7 +1648,7 @@ impl ReverseHostRuntime {
 
     async fn close_gateway_connection(&mut self, gateway_id: u32) {
         if let Some(connection) = self.gateway_connections.remove(&gateway_id) {
-            connection.task.abort();
+            connection.abort();
         }
     }
 
@@ -1706,7 +1733,10 @@ impl ReverseHostRuntime {
             && self.active_request.is_none()
             && self.pending_proof.is_none()
             && self.sessions.is_empty()
-            && self.gateway_connections.is_empty()
+            && self
+                .gateway_connections
+                .values()
+                .all(ReverseGatewayConnection::is_finished)
     }
 
     async fn emit_session_count(&self) {
@@ -1867,11 +1897,6 @@ struct ReverseHostPtySession {
     pending_output: Arc<StdMutex<VecDeque<Vec<u8>>>>,
     exit_code: Arc<StdMutex<Option<i32>>>,
     notifier: Arc<StdMutex<Option<mpsc::UnboundedSender<RuntimeEvent>>>>,
-}
-
-struct ReverseGatewayConnection {
-    write_tx: mpsc::Sender<Vec<u8>>,
-    task: tokio::task::JoinHandle<()>,
 }
 
 enum RuntimeEvent {
@@ -2452,118 +2477,10 @@ fn try_parse_download_header(buf: &[u8]) -> Result<Option<(PathBuf, usize)>> {
     Ok(Some((PathBuf::from(path), 4 + path_len)))
 }
 
-fn spawn_tcp_gateway(
-    client: PeerLink,
-    gateway_id: u32,
-    stream: TcpStream,
-) -> ReverseGatewayConnection {
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
-    let task = tokio::spawn(async move {
-        let (mut reader, mut writer) = stream.into_split();
-        let mut buf = vec![0_u8; 8192];
-        loop {
-            tokio::select! {
-                read = reader.read(&mut buf) => {
-                    match read {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let data = buf[..n].to_vec();
-                            let _ = client
-                                .send_fire_and_forget(Envelope {
-                                    msg_type: MsgType::GatewayData,
-                                    payload: Payload::GatewayData(GatewayDataPayload { gateway_id, data }),
-                                })
-                                .await;
-                        }
-                        Err(err) => {
-                            warn!(gateway_id, "reverse host TCP gateway read failed: {err}");
-                            break;
-                        }
-                    }
-                }
-                payload = write_rx.recv() => {
-                    match payload {
-                        Some(payload) => {
-                            if let Err(err) = writer.write_all(&payload).await {
-                                warn!(gateway_id, "reverse host TCP gateway write failed: {err}");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        let _ = client
-            .send_fire_and_forget(Envelope {
-                msg_type: MsgType::GatewayClose,
-                payload: Payload::GatewayClose(GatewayClosePayload {
-                    gateway_id,
-                    reason: Some("gateway stream closed".to_string()),
-                }),
-            })
-            .await;
-    });
-
-    ReverseGatewayConnection { write_tx, task }
-}
-
-fn spawn_udp_gateway(
-    client: PeerLink,
-    gateway_id: u32,
-    socket: UdpSocket,
-) -> ReverseGatewayConnection {
-    let socket = Arc::new(socket);
-    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(64);
-    let task = tokio::spawn(async move {
-        let mut buf = vec![0_u8; 8192];
-        loop {
-            tokio::select! {
-                read = socket.recv(&mut buf) => {
-                    match read {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let data = buf[..n].to_vec();
-                            let _ = client
-                                .send_fire_and_forget(Envelope {
-                                    msg_type: MsgType::GatewayData,
-                                    payload: Payload::GatewayData(GatewayDataPayload { gateway_id, data }),
-                                })
-                                .await;
-                        }
-                        Err(err) => {
-                            warn!(gateway_id, "reverse host UDP gateway recv failed: {err}");
-                            break;
-                        }
-                    }
-                }
-                payload = write_rx.recv() => {
-                    match payload {
-                        Some(payload) => {
-                            if let Err(err) = socket.send(&payload).await {
-                                warn!(gateway_id, "reverse host UDP gateway send failed: {err}");
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        let _ = client
-            .send_fire_and_forget(Envelope {
-                msg_type: MsgType::GatewayClose,
-                payload: Payload::GatewayClose(GatewayClosePayload {
-                    gateway_id,
-                    reason: Some("gateway datagram stream closed".to_string()),
-                }),
-            })
-            .await;
-    });
-
-    ReverseGatewayConnection { write_tx, task }
+impl GatewaySink for PeerLink {
+    async fn send(&self, envelope: Envelope) {
+        let _ = self.send_fire_and_forget(envelope).await;
+    }
 }
 
 fn filter_dns_addresses(addresses: impl Iterator<Item = IpAddr>, record_type: &str) -> Vec<String> {

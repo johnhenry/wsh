@@ -78,7 +78,8 @@ export const GATEWAY_MAX_FRAME = 65536;
  * @property {(reason?: string) => unknown} sendClose
  * @property {(bytes: Uint8Array) => void} [onData] sink mode: receive() calls this instead of queueing for `streams().readable`
  * @property {(reason?: string) => void} [onRemoteClose] the peer sent GatewayClose (it will send no more data)
- * @property {(reason?: string) => void} [onClose] called once, when the connection is over
+ * @property {(reason?: string, graceful?: boolean) => void} [onClose] called once, when the connection is over; `graceful` is true when
+ *   both sides finished by themselves (each sent its GatewayClose, no discard, no error, no idle bound, no destroy)
  */
 
 export class GatewayChannel {
@@ -92,6 +93,8 @@ export class GatewayChannel {
   #creditWaiters = [];
   #sentClose = false;
   #gotClose = false;
+  /** The peer's FIRST close was a discard: it reads nothing more, so nothing queued for it is worth delivering. */
+  #discarded = false;
   #finished = false;
   #idleTimer = null;
   #lastActive = 0;
@@ -159,11 +162,11 @@ export class GatewayChannel {
     this.#gotClose = true;
     // The peer discarded the connection (it reads nothing more): our direction is over too. Anything already received can
     // still be read; our writers fail; no GatewayClose goes back.
-    if (reason === GATEWAY_DISCARDED && !this.#sentClose) { this.#sentClose = true; this.#wakeWriters(); }
+    if (reason === GATEWAY_DISCARDED && !this.#sentClose) { this.#sentClose = true; this.#discarded = true; this.#wakeWriters(); }
     this.#waiter?.();
     try { this.#o.onRemoteClose?.(reason); } catch { /* the application's problem */ }
     if (!this.#o.writeAfterRemoteClose) this.#wakeWriters();
-    if (this.#sentClose) { if (this.#queue.length === 0) this.#finish(reason); return; }
+    if (this.#sentClose) { if (this.#queue.length === 0) this.#finish(reason, !this.#discarded); return; }
     this.#watchIdle();
   }
 
@@ -240,7 +243,7 @@ export class GatewayChannel {
     this.#sentClose = true;
     try { void this.#o.sendClose(reason); } catch { /* transport gone */ }
     this.#wakeWriters();
-    if (this.#gotClose && this.#queue.length === 0) this.#finish(reason);
+    if (this.#gotClose && this.#queue.length === 0) this.#finish(reason, true);
     else if (!this.#gotClose) this.#watchIdle(); // the peer owes us its own GatewayClose; it may take as long as it likes while bytes move
   }
 
@@ -283,7 +286,7 @@ export class GatewayChannel {
           return;
         }
         controller.close();
-        if (self.#sentClose) self.#finish();
+        if (self.#sentClose) self.#finish(undefined, !self.#discarded);
       },
       cancel(reason) { self.destroy(typeof reason === 'string' ? reason : undefined); },
     }, { highWaterMark: 0 });
@@ -304,7 +307,8 @@ export class GatewayChannel {
     for (const w of this.#creditWaiters.splice(0)) w(); // write() re-checks and throws or continues
   }
 
-  #finish(reason) {
+  /** @param {boolean} [graceful] both sides finished by themselves: nothing was discarded, so what was handed to a sink is still to be delivered */
+  #finish(reason, graceful = false) {
     if (this.#finished) return;
     this.#finished = true;
     clearTimeout(this.#idleTimer);
@@ -314,7 +318,7 @@ export class GatewayChannel {
     this.#queue = [];
     this.#waiter?.();
     this.#wakeWriters();
-    try { this.#o.onClose?.(reason); } catch { /* the application's problem */ }
+    try { this.#o.onClose?.(reason, graceful); } catch { /* the application's problem */ }
     this.#resolveClosed(reason);
   }
 }
