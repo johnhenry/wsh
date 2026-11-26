@@ -37,6 +37,7 @@ import { assertEd25519HostKey } from './host-key.mjs';
 import { resolveBackends, resolveHostKey, createRpcTable } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
 import { normalizeEndpointGateway, createEndpointGatewaySession } from './server/gateway-core.mjs';
+import { assertHalfCloseIdleMs } from './gateway-channel.mjs';
 import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
 import { RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { SessionRegistry, DEFAULT_RING_BYTES, DEFAULT_DETACH_TTL_MS, DEFAULT_MAX_DETACHED } from './session-registry.mjs';
@@ -171,6 +172,10 @@ function createRegistry(sessions, log) {
  *   backpressure) and `who` is the authenticated `{ username, fingerprint }`, so the handler can authorise per call:
  *   throw synchronously to refuse, or give `{ open, authorize(who) }`. Only the names listed here exist (an allow-list by
  *   construction); nothing else of the gateway (TCP, DNS, unix sockets) is on in memory.
+ * @param {number} [options.gatewayHalfCloseIdleMs=300000] - The half-close idle bound of this host's endpoint connections (the same rule
+ *   and meaning as `gateway.halfCloseIdleMs` of `createWshServer`, #271): a connection that one side has half-closed is ended after this
+ *   many milliseconds with nothing moving in either direction. A non-negative integer up to 2147483647, `0` = never; anything else is
+ *   a `TypeError`. An endpoint of its own can give `{ open, halfCloseIdleMs }`, which wins over this for that endpoint.
  * @param {Record<string, { description?: string, authorize?: Function, exec?: Function | { run: Function }, pty?: object, fs?: object, endpoints?: object }>} [options.targets]
  *   Execution targets (#121), as for `createWshServer`: each with its own `exec`, `pty`, `fs` and `endpoints` (the injected
  *   forms only: there is no shell or directory here) and an `authorize(who, { target, kind })`. Off unless given.
@@ -192,7 +197,7 @@ function createRegistry(sessions, log) {
  *   from `@johnhenry/wsh/host`), what is known of `who`, and a human `detail` (not stable). Not for parsing `onLog`.
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, loginTimeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onLog = () => {},
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, gatewayHalfCloseIdleMs, loginTimeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onLog = () => {},
   onShare, onRefused, onSealed, targets, requireTarget, usernamePattern } = {}) {
   if (onSealed !== undefined && typeof onSealed !== 'function') throw new TypeError('createMemoryHost: onSealed must be a function');
   resolveUsernamePattern(usernamePattern, 'createMemoryHost');
@@ -200,6 +205,7 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   validateOnRefused(onRefused, 'createMemoryHost');
   if (!Number.isFinite(connectionTtlMs) || connectionTtlMs < 0) throw new TypeError('createMemoryHost: connectionTtlMs must be a non-negative number');
   assertSealTimeoutMs(sealTimeoutMs, 'createMemoryHost');
+  const halfCloseIdleMs = assertHalfCloseIdleMs(gatewayHalfCloseIdleMs, 'createMemoryHost: gatewayHalfCloseIdleMs');
   assertLoginTimeoutMs(loginTimeoutMs, 'createMemoryHost');
   if (requireChannelBinding !== false && requireChannelBinding !== true && !(Array.isArray(requireChannelBinding) && requireChannelBinding.every((k) => CHANNEL_BINDING_KINDS.includes(k)))) {
     throw new TypeError(`createMemoryHost: requireChannelBinding must be true, false or an array of kinds (${CHANNEL_BINDING_KINDS.join(', ')})`);
@@ -228,9 +234,9 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   const methods = authMethods(auth);
   // Named virtual endpoints: a gateway with no TCP, DNS or unix sockets that answers only `OpenEndpoint`, built from
   // the browser-safe core (`server/gateway-core.mjs`), so a page can have it.
-  let gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints });
+  let gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints, halfCloseIdleMs });
   // A target's own endpoints (#121) need the endpoints-only gateway too, even when the host has none of its own.
-  if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({})), targetEndpoints: true };
+  if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({ halfCloseIdleMs })), targetEndpoints: true };
 
   const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
     authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, loginTimeoutMs, log: onLog,

@@ -183,7 +183,7 @@ export interface WshServerGatewayOptions {
     maxListeners?: number;
   };
   /** Named virtual endpoints (`OpenEndpoint`, feature `gateway-endpoints`): only these names exist. */
-  endpoints?: Record<string, WshGatewayEndpointHandler | { open: WshGatewayEndpointHandler; authorize?: (who: WshGatewayWho) => boolean | Promise<boolean> }>;
+  endpoints?: Record<string, WshGatewayEndpointHandler | { open: WshGatewayEndpointHandler; authorize?: (who: WshGatewayWho) => boolean | Promise<boolean>; /** This endpoint's own half-close idle bound (as `halfCloseIdleMs` above); wins over it. */ halfCloseIdleMs?: number }>;
   /** `false`: no TCP or DNS at all (an endpoints-only gateway). Default true. */
   tcp?: boolean;
   /**

@@ -70,7 +70,14 @@ export interface WshMemoryHostOptions {
    * `{ username, fingerprint }`) and refuses by throwing; `{ open, authorize(who) }` authorises per call. Only the
    * names listed exist. Nothing else of the gateway (TCP, DNS, unix sockets) is available in memory.
    */
-  endpoints?: Record<string, WshMemoryEndpointHandler | { open: WshMemoryEndpointHandler; authorize?: (who: { username: string | null; fingerprint: string | null }) => boolean | Promise<boolean> }>;
+  endpoints?: Record<string, WshMemoryEndpointHandler | { open: WshMemoryEndpointHandler; authorize?: (who: { username: string | null; fingerprint: string | null }) => boolean | Promise<boolean>; halfCloseIdleMs?: number }>;
+  /**
+   * The half-close idle bound (#271) of this host's endpoint connections, the same rule as `gateway.halfCloseIdleMs` of
+   * `createWshServer`: a connection one side has half-closed is ended after this many milliseconds with nothing moving in
+   * either direction. A non-negative integer up to 2147483647; `0` = never; anything else is a `TypeError`. Default 300000. An
+   * endpoint given as `{ open, halfCloseIdleMs }` uses its own bound instead (an endpoint with long-lived quiet streams wants a longer one).
+   */
+  gatewayHalfCloseIdleMs?: number;
   bindTimeoutMs?: number;
   /** End each authenticated connection this long after login; advertised as `AuthOk.ttl` in whole seconds. 0 / omitted = never. */
   connectionTtlMs?: number;
@@ -125,6 +132,8 @@ export interface WshMemoryConnectOptions {
   signer?: WshSigner;
   password?: string;
   timeout?: number;
+  /** As for `WshClient.connect()`: the client's own half-close idle bound for gateway connections (default 300000; `0` = never). */
+  gatewayHalfCloseIdleMs?: number;
 }
 
 export interface WshMemoryHost {
