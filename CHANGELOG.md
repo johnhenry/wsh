@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.60.0 / Rust `rust-v0.24.0`
+
 ### An operator behind a relay can use a reverse host's gateway, when the host's owner turned it on: `relay-gateway` (#289, #285; npm and Rust)
 
 - **What changes.** `OpenTcp`, `OpenUdp`, `ResolveDns` and `ListenRequest`, and their answers (`DnsResult`, `ListenOk`, `ListenFail`, `ListenClose`, `InboundOpen`, `InboundAccept`, `InboundReject`), are carried by a relay to a reverse host and back. Until now no relay carried them, so an operator behind a relay could not open a gateway connection on a reverse host at all (the finding of #285 / #287; the owner decided to make them reachable). **Off unless the host's owner turns it on, negotiated, bounded.** Nothing that works today changes.
