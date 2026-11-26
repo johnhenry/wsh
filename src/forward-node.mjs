@@ -168,6 +168,8 @@ export async function forward(client, { local, remote, reverse = false, replace 
   return {
     local, remote, ...(r.kind === 'endpoint' ? { endpoint: r.name } : {}), address: server.address(),
     ...(limit === Infinity ? {} : { maxConnections: limit }),
+    /** Connections open now (counted against `maxConnections`). */
+    get connections() { return conns.size; },
     async close() {
       await new Promise((res) => { server.close(() => res()); for (const s of conns) s.destroy(); });
       await cleanup();

@@ -70,7 +70,7 @@ describe('forwardEndpoint: a local socket or port joined to a named endpoint of 
         // a sink that reads nothing until the test opens the gate, then reads to EOF and reports the total
         sink: guard(async (d) => { const r = d.readable.getReader(); const w = d.writable.getWriter(); await st.gate; for (;;) { const { value, done } = await r.read(); if (done) break; st.received += value.length; } await w.write(enc.encode(String(st.received))); await w.close(); }),
         // holds a connection open until the client goes away
-        idle: guard(async (d) => { await d.closed; }),
+        idle: guard(async (d) => { const r = d.readable.getReader(); const w = d.writable.getWriter(); for (;;) { const { done } = await r.read(); if (done) break; } await w.close(); }),
         // refuses the first caller, accepts the rest
         flaky: { authorize: () => ++st.flaky > 1, open: guard(async (d) => { const r = d.readable.getReader(); const w = d.writable.getWriter(); const { value } = await r.read(); await w.write(value); await w.close(); }) },
         locked: { authorize: () => false, open: async () => {} },
@@ -258,17 +258,20 @@ describe('forwardEndpoint: a local socket or port joined to a named endpoint of 
   });
 
   it('bounds concurrent connections (128 by default; maxConnections changes it): the extra one is closed and reported, and a freed slot is reusable', async () => {
-    const { local, errors } = await start({ endpoint: 'idle', maxConnections: 2 });
+    const { fwd, local, errors } = await start({ endpoint: 'idle', maxConnections: 2 });
     const a = await open(local); const b = await open(local);
-    await until(() => st.active === 2, 'two live connections');
+    await until(() => st.active === 2 && fwd.connections === 2, 'two live connections');
     const c = await open(local);
     await closed(c);
     await until(() => errors.length === 1, 'the over-limit report');
     assert.match(errors[0].message, /more than 2 connections/);
-    a.destroy();
-    await until(() => st.active === 1, 'a slot to free up');
+    assert.equal(fwd.connections, 2);
+    const aGone = closed(a);
+    a.end(); // the endpoint ends its side once it sees ours, and the slot is free
+    await aGone;
+    await until(() => fwd.connections === 1, 'a slot to free up');
     const d = await open(local);
-    await until(() => st.active === 2, 'the freed slot to be used');
+    await until(() => st.active === 2 && fwd.connections === 2, 'the freed slot to be used');
     assert.equal(errors.length, 1);
     b.destroy(); d.destroy();
     const client = await newClient();

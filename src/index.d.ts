@@ -2237,6 +2237,8 @@ export interface WshForwardHandle {
   address?: { address: string; family: string; port: number } | string | null;
   /** Set when a bound on concurrent connections applies. */
   maxConnections?: number;
+  /** Local connections open now (what `maxConnections` counts); absent on a reverse forward. */
+  readonly connections?: number;
   /** Stop listening, end every live connection and remove the socket file this forward created. Safe to call twice. */
   close(): Promise<void>;
 }
