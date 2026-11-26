@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### A local forward and a host's unix listener remove only the socket they made (#267; npm, Node) and a flaky Rust test (#268)
+
+- **What changes.** `client.forwardUnix` / `forwardEndpoint` (a local unix socket) and the Node gateway's `ListenUnix` listener checked, on close, that the file at the path was still their own, but Node's `net.Server` unlinks whatever is at the name it bound when it closes, so a file or socket another process had put at the path meanwhile was removed anyway. The server is now bound inside a private `0700` directory next to the path, the socket is hard-linked to the path (it stays a real socket, mode `0600`, with no link to follow), and `close()` closes the server, removes the path only while it is still that same socket (moved into a private directory and checked again before the unlink), and removes the directory. `handle.local` and `handle.address` still report the requested path. A stale socket is still replaced only with `replace: true`; a killed process still leaves its socket, now with an empty `.w…` directory beside it.
+- **Limit.** A path too long to stage a directory next to (103 bytes on macOS, 107 on Linux) or a file system without hard links is bound directly, as before; there a replaced file is still removed on close. Windows named pipes and Linux abstract names are unchanged.
+- **Rust CLI.** It already bound through a private directory and a hard link, and never unlinked by name. Its cleanup and its stale-socket replacement now also move the file aside and check it again before removing it. The test `with_the_flag_only_a_stale_socket_is_replaced` could fail once in a while: its "stale" socket was a listener that had only been dropped, and a child forked by another test at that instant still held the descriptor, so the socket was briefly live; the test now binds a socket that never listens.
+- **Nothing changes on the wire.** No message, field or feature string.
+- Tests: `test/unix-listen.test.mjs` (the helper: foreign file and live socket survive, own files all gone, long paths, mode, 40 at once), additions to `test/forward-endpoint.test.mjs` and `test/gateway-unix.test.mjs`, and the Rust `unix_sockets` tests.
+
 ### `client.forwardEndpoint()`: forward a local unix socket or TCP port to a named endpoint of the host (#264; npm, Node only)
 
 - **What it is.** The JavaScript equivalent of the CLI's `wsh -N -L /tmp/d.sock:endpoint=NAME`. `await client.forwardEndpoint({ local, endpoint, replace?, maxConnections?, onError? })` listens on `local` (a socket path, `host:port`, or a bare port on loopback) and joins every connection to `openEndpoint(endpoint)`; it returns `{ local, remote: 'endpoint=NAME', endpoint, address, maxConnections, close() }`. `forwardUnix({ local, remote: 'endpoint=NAME' })` is the same forward in the CLI's spelling. Types: `WshForwardEndpointOptions`, `WshForwardHandle`. A JavaScript operator no longer has to write its own bridge.

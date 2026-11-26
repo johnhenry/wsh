@@ -40,7 +40,7 @@ const closed = (s) => {
 
 describe('forwardEndpoint: a local socket or port joined to a named endpoint of the host', () => {
   let keyPair; let raw; let host; let dir;
-  const clients = []; const forwards = []; const socks = [];
+  const clients = []; const forwards = []; const socks = []; const children = [];
   let n = 0;
   const sockPath = () => path.join(dir, `s${n++}.sock`);
 
@@ -84,6 +84,7 @@ describe('forwardEndpoint: a local socket or port joined to a named endpoint of 
     for (const s of socks.splice(0)) s.destroy();
     for (const f of forwards.splice(0)) await f.close().catch(() => {});
     for (const c of clients.splice(0)) await c.disconnect().catch(() => {});
+    for (const c of children.splice(0)) { c.stdin.end(); await new Promise((r) => c.once('exit', r)); }
     fs.rmSync(dir, { recursive: true, force: true }); // a directory this test made
   });
 
@@ -118,6 +119,108 @@ describe('forwardEndpoint: a local socket or port joined to a named endpoint of 
     assert.equal(fs.statSync(local).mode & 0o777, 0o600);
     await fwd.close();
     assert.equal(fs.existsSync(local), false);
+  });
+
+  describe('close() removes what the forward made and nothing else', () => {
+    const entries = () => fs.readdirSync(dir).sort();
+    const answers = async (p) => { const s = await open(p); s.end('x'); return (await readAll(s)).toString(); };
+    /** Another process listening at `p`; resolves once it accepts. */
+    const anotherProcessListens = async (p) => {
+      const child = spawn(process.execPath, [new URL('./live-socket-child.mjs', import.meta.url).pathname, p], { stdio: ['pipe', 'pipe', 'inherit'] });
+      children.push(child);
+      await new Promise((resolve, reject) => { child.stdout.once('data', resolve); child.once('exit', () => reject(new Error('the other process exited'))); });
+    };
+
+    it('the handle and its address report the path that was asked for, whatever the socket is bound to underneath', async () => {
+      const { fwd, local } = await start();
+      assert.equal(fwd.local, local);
+      assert.equal(fwd.address, local);
+    });
+
+    it('a regular file put at the path while the forward is up survives close()', async () => {
+      const { fwd, local } = await start();
+      fs.unlinkSync(local); fs.writeFileSync(local, 'not the forward\'s');
+      await fwd.close();
+      assert.equal(fs.readFileSync(local, 'utf8'), 'not the forward\'s');
+      assert.deepEqual(entries(), [path.basename(local)], 'and the forward\'s private directory is gone');
+    });
+
+    it('another process\'s live socket put at the path while the forward is up survives close() and still answers', async () => {
+      const { fwd, local } = await start();
+      fs.unlinkSync(local);
+      await anotherProcessListens(local);
+      const theirs = fs.lstatSync(local).ino;
+      await fwd.close();
+      assert.equal(fs.lstatSync(local).ino, theirs);
+      assert.equal(await answers(local), 'other');
+      assert.deepEqual(entries(), [path.basename(local)]);
+    });
+
+    it('everything the forward made is gone after close(): the socket, and the private directory it was made in', async () => {
+      const { fwd } = await start();
+      assert.equal(entries().length, 2, 'while up: the socket and its private directory');
+      await fwd.close();
+      assert.deepEqual(entries(), []);
+    });
+
+    it('the socket is reachable by its owner only: a private socket in a private directory', async () => {
+      const { local } = await start();
+      const st = fs.lstatSync(local);
+      assert.equal(st.isSocket(), true, 'the path is a socket itself, not a link to one');
+      assert.equal(st.mode & 0o777, 0o600);
+      const priv = entries().filter((n) => n !== path.basename(local));
+      assert.equal(priv.length, 1);
+      assert.equal(fs.statSync(path.join(dir, priv[0])).mode & 0o777, 0o700);
+    });
+
+    it('what a crashed forward leaves (a stale socket and its empty private directory) is a stale socket: replaced with replace: true, refused without', async () => {
+      const local = sockPath();
+      const child = spawn(process.execPath, [new URL('./stale-unix-listen-child.mjs', import.meta.url).pathname, local], { stdio: 'ignore' });
+      await new Promise((r) => child.on('exit', r));
+      assert.equal(fs.lstatSync(local).isSocket(), true);
+      const left = entries().filter((n) => n !== path.basename(local));
+      assert.equal(left.length, 1, 'the crashed run\'s private directory');
+      const client = await newClient();
+      await assert.rejects(client.forwardEndpoint({ local, endpoint: 'echo' }), /already exists.*replace/);
+      const fwd = await client.forwardEndpoint({ local, endpoint: 'echo', replace: true });
+      forwards.push(fwd);
+      assert.equal(await answers(local), 'x');
+      await fwd.close();
+      assert.deepEqual(entries(), left, 'only the crashed run\'s own leftover remains');
+    });
+
+    it('a forward on a path replaced by a live socket is refused with replace: true, and that socket is left alone', async () => {
+      const local = sockPath();
+      await anotherProcessListens(local);
+      const client = await newClient();
+      await assert.rejects(client.forwardEndpoint({ local, endpoint: 'echo', replace: true }), /in use/);
+      assert.equal(await answers(local), 'other');
+    });
+
+    it('many forwards at once in one directory: each answers, and closing them all leaves nothing', async () => {
+      const client = await newClient();
+      const all = await Promise.all(Array.from({ length: 24 }, () => client.forwardEndpoint({ local: sockPath(), endpoint: 'echo' })));
+      forwards.push(...all);
+      for (const f of all) assert.equal(await answers(f.local), 'x');
+      await Promise.all(all.map((f) => f.close()));
+      assert.deepEqual(entries(), []);
+    });
+
+    it('a path too long to stage a private directory next to still forwards (listening directly, as before)', async () => {
+      const root = fs.mkdtempSync('/tmp/wsh-fel-');
+      try {
+        const max = process.platform === 'linux' ? 107 : 103;
+        let parent = root;
+        while (Buffer.byteLength(parent) < max - 8) parent = path.join(parent, 'd'.repeat(Math.max(1, Math.min(30, max - 8 - Buffer.byteLength(parent) - 1))));
+        fs.mkdirSync(parent, { recursive: true });
+        const local = path.join(parent, 's.sock');
+        const { fwd } = await start({ local });
+        assert.equal(fs.statSync(local).mode & 0o777, 0o600);
+        assert.equal(await answers(local), 'x');
+        await fwd.close();
+        assert.equal(fs.existsSync(local), false);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    });
   });
 
   it('a TCP port on the local side binds loopback unless an address is given', async () => {
