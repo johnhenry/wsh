@@ -24,6 +24,8 @@ use wsh_core::gateway_credit::{
     SendCredit, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED, GATEWAY_MAX_FRAME,
 };
 use wsh_core::messages::*;
+use wsh_core::peer_watch::PeerWatch;
+pub use wsh_core::peer_watch::{WatchablePeer, DEFAULT_HALF_CLOSE_PROBE};
 use wsh_core::{frame_encode, WshError, WshResult};
 
 /// Feature a host lists when `OpenUnix` / `ListenUnix` are available.
@@ -436,7 +438,46 @@ impl GatewayStream {
     where
         L: AsyncRead + AsyncWrite + Send + 'static,
     {
+        self.pump_inner(local, idle, None).await
+    }
+
+    /// [`GatewayStream::pump_with_idle`] for a local socket (TCP, or a unix stream) whose peer is
+    /// WATCHED once it has half-closed (wsh #282): a local program that sent its end of file and was
+    /// then killed gives a plain read loop nothing, so the host's connection and slot would be held
+    /// until the far side next sent. The kernel does report it, as a hang-up of the socket's write
+    /// side; with `probe` set that is awaited as soon as the local side's end of file is read, and
+    /// the connection is then ended as a destroyed one (a second `GatewayClose` with the reason
+    /// `discarded`) and `pump` returns an error of kind `ConnectionAborted`. Nothing is ever
+    /// written to the local program. For a TCP socket `probe` is also the short keep-alive
+    /// schedule given to the socket at that moment (see [`wsh_core::peer_watch`]: a peer that
+    /// exited without unread data is noticed when its kernel drops the connection, about a minute).
+    /// `None` = no watch (as `pump_with_idle`). Where the platform cannot watch (Windows) this is
+    /// `pump_with_idle`.
+    pub async fn pump_watched<L>(
+        self,
+        local: L,
+        idle: Option<Duration>,
+        probe: Option<Duration>,
+    ) -> std::io::Result<(u64, u64)>
+    where
+        L: AsyncRead + AsyncWrite + Send + 'static + WatchablePeer,
+    {
+        let watch = probe.and_then(|p| local.peer_watch().map(|w| (w, p)));
+        self.pump_inner(local, idle, watch).await
+    }
+
+    async fn pump_inner<L>(
+        self,
+        local: L,
+        idle: Option<Duration>,
+        watch: Option<(PeerWatch, Duration)>,
+    ) -> std::io::Result<(u64, u64)>
+    where
+        L: AsyncRead + AsyncWrite + Send + 'static,
+    {
         let (mut lr, mut lw) = tokio::io::split(local);
+        // Whether the local side's end of file has been read: the exchange is half-closed by it.
+        let local_eof = Arc::new(AtomicBool::new(false));
         let started = std::time::Instant::now();
         // When a byte last moved either way (milliseconds since `started`), the bytes moved each
         // way, and whether either direction has finished (the exchange is half-closed).
@@ -453,6 +494,7 @@ impl GatewayStream {
             let touch = touch.clone();
             let half = half.clone();
             let up_bytes = up_bytes.clone();
+            let local_eof = local_eof.clone();
             async move {
                 let mut closed = me.shared.closed_tx.subscribe();
                 let mut buf = vec![0u8; GATEWAY_MAX_FRAME];
@@ -463,7 +505,10 @@ impl GatewayStream {
                         _ = closed.wait_for(|c| *c) => return Ok::<(), std::io::Error>(()),
                     };
                     match read {
-                        Ok(0) => break Ok(()),
+                        Ok(0) => {
+                            local_eof.store(true, Ordering::Release);
+                            break Ok(());
+                        }
                         Ok(n) => {
                             if me.write_all(&buf[..n]).await.is_err() {
                                 // The host is gone: nothing to feed, and nothing to wait for.
@@ -536,17 +581,39 @@ impl GatewayStream {
                 }
             }
         };
+        // The local program half-closed and went away: the kernel's hang-up of the socket's write
+        // side. Only awaited once the local side's end of file has been read (until then the socket
+        // is an ordinary connection: no keep-alive change, no watch), and not once the exchange is
+        // over from the host's side too (nothing then waits on the local program).
+        let peer_gone = {
+            let local_eof = local_eof.clone();
+            async move {
+                let Some((watch, every)) = watch else {
+                    return std::future::pending::<()>().await;
+                };
+                // Polled only once the local feeder has finished (the guard below): by then the
+                // flag says whether it ended on the local program's end of file or otherwise.
+                if !local_eof.load(Ordering::Acquire) {
+                    return std::future::pending::<()>().await;
+                }
+                watch.arm(every);
+                watch.gone().await
+            }
+        };
         let mut up = Box::pin(up);
         let mut down = Box::pin(down);
         let mut watch_idle = Box::pin(watch_idle);
+        let mut peer_gone = Box::pin(peer_gone);
         let (mut up_done, mut down_done) = (false, false);
         let mut down_result: std::io::Result<()> = Ok(());
         let mut timed_out = false;
+        let mut gone = false;
         while !(up_done && down_done) {
             tokio::select! {
                 _ = &mut up, if !up_done => up_done = true,
                 r = &mut down, if !down_done => { down_done = true; down_result = r; }
                 _ = &mut watch_idle => { timed_out = true; break; }
+                _ = &mut peer_gone, if up_done && !down_done => { gone = true; break; }
             }
         }
         if timed_out {
@@ -554,6 +621,14 @@ impl GatewayStream {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "a half-closed gateway connection had nothing moving in either direction",
+            ));
+        }
+        if gone {
+            // As a local socket that was destroyed: the host is told (a second close, "discarded").
+            self.destroy();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the local peer went away after finishing its side",
             ));
         }
         drop(self);

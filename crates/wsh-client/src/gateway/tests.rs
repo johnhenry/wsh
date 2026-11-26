@@ -868,3 +868,161 @@ fn a_timeout_code_is_the_clients_timeout_error() {
         WshError::Other(_)
     ));
 }
+
+// ── a local peer that half-closed and then went away is noticed (wsh #282) ──
+
+#[cfg(unix)]
+mod half_closed_peer {
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream, UnixStream};
+
+    /// Far above what noticing a hang-up needs (it is immediate); only so a regression fails with a
+    /// message instead of hanging. Never waited for in full.
+    const SEEN: Duration = Duration::from_secs(20);
+
+    fn gone_error(e: std::io::Error) -> bool {
+        e.kind() == std::io::ErrorKind::ConnectionAborted
+            && e.to_string().contains("went away after finishing its side")
+    }
+
+    #[tokio::test]
+    async fn a_unix_peer_that_half_closed_and_was_dropped_ends_the_connection_with_the_far_side_silent(
+    ) {
+        let mut h = host(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut app) = UnixStream::pair().unwrap();
+        let pump = tokio::spawn(s.pump_watched(local, None, Some(DEFAULT_HALF_CLOSE_PROBE)));
+        app.shutdown().await.unwrap(); // half-closed: its FIN
+        expect_close(&mut h, id, None).await;
+        // Alive and half-closed: nothing happens, however long the far side is silent.
+        assert!(h.sent_within(700).await.is_none());
+        assert!(!pump.is_finished());
+        let t0 = std::time::Instant::now();
+        drop(app); // gone, with nothing written to it by anyone
+        expect_close(&mut h, id, Some(GATEWAY_DISCARDED)).await;
+        eprintln!(
+            "unix: noticed {} ms after the peer went away",
+            t0.elapsed().as_millis()
+        );
+        let r = tokio::time::timeout(SEEN, pump).await.unwrap().unwrap();
+        assert!(gone_error(r.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn a_half_closed_unix_peer_that_stays_alive_and_reading_is_never_cut_and_gets_the_answer_whole(
+    ) {
+        let mut h = host(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut app) = UnixStream::pair().unwrap();
+        let pump = tokio::spawn(s.pump_watched(local, None, Some(Duration::from_millis(50))));
+        app.shutdown().await.unwrap();
+        expect_close(&mut h, id, None).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await; // thirty of its probe intervals
+        assert!(!pump.is_finished());
+        let answer = vec![9u8; 100_000];
+        for chunk in answer.chunks(30_000) {
+            h.data(id, chunk).await;
+        }
+        host_close(&h, id, None).await;
+        let mut got = Vec::new();
+        tokio::time::timeout(SEEN, app.read_to_end(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, answer);
+        drop(app);
+        let (up, down) = tokio::time::timeout(SEEN, pump)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!((up, down), (0, answer.len() as u64));
+    }
+
+    #[tokio::test]
+    async fn a_tcp_peer_reset_after_its_half_close_is_noticed_and_one_that_is_alive_is_not() {
+        let mut h = host(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (local, _) = l.accept().await.unwrap();
+        // A second handle on the same socket, to look at its keep-alive from outside the pump.
+        let handle = std::os::fd::AsFd::as_fd(&local)
+            .try_clone_to_owned()
+            .unwrap();
+        let keepalive = || socket2::SockRef::from(&handle).keepalive().unwrap();
+        let pump = tokio::spawn(s.pump_watched(local, None, Some(Duration::from_secs(1))));
+        // An ordinary connection is left as it was: no keep-alive until the local side half-closes.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!keepalive());
+        app.shutdown().await.unwrap();
+        expect_close(&mut h, id, None).await;
+        let t0 = std::time::Instant::now();
+        while !keepalive() {
+            assert!(
+                t0.elapsed() < SEEN,
+                "keep-alive was never set on the half-closed socket"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            h.sent_within(2500).await.is_none(),
+            "keep-alive answered by a live peer"
+        );
+        assert!(!pump.is_finished());
+        // Gone with data unread: the kernel resets (here by a linger of zero).
+        socket2::SockRef::from(&app)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(app);
+        expect_close(&mut h, id, Some(GATEWAY_DISCARDED)).await;
+        let r = tokio::time::timeout(SEEN, pump).await.unwrap().unwrap();
+        assert!(gone_error(r.unwrap_err()));
+    }
+
+    #[tokio::test]
+    async fn without_the_probe_a_gone_peer_is_not_noticed_by_itself() {
+        let mut h = host(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut app) = UnixStream::pair().unwrap();
+        let pump = tokio::spawn(s.pump_watched(local, None, None));
+        app.shutdown().await.unwrap();
+        expect_close(&mut h, id, None).await;
+        drop(app);
+        // Nothing can notice it; this bounds how long we look.
+        assert!(h.sent_within(1000).await.is_none());
+        assert!(!pump.is_finished());
+        pump.abort();
+    }
+
+    #[tokio::test]
+    async fn the_watch_is_released_when_the_pump_ends() {
+        let mut h = host(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut app) = UnixStream::pair().unwrap();
+        let victim = s.clone();
+        let pump = tokio::spawn(s.pump_watched(local, None, Some(Duration::from_secs(1))));
+        app.shutdown().await.unwrap();
+        expect_close(&mut h, id, None).await;
+        victim.destroy(); // the connection ends some other way
+        tokio::time::timeout(SEEN, pump)
+            .await
+            .unwrap()
+            .unwrap()
+            .ok();
+        // Nothing of the pump holds the socket any more (a duplicate of its descriptor would keep it
+        // open): a write from the peer finds it closed.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(SEEN, app.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(app.write_all(b"x").await.is_err());
+    }
+}

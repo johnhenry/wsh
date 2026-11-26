@@ -45,6 +45,7 @@ dialoguer = "0.11"
 
 [dev-dependencies]
 tokio = { workspace = true }
+socket2 = { version = "0.6", features = ["all"] }
 # #38 Phase 2 e2e test only: adds the rustls-backed client connector
 # (`Connector::Rustls`/`connect_async_tls_with_config`) so the WISP
 # reverse-connect end-to-end test can dial the real listener as both a

@@ -15,6 +15,7 @@ pub mod keys;
 pub mod messages;
 pub mod operator_proof;
 pub mod peer_record;
+pub mod peer_watch;
 pub mod qmux;
 pub mod qmux_connection;
 pub mod remote_runtime;

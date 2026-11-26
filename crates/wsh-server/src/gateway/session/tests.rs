@@ -1818,3 +1818,203 @@ async fn a_tcp_listener_hands_inbound_connections_to_the_client_and_relays_them(
         "a rejected connection is closed"
     );
 }
+
+// ── an origin that half-closed and then went away is noticed (wsh #282) ──
+//
+// The origin sends its end of file (a half-close towards the client goes out), and is then gone. The
+// client says nothing: nothing is ever written to the origin. The host learns from the kernel's
+// hang-up of the socket and tells the client the connection is discarded.
+
+mod half_closed_origin {
+    use super::*;
+
+    /// How long the gone origin may take to be noticed: it is immediate; this only makes a
+    /// regression fail with a message. Never waited for in full.
+    const SEEN: Duration = Duration::from_secs(20);
+    /// How long a live half-closed origin is watched before it is called alive. Nothing can
+    /// happen in that time; the wait only gives a wrong answer a chance to show.
+    const QUIET_MS: u64 = 700;
+
+    fn reset(s: &TcpStream) {
+        socket2::SockRef::from(s)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+    }
+
+    /// A TCP origin that half-closes at once and hands the connection to the test.
+    async fn finishing_origin() -> (u16, mpsc::UnboundedReceiver<TcpStream>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = s.shutdown().await;
+                let _ = tx.send(s);
+            }
+        });
+        (port, rx)
+    }
+
+    async fn next_close(r: &mut Rig) -> Option<String> {
+        match tokio::time::timeout(SEEN, r.next()).await {
+            Ok(m) => match m.payload {
+                Payload::GatewayClose(c) => c.reason,
+                other => panic!("{other:?}"),
+            },
+            Err(_) => panic!("the host never told the client the connection was discarded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tcp_origin_that_half_closed_and_is_reset_is_told_to_the_client_with_the_client_silent(
+    ) {
+        let (port, mut held) = finishing_origin().await;
+        let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+        r.open_tcp(1, port);
+        r.expect_ok(1).await;
+        assert_eq!(
+            got_close(&[r.next().await]),
+            Some(None),
+            "its FIN: a half-close"
+        );
+        let origin = held.recv().await.unwrap();
+        // Alive and half-closed: held, with the keep-alive schedule running, for as long as it likes.
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        assert_eq!(conns(&r).await, 1);
+        // Gone with the client having sent nothing, ever (the connection is reset).
+        let t0 = std::time::Instant::now();
+        reset(&origin);
+        drop(origin);
+        assert_eq!(next_close(&mut r).await.as_deref(), Some(GATEWAY_DISCARDED));
+        eprintln!(
+            "tcp origin: noticed {} ms after the reset",
+            t0.elapsed().as_millis()
+        );
+        wait_for_no_connections(&r).await;
+    }
+
+    #[tokio::test]
+    async fn with_the_watch_off_a_gone_origin_is_not_noticed_by_itself() {
+        let (port, mut held) = finishing_origin().await;
+        let mut r = rig_with(
+            GatewayPolicy {
+                half_close_probe: None,
+                ..policy_with_idle(None)
+            },
+            true,
+            CREDIT,
+        );
+        r.open_tcp(1, port);
+        r.expect_ok(1).await;
+        assert_eq!(got_close(&[r.next().await]), Some(None));
+        let origin = held.recv().await.unwrap();
+        reset(&origin);
+        drop(origin);
+        // Nothing can notice it; this bounds how long we look.
+        assert!(r.drain(1000).await.is_empty());
+        assert_eq!(conns(&r).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_is_not_half_closed_is_left_alone() {
+        // The keep-alive schedule is for half-closed sockets only: an origin that has not sent its end of file is an ordinary
+        // connection, whatever it does.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, mut held) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let _ = tx.send(s);
+            }
+        });
+        let mut r = rig_with(policy_with_idle(None), true, CREDIT);
+        r.open_tcp(1, port);
+        r.expect_ok(1).await;
+        let origin = held.recv().await.unwrap();
+        // The accepted socket on the origin's side has no keep-alive; neither has the host's.
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        assert_eq!(conns(&r).await, 1);
+        drop(origin);
+    }
+
+    #[tokio::test]
+    async fn a_reverse_listeners_caller_that_half_closed_and_is_reset_is_told_to_the_client() {
+        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut r = rig_with(reverse_policy(lo), true, CREDIT);
+        let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+            Payload::ListenOk(ok) => ok.actual_port,
+            other => panic!("{other:?}"),
+        };
+        let mut caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        caller.shutdown().await.unwrap();
+        assert_eq!(got_close(&[r.next().await]), Some(None));
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        reset(&caller);
+        drop(caller);
+        assert_eq!(next_close(&mut r).await.as_deref(), Some(GATEWAY_DISCARDED));
+        wait_for_no_connections(&r).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_unix_origin_that_half_closed_and_is_gone_is_told_to_the_client_with_the_client_silent(
+    ) {
+        use tokio::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!(
+            "wgh-{}-{}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let path = dir.join("o.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let (tx, mut held) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let _ = s.shutdown().await;
+                let _ = tx.send(s);
+            }
+        });
+        let mut r = rig_with(
+            GatewayPolicy {
+                unix: UnixPolicy::new(vec![path.to_string_lossy().into_owned()], vec![], false, 4)
+                    .unwrap(),
+                ..GatewayPolicy::default()
+            },
+            true,
+            CREDIT,
+        );
+        r.send(
+            MsgType::OpenUnix,
+            Payload::OpenUnix(OpenUnixPayload {
+                gateway_id: 1,
+                path: path.to_string_lossy().into_owned(),
+            }),
+        );
+        r.expect_ok(1).await;
+        assert_eq!(got_close(&[r.next().await]), Some(None));
+        let origin = held.recv().await.unwrap();
+        assert!(r.drain(QUIET_MS).await.is_empty());
+        let t0 = std::time::Instant::now();
+        drop(origin);
+        assert_eq!(next_close(&mut r).await.as_deref(), Some(GATEWAY_DISCARDED));
+        eprintln!(
+            "unix origin: noticed {} ms after it went away",
+            t0.elapsed().as_millis()
+        );
+        wait_for_no_connections(&r).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

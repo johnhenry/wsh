@@ -75,6 +75,10 @@ pub struct GatewayPolicy {
     /// A connection half-closed by one side (and not the other) is closed after this long with
     /// nothing moving in either direction. `None` = never.
     pub half_close_idle: Option<std::time::Duration>,
+    /// While an origin's socket is half-closed (it sent its end of file), watch it for a peer that
+    /// went away (wsh #282); for TCP, the keep-alive schedule it is given (first probe after this
+    /// long, then one per this long). `None` = no watch.
+    pub half_close_probe: Option<std::time::Duration>,
 }
 
 /// Default for [`GatewayPolicy::half_close_idle`], in seconds (the same as the Node host: five minutes).
@@ -102,6 +106,7 @@ impl Default for GatewayPolicy {
             max_buffered_bytes: DEFAULT_MAX_BUFFERED_BYTES,
             max_client_buffered_bytes: DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
             half_close_idle: Some(std::time::Duration::from_secs(DEFAULT_HALF_CLOSE_IDLE_SECS)),
+            half_close_probe: Some(wsh_core::peer_watch::DEFAULT_HALF_CLOSE_PROBE),
         }
     }
 }
@@ -415,6 +420,11 @@ impl GatewayPolicyEnforcer {
     /// How long a half-closed connection may sit with nothing moving in either direction.
     pub fn half_close_idle(&self) -> Option<std::time::Duration> {
         self.policy.half_close_idle
+    }
+
+    /// The schedule of the watch on a half-closed origin socket (`None` = no watch).
+    pub fn half_close_probe(&self) -> Option<std::time::Duration> {
+        self.policy.half_close_probe
     }
 
     /// Count a connection if the limit allows it: the check and the count are one step, so
