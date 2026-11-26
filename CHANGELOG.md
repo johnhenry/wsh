@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.59.1 / Rust `rust-v0.23.1`
+
 ### A caller that half-closed first gets the whole answer even when the service closed completely at once; the CLI's reverse host holds a gateway connection by the half-close rule (#285; npm and Rust)
 
 - **What was wrong (the tail).** 0.59.0 noted that a reverse forward whose local service sends a large answer and closes completely at once, after the caller had half-closed, lost the tail of the answer. Reproduced (`test/reverse-forward-full-close.test.mjs`: 3 MiB, a slow caller; about 2.9 MB of it arrived), with the probe on and off, and for a TCP origin the Node host dialled when the client had half-closed first. The cause was not the forwarding client's teardown: it was the Node host's. When the caller half-closed first, the host had already sent its `GatewayClose`; the client's close at the end of the answer then finished the connection and the host destroyed the socket, throwing away what it had handed to it and the caller had not read yet. (When the caller had not half-closed, the socket was ended, which flushes, so the earlier "service closes at once" tests did not see it.)
