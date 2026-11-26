@@ -26,8 +26,11 @@ async function gatewayTypes(c: WshClient): Promise<void> {
   const u: WshGatewayDuplex = await c.openUnix('/var/run/docker.sock');
   const l = await c.listenUnix('/run/x.sock', { replace: true, onConnection: (duplex, info) => { void [duplex.readable, info.peer]; } });
   const f = await c.forwardUnix({ local: '127.0.0.1:2375', remote: '/var/run/docker.sock' });
-  void [d.closed, u.writable, l.path, f.local, withEndpoints];
-  await Promise.all([l.close(), f.close()]);
+  const e = await c.forwardEndpoint({ local: '/tmp/d.sock', endpoint: 'docker', replace: true, maxConnections: 16, onError: (err) => { void err.message; } });
+  const e2 = await c.forwardUnix({ local: '0', remote: 'endpoint=docker' });
+  const name: string = e.endpoint;
+  void [d.closed, u.writable, l.path, f.local, withEndpoints, name, e.remote, e.maxConnections, e2.address];
+  await Promise.all([l.close(), f.close(), e.close(), e2.close()]);
 }
 void gatewayTypes;
 

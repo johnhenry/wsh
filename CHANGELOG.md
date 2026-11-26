@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### `client.forwardEndpoint()`: forward a local unix socket or TCP port to a named endpoint of the host (#264; npm, Node only)
+
+- **What it is.** The JavaScript equivalent of the CLI's `wsh -N -L /tmp/d.sock:endpoint=NAME`. `await client.forwardEndpoint({ local, endpoint, replace?, maxConnections?, onError? })` listens on `local` (a socket path, `host:port`, or a bare port on loopback) and joins every connection to `openEndpoint(endpoint)`; it returns `{ local, remote: 'endpoint=NAME', endpoint, address, maxConnections, close() }`. `forwardUnix({ local, remote: 'endpoint=NAME' })` is the same forward in the CLI's spelling. Types: `WshForwardEndpointOptions`, `WshForwardHandle`. A JavaScript operator no longer has to write its own bridge.
+- **Matches the CLI.** A missing or refused endpoint closes that one local connection and reports the reason to `onError`; the listener stays up. Half-close and backpressure work in both directions. A local unix socket is created `0600`, an existing path is refused unless `replace: true` (which replaces only a stale socket), and the file is removed on `close()`. A local TCP port binds loopback unless an address is given. At most `maxConnections` connections (default 128) are open at once. The endpoint name follows the CLI's rule and a host without `gateway-endpoints` is refused at start.
+- **Fixes in the shared local-forward code (`forwardUnix` too).** The local listener now keeps its sockets half-open, so a client that closes its write side (an HTTP/1.0 style request, `nc -N`) still receives the answer instead of having the return path closed under it; `close()` now ends the live connections (the listener used to call a method a TCP/unix server does not have, so they stayed open); a socket that ended while the bridge was waiting to write to it no longer leaves that wait pending; a failure after a reverse forward connected (a local peer that closed first) is no longer reported to `onError` as a failed connect. `forwardUnix` gains `maxConnections`, unbounded by default as before.
+- **Nothing changes on the wire.** No message, field or feature string; the Rust `wsh-server` and `wsh-cli` are unchanged. A released peer sees ordinary `OpenEndpoint` messages.
+- Tests: `test/forward-endpoint.test.mjs` (a real in-process memory host and client: bytes both ways, 20 MiB and 12 MiB transfers, a stalled reader each way, half-close each way, a missing, refused and once-refused endpoint, 48 concurrent connections, the connection bound, `close()` during traffic, a client that closes first, existing, stale and live socket paths, the file mode, a TCP local side) and `test/types/memory.ts`.
+
 ## Rust `rust-v0.21.2`
 
 ### The Rust `wsh-server` gateway accepts only the destination addresses the Node gateway accepts (a tightening; Rust, #260)

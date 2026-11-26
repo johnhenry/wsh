@@ -5,11 +5,23 @@
 
 import net from 'node:net';
 import fsp from 'node:fs/promises';
-import { once } from 'node:events';
 
-/** `/path`, `./path`, `@abstract` are sockets; anything else is `host:port` (also `[::1]:80`, or a bare port = 127.0.0.1). */
+/** A named endpoint: the CLI's rule (`valid_endpoint_name`): letters, digits, ".", "_", "-", starting with a letter or digit, at most 64. */
+export const ENDPOINT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** How many connections one forward to a named endpoint serves at once: the CLI's `MAX_FORWARDED_CONNECTIONS`. */
+export const DEFAULT_MAX_ENDPOINT_CONNECTIONS = 128;
+
+/**
+ * `/path`, `./path`, `@abstract` are sockets; `endpoint=NAME` is a named endpoint of the host (the CLI's spelling; the `=`
+ * cannot occur in a path or host name); anything else is `host:port` (also `[::1]:80`, or a bare port = 127.0.0.1).
+ */
 export function parseEndpoint(spec) {
   if (typeof spec !== 'string' || !spec) throw new TypeError('forwardUnix: an endpoint must be a non-empty string');
+  if (spec.startsWith('endpoint=')) {
+    const name = spec.slice('endpoint='.length);
+    if (!ENDPOINT_NAME.test(name)) throw new TypeError(`forwardUnix: ${JSON.stringify(name)} is not a valid endpoint name (letters, digits, ".", "_", "-"; at most 64)`);
+    return { kind: 'endpoint', name };
+  }
   if (spec.startsWith('/') || spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('@')) return { kind: 'unix', path: spec };
   if (/^\d{1,5}$/.test(spec)) return { kind: 'tcp', host: '127.0.0.1', port: Number(spec) };
   const m = /^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$/.exec(spec);
@@ -19,7 +31,20 @@ export function parseEndpoint(spec) {
   return { kind: 'tcp', host: m[1] ?? m[2], port };
 }
 
-/** Pipe a net.Socket and a gateway duplex both ways with backpressure on each leg. */
+/** Resolves when `sock` can take more, or is gone (a bare `once(sock, 'drain')` never settles on a socket that closed meanwhile). */
+function drained(sock) {
+  return new Promise((resolve) => {
+    const done = () => { sock.off('drain', done); sock.off('close', done); sock.off('error', done); resolve(); };
+    sock.on('drain', done); sock.on('close', done); sock.on('error', done);
+  });
+}
+
+/**
+ * Pipe a net.Socket and a gateway duplex both ways with backpressure on each leg. The socket must have been created with
+ * `allowHalfOpen: true`: a local EOF closes only the write side towards the host (the answer still comes back), and the
+ * host ending its side ends the local write side. A socket error (EPIPE or a reset when the local peer closed first) is
+ * the end of that connection, not a failure of the forward.
+ */
 function pipe(sock, duplex) {
   const writer = duplex.writable.getWriter();
   const reader = duplex.readable.getReader();
@@ -35,16 +60,19 @@ function pipe(sock, duplex) {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
-        if (!sock.write(value)) await once(sock, 'drain');
+        if (sock.destroyed) break;
+        if (!sock.write(value)) await drained(sock);
+        if (sock.destroyed) break;
       }
-      sock.end();
+      if (!sock.destroyed) sock.end();
+      else duplex.destroy();
     } catch { sock.destroy(); }
   })();
   duplex.closed.then(() => { if (!sock.destroyed) sock.end(); });
 }
 
 async function listenLocal(spec, { replace }) {
-  const server = net.createServer({ pauseOnConnect: true });
+  const server = net.createServer({ pauseOnConnect: true, allowHalfOpen: true });
   if (spec.kind === 'tcp') {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ host: spec.host, port: spec.port }, () => { server.off('error', reject); resolve(); }); });
     return { server, cleanup: async () => {} };
@@ -76,42 +104,72 @@ async function listenLocal(spec, { replace }) {
 }
 
 /**
+ * `client.forwardEndpoint({ local, endpoint })`: sugar for `forward` with `remote: 'endpoint=NAME'`; the handle also names `endpoint`.
  * @param {import('./client.mjs').WshClient} client
- * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, onError?: (err: Error) => void }} opts
+ * @param {{ local: string, endpoint: string, replace?: boolean, maxConnections?: number, onError?: (err: Error) => void }} opts
  */
-export async function forward(client, { local, remote, reverse = false, replace = false, onError = () => {} } = {}) {
+export async function forwardEndpoint(client, opts = {}) {
+  const { endpoint, ...rest } = opts ?? {};
+  if (typeof endpoint !== 'string') throw new TypeError('forwardEndpoint: endpoint must be the name of one of the host\'s endpoints');
+  if ('remote' in rest || 'reverse' in rest) throw new TypeError('forwardEndpoint: takes { local, endpoint }; use forwardUnix for the other forwards');
+  return forward(client, { ...rest, remote: `endpoint=${endpoint}` });
+}
+
+/**
+ * @param {import('./client.mjs').WshClient} client
+ * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, maxConnections?: number, onError?: (err: Error) => void }} opts
+ */
+export async function forward(client, { local, remote, reverse = false, replace = false, maxConnections, onError = () => {} } = {}) {
   const l = parseEndpoint(local);
   const r = parseEndpoint(remote);
+  if (l.kind === 'endpoint') throw new TypeError('forwardUnix: the local end cannot be a named endpoint (a host offers those; it is the remote end)');
+  if (maxConnections !== undefined && !(Number.isInteger(maxConnections) && maxConnections > 0)) throw new TypeError('forwardUnix: maxConnections must be a positive integer');
+  // A bound on concurrent connections: the CLI's 128 for a named endpoint; the other forwards stay unbounded unless asked.
+  const limit = maxConnections ?? (r.kind === 'endpoint' ? DEFAULT_MAX_ENDPOINT_CONNECTIONS : Infinity);
+  // An error callback must never take the forward down.
+  const report = (e) => { try { onError(e); } catch { /* the caller's callback threw */ } };
 
   if (reverse) {
+    if (r.kind === 'endpoint') throw new TypeError('forwardUnix: a named endpoint is something a host offers; the host cannot listen on one');
     if (r.kind !== 'unix') throw new TypeError('forwardUnix: with reverse: true the remote end must be a socket path (the host listens on it)');
     const handle = await client.listenUnix(r.path, {
       replace,
       onConnection: (duplex) => {
-        const sock = l.kind === 'unix' ? net.connect({ path: l.path }) : net.connect({ host: l.host, port: l.port });
+        const sock = l.kind === 'unix' ? net.connect({ path: l.path, allowHalfOpen: true }) : net.connect({ host: l.host, port: l.port, allowHalfOpen: true });
         sock.pause();
         sock.once('connect', () => { pipe(sock, duplex); sock.resume(); });
-        sock.once('error', (e) => { duplex.destroy(); onError(e); });
+        // Only a failure to reach the local service is reported; a socket that ends later (EPIPE, a reset) is just the end of that connection.
+        const failed = (e) => { sock.off('connect', failed); duplex.destroy(); report(e); };
+        sock.once('error', failed);
+        sock.once('connect', () => sock.off('error', failed));
       },
     });
     return { local, remote, close: () => handle.close() };
   }
 
+  if (r.kind === 'endpoint' && !client.hasFeature('gateway-endpoints')) {
+    throw new Error('forwardEndpoint: this host does not offer named endpoints (it did not advertise gateway-endpoints)');
+  }
   const { server, cleanup } = await listenLocal(l, { replace });
-  const open = r.kind === 'unix' ? () => client.openUnix(r.path) : () => client.openTcp(r.host, r.port);
+  const open = r.kind === 'unix' ? () => client.openUnix(r.path) : r.kind === 'endpoint' ? () => client.openEndpoint(r.name) : () => client.openTcp(r.host, r.port);
+  const conns = new Set(); // a net.Server has no closeAllConnections(): keep our own list, so close() can end them
   server.on('connection', async (sock) => {
     sock.on('error', () => {});
+    if (conns.size >= limit) { sock.destroy(); report(new Error(`forward ${local} -> ${remote}: more than ${limit} connections are open; refusing another`)); return; }
+    conns.add(sock);
+    sock.once('close', () => { conns.delete(sock); });
     let duplex;
-    try { duplex = await open(); } catch (e) { sock.destroy(); onError(e); return; }
+    try { duplex = await open(); } catch (e) { sock.destroy(); report(e); return; }
     if (sock.destroyed) { duplex.destroy(); return; }
     pipe(sock, duplex);
     sock.resume();
   });
-  server.on('error', onError);
+  server.on('error', report);
   return {
-    local, remote, address: server.address(),
+    local, remote, ...(r.kind === 'endpoint' ? { endpoint: r.name } : {}), address: server.address(),
+    ...(limit === Infinity ? {} : { maxConnections: limit }),
     async close() {
-      await new Promise((res) => { server.close(() => res()); server.closeAllConnections?.(); });
+      await new Promise((res) => { server.close(() => res()); for (const s of conns) s.destroy(); });
       await cleanup();
     },
   };
