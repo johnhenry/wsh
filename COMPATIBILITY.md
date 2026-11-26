@@ -57,7 +57,7 @@ Counter-examples this repository has paid for: `ReverseAccept.features` was reje
 
 - A host states what it can do in `ServerHello.features` (and, behind a relay or a bridge, `ReverseAccept.features`); the other side sends
   the new field or message **only** to a peer that stated the feature. Examples: `mcp-call-id`, `mcp-cancel`, `targets`,
-  `relay-multi-operator`, `e2e-sign`, `operator-proof`, `e2e-sealed`, `e2e-session`, `exec-pipes`, `stream-announce`. The names live in
+  `relay-multi-operator`, `relay-gateway`, `e2e-sign`, `operator-proof`, `e2e-sealed`, `e2e-session`, `exec-pipes`, `stream-announce`. The names live in
   `src/features.mjs` and next to their handlers in the Rust crates; add the new one to both and to the README's capability matrix.
 - The receiving side of a feature is built before the sending side is turned on, and a peer that did not state the feature is never
   sent it, **even when it is probably fine**: a peer that predates the feature can only be assumed to reject or ignore it.
@@ -101,6 +101,33 @@ last release is breaking in the sense of rule "versions" above even when no depl
   (`test/rust/*.test.mjs` drives the real `wsh-server` with the JS client).
 - If you change `spec/wsh-v1.yaml`: `npm run codegen`, then the matrix with `npm run matrix`; `npm run codegen:check` and
   `npm run matrix:check` are both CI gates.
+
+## Worked case: the gateway through a relay (`relay-gateway`, #289)
+
+`OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their answers (`DnsResult`, `ListenOk`, `ListenFail`, `ListenClose`, `InboundOpen`,
+`InboundAccept`, `InboundReject`; the spec's `relay.gateway_forwardable`) were not on `relay.forwardable`, so no relay carried them. They
+are **not added to that list** (every released relay and client reads it): they are a second list, carried only by a relay that lists
+`relay-gateway` in its `ServerHello.features`, only for a bridge whose peer stated `relay-gateway` in `ReverseAccept.features`, which a
+peer does only when its owner gave it a gateway AND the relay lists the feature. No message or field is new, so a released Rust peer's
+`deny_unknown_fields` decoders are not involved: what changes is who is SENT what. "Released" below is npm 0.59.1 and earlier, Rust
+`rust-v0.23.1` and earlier.
+
+| Operator | Relay | Reverse host | What happens |
+| --- | --- | --- | --- |
+| new | new | new, gateway on | The feature is stated at both ends; the requests cross; every connection is metered (credit is implied). |
+| new | new | new, gateway off (the default) | The host states nothing; the relay carries nothing; `openTcp()` rejects locally (`this host does not support TCP egress`); a request sent anyway is dropped by the relay, nothing is dialled. |
+| new | released | any | The relay does not list the feature, so the host (new) states no gateway and serves none, and the operator sends nothing (`openTcp()` rejects locally). Where the host stated features without the feature, the operator refuses with "does not state relay-gateway" and sends nothing. |
+| new | new (`carryGateway: false`, `carry_gateway = false`) | new | As the row above: the relay does not list the feature, nothing is stated or carried. |
+| new | new | released | The released host never states the feature, so the relay carries none of it to it; the operator refuses locally. A released Rust CLI host with `--capability gateway` (it had handlers since 0.22, unreachable) stays unreachable. |
+| released JS | new | new, gateway on | A released JS client sends `OpenTcp` / `OpenUdp` (its own check is the host's `gateway` feature, which a new host states), the relay carries them, and **TCP and UDP flows work** (`GatewayOk`, data, credit and close were always forwardable). `ResolveDns` and `ListenRequest` are carried and answered, but the answers (`DnsResult`, `ListenOk`, `InboundOpen`) are not on the released client's list and are dropped there: they time out. A released client does not seal them, so on a sealed bridge the host drops its requests. Use a new client. |
+| released Rust | any | any | A released Rust operator has no way to open a gateway connection over a bridge (`wsh reverse-connect` has no forwarding), so nothing changes. |
+| any | released | new | Nothing changes for what the relay already carried. |
+
+What is tested: both relays against both host implementations, a host that states the feature on a relay that does not carry it, a relay
+that carries it for a host that did not state it, sealed bridges, and an operator that sends where it is not carried
+(`test/relay-gateway.test.mjs`, `test/rust/wsh-reverse-host-half-close.test.mjs`, `test/rust/wsh-relay-gateway.test.mjs`, the `bridges`,
+`reverse_gateway` and `common` unit tests). Not tested against a release binary: the released-client row (stated from the code: its
+inner-type check is `isRelayForwardable`).
 
 ## What this policy does not promise
 
