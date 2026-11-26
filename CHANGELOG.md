@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.56.0
 
 ### `client.forwardEndpoint()`: forward a local unix socket or TCP port to a named endpoint of the host (#264; npm, Node only)
 
