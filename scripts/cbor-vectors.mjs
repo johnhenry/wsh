@@ -6,7 +6,7 @@
  * integers at the head-size edges) plus a set of JSON-RPC (rpc channel) messages, encodes them with the JS encoder
  * (`src/cbor.mjs`) and records the bytes as hex under `js`. `crates/wsh-core/examples/cbor_vectors.rs` then reads the same
  * file, decodes each `js` vector with the (lenient) typed Rust decoder, re-encodes it with the Rust encoder and records that
- * under `rust`. `test/cbor-vectors.test.mjs` and the Rust test `codec::tests::golden_vectors` hold BOTH sets against the strict
+ * under `rust`. `rust_released` is what the SHIPPED Rust encoder wrote (recorded once, before the Envelope encoder was fixed to write a definite map; never regenerated). `test/cbor-vectors.test.mjs` and the Rust test `codec::tests::golden_vectors` hold BOTH sets against the strict
  * decoder, so a change to either encoder that stops being accepted by either decoder fails.
  *
  *   node scripts/cbor-vectors.mjs            # write the `js` side to spec/cbor-vectors.json (keeps an existing `rust` side)
@@ -114,10 +114,13 @@ export function jsVectors() {
   return vectors;
 }
 
+/** The recorded encoder sides of an existing vector: kept when the JS side is regenerated. */
+const pick = (v) => (v ? Object.fromEntries(["rust", "rust_error", "rust_released"].filter((k) => v[k] !== undefined).map((k) => [k, v[k]])) : {});
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const prev = existsSync(OUT) ? JSON.parse(readFileSync(OUT, 'utf8')) : { vectors: [] };
   const byKey = new Map(prev.vectors.map((v) => [`${v.name}/${v.kind}`, v]));
-  const vectors = jsVectors().map((v) => ({ ...v, ...(byKey.get(`${v.name}/${v.kind}`)?.rust ? { rust: byKey.get(`${v.name}/${v.kind}`).rust } : {}) }));
+  const vectors = jsVectors().map((v) => ({ ...v, ...pick(byKey.get(`${v.name}/${v.kind}`)) }));
   const doc = { note: 'Golden CBOR vectors (#317): hex of what each encoder emits. Regenerate with scripts/cbor-vectors.mjs, then the Rust example.', vectors };
   if (process.argv.includes('--check')) {
     const same = vectors.length === prev.vectors.length && vectors.every((v, i) => v.js === prev.vectors[i].js && v.name === prev.vectors[i].name);

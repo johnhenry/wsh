@@ -8,6 +8,7 @@
 extern crate self as wsh_core;
 
 pub mod channel_binding;
+pub mod cbor_strict;
 pub mod codec;
 pub mod e2e_exchange;
 pub mod error;

@@ -374,4 +374,60 @@ mod tests {
             other => panic!("unexpected payload: {other:?}"),
         }
     }
+
+    // ── strict decoding (#317) ──────────────────────────────────────────
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../../spec/cbor-vectors.json")).unwrap()
+    }
+
+    #[test]
+    fn cbor_decode_is_strict_a_stray_byte_a_bad_length_and_a_long_head_are_errors() {
+        use ciborium::value::Value;
+        assert!(cbor_decode::<Value>(&[0x00]).is_ok());
+        for bad in [&[0x00u8, 0x00][..], &[0x61][..], &[0x18, 0x01][..], &[0x7a, 0, 0, 0, 0x10][..], &[0xf7][..], &[0xc0, 0x00][..]] {
+            assert!(cbor_decode::<Value>(bad).is_err(), "{bad:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_frame_with_a_stray_byte_after_the_value_is_an_error_not_a_message() {
+        let mut frame = frame_encode(&TestMsg { name: "x".into(), value: 1 }).unwrap();
+        frame.push(0x00);
+        let len = (frame.len() - 4) as u32;
+        frame[..4].copy_from_slice(&len.to_be_bytes());
+        let mut decoder = FrameDecoder::new();
+        assert!(decoder.feed::<TestMsg>(&frame).is_err());
+    }
+
+    #[test]
+    fn an_encoded_envelope_is_a_definite_length_map_not_serdes_indefinite_flatten_map() {
+        let v = vectors();
+        let mut n = 0;
+        for vec in v["vectors"].as_array().unwrap().iter().filter(|x| x["layer"] == "control") {
+            let js = hex::decode(vec["js"].as_str().unwrap()).unwrap();
+            let env = decode_envelope(&js).unwrap();
+            let out = cbor_encode(&env).unwrap();
+            assert_ne!(out[0], 0xbf, "{}: indefinite-length map", vec["name"]);
+            assert_eq!(out[0] >> 5, 5, "{}: a map", vec["name"]);
+            crate::cbor_strict::validate_with(&out, &crate::cbor_strict::Options { legacy_indefinite_map: false })
+                .unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
+            // and what it says is unchanged
+            let back = decode_envelope(&out).unwrap();
+            assert_eq!(back.msg_type, env.msg_type);
+            n += 1;
+        }
+        assert!(n >= 200, "{n}");
+    }
+
+    #[test]
+    fn a_released_rust_peers_indefinite_map_envelope_is_still_read() {
+        let v = vectors();
+        for vec in v["vectors"].as_array().unwrap().iter().filter(|x| x["layer"] == "control") {
+            let old = hex::decode(vec["rust_released"].as_str().unwrap()).unwrap();
+            assert_eq!(old[0], 0xbf);
+            let env = decode_envelope(&old).unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
+            assert_eq!(env.msg_type as u8 as u64, vec["code"].as_u64().unwrap());
+        }
+    }
 }
