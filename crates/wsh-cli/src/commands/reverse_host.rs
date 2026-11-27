@@ -23,6 +23,9 @@ use wsh_core::messages::*;
 use wsh_core::peer_record::{build_peer_record_transcript, PeerRecord};
 
 pub use super::reverse_gateway::RelayGateway;
+
+/// What an operator is told when this host has a gateway but no `--relay-gateway-allow` rule reaches it (wsh #296).
+const NO_RULE_FOR_OPERATOR: &str = "this reverse host has no gateway rule for this operator";
 use super::reverse_gateway::{GatewayLink, OperatorGateway};
 
 const DEFAULT_PTY_REPLAY_LIMIT: usize = 256 * 1024;
@@ -1024,7 +1027,18 @@ impl ReverseHostRuntime {
             return Ok(false);
         }
         if fresh || self.gateway.is_none() {
-            self.gateway = Some(OperatorGateway::new(&options, client));
+            // Per operator (wsh #296): the rules scoped to this operator and the unscoped ones. An operator no rule reaches gets none,
+            // and its requests are refused with a sentence that says so. The host still states `relay-gateway` (it is a statement about
+            // the host, which the relay keeps per peer connection: a statement that differed per operator would switch the relay's
+            // carrying off for the operators that have a gateway).
+            let from = self
+                .active_request
+                .as_ref()
+                .map(|r| r.from_fingerprint.clone())
+                .unwrap_or_default();
+            self.gateway = options
+                .for_operator(&from)
+                .map(|own| OperatorGateway::new(&own, client));
         }
         Ok(true)
     }
@@ -1503,7 +1517,11 @@ impl ReverseHostRuntime {
                 msg_type: MsgType::ListenFail,
                 payload: Payload::ListenFail(ListenFailPayload {
                     listener_id: p.listener_id,
-                    reason: "the gateway is not enabled on this reverse host".to_string(),
+                    reason: if self.options.gateway.is_some() {
+                        NO_RULE_FOR_OPERATOR.to_string()
+                    } else {
+                        "the gateway is not enabled on this reverse host".to_string()
+                    },
                 }),
             }),
             _ => None,
@@ -1518,6 +1536,17 @@ impl ReverseHostRuntime {
     }
 
     fn gateway_fail(&self, gateway_id: u32) -> Envelope {
+        // The host has a gateway but none for this operator (wsh #296): a policy refusal, not a disabled gateway.
+        if self.options.gateway.is_some() {
+            return Envelope {
+                msg_type: MsgType::GatewayFail,
+                payload: Payload::GatewayFail(GatewayFailPayload {
+                    gateway_id,
+                    code: 4,
+                    message: NO_RULE_FOR_OPERATOR.to_string(),
+                }),
+            };
+        }
         Envelope {
             msg_type: MsgType::GatewayFail,
             payload: Payload::GatewayFail(GatewayFailPayload {

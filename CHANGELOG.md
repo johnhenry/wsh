@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### The Rust CLI reverse host grants its gateway per operator (#296; Rust)
+
+- **What was wrong.** `wsh reverse` / `wsh agent run` had one `--relay-gateway-allow` list for every operator `--allow-operator` let in, where the Node reverse host grants per operator (`accept` returns `{ capabilities }`).
+- **The syntax.** `--relay-gateway-allow FINGERPRINT=RULE` (repeatable; at least 8 hex digits of the operator's fingerprint, one `--allow-operator` can let in) is that operator's rule only and is added to what is unscoped. **A rule without `FINGERPRINT=` keeps meaning every allowed operator's: a command line that has none is unchanged.** `--relay-gateway-udp-for FINGERPRINT`, `--relay-gateway-dns-for FINGERPRINT` and `--relay-gateway-listen-for FINGERPRINT` (repeatable) scope the three switches the same way. An operator that no rule reaches (none scoped to it, none unscoped) gets no gateway: its requests are refused with `GatewayFail` code 4, "this reverse host has no gateway rule for this operator", and nothing is dialled. Each operator's own gateway is built from the rules and switches that reach its fingerprint (a scope is a prefix, so a longer scope adds to a shorter one). A scope that is not a fingerprint, that no `--allow-operator` covers, a rule with nothing after the `=`, and a switch no rule reaches are errors at start. `agent install` writes the new forms into the unit (the round-trip test reads them back). The host still states `relay-gateway` for every operator (the relay keeps the statement per peer connection).
+- **Wire.** Nothing: command-line flags and a refusal sentence in the existing `GatewayFail`. No default changes.
+- **Not built.** A config-file table (the CLI's relay-gateway policy has none); a per-operator `--relay-gateway-max-connections` (it bounds each operator's own gateway); the `gateway:tcp:HOST:PORT` capability notation (the destination rules of `--relay-gateway-allow` are used). With `--relay-gateway-trust-relay` a scope is matched against what the relay says, as `--allow-operator` is; `--require-operator-proof` makes it the proven fingerprint.
+- Tests: `reverse_gateway` unit tests (unscoped unchanged, scoped adds, another operator's rules not reachable, no rule gets nothing, scoped switches, prefix scopes), `common` unit tests (the syntax and every refusal), the `agent` unit-file round trip, and `test/rust/wsh-relay-gateway-per-operator.test.mjs` (the real `wsh` host behind the Rust relay with three operators: A reaches what its rules name and not B's, an unscoped rule is everyone's, a scoped switch is one operator's, the refusals at start). Each rule was broken once and its test failed: the scope ignored (everyone gets every scoped rule), and an operator with no rule getting a gateway anyway.
+
 ## 0.61.0 / Rust `rust-v0.25.0`
 
 ### A host that runs in a browser page can offer the gateway over a network its embedder supplies (#299; npm only)

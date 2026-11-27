@@ -167,7 +167,9 @@ struct Cli {
     max_operators: u64,
 
     /// Reverse host (`wsh reverse`, `wsh agent run`): let an operator behind the relay use THIS machine's network, to the
-    /// destinations this rule names (`host`, `host:port`, `10.0.0.0/8:5432`, `*`). Repeatable. OFF without it, and then the host does not
+    /// destinations this rule names (`host`, `host:port`, `10.0.0.0/8:5432`, `*`). Repeatable. A rule written `FINGERPRINT=RULE` (at least
+    /// 8 hex digits of the operator's fingerprint, one of those `--allow-operator` lets in) is that operator's only; a rule without it is
+    /// every allowed operator's. An operator no rule reaches gets no gateway. OFF without it, and then the host does not
     /// say `relay-gateway`. Needs `--capability gateway`. Nothing is reachable that no rule names, and no loopback, private or
     /// otherwise non-public address unless a rule names it. Only on a relay that carries it (`relay-gateway`).
     #[arg(long = "relay-gateway-allow", global = true, value_name = "RULE", action = clap::ArgAction::Append)]
@@ -185,6 +187,18 @@ struct Cli {
     /// 1024-65535) and receive its connections (off by default).
     #[arg(long = "relay-gateway-listen", global = true)]
     relay_gateway_listen: bool,
+
+    /// Reverse host: `--relay-gateway-udp` for this operator only (at least 8 hex digits of its fingerprint; repeatable).
+    #[arg(long = "relay-gateway-udp-for", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
+    relay_gateway_udp_for: Vec<String>,
+
+    /// Reverse host: `--relay-gateway-dns` for this operator only (repeatable).
+    #[arg(long = "relay-gateway-dns-for", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
+    relay_gateway_dns_for: Vec<String>,
+
+    /// Reverse host: `--relay-gateway-listen` for this operator only (repeatable).
+    #[arg(long = "relay-gateway-listen-for", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
+    relay_gateway_listen_for: Vec<String>,
 
     /// Reverse host: with `--relay-gateway-allow` and without `--require-operator-proof`, say that you trust the relay's word about who
     /// is asking (it can stamp an accepted operator's identity on a request, and then open what that operator could). Several operators
@@ -643,6 +657,9 @@ async fn main() {
         relay_gateway_udp: cli.relay_gateway_udp,
         relay_gateway_dns: cli.relay_gateway_dns,
         relay_gateway_listen: cli.relay_gateway_listen,
+        relay_gateway_udp_for: cli.relay_gateway_udp_for.clone(),
+        relay_gateway_dns_for: cli.relay_gateway_dns_for.clone(),
+        relay_gateway_listen_for: cli.relay_gateway_listen_for.clone(),
         relay_gateway_trust_relay: cli.relay_gateway_trust_relay,
         relay_gateway_max_connections: cli.relay_gateway_max_connections as usize,
         operator_proof: if cli.operator_proof {
