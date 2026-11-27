@@ -13,7 +13,7 @@
  *   node scripts/cbor-vectors.mjs --check    # exit 1 if the `js` side differs from what the encoder emits now
  *   cargo run -p wsh-core --example cbor_vectors   # then add the `rust` side
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { cborEncode } from '../src/cbor.mjs';
 
@@ -118,7 +118,8 @@ export function jsVectors() {
 const pick = (v) => (v ? Object.fromEntries(["rust", "rust_error", "rust_released"].filter((k) => v[k] !== undefined).map((k) => [k, v[k]])) : {});
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const prev = existsSync(OUT) ? JSON.parse(readFileSync(OUT, 'utf8')) : { vectors: [] };
+  let prev = { vectors: [] };
+  try { prev = JSON.parse(readFileSync(OUT, 'utf8')) } catch (e) { if (e.code !== 'ENOENT') throw e }
   const byKey = new Map(prev.vectors.map((v) => [`${v.name}/${v.kind}`, v]));
   const vectors = jsVectors().map((v) => ({ ...v, ...pick(byKey.get(`${v.name}/${v.kind}`)) }));
   const doc = { note: 'Golden CBOR vectors (#317): hex of what each encoder emits. Regenerate with scripts/cbor-vectors.mjs, then the Rust example.', vectors };

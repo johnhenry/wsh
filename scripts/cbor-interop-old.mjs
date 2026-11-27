@@ -10,7 +10,7 @@
  * checks that this tree's `cborDecode` accepts each result and reads the same value. Prints one line per install and exits 1 on any refusal.
  */
 import { readFileSync } from 'node:fs';
-import { pathToFileURL, fileURLToPath } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { cborEncode as newEncode, cborDecode } from '../src/cbor.mjs';
 
