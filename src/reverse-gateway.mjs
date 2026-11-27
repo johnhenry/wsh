@@ -1,12 +1,14 @@
 /**
  * The gateway of a reverse host (#289, #299), built from the browser-safe session (`server/gateway-session.mjs`): the Node
  * `createReverseHost` (`@johnhenry/wsh/server`, which dials the machine's network unless given `gateway.network`) and the browser-safe
- * one (`@johnhenry/wsh/reverse`, which dials only a network its embedder supplies) share it. No `node:*` import.
+ * one (`@johnhenry/wsh/reverse`, which dials only a network its embedder supplies, and loads this module by a dynamic import only when it
+ * is given a gateway) share it. No `node:*` import.
  */
 
 import { normalizeGateway, createGatewaySession } from './server/gateway-session.mjs';
 import { GATEWAY_FAIL } from './server/gateway-core.mjs';
 import { MSG, gatewayFail } from './messages.gen.mjs';
+import { checkGatewayShape, checkReverseTrust } from './gateway-shape.mjs';
 
 const GATEWAY_OPTIONS = new Set([
   'allow', 'allowPrivate', 'maxConnections', 'maxBufferedBytes', 'maxClientBufferedBytes', 'connectTimeoutMs', 'halfCloseIdleMs',
@@ -30,17 +32,13 @@ export function buildReverseGateway(opts, hostOptions = {}, { who = 'createRever
     if (k === 'unix' || k === 'endpoints' || k === 'tcp') throw new TypeError(`${who}: gateway.${k} is not carried by a relay; a reverse host serves TCP, and UDP, DNS and reverse tunnels when turned on`);
     if (!GATEWAY_OPTIONS.has(k)) throw new TypeError(`${who}: unknown gateway option "${k}"`);
   }
-  if (requireNetwork && (opts.network === undefined || opts.network === null)) {
-    throw new TypeError(`${who}: gateway dials a network, and this one has no sockets: give gateway.network ({ connectTcp, resolve, openUdp, listenTcp }), or use createReverseHost from @johnhenry/wsh/server to dial this machine's network`);
-  }
+  if (requireNetwork) checkGatewayShape(opts, who);
   if (opts.dns !== undefined && typeof opts.dns !== 'boolean') throw new TypeError(`${who}: gateway.dns must be a boolean`);
   if (opts.trustRelayIdentity !== undefined && typeof opts.trustRelayIdentity !== 'boolean') throw new TypeError(`${who}: gateway.trustRelayIdentity must be a boolean`);
   // Who an operator is, on a bridge that is not sealed, is whatever the relay stamps on its messages: a relay can open what any accepted
   // operator could. So a gateway starts only when the owner either has operators PROVE themselves and seal the bridge (`requireOperatorProof`),
   // or says in so many words that they trust the relay's word about who is asking.
-  if (hostOptions.requireOperatorProof !== true && opts.trustRelayIdentity !== true) {
-    throw new TypeError(`${who}: a gateway needs requireOperatorProof: true (operators prove themselves and the bridge is sealed), or gateway.trustRelayIdentity: true to say you trust the relay's word about who is asking (a relay can then open what an accepted operator could)`);
-  }
+  checkReverseTrust(opts, hostOptions, who);
   const udpOn = opts.udp !== undefined && opts.udp !== false && opts.udp !== null;
   const dnsOn = opts.dns === true;
   const { udp, dns, trustRelayIdentity, ...rest } = opts;

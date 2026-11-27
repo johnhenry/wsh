@@ -147,6 +147,12 @@ export interface WshMemoryConnectOptions {
 export interface WshMemoryHost {
   /** The URL to give `client.connect()`; the host ignores it. */
   readonly url: string;
+  /**
+   * Resolves once the host is set up: its backends resolved and, when a `gateway` was given (#299), the gateway module loaded (it is fetched by a dynamic
+   * import only then, so a bundler puts it in a chunk of its own) and the option fully validated. REJECTS with the reason when it could not be (a bad
+   * value in `gateway`): every `accept()` and every connection then fails the same way, and `onLog` is told. A typo in the shape of `gateway` throws from `createMemoryHost` itself.
+   */
+  readonly ready: Promise<void>;
   /** A `WebSocket` constructor that dials this host. */
   readonly WebSocket: new (url?: string) => any;
   /** Serve any pre-upgraded socket (see `createSocketPair()`). */

@@ -28,7 +28,7 @@ import { RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { createConnectionFactory, hostFeatures } from './server/connection.mjs';
 import { validateOnShare } from './shares.mjs';
 import { refusalNotifier, validateOnRefused } from './refusal.mjs';
-import { buildReverseGateway } from './reverse-gateway.mjs';
+import { checkGatewayShape, checkReverseTrust } from './gateway-shape.mjs';
 
 const BACKOFF_START_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
@@ -88,8 +88,21 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost(options = {}) {
-  // A gateway here dials only a network the embedder supplies (`gateway.network`): this entry has no sockets of its own (#299).
-  const gateway = buildReverseGateway(options.gateway, options, { requireNetwork: true });
+  // A gateway here dials only a network the embedder supplies (`gateway.network`): this entry has no sockets of its own (#299). Its shape is checked
+  // now (a typo throws at once); the session behind it is fetched by a dynamic import only when a gateway was given, so a bundler splits it into a
+  // chunk of its own, and the full validation runs then: `start()` rejects with the reason, nothing is dialled.
+  let gateway = null;
+  if (options.gateway !== undefined && options.gateway !== null && options.gateway !== false) {
+    checkGatewayShape(options.gateway, 'createReverseHost');
+    checkReverseTrust(options.gateway, options, 'createReverseHost');
+    gateway = { cfg: null, createGatewaySession: null, ready: null };
+    gateway.ready = import('./reverse-gateway.mjs').then((m) => {
+      const built = m.buildReverseGateway(options.gateway, options, { requireNetwork: true });
+      gateway.cfg = built.cfg;
+      gateway.createGatewaySession = built.createGatewaySession;
+    });
+    gateway.ready.catch(() => {});
+  }
   const rpc = options.rpc === undefined || options.rpc === null ? null
     : createRpcTable(options.rpc, options.rpcMaxMessageBytes ?? RPC_DEFAULT_MAX_MESSAGE, options.rpcMaxInflight ?? 64, 'createReverseHost');
   return createReverseHostWith(options, { ...resolveBackends(options), rpc, gateway });
@@ -143,7 +156,9 @@ export function createReverseHostWith({
     ...(gatewayOn(c) ? [RELAY_GATEWAY_FEATURE] : []),
     ...(manyOperators ? [MULTI_OPERATOR_FEATURE] : []),
   ];
-  const factory = createConnectionFactory({
+  // Built on first use (`start()` has waited for a lazily loaded gateway by then).
+  let factory = null;
+  const makeFactory = () => createConnectionFactory({
     authorize: async () => false, methods: { pubkey: false, password: null }, hostKey: null, rateLimit: null,
     execRunner: backends.execRunner, execOptions: backends.execOptions, pty: backends.pty, files: backends.files, mcp: backends.mcp, rpc: backends.rpc ?? null,
     sessions: null, relay: null, e2e: null, bindTimeoutMs: 3000, log: (l) => onLog(`[reverse] ${l}`), onShare, onRefused,
@@ -277,7 +292,7 @@ export function createReverseHostWith({
       const to = () => (manyOperators() ? { to: from } : undefined);
       let sealed = null;
       const mustSeal = requireOperatorProof;
-      const base = factory({
+      const base = (factory ??= makeFactory())({
         // With several operators every message names its recipient; with one the relay knows.
         sendMessage: async (m) => {
           if (sealed) return conn.sendRelayControl(await sealed.seal(m), to());
@@ -387,6 +402,7 @@ export function createReverseHostWith({
     async start() {
       if (client) throw new Error('createReverseHost: already started');
       closed = false;
+      await backends.gateway?.ready; // a gateway loaded on demand (#299): an invalid one rejects here, before anything is dialled
       myPublicKeyRaw = await exportPublicKeyRaw(keyPair.publicKey);
       myFingerprint = await fingerprint(myPublicKeyRaw);
       await dial();

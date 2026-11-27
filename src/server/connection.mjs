@@ -32,7 +32,8 @@ import { RpcCreditLink, rpcChannelOfCredit, rpcCreditId } from '../rpc-virtual.m
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
-import { gatewayFeatures, GATEWAY_FAIL } from './gateway-core.mjs';
+import { gatewayFeatures } from './gateway-features.mjs';
+import { GATEWAY_FAIL } from '../gateway-errors.mjs';
 import { GATEWAY_CREDIT_FEATURE } from '../gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';

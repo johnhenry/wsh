@@ -66,9 +66,10 @@ export function replaceReadmeBlock(readme, table) {
 function table(sizes, budget) {
   const rows = sizes.map((s) => {
     const b = budget?.entries?.[s.name];
-    return `| ${s.name} | ${kb(s.raw)} kB | ${kb(s.gzip)} kB | ${b ? `${kb(b.gzip)} kB` : '-'} |`;
+    // `lazy`: what sits behind a dynamic import() and is fetched only when used (a separate chunk in an embedder's bundler); not in the entry's size.
+    return `| ${s.name} | ${kb(s.raw)} kB | ${kb(s.gzip)} kB | ${b ? `${kb(b.gzip)} kB` : '-'} | ${s.lazy?.chunks ? `${kb(s.lazy.gzip)} kB` : '-'} |`;
   });
-  return ['| entry point | minified | gzip | gzip budget |', '| --- | ---: | ---: | ---: |', ...rows].join('\n');
+  return ['| entry point | minified | gzip | gzip budget | lazy chunk gzip |', '| --- | ---: | ---: | ---: | ---: |', ...rows].join('\n');
 }
 
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('bundle-size.mjs')) {

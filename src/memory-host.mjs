@@ -40,7 +40,7 @@ import { assertEd25519HostKey } from './host-key.mjs';
 import { resolveBackends, resolveHostKey, createRpcTable } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
 import { normalizeEndpointGateway, createEndpointGatewaySession } from './server/gateway-core.mjs';
-import { normalizeGateway, createGatewaySession } from './server/gateway-session.mjs';
+import { checkGatewayShape } from './gateway-shape.mjs';
 import { assertHalfCloseIdleMs } from './gateway-channel.mjs';
 import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
 import { RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
@@ -249,25 +249,36 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   // the browser-safe core (`server/gateway-core.mjs`), so a page can have it.
   let gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints, halfCloseIdleMs });
   // The gateway proper (#299): TCP, DNS, UDP and listening over the embedder's network. The same session the Node host runs; nothing here dials.
+  // The session (with the address guard, the UDP and reverse-tunnel policies and the stream adapter) is fetched by a dynamic import ONLY when a
+  // gateway was given, so a bundler puts it in a chunk of its own and a page host that has none does not carry it. The shape of the option is
+  // checked now (a typo throws at once); the full validation runs when the module has loaded and fails `host.ready`, every `accept()` and
+  // every connection (the in-memory client socket is closed, and `onLog` is told), never silently.
   let createSession = createEndpointGatewaySession;
+  let gatewayLoaded = null;
   if (gateway !== undefined && gateway !== null && gateway !== false) {
-    if (gateway === true || typeof gateway !== 'object' || Array.isArray(gateway)) throw new TypeError('createMemoryHost: gateway needs a network and an explicit allow list (default deny): { network: { connectTcp, ... }, allow: ["host:port", ...] }');
-    if (gateway.network === undefined || gateway.network === null) throw new TypeError('createMemoryHost: gateway needs a network (a page has no sockets to dial): gateway.network = { connectTcp, resolve, openUdp, listenTcp }');
+    checkGatewayShape(gateway, 'createMemoryHost');
     if (gateway.endpoints !== undefined) throw new TypeError('createMemoryHost: give the named endpoints as the `endpoints` option, not gateway.endpoints');
     for (const k of ['socks', 'unix', 'tcp']) if (gateway[k] !== undefined) throw new TypeError(`createMemoryHost: gateway.${k} does not apply to a host with no sockets`);
-    gatewayCfg = normalizeGateway({ ...gateway, endpoints, halfCloseIdleMs: gateway.halfCloseIdleMs ?? halfCloseIdleMs });
-    createSession = createGatewaySession;
+    gatewayLoaded = import('./server/gateway-session.mjs').then((m) => {
+      gatewayCfg = m.normalizeGateway({ ...gateway, endpoints, halfCloseIdleMs: gateway.halfCloseIdleMs ?? halfCloseIdleMs });
+      createSession = m.createGatewaySession;
+    });
+    gatewayLoaded.catch(() => {});
   }
-  // A target's own endpoints (#121) need the endpoints-only gateway too, even when the host has none of its own.
-  if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({ halfCloseIdleMs })), targetEndpoints: true };
 
-  const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
-    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, loginTimeoutMs, log: onLog,
-    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused, onSealed,
-    targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
-    gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createSession : undefined, sessions: registry, relay: null,
-  }));
+  const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady, gatewayLoaded]).then(([authorize, hostKeyResolved]) => {
+    // A target's own endpoints (#121) need the endpoints-only gateway too, even when the host has none of its own.
+    if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({ halfCloseIdleMs })), targetEndpoints: true };
+    return createConnectionFactory({
+      authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, loginTimeoutMs, log: onLog,
+      methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused, onSealed,
+      targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
+      gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createSession : undefined, sessions: registry, relay: null,
+    });
+  });
   ready.catch(() => {});
+  const hostReady = ready.then(() => undefined);
+  hostReady.catch(() => {});
 
   const accepted = new Set();
   let closed = false;
@@ -284,7 +295,8 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
     constructor() {
       super();
       const [client, server] = createSocketPair();
-      void accept(server, { remote: { address: 'memory' } }).catch(onLog);
+      // A host that could not be set up (an invalid `gateway`, a key that does not resolve) says so, and the client's connect fails now instead of waiting out its timeout.
+      void accept(server, { remote: { address: 'memory' } }).catch((e) => { onLog(`createMemoryHost: ${e?.message ?? e}`); try { client.close(1011, String(e?.message ?? e).slice(0, 100)); } catch { /* closed */ } });
       return client;
     }
   }
@@ -292,6 +304,8 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   const host = {
     /** Pass to `client.connect()`. */
     url: MEMORY_URL,
+    /** Resolves once the host is set up (backends resolved, and the gateway module loaded when a `gateway` was given); REJECTS with the reason when it could not be (an invalid `gateway`). */
+    ready: hostReady,
     WebSocket: HostWebSocket,
     accept,
     socketPair: createSocketPair,

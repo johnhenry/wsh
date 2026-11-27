@@ -11,6 +11,7 @@
 import { describe, it, afterEach, before } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { WebSocket as WsClient } from 'ws';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { createReverseHost } from '@johnhenry/wsh/reverse';
@@ -552,6 +553,64 @@ describe('the gateway over a network the embedder supplies (#299)', () => {
       assert.deepEqual(vnet.calls.connect.map((c) => c.host), ['93.184.216.7']);
       // the owner's separate switches: UDP and DNS were not turned on
       await refused(op.openUdp('93.184.216.7', 53), /UDP is not enabled/);
+    });
+  });
+
+  describe('the gateway session is loaded only by a host that was given a gateway (lazy import)', () => {
+    const child = (mode) => new Promise((resolve, reject) => {
+      execFile(process.execPath, [new URL('./helpers/lazy-gateway-child.mjs', import.meta.url).pathname, mode], { env: { ...process.env, NODE_NO_WARNINGS: '1' } }, (err, out, errOut) => {
+        if (err) reject(new Error(`${err.message}\n${errOut}`)); else resolve(JSON.parse(out.trim().split('\n').pop()));
+      });
+    });
+
+    it('a host created WITHOUT a gateway never loads the session module, not even after a client connected', async () => {
+      assert.deepEqual(await child('none'), { before: false, afterConnect: false, afterGateway: null });
+    });
+
+    it('a host created with one loads it, and has it by the time a connection is served', async () => {
+      const seen = await child('gateway');
+      assert.equal(seen.afterConnect, true);
+      assert.equal(seen.afterGateway, true);
+    });
+
+    it('a gateway whose shape is wrong throws at creation, at once', () => {
+      assert.throws(() => createMemoryHost({ gateway: { network: { connectTcp: 1 }, allow: [] } }), /connectTcp must be a function/);
+      assert.throws(() => createMemoryHost({ gateway: { network: { connect() {} }, allow: [] } }), /not a network method/);
+      assert.throws(() => createReverseHost({ url: 'ws://x', username: 'h', keyPair, gateway: { network: {}, allow: [], trustRelayIdentity: true } }), /at least one/);
+      assert.throws(() => createReverseHost({ url: 'ws://x', username: 'h', keyPair, gateway: { network: { connectTcp() {} }, allow: [] } }), /requireOperatorProof|trustRelayIdentity/);
+    });
+
+    it('a gateway that is invalid in a value fails LOUDLY: host.ready rejects, accept() rejects, a connection is refused at once and onLog is told', async () => {
+      const logs = [];
+      const h = createMemoryHost({ auth: { authorizedKeys: [raw] }, onLog: (l) => logs.push(l), gateway: { network: { connectTcp() {} }, allow: ['*'], maxConnections: -1 } });
+      hosts.push(h);
+      await assert.rejects(h.ready, /maxConnections/);
+      const [a, b] = h.socketPair();
+      await assert.rejects(h.accept(b), /maxConnections/);
+      a.close();
+      const t0 = Date.now();
+      await assert.rejects(h.connect({ username: 'alice', keyPair }));
+      assert.ok(Date.now() - t0 < 5000, 'refused, not timed out');
+      assert.ok(logs.some((l) => /maxConnections/.test(l)), logs.join('\n'));
+    });
+
+    it('a reverse host with an invalid gateway value refuses to start, with the reason, before it dials', async () => {
+      const rh = createReverseHost({ url: 'ws://127.0.0.1:1', username: 'host', keyPair, reconnect: false, gateway: { network: { connectTcp() {} }, allow: [], trustRelayIdentity: true, maxConnections: -1 } });
+      await assert.rejects(rh.start(), /maxConnections/);
+    });
+
+    it('two connections racing the first load both work', async () => {
+      const vnet = createVirtualNetwork({ services: { '93.184.216.7:7': echoService } });
+      const h = createMemoryHost({ auth: { authorizedKeys: [raw] }, gateway: { network: vnet.network, allow: ['93.184.216.7'] } });
+      hosts.push(h);
+      const [c1, c2] = await Promise.all([h.connect({ username: 'alice', keyPair }), h.connect({ username: 'alice', keyPair })]);
+      clients.push(c1, c2);
+      const run = async (c, text) => {
+        const d = await c.openTcp('93.184.216.7', 7);
+        const w = d.writable.getWriter(); await w.write(enc.encode(text)); await w.close();
+        return dec.decode(await readAll(d.readable));
+      };
+      assert.deepEqual(await Promise.all([run(c1, 'one'), run(c2, 'two')]), ['one', 'two']);
     });
   });
 });

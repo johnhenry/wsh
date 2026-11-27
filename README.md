@@ -486,7 +486,8 @@ building a host takes it, with one meaning and one validation (a whole number of
 endpoint that carries long-lived quiet streams (an attached process's output) can have `0` or a long one while a
 request/response endpoint keeps a short one. On the client, `openEndpoint(name, { halfCloseIdleMs })` (and the other `open*`
 calls) bounds one connection; `host.connect({ ..., gatewayHalfCloseIdleMs })` on a memory host is `connect()`'s option. A page
-host (`createPageHost`), a reverse host and a pipe-relay pairing serve no gateway, so they have no such clock. A
+host (`createPageHost`) and a pipe-relay pairing serve no gateway, so they have no such clock; a reverse host that was given a gateway
+(#289, #299) has the gateway's `halfCloseIdleMs` like any other, and one without a gateway serves none. A
 connection that is not half-closed has no idle bound of this kind; a reverse listener keeps its own `idleMs`, a UDP flow
 its `udpIdleMs`. Not covered: an origin that closed its socket completely, without the client having closed, stays open
 (until the client closes or the idle bound) because the host cannot tell a full close from a half-close.
@@ -714,9 +715,19 @@ const host = createMemoryHost({
 - **A reverse host in a page.** `createReverseHost({ ..., gateway: { network, allow, trustRelayIdentity | requireOperatorProof, udp, dns,
   reverse } })` from `@johnhenry/wsh/reverse` is the browser-safe form of the reverse host's gateway (#289), with the same owner switches
   and per-operator grants; without `gateway.network` it refuses to start (a page has no sockets).
-- **Types and bundle.** `WshGatewayNetwork` and friends are in `@johnhenry/wsh/gateway` (`src/gateway.d.ts`); that entry point bundles
-  for the browser with nothing from Node. Bringing the gateway into `@johnhenry/wsh/memory` and `/reverse` costs about 15 kB gzipped
-  in a page that bundles them (see the size table).
+- **Types and bundle: the session is loaded on demand.** `WshGatewayNetwork` and friends are in `@johnhenry/wsh/gateway` (`src/gateway.d.ts`);
+  that entry point bundles for the browser with nothing from Node. `createMemoryHost` and the browser-safe `createReverseHost` fetch the
+  gateway session (about 13 kB gzipped, with the address guard and the UDP and reverse-tunnel policies) by a dynamic `import()` **only when
+  a `gateway` is given**, so a bundler (esbuild with `splitting`, Rollup, webpack, Vite) puts it in a chunk of its own and a page host that
+  passes none never loads it: the entry points' sizes in the table below are the eager part, and `node scripts/bundle-size.mjs` prints the lazy
+  chunk beside them. What that means at run time: the shape of `gateway` (a `network` object with at least one method, an `allow` array, no
+  `socks`/`unix`/`tcp`; for a reverse host also `requireOperatorProof` or `trustRelayIdentity`) is checked by `createMemoryHost` /
+  `createReverseHost` themselves and **throws at once**; the values (`maxConnections`, `allowPrivate`, ...) are validated when the module has
+  loaded, and a bad one fails loudly: `host.ready` rejects (new, resolves when the host is set up), every `accept()` rejects, a connection
+  through `host.connect()` / `host.WebSocket` is closed at once with the reason and `onLog` is told; a reverse host's `start()` rejects before
+  it dials. The first connections wait for the load (several racing it are fine). To control the loading yourself, build the host on
+  `@johnhenry/wsh/host` and pass `createConnectionFactory({ gateway: normalizeGateway(...), createGatewaySession })` from
+  `@johnhenry/wsh/gateway`: no dynamic import.
 
 **Not covered:** wsh cannot vouch for what your network reaches (see the Security model). Not built: a Node-side adapter that
 exposes the machine's own network as a `network` object (the machine's is the built-in default), UNIX sockets over a network, and
@@ -1027,12 +1038,12 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | browser bundle | minified | gzip |
 | --- | ---: | ---: |
 | `@johnhenry/wsh` (whole entry point) | 169.2 kB | 51.4 kB |
-| `@johnhenry/wsh/memory` (whole entry point) | 283.3 kB | 88.1 kB |
-| `@johnhenry/wsh/host` (whole entry point) | 132.5 kB | 43.5 kB |
-| `@johnhenry/wsh/reverse` (whole entry point) | 277.2 kB | 85.9 kB |
+| `@johnhenry/wsh/memory` (whole entry point) | 245.4 kB | 77.0 kB |
+| `@johnhenry/wsh/host` (whole entry point) | 132.4 kB | 43.5 kB |
+| `@johnhenry/wsh/reverse` (whole entry point) | 234.1 kB | 73.0 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 8.0 kB | 3.3 kB |
-| `@johnhenry/wsh/testing` (whole entry point) | 292.2 kB | 91.6 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 383.0 kB | 121.5 kB |
+| `@johnhenry/wsh/testing` (whole entry point) | 254.3 kB | 80.5 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 344.9 kB | 110.5 kB |
 | `@johnhenry/wsh/objects` (whole entry point) | 209.2 kB | 64.7 kB |
 | `@johnhenry/wsh/objects-types` (whole entry point) | 10.2 kB | 4.2 kB |
 | `@johnhenry/wsh/capabilities` (whole entry point) | 10.6 kB | 3.8 kB |

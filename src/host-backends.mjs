@@ -6,7 +6,7 @@
 
 import { normalizePty } from './server/pty.mjs';
 import { createMcpHost } from './server/mcp.mjs';
-import { normalizeEndpoints } from './server/gateway-core.mjs';
+import { normalizeEndpoints } from './server/gateway-features.mjs';
 import { DEFAULT_MAX_FILE_BYTES } from './server/constants.mjs';
 import { RPC_PROTOCOL_NAME_RE } from './rpc.mjs';
 import { generateKeyPair, resolveSigner, fingerprint, exportPublicKeySSH, importPublicKeyRaw } from './auth.mjs';
