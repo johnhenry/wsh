@@ -372,6 +372,10 @@ pub struct IdentityPolicy {
     pub relay_gateway_dns: bool,
     /// Reverse host: also answer `ListenRequest` (`--relay-gateway-listen`).
     pub relay_gateway_listen: bool,
+    /// Reverse host (wsh #296): the same three switches for the named operators only (`--relay-gateway-udp-for FINGERPRINT`, ...).
+    pub relay_gateway_udp_for: Vec<String>,
+    pub relay_gateway_dns_for: Vec<String>,
+    pub relay_gateway_listen_for: Vec<String>,
     /// Reverse host: take who an operator is from the relay's word (`--relay-gateway-trust-relay`); required for a gateway unless
     /// `--require-operator-proof` makes operators prove themselves.
     pub relay_gateway_trust_relay: bool,
@@ -479,11 +483,16 @@ fn relay_gateway_from_policy(
     p: &IdentityPolicy,
     options: &crate::commands::reverse_host::ReverseHostOptions,
 ) -> Result<Option<crate::commands::reverse_host::RelayGateway>> {
-    use crate::commands::reverse_gateway::DEFAULT_MAX_CONNECTIONS;
+    use crate::commands::reverse_gateway::{
+        is_operator_scope, OperatorGrant, DEFAULT_MAX_CONNECTIONS,
+    };
     if p.relay_gateway_allow.is_empty() {
         if p.relay_gateway_udp
             || p.relay_gateway_dns
             || p.relay_gateway_listen
+            || !p.relay_gateway_udp_for.is_empty()
+            || !p.relay_gateway_dns_for.is_empty()
+            || !p.relay_gateway_listen_for.is_empty()
             || p.relay_gateway_trust_relay
             || p.relay_gateway_max_connections != 0
         {
@@ -521,8 +530,98 @@ fn relay_gateway_from_policy(
             "--relay-gateway-allow needs `--capability gateway`: the gateway is a capability this host exposes on purpose"
         );
     }
+    // `FINGERPRINT=RULE` is scoped to the operators whose fingerprint starts with it (wsh #296); a rule without `=` is every operator's.
+    // (A destination rule never contains `=`.) A scope must be one the owner's --allow-operator list can let in, else the rule would be
+    // for an operator that is never served.
+    let covered = |scope: &str| {
+        p.allow_operators.iter().any(|a| {
+            let a = a.to_ascii_lowercase();
+            a.starts_with(scope) || scope.starts_with(a.as_str())
+        })
+    };
+    let check_scope = |scope: &str, flag: &str| -> Result<String> {
+        let scope = scope.to_ascii_lowercase();
+        if !is_operator_scope(&scope) {
+            anyhow::bail!(
+                "{flag}: `{scope}` is not an operator: give at least 8 hex digits of its fingerprint"
+            );
+        }
+        if !covered(&scope) {
+            anyhow::bail!(
+                "{flag}: `{scope}` is not covered by any --allow-operator (it would be a rule for an operator that is never served)"
+            );
+        }
+        Ok(scope)
+    };
+    let mut unscoped = Vec::new();
+    let mut grants: Vec<OperatorGrant> = Vec::new();
+    let grant_for = |grants: &mut Vec<OperatorGrant>, scope: String| -> usize {
+        grants
+            .iter()
+            .position(|g| g.operator == scope)
+            .unwrap_or_else(|| {
+                grants.push(OperatorGrant {
+                    operator: scope,
+                    allow: Vec::new(),
+                    udp: false,
+                    dns: false,
+                    listen: false,
+                });
+                grants.len() - 1
+            })
+    };
+    for entry in &p.relay_gateway_allow {
+        match entry.split_once('=') {
+            None => unscoped.push(entry.clone()),
+            Some((scope, rule)) => {
+                if rule.is_empty() {
+                    anyhow::bail!("--relay-gateway-allow: `{entry}` has no rule after the `=`");
+                }
+                let scope = check_scope(scope, "--relay-gateway-allow")?;
+                let i = grant_for(&mut grants, scope);
+                grants[i].allow.push(rule.to_string());
+            }
+        }
+    }
+    for (scopes, flag) in [
+        (&p.relay_gateway_udp_for, "--relay-gateway-udp-for"),
+        (&p.relay_gateway_dns_for, "--relay-gateway-dns-for"),
+        (&p.relay_gateway_listen_for, "--relay-gateway-listen-for"),
+    ] {
+        for scope in scopes {
+            let scope = check_scope(scope, flag)?;
+            let i = grant_for(&mut grants, scope.clone());
+            match flag {
+                "--relay-gateway-udp-for" => grants[i].udp = true,
+                "--relay-gateway-dns-for" => grants[i].dns = true,
+                _ => grants[i].listen = true,
+            }
+        }
+    }
+    // A switch for an operator that no rule reaches would switch on nothing.
+    for g in &grants {
+        let reached = !unscoped.is_empty()
+            || grants.iter().any(|h| {
+                !h.allow.is_empty()
+                    && (h.operator.starts_with(&g.operator) || g.operator.starts_with(&h.operator))
+            });
+        if !reached {
+            let flag = if g.udp {
+                "--relay-gateway-udp-for"
+            } else if g.dns {
+                "--relay-gateway-dns-for"
+            } else {
+                "--relay-gateway-listen-for"
+            };
+            anyhow::bail!(
+                "{flag} {}: no --relay-gateway-allow rule (scoped to it or unscoped) reaches this operator, so there is nothing to switch on",
+                g.operator
+            );
+        }
+    }
     let gateway = crate::commands::reverse_host::RelayGateway {
-        allow: p.relay_gateway_allow.clone(),
+        allow: unscoped,
+        operators: grants,
         udp: p.relay_gateway_udp,
         dns: p.relay_gateway_dns,
         listen: p.relay_gateway_listen,
@@ -1243,6 +1342,110 @@ mod redact_tests {
         assert!(err.to_string().contains("--max-operators"), "{err}");
         p.relay_gateway_trust_relay = true;
         assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_ok());
+    }
+
+    // ── Per operator (wsh #296) ───────────────────────────────────────────
+
+    fn scoped() -> IdentityPolicy {
+        IdentityPolicy {
+            relay_gateway_allow: vec![
+                "aaaaaaaa=a.example.com:1".into(),
+                "BBBBBBBB=b.example.com:2".into(),
+            ],
+            allow_operators: vec!["aaaaaaaa1111".into(), "bbbbbbbb2222".into()],
+            relay_gateway_trust_relay: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_rule_scoped_to_an_operator_is_that_operators_and_an_unscoped_one_everyones() {
+        let mut p = scoped();
+        p.relay_gateway_allow.push("shared.example.com".into());
+        let g = relay_gateway_from_policy(&p, &host_with(&["gateway"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.allow, ["shared.example.com"]);
+        assert_eq!(g.operators.len(), 2);
+        assert_eq!(g.operators[0].operator, "aaaaaaaa");
+        assert_eq!(g.operators[1].operator, "bbbbbbbb", "lower-cased");
+        assert_eq!(g.operators[1].allow, ["b.example.com:2"]);
+        // only scoped rules is a gateway too, and an operator with no rule then gets nothing
+        let only = relay_gateway_from_policy(&scoped(), &host_with(&["gateway"]))
+            .unwrap()
+            .unwrap();
+        assert!(only.allow.is_empty());
+        assert!(only.for_operator("aaaaaaaa1111ffff").is_some());
+        assert!(only.for_operator("cccccccc00000000").is_none());
+    }
+
+    #[test]
+    fn a_scope_must_be_a_fingerprint_with_a_rule_and_one_the_owner_lets_in() {
+        for bad in [
+            "zzzzzzzz=x.example.com",
+            "aaaa=x.example.com",
+            "=x.example.com",
+            "aaaaaaaa=",
+        ] {
+            let mut p = scoped();
+            p.relay_gateway_allow.push(bad.into());
+            let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+            assert!(
+                err.to_string().contains("--relay-gateway-allow"),
+                "{bad}: {err}"
+            );
+        }
+        // a scope no --allow-operator entry covers would be a rule for an operator that is never served
+        let mut p = scoped();
+        p.relay_gateway_allow.push("cccccccc=x.example.com".into());
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--allow-operator"), "{err}");
+        // a scope that is a prefix of an allowed fingerprint is covered, and so is a longer one
+        let mut q = scoped();
+        q.relay_gateway_allow = vec!["aaaaaaaa1111=x.example.com".into()];
+        assert!(relay_gateway_from_policy(&q, &host_with(&["gateway"])).is_ok());
+    }
+
+    #[test]
+    fn a_switch_scoped_to_an_operator_needs_a_rule_that_reaches_it() {
+        let mut p = scoped();
+        p.relay_gateway_udp_for = vec!["aaaaaaaa".into()];
+        p.relay_gateway_dns_for = vec!["bbbbbbbb".into()];
+        p.relay_gateway_listen_for = vec!["aaaaaaaa".into()];
+        let g = relay_gateway_from_policy(&p, &host_with(&["gateway"]))
+            .unwrap()
+            .unwrap();
+        let (a, b) = (&g.operators[0], &g.operators[1]);
+        assert!(a.udp && !a.dns && a.listen);
+        assert!(!b.udp && b.dns && !b.listen);
+        assert!(!g.udp && !g.dns && !g.listen, "nothing became everyone's");
+        // for an operator no rule reaches
+        let mut p = scoped();
+        p.allow_operators.push("cccccccc3333".into());
+        p.relay_gateway_udp_for = vec!["cccccccc".into()];
+        let err = relay_gateway_from_policy(&p, &host_with(&["gateway"])).unwrap_err();
+        assert!(err.to_string().contains("--relay-gateway-udp-for"), "{err}");
+        // a scope that is not a fingerprint
+        let mut p = scoped();
+        p.relay_gateway_dns_for = vec!["nothex".into()];
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_err());
+        // and without any rule the scoped switches are an error too, as the unscoped ones are
+        let p = IdentityPolicy {
+            relay_gateway_udp_for: vec!["aaaaaaaa".into()],
+            ..Default::default()
+        };
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_err());
+    }
+
+    #[test]
+    fn scoped_rules_need_everything_a_gateway_needs() {
+        let mut p = scoped();
+        p.allow_operators.clear();
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_err());
+        let mut p = scoped();
+        p.relay_gateway_trust_relay = false;
+        assert!(relay_gateway_from_policy(&p, &host_with(&["gateway"])).is_err());
+        assert!(relay_gateway_from_policy(&scoped(), &host_with(&["shell"])).is_err());
     }
 
     #[test]

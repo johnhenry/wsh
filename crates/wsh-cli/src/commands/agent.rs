@@ -695,6 +695,19 @@ fn startup_command_arguments(
         args.push("--relay-gateway-allow".to_string());
         args.push(rule.clone());
     }
+    for (scopes, flag) in [
+        (&policy.relay_gateway_udp_for, "--relay-gateway-udp-for"),
+        (&policy.relay_gateway_dns_for, "--relay-gateway-dns-for"),
+        (
+            &policy.relay_gateway_listen_for,
+            "--relay-gateway-listen-for",
+        ),
+    ] {
+        for scope in scopes {
+            args.push(flag.to_string());
+            args.push(scope.clone());
+        }
+    }
     for (on, flag) in [
         (policy.relay_gateway_udp, "--relay-gateway-udp"),
         (policy.relay_gateway_dns, "--relay-gateway-dns"),
@@ -1082,7 +1095,16 @@ mod tests {
             cert_hashes: vec![[0xab; 32], [0x01; 32]],
             allow_operators: vec!["0123456789abcdef".into(), "fedcba9876543210".into()],
             max_operators: 1,
-            relay_gateway_allow: vec!["db.example.com:5432".into(), "10.0.0.0/8".into()],
+            // scoped forms (wsh #296): an `=` in a rule and the three per-operator switches are written into the unit too
+            relay_gateway_allow: vec![
+                "db.example.com:5432".into(),
+                "10.0.0.0/8".into(),
+                "0123456789abcdef=10.1.0.0/16:22".into(),
+                "fedcba98=*.internal.example:443".into(),
+            ],
+            relay_gateway_udp_for: vec!["0123456789ab".into()],
+            relay_gateway_dns_for: vec!["fedcba98".into(), "0123456789ab".into()],
+            relay_gateway_listen_for: vec!["fedcba98".into()],
             relay_gateway_udp: true,
             relay_gateway_dns: true,
             relay_gateway_listen: true,
@@ -1109,6 +1131,12 @@ mod tests {
         assert_eq!(cli.allow_operators, policy.allow_operators);
         assert_eq!(cli.relay_gateway_allow, policy.relay_gateway_allow);
         assert_eq!(cli.no_half_close_probe_answers, policy.no_probe_answers);
+        assert_eq!(cli.relay_gateway_udp_for, policy.relay_gateway_udp_for);
+        assert_eq!(cli.relay_gateway_dns_for, policy.relay_gateway_dns_for);
+        assert_eq!(
+            cli.relay_gateway_listen_for,
+            policy.relay_gateway_listen_for
+        );
         assert_eq!(cli.relay_gateway_udp, policy.relay_gateway_udp);
         assert_eq!(cli.relay_gateway_dns, policy.relay_gateway_dns);
         assert_eq!(cli.relay_gateway_listen, policy.relay_gateway_listen);
