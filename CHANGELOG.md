@@ -15,6 +15,12 @@
 - **Not built** (an owner decision): any capability beyond tools; a server-initiated graceful end of a `subscriptions/listen` stream (the empty response the spec suggests; the channel closes instead); `logLevel`; `ttlMs` above 0.
 - Tests: `test/mcp-modern.test.mjs` (both eras over `serveMcpOverDuplex`, raw JSON-RPC and the MCP SDK 2.x `Client` (devDependency `@modelcontextprotocol/client`) in legacy, `auto` and pinned modes; a loud `_meta` that changes nothing; the stream's order, filter, bound and cancel; reserved codes; the call pattern of browsermesh-mcp 0.3.0's wrapper around the handler). Two existing assertions changed: the default limits (`maxSubscriptions`) and the order of `tools/list` in `test/mcp-duplex.test.mjs`. Docs: README ("Over any duplex").
 
+### Test flakes of #291: `free-port` no longer asserts a port the OS chose for UDP is free for TCP (tests only; no code, wire or default change)
+
+- **Cause.** `test/free-port.test.mjs` took the port the OS handed out for a UDP socket, closed it, and asserted that `portIsFree()` called that same number free for TCP too. The OS picks the UDP number looking at UDP alone, and the same number is often in use for TCP on a busy machine (an outgoing connection's local port is in the same range, and parallel test files open many): about 1 run in 6 failed with 9000 connections held open. The helper was right; the test asked it about a port nobody had checked.
+- **Now.** The test finds, by binding both itself, a port nothing holds (up to 50 tries) and only then asks the helper; the `freePort()` check is repeated a few times, as the helper's own comment says another process may take the port in the moment after. 7 of 40 runs failed before under that load, 0 of 40 after.
+- **Not in this change.** `reverse-forward-full-close` and `gateway-sealed-backpressure`, the other two of #291, were fixed by #312 (0.62.2).
+
 ## 0.62.2 / Rust `rust-v0.26.2`
 
 ### An answering socket that finished its answer and then fails releases its connection, it does not discard it (#311; npm and Rust)
