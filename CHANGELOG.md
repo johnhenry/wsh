@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### A connection closed while a gateway call is being sent no longer leaves an unhandled rejection (#308; npm)
+
+- **What was wrong.** `openEndpoint`, `openTcp`, `openUnix`, `openUdp`, `listenTcp` and `listenUnix` created the promise that settles when the host answers before they awaited the send of the request. If the transport closed while that send was still in flight, or the caller's signal fired, or the timeout ran, the promise was rejected before anything was waiting on it: an unhandled `GatewayError: transport closed` that ends a Node process with status 1. It was there since the gateway's first release of these calls and showed up under load, when a link was closed while a dial was still opening.
+- **Now.** The rejection reaches the caller of the call, as before (with the close, abort or timeout error, or the send's own error if the send failed); nothing is raised that nobody can see. The other fire-and-forget promises on the gateway close paths (channel close and credit sends, the pipe's tail, the QMux write queue) were checked and already handle their errors.
+- **Test guard.** `npm test` runs every test file with `--unhandled-rejections=strict`, so an unhandled rejection anywhere in a file fails it. New test: `test/gateway-close-unhandled.test.mjs` (each call, closed, signalled and timed out while its request is held).
+- No wire, spec or default change.
+
 ## 0.62.0 / Rust `rust-v0.26.0`
 
 ### The answering side of a gateway connection is watched, losslessly: `gateway-lossless-close` and the close reason `released` (#286, #283; npm and Rust)
