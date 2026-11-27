@@ -681,7 +681,10 @@ mod tests {
             f.channel_id = 1;
         }
         assert!(g.incoming_direct(frame).deliver.is_none());
-        assert!(g.has_failed(), "a frame of another channel ends the session");
+        assert!(
+            g.has_failed(),
+            "a frame of another channel ends the session"
+        );
     }
 
     #[test]
