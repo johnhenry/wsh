@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Rust reverse host: a same-operator re-attach with no proof no longer replaces a proven bridge's request (#327; Rust CLI)
+
+- **What was wrong.** After an operator had proved itself, a second attach from the same operator that offered no proof was acknowledged from the
+  new, unproven request and stored in place of the proven one (its feature list is what the ack and the gateway read). A relay that could open a
+  second attach could therefore swap the operator's signed statements for its own list.
+- **Now.** A proven bridge keeps the request it was proven with; the re-attach is answered from it. An unproven bridge behaves as before. The
+  JS reverse host was never affected: it refuses a second attach from an operator that already has a bridge. No wire change.
+
+
 ### CBOR decoding is strict, in JS and in Rust: a length past the buffer, a stray byte, a non-canonical encoding are decode errors (#317; npm and Rust)
 
 - **What was wrong.** The JS decoder (`src/cbor.mjs`) read a text string of its declared length without checking it against the buffer, so on a
