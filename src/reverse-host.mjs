@@ -335,6 +335,8 @@ export function createReverseHostWith({
       return {
         receiveMessage(msg) {
           if (sealed) {
+            // DROPPED, not fatal (unlike a sealed SESSION, which closes on a foreign-id EncryptedFrame, #292): this connection carries several
+            // accepted relay peers, each with its own bridge key and session id, so a frame of another bridge can be legitimate here.
             if (!sealed.isFrame(msg)) { onLog('[reverse] dropped a plaintext message on a sealed bridge'); return; }
             openSealed(msg);
             return;

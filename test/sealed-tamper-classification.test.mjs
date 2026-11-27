@@ -68,8 +68,9 @@ async function through(hooks = {}) {
   wss.on('connection', (ws) => { void host.accept(ws); });
   const relay = await hostileRelay(`ws://127.0.0.1:${wss.address().port}`, hooks);
   const client = new WshClient();
-  const state = { closed: false };
+  const state = { closed: false, errors: [] };
   client.onClose = () => { state.closed = true; };
+  client.onError = (e) => state.errors.push(e);
   closers.push(async () => { await client.disconnect().catch(() => {}); await relay.close(); for (const c of wss.clients) c.terminate(); wss.close(); await host.close(); });
   await client.connect(relay.url, { username: 'alice', keyPair, transport: 'ws', sealSession: true });
   return { ran, logs, relay, client, state };
@@ -115,7 +116,7 @@ describe('a sealed frame whose LAST byte is changed (#292)', () => {
     tamperNextFrame(s.ctl, 'operator', flipLast);
     const session = await s.client.openSession({ type: 'exec', command: 'x', timeout: 500 }).catch((e) => e.message);
     await until(() => s.state.closed, `the client to close (open said ${typeof session === 'string' ? session : 'opened'})`);
-    assert.ok(s.state.errors.some((e) => /sealed frame did not open|not a frame of this session/.test(e.message)), s.state.errors.map((e) => e.message).join('|'));
+    assert.ok(s.state.errors.some((e) => /not a frame of this session/.test(e.message)), s.state.errors.map((e) => e.message).join('|'));   // the foreign frame itself, not a later counter failure
     assert.equal(s.client.droppedMessages.plaintext, 0, 'it was not filed under "plaintext"');
   });
 
@@ -125,6 +126,24 @@ describe('a sealed frame whose LAST byte is changed (#292)', () => {
     await s.client.openSession({ type: 'exec', command: 'must-not-run', timeout: 500 }).catch(() => {});
     await sleep(300);
     assert.deepEqual(s.ran, []);
+  });
+
+  // Pins (these pass on the code that closes on any foreign EncryptedFrame; they kill a mutant that closes only on a session-id mismatch).
+  it('a frame with the right session id but another channel closes the session toward the host', async () => {
+    let n = 0;
+    const s = await through({ toRelay: (m) => (m.type === MSG.ENCRYPTED_FRAME && n++ === 0 ? { ...m, channel_id: 1 } : m) });
+    await s.client.openSession({ type: 'exec', command: 'must-not-run', timeout: 500 }).catch(() => {});
+    await until(() => s.state.closed, 'the session to close');
+    assert.ok(s.logs.some((l) => /not a frame of this session/.test(l)), s.logs.slice(-3).join('|'));
+    assert.deepEqual(s.ran, []);
+  });
+
+  it('a frame with the right session id but another channel closes the client', async () => {
+    let n = 0;
+    const s = await through({ toClient: (m) => (m.type === MSG.ENCRYPTED_FRAME && n++ === 0 ? { ...m, channel_id: 1 } : m) });
+    await s.client.openSession({ type: 'exec', command: 'x', timeout: 500 }).catch(() => {});
+    await until(() => s.state.closed, 'the client to close');
+    assert.ok(s.state.errors.some((e) => /not a frame of this session/.test(e.message)), s.state.errors.map((e) => e.message).join('|'));
   });
 
   it('(c) the loss is visible: a frame the relay drops outright leaves a gap, and the next frame closes the session', async () => {

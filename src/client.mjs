@@ -3371,6 +3371,8 @@ export class WshClient {
       // only the key exchange that sets the bridge up (while it is pending) and frames of the bridge are heard.
       const sealState = this.#sealState;
       if (sealState) {
+        // A frame of another session id is dropped below, not fatal (unlike a sealed SESSION, #292): several bridges share this connection,
+        // so a frame of another bridge can be legitimate here.
         if (sealState.bridge?.isFrame(inner)) {
           this.#trackOpen(sealState.bridge.open(inner)
             .then((opened) => this.#handleControl(opened, msg.from_fingerprint))

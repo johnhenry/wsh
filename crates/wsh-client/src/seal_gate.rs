@@ -662,6 +662,29 @@ mod tests {
     }
 
     #[test]
+    fn an_encrypted_frame_of_another_channel_ends_the_session() {
+        // #292: pins that a foreign CHANNEL closes too, not only a foreign session id (kills "only the session id closes").
+        let g = host_gate(true);
+        let secret = x25519_dalek::EphemeralSecret::random();
+        let gated = g.incoming_direct(round_one("sid", &secret));
+        let Payload::KeyExchange(reply) = &gated.replies[0].payload else {
+            panic!("a key exchange reply");
+        };
+        let theirs: [u8; 32] = reply.public_key.clone().unwrap().try_into().unwrap();
+        let key = *secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(theirs))
+            .as_bytes();
+        let mut initiator =
+            SealedBridge::with_scope(key, "sid".into(), RoleTag::Initiator, Scope::Session);
+        let mut frame = initiator.seal(&close(9)).unwrap();
+        if let Payload::EncryptedFrame(f) = &mut frame.payload {
+            f.channel_id = 1;
+        }
+        assert!(g.incoming_direct(frame).deliver.is_none());
+        assert!(g.has_failed(), "a frame of another channel ends the session");
+    }
+
+    #[test]
     fn a_host_session_seals_what_it_sends_and_leaves_the_keepalive_plain() {
         let g = host_gate(true);
         let secret = x25519_dalek::EphemeralSecret::random();
