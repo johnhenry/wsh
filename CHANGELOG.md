@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.62.2 / Rust `rust-v0.26.2`
+
 ### An answering socket that finished its answer and then fails releases its connection, it does not discard it (#311; npm and Rust)
 
 - **What was wrong.** Where both ends stated `gateway-lossless-close`, an answering socket (an origin the host dialled, the local service of a reverse forward) that had sent its whole answer and its end of file was released by the half-close probe when its peer vanished. A failed write to the same socket (the caller's request body still arriving into an origin that has been reset) closes it too, and the probe is skipped while a write is queued, so that could come first; it ended the connection as a discard. After an end of file that is a second close of `discarded`, which makes the receiver drop what it has received and not yet read: all of a 100 kB answer in the reproduction.
