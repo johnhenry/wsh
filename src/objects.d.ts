@@ -312,7 +312,7 @@ declare module './index.js' {
 export function get(ref: any, ...keys: Array<string | number>): Promise<any>;
 /** Assign a property of a remote object (not `=`: that throws). The reference must be a plain path. */
 export function set<R, K extends SetKeyOf<R>>(ref: R, key: K, value: SetValueOf<R, K>): Promise<void>;
-/** Call a method reached by name, with plain-data arguments. */
+/** Call the method a reference points at, with plain-data arguments: `await call(win.app.cart.add, { sku: 'A1' })` (the same as `win.app.cart.add({ sku: 'A1' })`; the first argument is the method's reference, not the object and a name). */
 export function call(ref: any, ...args: unknown[]): Promise<any>;
 /** `new` a constructor reached by name. */
 export function construct(ref: any, ...args: unknown[]): Promise<any>;

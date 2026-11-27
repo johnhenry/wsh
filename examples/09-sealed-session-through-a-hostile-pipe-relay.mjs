@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { WshClient, WebSocketTransport, generateKeyPair, exportPublicKeyRaw, fingerprint } from '@johnhenry/wsh';
+import { WshClient, WebSocketTransport, generateKeyPair, exportPublicKeyRaw } from '@johnhenry/wsh';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { pipeUrl, newRendezvousId } from '@johnhenry/wsh/pipe-relay';
 import { createInProcessPipeRelay } from '@johnhenry/wsh/testing';
@@ -18,17 +18,17 @@ import { createInProcessPipeRelay } from '@johnhenry/wsh/testing';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const keyPair = await generateKeyPair(true);
 const raw = await exportPublicKeyRaw(keyPair.publicKey);
-const hostPair = await generateKeyPair(true);
-const hostFingerprint = await fingerprint(await exportPublicKeyRaw(hostPair.publicKey));
 
 /** One host and one operator meeting through a relay whose `tap` is given. Returns what the operator needs. */
-async function meet(tap, { serves = hostPair, pin = hostFingerprint } = {}) {
+async function meet(tap, { pinTo } = {}) {
   const relay = await createInProcessPipeRelay({ tap });
   const ran = []; const logs = [];
   const host = createMemoryHost({
-    auth: { authorizedKeys: [raw] }, hostKey: serves, dataStreams: false, sealSession: 'require', onLog: (l) => logs.push(l),
+    auth: { authorizedKeys: [raw] }, hostKey: true, dataStreams: false, sealSession: 'require', onLog: (l) => logs.push(l),
     exec: async (command, io) => { ran.push(command); await io.write(`output-of:${command}\n`); return 0; },
   });
+  const hostFingerprint = await host.hostFingerprint;   // the host made its own key; this is what an operator pins
+  const pin = pinTo ?? hostFingerprint;
   const id = newRendezvousId();
   void host.accept(new relay.WebSocket(pipeUrl('ws://relay.test', id, 'host')), { remote: { address: 'pipe' } });
   const client = new WshClient({ transportFactories: {
@@ -39,7 +39,7 @@ async function meet(tap, { serves = hostPair, pin = hostFingerprint } = {}) {
     expectHostKey: pin,                                                        // and pin who we are talking to
   });
   const close = async () => { await client.disconnect().catch(() => {}); await host.close(); await relay.close(); };
-  return { relay, host, client, connect, ran, logs, close };
+  return { relay, host, client, connect, ran, logs, close, hostFingerprint };
 }
 
 // ── 1. An honest-but-curious relay: it records, it cannot read ─────────
@@ -87,8 +87,7 @@ await b.close();
 // ── 3. An impostor at the far end: the pinned host key does not match ───
 
 console.log('3. a relay that puts its own host in place of the real one');
-const impostor = await generateKeyPair(true);
-const c = await meet(null, { serves: impostor });      // we pinned the REAL host's fingerprint
+const c = await meet(null, { pinTo: a.hostFingerprint });   // this host has another key; we pinned the REAL host's fingerprint
 const refusal = await c.connect().then(() => null, (e) => e);
 console.log(`   REFUSED: ${refusal?.message}`);
 assert.ok(refusal, 'a host key that is not the pinned one is never accepted');

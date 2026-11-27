@@ -21,6 +21,14 @@
 - **Now.** The test finds, by binding both itself, a port nothing holds (up to 50 tries) and only then asks the helper; the `freePort()` check is repeated a few times, as the helper's own comment says another process may take the port in the moment after. 7 of 40 runs failed before under that load, 0 of 40 after.
 - **Not in this change.** `reverse-forward-full-close` and `gateway-sealed-backpressure`, the other two of #291, were fixed by #312 (0.62.2).
 
+
+### The memory host states its own key fingerprint: `host.hostFingerprint` (#292; npm, additive)
+
+- **What was missing.** A client pins a host with `expectHostKey`, but a memory host (`createMemoryHost`) had no accessor for its key's fingerprint, so examples generated the host key pair and computed the fingerprint themselves.
+- **Now.** `host.hostFingerprint` is a `Promise<string | null>`: the host key's fingerprint (64 hex digits), also for `hostKey: true` (the host makes its own key), `null` for a host with no key; it never rejects. `await host.connect({ ..., expectHostKey: await host.hostFingerprint })` pins it. Examples 09 and 11 use it. (`resolveHostKey` from `@johnhenry/wsh/host` still gives the same for a key you hold.)
+- **README and types.** The remote-objects section shows `call(win.app.cart.add, x)` (the first argument is the method's reference; `call(win.app.cart, 'add', x)` is refused) and says how to test a refusal: `assert.rejects(async () => win.app.cart.add(x))`, since a reference is `PromiseLike`, not a `Promise`. The `call` doc comment in `objects.d.ts` says the same.
+- Test: `test/memory-host-fingerprint.test.mjs`. No wire, spec or default change.
+
 ## 0.62.2 / Rust `rust-v0.26.2`
 
 ### An answering socket that finished its answer and then fails releases its connection, it does not discard it (#311; npm and Rust)
