@@ -350,6 +350,21 @@ impl ReverseHostOptions {
     }
 }
 
+/// The request a same-operator re-attach (one that offers no proof) is served from. A bridge that was PROVEN keeps the request it was proven with
+/// (its feature list is what the ack and the gateway read, and the operator's signed statement went into it); a relay that opens a second attach for
+/// the same operator must not replace it with an unproven one (wsh #327). An unproven bridge takes the new request, as before.
+fn reattach_request(
+    stored: &ReverseConnectPayload,
+    stored_proven: bool,
+    incoming: ReverseConnectPayload,
+) -> ReverseConnectPayload {
+    if stored_proven {
+        stored.clone()
+    } else {
+        incoming
+    }
+}
+
 fn same_reverse_request(left: &ReverseConnectPayload, right: &ReverseConnectPayload) -> bool {
     left.username == right.username && left.target_fingerprint == right.target_fingerprint
 }
@@ -794,6 +809,8 @@ struct ReverseHostRuntime {
     options: ReverseHostOptions,
     status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
     active_request: Option<ReverseConnectPayload>,
+    /// `active_request` is the request its operator PROVED itself with (wsh #327): a re-attach without proof leaves it as it is.
+    request_proven: bool,
     /// This runtime accepted its operator and has not ended the bridge (it outlives the operator's
     /// sessions: `active_request` is cleared with the last one). Only a host serving several
     /// operators reads it.
@@ -815,6 +832,7 @@ impl ReverseHostRuntime {
             event_tx: None,
             status_tx: None,
             active_request: None,
+            request_proven: false,
             bridged: false,
             sealing: None,
             pending_proof: None,
@@ -888,6 +906,11 @@ impl ReverseHostRuntime {
                     target = %request.target_fingerprint,
                     "reattaching reverse host connection"
                 );
+                // A proven bridge keeps the request it was proven with: the ack and the gateway read its feature list (wsh #327).
+                let request = match &self.active_request {
+                    Some(stored) => reattach_request(stored, self.request_proven, request),
+                    None => request,
+                };
                 self.active_request = Some(request.clone());
                 let client = self.client()?;
                 client
@@ -1003,6 +1026,7 @@ impl ReverseHostRuntime {
         }
         // (no proof: the relay's list is taken as before)
         self.active_request = Some(request.clone());
+        self.request_proven = proven.is_some();
         self.bridged = true;
         let client = self.client()?;
         client
@@ -1136,6 +1160,7 @@ impl ReverseHostRuntime {
         // This operator's connections and listeners go with it.
         self.gateway = None;
         self.active_request = None;
+        self.request_proven = false;
         self.bridged = false;
         Ok(())
     }
@@ -1635,6 +1660,7 @@ impl ReverseHostRuntime {
 
         if self.sessions.is_empty() {
             self.active_request = None;
+            self.request_proven = false;
         }
         self.emit_session_count().await;
     }
@@ -2731,6 +2757,31 @@ mod tests {
 
         assert!(same_reverse_request(&left, &right));
         assert!(!same_reverse_request(&left, &wrong_user));
+    }
+
+    fn request_with(features: Option<Vec<String>>) -> ReverseConnectPayload {
+        ReverseConnectPayload {
+            target_fingerprint: "fp".into(),
+            username: "alice".into(),
+            from_fingerprint: "operator".into(),
+            features,
+        }
+    }
+
+    // wsh #327: a proven bridge, then a same-operator re-attach with no proof offered: the stored (proven) request stays.
+    #[test]
+    fn a_reattach_without_proof_keeps_the_proven_request() {
+        let proven = request_with(feats(&["operator-proof", LOSSLESS]));
+        let unproven = request_with(None);
+        let served = super::reattach_request(&proven, true, unproven);
+        assert_eq!(served.features, feats(&["operator-proof", LOSSLESS]));
+    }
+
+    #[test]
+    fn a_reattach_to_an_unproven_bridge_takes_the_new_request() {
+        let old = request_with(feats(&[LOSSLESS]));
+        let new = request_with(None);
+        assert_eq!(super::reattach_request(&old, false, new).features, None);
     }
 
     #[test]
