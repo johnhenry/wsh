@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint } from '../../src/index.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -42,8 +42,7 @@ async function startServer(lines, extraArgs = []) {
   const home = mkdtempSync(path.join(tmpdir(), 'wsh-keyopts-rust-'));
   mkdirSync(path.join(home, '.wsh'));
   writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${lines.join('\n')}\n`);
-  const port = await freePort();
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', '/dev/null/none', ...extraArgs], {
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', '/dev/null/none', ...extraArgs], {
     env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -51,11 +50,11 @@ async function startServer(lines, extraArgs = []) {
   proc.stdout.on('data', (d) => logs.push(stripAnsi(d.toString())));
   proc.stderr.on('data', (d) => logs.push(stripAnsi(d.toString())));
   const t = Date.now();
-  while (!logs.some((l) => l.includes('WebSocket TLS listener started'))) {
+  while (!listeningPort(logs)) { // the line `listening on 0.0.0.0:<port>`: both listeners are bound (#320)
     if (Date.now() - t > 15_000) throw new Error(`the server did not start: ${logs.join('')}`);
     await new Promise((r) => setTimeout(r, 50));
   }
-  return { url: `wss://127.0.0.1:${port}`, logs, home, stop() { proc.kill(); rmSync(home, { recursive: true, force: true }); } };
+  return { url: `wss://127.0.0.1:${listeningPort(logs)}`, logs, home, stop() { proc.kill(); rmSync(home, { recursive: true, force: true }); } };
 }
 
 describe('Rust wsh-server: permit-relay gates the relay (#122)', () => {
@@ -134,19 +133,18 @@ for (let from = 0; from < cases.length; from += CHUNK) {
         keys.push({ v, keyPair, fp: await fingerprint(await exportPublicKeyRaw(keyPair.publicKey)) });
       }
       writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${lines.join('\n')}\n`);
-      const port = await freePort();
-      proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', '/dev/null/none'], {
+      proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', '/dev/null/none'], {
         env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       proc.stdout.on('data', (d) => logs.push(stripAnsi(d.toString())));
       proc.stderr.on('data', (d) => logs.push(stripAnsi(d.toString())));
-      url = `wss://127.0.0.1:${port}`;
       const t = Date.now();
-      while (!logs.some((l) => l.includes('WebSocket TLS listener started'))) {
+      while (!listeningPort(logs)) { // the line `listening on 0.0.0.0:<port>`: both listeners are bound (#320)
         if (Date.now() - t > 15_000) throw new Error(`the server did not start: ${logs.join('')}`);
         await new Promise((r) => setTimeout(r, 50));
       }
+      url = `wss://127.0.0.1:${listeningPort(logs)}`;
     });
     after(async () => {
       for (const c of clients.splice(0)) await c.disconnect().catch(() => {});

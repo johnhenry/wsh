@@ -159,7 +159,7 @@ import {
 } from '../../src/index.mjs';
 import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-components/webtransport';
 import WebSocket from 'ws';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -235,11 +235,10 @@ async function startServer(sshLines, extraArgs = [], { config } = {}) {
     writeFileSync(configPath, config(homeDir));
   }
 
-  const port = await freePort();
   const logs = [];
   const proc = spawn(
     SERVER_BIN,
-    ['--port', String(port), '--generate-cert', '--config', configPath, ...extraArgs],
+    ['--port', '0', '--generate-cert', '--config', configPath, ...extraArgs],
     {
       env: { ...process.env, HOME: homeDir },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -248,11 +247,8 @@ async function startServer(sshLines, extraArgs = [], { config } = {}) {
   proc.stdout.on('data', (d) => logs.push(d.toString()));
   proc.stderr.on('data', (d) => logs.push(d.toString()));
 
-  // Wait for the actual "WebSocket TLS listener started" log line rather than
-  // a fixed timer: cert generation (rcgen) + TLS listener bind time varies
-  // with machine load, and a fixed STARTUP_GRACE_MS was observed to
-  // occasionally race the real readiness signal (intermittent "WebSocket
-  // connection failed" in the very first test of a run, ~1-in-6 under load).
+  // Wait for the `listening on 0.0.0.0:<port>` line (the server was started with --port 0 and prints the port it got once both
+  // listeners are bound, #320) rather than a fixed timer: cert generation (rcgen) + bind time varies with machine load.
   // STARTUP_GRACE_MS is kept as an upper-bound safety net only.
   await new Promise((resolve, reject) => {
     const deadline = setTimeout(() => {
@@ -263,7 +259,7 @@ async function startServer(sshLines, extraArgs = [], { config } = {}) {
     }, STARTUP_GRACE_MS);
 
     function checkReady() {
-      if (logs.some((l) => l.includes('WebSocket TLS listener started'))) {
+      if (listeningPort(logs)) {
         cleanup();
         resolve();
       }
@@ -289,7 +285,7 @@ async function startServer(sshLines, extraArgs = [], { config } = {}) {
     checkReady();
   });
 
-  return { proc, url: `wss://127.0.0.1:${port}`, homeDir, logs };
+  return { proc, url: `wss://127.0.0.1:${listeningPort(logs)}`, homeDir, logs };
 }
 
 async function stopServer(server) {

@@ -19,7 +19,7 @@ import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-component
 
 import { WshClient, generateKeyPair, exportPublicKeySSH } from '../../src/index.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../../src/gateway-datagram.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -75,19 +75,17 @@ describe('Rust wsh-server: UDP flows as WebTransport datagrams (gateway-datagram
     fs.writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${await exportPublicKeySSH(kp.publicKey)}\n`);
     const configPath = path.join(home, '.wsh', 'config.toml');
     fs.writeFileSync(configPath, `[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1:${port}"]\n${lines}\n`);
-    const sport = await freePort();
-    const proc = spawn(SERVER_BIN, ['--port', String(sport), '--generate-cert', '--config', configPath], {
+    const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath], {
       env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config') }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     procs.push(proc);
     let logs = '';
     proc.stdout.on('data', (d) => { logs += d; }); proc.stderr.on('data', (d) => { logs += d; });
-    await until(() => logs.includes('WebSocket TLS listener started') || (proc.exitCode !== null && (() => { throw new Error(`wsh-server exited: ${logs}`); })()), 'the server to start', 10_000);
-    await until(() => logs.includes('WebTransport listener started'), 'the WebTransport listener', 10_000);
+    await until(() => listeningPort(logs) || (proc.exitCode !== null && (() => { throw new Error(`wsh-server exited: ${logs}`); })()), 'the server to start', 10_000);
     const fp = execFileSync('openssl', ['x509', '-in', path.join(home, '.wsh', 'cert.pem'), '-noout', '-fingerprint', '-sha256']).toString().split('=')[1].trim();
     pinned = Uint8Array.from(fp.split(':').map((h) => parseInt(h, 16)));
     const client = new WshClient();
-    const url = transport === 'wt' ? `https://127.0.0.1:${sport}` : `wss://127.0.0.1:${sport}`;
+    const url = transport === 'wt' ? `https://127.0.0.1:${listeningPort(logs)}` : `wss://127.0.0.1:${listeningPort(logs)}`;
     await client.connect(url, { username: 'tester', keyPair: kp, transport });
     clients.push(client);
     return { client, logs: () => logs };

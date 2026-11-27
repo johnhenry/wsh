@@ -22,7 +22,7 @@ import { WebSocketTransport } from '../../src/transport-ws.mjs';
 import { signChallenge } from '../../src/auth.mjs';
 import { hello as helloMsg, auth as authMsg, MSG, AUTH_METHOD } from '../../src/messages.gen.mjs';
 import { computeChannelBinding } from '../../src/channel-binding.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -56,17 +56,16 @@ async function startServer({ serverToml = '', authorizedKey, hostKeyAt = 'host_k
   const hostKeyPath = path.join(home, '.wsh', hostKeyAt);
   const configPath = path.join(home, '.wsh', 'config.toml');
   writeFileSync(configPath, serverToml.replaceAll('$HOSTKEY', hostKeyPath));
-  const port = await freePort();
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(proc);
   let logs = '';
   const ready = new Promise((resolve, reject) => {
-    const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+    const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
     proc.stdout.on('data', onData); proc.stderr.on('data', onData);
     proc.once('exit', (c) => reject(Object.assign(new Error(`wsh-server exited (${c}): ${logs}`), { logs })));
     setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);
   });
-  await ready;
+  const port = await ready;
   return { url: `wss://127.0.0.1:${port}`, port, kp, home, hostKeyPath, certFile: path.join(home, '.wsh', 'cert.pem'), logs: () => logs };
 }
 
@@ -93,10 +92,16 @@ describe('Rust wsh-server host key (JS client)', () => {
     await first.disconnect();
     a.logs();
     // a second server on the same HOME and key file: the same identity
-    const proc2Port = await freePort();
-    const proc = spawn(SERVER_BIN, ['--port', String(proc2Port), '--generate-cert', '--config', path.join(a.home, '.wsh', 'config.toml')], { env: cleanEnv(a.home), stdio: 'ignore' });
+    const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', path.join(a.home, '.wsh', 'config.toml')], { env: cleanEnv(a.home), stdio: ['ignore', 'pipe', 'pipe'] });
     procs.push(proc);
-    await new Promise((r) => setTimeout(r, 1500));
+    // the line the server prints once both listeners are bound (#320), not a fixed sleep
+    let logs2 = '';
+    const proc2Port = await new Promise((resolve, reject) => {
+      const onData = (d) => { logs2 += d; const p = listeningPort(logs2); if (p) resolve(p); };
+      proc.stdout.on('data', onData); proc.stderr.on('data', onData);
+      proc.once('exit', (c) => reject(new Error(`wsh-server exited (${c}): ${logs2}`)));
+      setTimeout(() => reject(new Error(`wsh-server not ready: ${logs2}`)), 10_000);
+    });
     const second = new WshClient();
     await second.connect(`wss://127.0.0.1:${proc2Port}`, { username: 'tester', keyPair: a.kp, timeout: 5000 });
     assert.equal(second.hostKey.fingerprint, fp);
@@ -172,9 +177,8 @@ describe('Rust wsh-server host key (JS client)', () => {
     const pem = execFileSync(process.execPath, ['-e', "const {generateKeyPairSync}=require('node:crypto');process.stdout.write(generateKeyPairSync('ed25519').privateKey.export({type:'pkcs8',format:'pem'}))"], { encoding: 'utf8' });
     writeFileSync(keyFile, pem, { mode: 0o644 });
     writeFileSync(path.join(home, '.wsh', 'config.toml'), `[server]\nhost_key = ${JSON.stringify(keyFile)}\n`);
-    const port = await freePort();
     const out = await new Promise((resolve) => {
-      const proc = spawn(SERVER_BIN, ['--port', String(port),'--generate-cert', '--config', path.join(home, '.wsh', 'config.toml')], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', path.join(home, '.wsh', 'config.toml')], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
       let logs = ''; proc.stdout.on('data', (d) => { logs += d; }); proc.stderr.on('data', (d) => { logs += d; });
       proc.once('close', (code) => resolve({ code, logs }));
       setTimeout(() => { proc.kill(); resolve({ code: null, logs }); }, 8000);
