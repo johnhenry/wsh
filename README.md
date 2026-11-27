@@ -1231,7 +1231,7 @@ tools the session may see). A tool that is not allowed, not permitted to the key
 
 **Bounds, each refused by name** (`mcp.limits`): `maxTools` 64 (more are not listed), `maxSchemaBytes` 16384 per tool (a tool over it is not listed
 or callable), `maxInputBytes` 65536, `maxResultBytes` 262144, `maxInflight` 4 per session, `maxCallsPerMinute` 30 per session (an unknown tool name counts),
-`callTimeoutMs` 120000. The error names the bound (`refused: maxInflight: more than 2 calls in flight`); `onCall` hears of every one.
+`callTimeoutMs` 120000, `maxSubscriptions` 4 `subscriptions/listen` streams per session (below). The error names the bound (`refused: maxInflight: more than 2 calls in flight`); `onCall` hears of every one.
 
 **Asking the person.** `approve: 'consequential'` (the default) asks before a tool that is **not marked `readOnlyHint`** runs (anything not
 marked read-only is consequential; `consequentialHint` forces it), `'always'` before every call, `'never'` not at all. The question is `mcp.prompt(call, who, { signal })`
@@ -1249,6 +1249,34 @@ either direction), `maxInflight` (default 64 requests of any kind), one answer p
 `{ username, fingerprint, podId }` (what the prompt and `onCall` see), and `permits` is asked per tool, so `(req) => permits(caps,
 req)` of `@johnhenry/wsh/capabilities` narrows it by `mcp:TOOL`. **It authenticates and seals nothing**: who is on the other end, and what they
 were granted, are the transport's to establish; they are not in the messages.
+
+**MCP 2026-07-28 as well as the `initialize` session (#302; tools only).** The handler answers both eras of MCP on the same channel, whichever the far side
+opens with, so a client that probes (the MCP SDK 2.x `Client` in `auto` mode, or pinned to `2026-07-28`) and one that does not (`legacy`, the SDK default) both
+connect, and nothing wraps the handler any more to add it. The era is chosen **per request**: one whose `params._meta` has `io.modelcontextprotocol/protocolVersion`
+is served statelessly, any other is what it always was.
+
+| | a request with `_meta["io.modelcontextprotocol/protocolVersion"]: "2026-07-28"` | any other request (`initialize`, and `tools/list` or `tools/call` without it) |
+|---|---|---|
+| `server/discover` | `supportedVersions` (`2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`), `capabilities: { tools: { listChanged: true } }`, `instructions`, `ttlMs: 0`, `cacheScope: 'private'`, the server in `_meta`. **No tool names**: what a caller may see is `tools/list`'s answer, scoped to its key | `-32602` (it is a 2026-07-28 method) |
+| a version this side does not speak | `-32022` `UnsupportedProtocolVersion`, `data: { supported, requested }`, before anything runs | |
+| a result | `resultType: 'complete'` and `_meta["io.modelcontextprotocol/serverInfo"]` added; `tools/list` also `ttlMs: 0` (a tool can be registered at any moment) and `cacheScope: 'private'` (the list is what *this caller's key* may list) | unchanged: no `resultType`, `ttlMs` or `cacheScope` |
+| `subscriptions/listen` `{ notifications: { toolsListChanged: true } }` | an open stream: `notifications/subscriptions/acknowledged` first (what it will announce: `toolsListChanged` only, the rest of the filter is left out), then `notifications/tools/list_changed` tagged `io.modelcontextprotocol/subscriptionId` (the request's id), for changes of the list **this caller** may see; ends on `notifications/cancelled` or when the session ends; `limits.maxSubscriptions` (4) at once, the next is `-32002` naming the bound | `-32602` |
+| the list-changed notification | to a caller that sent `notifications/initialized`: untagged, as before | |
+
+`tools/list` (and `handler.list()`) is in **order of name** in both eras (it was the order the page registered the tools in, which changes when a tool is
+unregistered and registered again): the spec asks for a deterministic list so that a client's cache and a model's prompt cache hold. This is the only change
+a caller of the `initialize` session sees. The cut at `maxTools` is still made in registration order, before the sort. A list-changed notification now fires
+only when the list a caller would see changes, not when the same tools come back in another order.
+
+**What `_meta` decides, and what it does not.** Only the protocol version, and whether `clientCapabilities` is present (the spec requires it; a 2026-07-28
+request without it is `-32602`). `clientInfo` and the capabilities a caller declares are what the caller *says*: they are never read, so nothing in them reaches `permits`,
+the limits, the approval prompt or `onCall` (whose `who` is the transport's verified identity). **Tools only**: resources, prompts, sampling, roots,
+elicitation, tasks, skills, events and uploads are not offered, whatever a client declares (they stay `-32601`). `ping` and `initialize` are still answered, for callers of the
+earlier revisions. The error codes are as they were (`-32602`, `-32002` for a bound, `-32601`); the one new one is the spec's own `-32022`. wsh's `-32000`..`-32003` are
+in the range the spec leaves to implementations, and no wsh meaning uses one of `-32020`..`-32099`. (`-32002` is also what the earlier revisions used for "resource not found", which this server never says.)
+**Closing:** `closeSessions(reason)` sends the `notifications/message` notice only to a caller that has spoken an earlier revision: 2026-07-28 forbids log messages to a caller that asked for none,
+so one that has only spoken it sees the channel close. A server-side graceful end of a `subscriptions/listen` stream (the empty response the spec suggests) is not sent: the channel closes.
+A host that wraps this handler to add the same from outside (browsermesh-mcp 0.3.0 does) keeps working: its own `server/discover`, `subscriptions/listen` and version check answer first, and what wsh adds is the same, once.
 
 **The indicator.** While a session is connected, `window.document` has a visible element (`data-wsh-page="indicator"`, `role="status"`) saying so,
 with the key's fingerprint and a **Stop** button that calls `revoke`. Stop ends the session (the operator is told why), and that key is refused until the host

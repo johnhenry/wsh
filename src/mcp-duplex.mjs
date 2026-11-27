@@ -17,6 +17,11 @@
  * `Client` can be connected to it through any `Transport` that moves those objects. Encoding them (JSON text, CBOR, structured clone) is the
  * transport's business; this file sees objects. No batches (MCP no longer has them), no ids but strings and integers, one answer per id.
  *
+ * TWO ERAS OF MCP (#302): the far side may open with `initialize` (every revision up to 2025-11-25) or send requests whose `_meta` has
+ * `io.modelcontextprotocol/protocolVersion: '2026-07-28'`, with `server/discover` and `subscriptions/listen` in place of the handshake and the
+ * session. The handler of `webmcpTools` answers both (`src/mcp-modern.mjs`); this seam is era-blind and passes `params` (and so `_meta`) through. Nothing the
+ * far side says about itself in `_meta` is an identity: `who` and `permits` are the transport's, as below.
+ *
  * WHAT IS THE HANDLER'S, UNCHANGED: the allow-list of tools, the bounds on tools, schemas, arguments and results, the approval of the
  * person at the page (`approve`, `prompt`), the `onCall` events and the labelling of every result as untrusted page content. WHAT THIS
  * ADDS: the bounds of the seam itself (the size of a message in either direction, the requests running at once, one id one request), and

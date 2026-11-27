@@ -115,6 +115,7 @@
     "@fails-components/webtransport": "^1.6.4",
     "@fails-components/webtransport-transport-http3-quiche": "^1.6.4",
     "@johnhenry/browsermesh-primitives": "^0.5.0",
+    "@modelcontextprotocol/client": "^2.4.0",
     "@playwright/test": "^1.65.1",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.0",
