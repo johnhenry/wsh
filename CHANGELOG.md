@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Test only: `test/rust/wsh-reverse-forward-full-close.test.mjs`, the JS reverse forward case no longer races a kernel reset (#328, #291)
+
+- The test's service answered 3 MiB and closed without reading the request; the kernel resets such a socket when the request arrives and the reset
+  discards the unread tail of the answer (128000 of 3145728 bytes). It now reads the request first, as the other cases of the file and the
+  Node-host test do. No library or wire change.
+
+
 ### CBOR decoding is strict, in JS and in Rust: a length past the buffer, a stray byte, a non-canonical encoding are decode errors (#317; npm and Rust)
 
 - **What was wrong.** The JS decoder (`src/cbor.mjs`) read a text string of its declared length without checking it against the buffer, so on a
