@@ -147,6 +147,19 @@ pub async fn start_listener(
     let tcp_listener = TcpListener::bind(bind_addr)
         .await
         .map_err(|e| WshError::Transport(format!("WSS bind failed: {e}")))?;
+    start_listener_on(tcp_listener, tls_config, login_timeout)
+}
+
+/// [`start_listener`] on a socket the caller already bound. `--port 0` needs the TCP port before the
+/// WebTransport (UDP) listener is bound, because both must share one number.
+pub fn start_listener_on(
+    tcp_listener: TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+    login_timeout: Option<std::time::Duration>,
+) -> WshResult<ListenerChannels> {
+    let bind_addr = tcp_listener
+        .local_addr()
+        .map_err(|e| WshError::Transport(format!("WSS local_addr failed: {e}")))?;
     let tls_acceptor = TlsAcceptor::from(tls_config);
 
     info!(addr = %bind_addr, "WebSocket TLS listener started");

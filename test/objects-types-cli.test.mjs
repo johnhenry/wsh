@@ -47,7 +47,7 @@ describe('wsh-objects-types: the declarations of what this key may do', () => {
     let stdout = ''; let stderr = '';
     proc.stdout.on('data', (d) => { stdout += d; });
     proc.stderr.on('data', (d) => { stderr += d; });
-    proc.once('exit', (code) => resolve({ code, stdout, stderr }));
+    proc.once('close', (code) => resolve({ code, stdout, stderr })); // 'close', not 'exit': 'exit' can fire before the last of stdout/stderr has been read
     cleanups.push(async () => { proc.kill('SIGKILL'); });
   });
   const expected = (extra = {}, options) => describeRootTypes({ root: 'window', allow: ALLOW, eventFields: { '*': ['detail'] }, types: TYPES, ...extra }, options);

@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket } from 'ws';
 
 import { WshClient, generateKeyPair, exportPublicKeySSH } from '../../src/index.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -50,12 +50,11 @@ async function startServer({ loginTimeoutSecs } = {}) {
   writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${await exportPublicKeySSH(kp.publicKey)}\n`);
   const configPath = path.join(home, '.wsh', 'config.toml');
   writeFileSync(configPath, `[server]\n${loginTimeoutSecs === undefined ? '' : `login_timeout_secs = ${loginTimeoutSecs}\n`}`);
-  const port = await freePort();
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(proc);
   let logs = '';
-  await new Promise((resolve, reject) => {
-    const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+  const port = await new Promise((resolve, reject) => {
+    const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
     proc.stdout.on('data', onData); proc.stderr.on('data', onData);
     proc.once('exit', (c) => reject(Object.assign(new Error(`wsh-server exited (${c}): ${logs}`), { logs })));
     setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);

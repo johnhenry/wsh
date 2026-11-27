@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 import { WshClient, generateKeyPair, exportPublicKeySSH, MSG, cborEncode } from '../../src/index.mjs';
 import { hostileRelay } from '../helpers/hostile-relay.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // a port free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 import { WebTransport as RealWebTransport, quicheLoaded } from '@fails-components/webtransport';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -73,12 +73,11 @@ async function startServer({ seal, sealTimeoutSecs, authorizedKey, extraToml = '
   const hostKeyPath = path.join(home, '.wsh', 'host_key');
   const configPath = path.join(home, '.wsh', 'config.toml');
   writeFileSync(configPath, `[server]\nhost_key = ${JSON.stringify(hostKeyPath)}\n${seal ? `seal_session = "${seal}"\n` : ''}${sealTimeoutSecs === undefined ? '' : `seal_timeout_secs = ${sealTimeoutSecs}\n`}\n[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1"]\n${extraToml}`);
-  const port = await freePort();
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(proc);
   let logs = '';
-  await new Promise((resolve, reject) => {
-    const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+  const port = await new Promise((resolve, reject) => {
+    const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
     proc.stdout.on('data', onData); proc.stderr.on('data', onData);
     proc.once('exit', (c) => reject(Object.assign(new Error(`wsh-server exited (${c}): ${logs}`), { logs })));
     setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);

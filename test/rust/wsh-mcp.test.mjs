@@ -22,7 +22,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { createWshServer, mcpServerAdapter } from '@johnhenry/wsh/server';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -100,7 +100,8 @@ describe('wsh mcp: an MCP client reaches an MCP server behind a wsh host (#127, 
     proc.stdout.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { lines.push(buf.slice(0, i)); buf = buf.slice(i + 1); } });
     proc.stderr.on('data', (d) => { stderr += d; });
     proc.stdin.on('error', () => {});
-    const exited = new Promise((resolve) => proc.once('exit', (code, signal) => resolve({ code, signal })));
+    // 'close', not 'exit': 'exit' can fire before the last of stdout/stderr has been read, and both are asserted on after it
+    const exited = new Promise((resolve) => proc.once('close', (code, signal) => resolve({ code, signal })));
     cleanups.push(async () => { proc.kill('SIGKILL'); });
     const api = {
       proc, exited, lines, stderr: () => stderr,
@@ -476,12 +477,11 @@ describe('wsh mcp against the Rust wsh-server (#127)', { skip: !existsSync(SERVE
     mkdirSync(path.join(sh, '.wsh'));
     writeFileSync(path.join(sh, '.wsh', 'authorized_keys'), `${me.pub}\n`);
     writeFileSync(path.join(sh, '.wsh', 'config.toml'), '');
-    port = await freePort();
-    server = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', path.join(sh, '.wsh', 'config.toml')], { env: { PATH: process.env.PATH, HOME: sh }, stdio: ['ignore', 'pipe', 'pipe'] });
+    server = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', path.join(sh, '.wsh', 'config.toml')], { env: { PATH: process.env.PATH, HOME: sh }, stdio: ['ignore', 'pipe', 'pipe'] });
     cleanups.push(async () => server.kill());
     let logs = '';
-    await new Promise((resolve, reject) => {
-      const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+    port = await new Promise((resolve, reject) => {
+      const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
       server.stdout.on('data', onData); server.stderr.on('data', onData);
       server.once('exit', (c) => reject(new Error(`wsh-server exited (${c}): ${logs}`)));
       setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);
