@@ -60,7 +60,7 @@ describe('the far side is a plain MCP client', () => {
     const win = createFakeWindow();
     const { client } = await sdkClient(webmcpTools({ window: win, allow: ['search', 'buy'], tools: [read, write], approve: 'never' }));
     assert.match(client.getInstructions(), /untrusted/);
-    assert.deepEqual((await client.listTools()).tools.map((t) => t.name), ['search', 'buy']);
+    assert.deepEqual((await client.listTools()).tools.map((t) => t.name), ['buy', 'search']); // by name, whatever the order of registration (#302)
     const r = await client.callTool({ name: 'search', arguments: { q: 'x' } });
     assert.deepEqual(r.structuredContent, { hits: ['x-1'] });
     assert.equal(r._meta['wsh/untrusted'], true);

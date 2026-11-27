@@ -81,6 +81,8 @@ export interface WebMcpLimits {
   maxCallsPerMinute: number;
   /** Default 120000. A call still running then is aborted and fails. */
   callTimeoutMs: number;
+  /** Default 4. `subscriptions/listen` streams (MCP 2026-07-28) open at once, per session; one more is refused with -32002. */
+  maxSubscriptions: number;
 }
 export const WEBMCP_DEFAULT_LIMITS: Readonly<WebMcpLimits>;
 
@@ -102,7 +104,7 @@ export interface WebMcpCallEvent {
   outcome: 'ok' | 'error' | 'denied' | 'approved' | 'refused' | 'unknown' | 'unlisted';
   name?: string;
   who?: WebMcpWho;
-  /** For `refused` and `unlisted`: the bound, by name (`maxTools`, `maxSchemaBytes`, `maxInputBytes`, `maxResultBytes`, `maxInflight`, `maxCallsPerMinute`). */
+  /** For `refused` and `unlisted`: the bound, by name (`maxTools`, `maxSchemaBytes`, `maxInputBytes`, `maxResultBytes`, `maxInflight`, `maxCallsPerMinute`, `maxSubscriptions`). */
   limit?: string;
   detail?: string;
 }
@@ -184,6 +186,10 @@ export interface McpDuplexSession {
  * Serve the handler of `webmcpTools` (or any rpc handler of the `mcp` protocol) over any duplex: `send` and `receive` of plain MCP
  * JSON-RPC 2.0 messages. The handler's bounds, approval hook and untrusted labelling are unchanged; the seam adds the size of a message,
  * the requests running at once and one answer per id.
+ *
+ * The far side may speak MCP 2026-07-28 as well as the `initialize` session (#302): a request whose `_meta` has `io.modelcontextprotocol/protocolVersion`
+ * is answered statelessly (an unknown version is -32022), results carry `resultType`, `tools/list` carries `ttlMs: 0` and `cacheScope: 'private'`,
+ * `server/discover` and `subscriptions/listen` (tool list changes) are answered. Tools only. `tools/list` is in order of name in both eras.
  */
 export function serveMcpOverDuplex(handler: (channel: any, ctx?: any) => void, options: ServeMcpOverDuplexOptions): McpDuplexSession;
 

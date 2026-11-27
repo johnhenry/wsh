@@ -498,7 +498,7 @@ describe('bounds, each refused by name', () => {
   });
 
   it('the defaults are the documented ones', () => {
-    assert.deepEqual({ ...WEBMCP_DEFAULT_LIMITS }, { maxTools: 64, maxSchemaBytes: 16384, maxInputBytes: 65536, maxResultBytes: 262144, maxInflight: 4, maxCallsPerMinute: 30, callTimeoutMs: 120000 });
+    assert.deepEqual({ ...WEBMCP_DEFAULT_LIMITS }, { maxTools: 64, maxSchemaBytes: 16384, maxInputBytes: 65536, maxResultBytes: 262144, maxInflight: 4, maxCallsPerMinute: 30, callTimeoutMs: 120000, maxSubscriptions: 4 });
   });
 });
 
