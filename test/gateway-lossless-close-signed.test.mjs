@@ -196,7 +196,8 @@ describe('lossless close behind a relay on a bridge with an operator proof (#318
     rewriteConnect((m) => { m.features = [...(m.features ?? []), 'gateway-lossless-close']; return m; });
     const closes = tapCloses(); const o = await vanishingOrigin();
     const { url } = await setup({ host: { requireOperatorProof: true, proofTimeoutMs: 8000 } });
-    const { c } = await operator(url, { connectOptions: { sealed: true }, clientOptions: { gatewayLosslessClose: false } });
+    const { c, accepted } = await operator(url, { connectOptions: { sealed: true }, clientOptions: { gatewayLosslessClose: false } });
+    assert.ok(!accepted.features.includes('gateway-lossless-close-ack'), 'the host did not believe it (a sealed bridge hides its frames from the tap, the acknowledgement is what shows)');
     const r = await vanish(c, o, 1500);
     assert.equal(r.lossless, false); assert.equal(r.end, 'open');
     assert.ok(!closes.includes('released'));
