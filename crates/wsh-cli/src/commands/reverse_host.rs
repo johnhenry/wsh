@@ -238,6 +238,12 @@ impl ReverseHostOptions {
         let mut capabilities = self.capabilities.clone();
         if self.identity.is_some() {
             capabilities.push(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE.to_string());
+            // wsh #318: this host reads an operator's SIGNED `gateway-lossless-close` (a `wsh-operator-proof-v2` proof); an operator signs it only
+            // for a host whose record says so, since a host that does not would not verify the proof.
+            if self.lossless_close && self.gateway.is_some() && self.has_capability("gateway") {
+                capabilities
+                    .push(wsh_core::operator_proof::GATEWAY_LOSSLESS_SIGNED_FEATURE.to_string());
+            }
         }
         let record = PeerRecord {
             username: username.clone(),
@@ -968,7 +974,7 @@ impl ReverseHostRuntime {
 
     async fn accept_request(
         &mut self,
-        request: ReverseConnectPayload,
+        mut request: ReverseConnectPayload,
         proven: Option<(wsh_core::operator_proof::ProvenOperator, String)>,
     ) -> Result<()> {
         info!(
@@ -981,6 +987,24 @@ impl ReverseHostRuntime {
             target_fingerprint: request.target_fingerprint.clone(),
         })
         .await;
+        // wsh #318: what the operator stated about the lossless close. Behind a proof it is what the operator SIGNED (a relay can add or strip the
+        // unsigned list, and an operator that signs nothing, a 0.62.x one, is not believed); with no proof there is nothing to check it against
+        // and the relay's list is taken as before (the relay is trusted for identity on such a bridge).
+        if let Some((operator, _)) = &proven {
+            let lossless = wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE;
+            let signed = operator.signed_features.iter().any(|f| f == lossless);
+            let mut features: Vec<String> = request
+                .features
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| f != lossless)
+                .collect();
+            if signed {
+                features.push(lossless.to_string());
+            }
+            request.features = Some(features);
+        }
         self.active_request = Some(request.clone());
         self.bridged = true;
         let client = self.client()?;

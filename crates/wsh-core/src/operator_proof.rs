@@ -28,9 +28,15 @@ pub const OPERATOR_PROOF_FEATURE: &str = "operator-proof";
 /// `ReverseAccept.features` of a peer that takes a signed initiator half and a sealed bridge.
 pub const E2E_SEALED_FEATURE: &str = "e2e-sealed";
 pub const NONCE_LENGTH: usize = 32;
+/// What a host lists in its REGISTERED capabilities when it reads a signed statement of `gateway-lossless-close` in an operator's proof
+/// (wsh #318): an operator signs the statement (a `wsh-operator-proof-v2` proof) only for a peer that lists this.
+pub const GATEWAY_LOSSLESS_SIGNED_FEATURE: &str = "gateway-lossless-close-signed";
+/// The one statement a proof can carry (wsh #318); equals [`crate::gateway_credit::GATEWAY_LOSSLESS_FEATURE`].
+const SIGNABLE: &[&str] = &[crate::gateway_credit::GATEWAY_LOSSLESS_FEATURE];
 
 const CHALLENGE_LABEL: &[u8] = b"wsh-reverse-challenge-v1\0";
 const PROOF_LABEL: &[u8] = b"wsh-operator-proof-v1\0";
+const PROOF_LABEL_V2: &[u8] = b"wsh-operator-proof-v2\0";
 
 fn lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -60,12 +66,41 @@ pub fn proof_transcript(
     nonce: &[u8],
     session_id: &str,
 ) -> Vec<u8> {
-    let mut out = PROOF_LABEL.to_vec();
+    proof_transcript_with(
+        peer_public_key,
+        operator_public_key,
+        username,
+        nonce,
+        session_id,
+        &[],
+    )
+}
+
+/// [`proof_transcript`] with the statements the operator makes about this bridge (wsh #318): with none, the unchanged v1 bytes; with some, the
+/// `wsh-operator-proof-v2` label and each statement length-prefixed, sorted, after the session id. Byte-compatible with `src/operator-proof.mjs`.
+pub fn proof_transcript_with(
+    peer_public_key: &[u8],
+    operator_public_key: &[u8],
+    username: &str,
+    nonce: &[u8],
+    session_id: &str,
+    features: &[&str],
+) -> Vec<u8> {
+    let mut out = if features.is_empty() {
+        PROOF_LABEL.to_vec()
+    } else {
+        PROOF_LABEL_V2.to_vec()
+    };
     lp(&mut out, peer_public_key);
     lp(&mut out, operator_public_key);
     lp(&mut out, username.as_bytes());
     lp(&mut out, nonce);
     lp(&mut out, session_id.as_bytes());
+    let mut sorted: Vec<&str> = features.to_vec();
+    sorted.sort_unstable();
+    for f in sorted {
+        lp(&mut out, f.as_bytes());
+    }
     out
 }
 
@@ -193,14 +228,27 @@ pub fn create_proof(
     challenge: &VerifiedChallenge,
     username: &str,
 ) -> ReverseProofPayload {
+    create_proof_with(key, challenge, username, &[])
+}
+
+/// [`create_proof`] that signs the statements in `features` (wsh #318; only those this crate knows: `gateway-lossless-close`). Send it only to a
+/// peer that lists [`GATEWAY_LOSSLESS_SIGNED_FEATURE`].
+pub fn create_proof_with(
+    key: &SigningKey,
+    challenge: &VerifiedChallenge,
+    username: &str,
+    features: &[&str],
+) -> ReverseProofPayload {
+    debug_assert!(features.iter().all(|f| SIGNABLE.contains(f)));
     let public_key = key.verifying_key().to_bytes();
     let signature = key
-        .sign(&proof_transcript(
+        .sign(&proof_transcript_with(
             &challenge.peer_public_key,
             &public_key,
             username,
             &challenge.nonce,
             &challenge.session_id,
+            features,
         ))
         .to_bytes()
         .to_vec();
@@ -222,6 +270,9 @@ pub struct ProvenOperator {
     pub public_key: [u8; 32],
     pub fingerprint: String,
     pub username: String,
+    /// The statements the operator itself signed (wsh #318): empty for a v1 proof, `["gateway-lossless-close"]` for a v2 one. Whatever a relay did to
+    /// `ReverseConnect.features`, this is what the operator said.
+    pub signed_features: Vec<String>,
 }
 
 /// Peer side: check a `ReverseProof` against the challenge it issued. `None` when it does not verify.
@@ -234,17 +285,25 @@ pub fn verify_proof(msg: &ReverseProofPayload, issued: &IssuedChallenge) -> Opti
     {
         return None;
     }
-    let data = proof_transcript(
-        &issued.peer_public_key,
-        &public_key,
-        &msg.username,
-        &issued.nonce,
-        &issued.session_id,
-    );
-    verify_with(&public_key, &msg.signature, &data).then(|| ProvenOperator {
+    // v1 (no statement signed), then v2 with the signable statement (wsh #318).
+    let signed: &[&str] = [&[][..], SIGNABLE]
+        .into_iter()
+        .find(|features| {
+            let data = proof_transcript_with(
+                &issued.peer_public_key,
+                &public_key,
+                &msg.username,
+                &issued.nonce,
+                &issued.session_id,
+                features,
+            );
+            verify_with(&public_key, &msg.signature, &data)
+        })?;
+    Some(ProvenOperator {
         public_key,
         fingerprint: fingerprint(&public_key),
         username: msg.username.clone(),
+        signed_features: signed.iter().map(|f| f.to_string()).collect(),
     })
 }
 
@@ -304,6 +363,30 @@ mod tests {
         let proven = verify_proof(&proof, &issued).unwrap();
         assert_eq!(proven.fingerprint, fp(&op));
         assert_eq!(proven.username, "alice");
+    }
+
+    #[test]
+    fn a_v2_proof_signs_the_statement_and_v1_signs_none() {
+        let (peer, op) = (key(1), key(2));
+        let (msg, issued) = create_challenge(&peer, &fp(&op), &fp(&op));
+        let verified = verify_challenge(&msg, &fp(&peer)[..12], &fp(&op)).unwrap();
+        let v1 = verify_proof(&create_proof(&op, &verified, "alice"), &issued).unwrap();
+        assert!(v1.signed_features.is_empty());
+        let v2proof = create_proof_with(&op, &verified, "alice", &["gateway-lossless-close"]);
+        let v2 = verify_proof(&v2proof, &issued).unwrap();
+        assert_eq!(v2.signed_features, vec!["gateway-lossless-close".to_string()]);
+        assert!(proof_transcript_with(&[1u8; 32], &[3u8; 32], "a", &[2u8; 32], "s", &["gateway-lossless-close"])
+            .starts_with(b"wsh-operator-proof-v2\0"));
+    }
+
+    #[test]
+    fn the_v2_transcript_equals_the_bytes_the_js_implementation_produces() {
+        // printed by src/operator-proof.mjs proofTranscript({ ..., features: ['gateway-lossless-close'] }) for the same inputs as the v1 vector
+        const PROOF_V2: &str = "7773682d6f70657261746f722d70726f6f662d76320000000020010101010101010101010101010101010101010101010101010101010101010100000020030303030303030303030303030303030303030303030303030303030303030300000005616c6963650000002002020202020202020202020202020202020202020202020202020202020202020000000373696400000016676174657761792d6c6f73736c6573732d636c6f7365";
+        assert_eq!(
+            hex::encode(proof_transcript_with(&[1u8; 32], &[3u8; 32], "alice", &[2u8; 32], "sid", &["gateway-lossless-close"])),
+            PROOF_V2
+        );
     }
 
     #[test]

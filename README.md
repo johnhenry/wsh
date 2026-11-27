@@ -870,10 +870,16 @@ added: the reason is the existing optional text). It is used only between two si
 operator's statement travels in a field a relay can drop or add, so the host answers it with the feature `gateway-lossless-close-ack` in
 `ReverseAccept.features` ONLY when it actually received the statement, and the operator relies on the feature for that bridge only when it stated it
 AND got the answer back (the host: only when it received the statement). A relay that drops the statement (a released JS relay does, for a host without
-operator proof) leaves both sides on the earlier behaviour; one that ADDS a statement the operator never made makes the host believe in it, and the
-operator, which did not state it, treats a `released` it is sent as an ordinary reason (the connection then waits for its own close or the idle bound;
-nothing is lost). There is no signed or sealed carrier for the statement (it precedes the bridge's key exchange), so a relay is trusted not to forge
-it only as far as it is trusted for `ReverseConnect.features` at all. With it the watch above covers the answering side: an
+operator proof) leaves both sides on the earlier behaviour. **Where the operator proves itself (operator proof, sealed or not; #318) the statement is
+signed**: an operator that states it signs it into its proof (`wsh-operator-proof-v2`, see `src/operator-proof.mjs`), only for a host whose registered
+capabilities list `gateway-lossless-close-signed`, and the host acts on the statement it finds SIGNED, never on the unsigned list. A relay that ADDS the
+statement for an operator that did not make it is not believed (no acknowledgement, no watching); one that strips it changes nothing (the signature
+still carries it); an operator or host from before this (0.62.x) falls back to the earlier behaviour on such a bridge (a host acts on no unsigned
+statement behind a proof). **Where there is no proof** (a bridge whose host trusts the relay for identity, `trustRelayIdentity` /
+`--relay-gateway-trust-relay`, and an operator without a key to sign with) there is nothing to sign with: the relay's list is taken as before, so a relay
+that ADDS the statement makes the host believe in it, and the operator, which did not state it, treats a `released` it is sent as an ordinary reason (the
+connection then waits for its own close or the idle bound; nothing is lost). The host's acknowledgement is not signed either way. See
+[COMPATIBILITY.md](COMPATIBILITY.md) for every pairing. With it the watch above covers the answering side: an
 origin (or a reverse forward's local service) that half-closed and then vanished is noticed (a zero-length write probe in Node, write-closed
 readiness in Rust, TCP keep-alive while half-closed: the same detection and the same per-kind speed as for a caller) and the connection
 is freed with `released` instead of waiting for the idle bound, while a server that sent its whole answer, half-closed and closed completely
@@ -3186,7 +3192,10 @@ out explicitly below rather than left to be discovered.
   is accepted only from a peer that stated the feature, drops nothing, and cannot make a side deliver more than it was already sent;
   the receiver's own queue and credit bounds are unchanged. A relay cannot forge a release for an operator or a host: on a sealed bridge it
   is a sealed frame, and on an unsealed one a relay can already close a bridge. The feature string in `ReverseConnect.features` is the
-  operator's own claim and decides nothing at the relay.
+  operator's own claim and decides nothing at the relay. Behind an operator proof the host acts only on the statement the operator SIGNED (#318);
+  with no proof the unsigned statement is taken as stated, and a relay that adds it only makes the host watch and release a connection whose
+  operator holds it until its own close or the idle bound. The host's `gateway-lossless-close-ack` is not signed: a relay that adds it to a
+  bridge whose host did not see the statement makes the operator send `released` to a host that reads it as an ordinary reason.
 - **A relay and a reverse host's gateway (#289): what a relay can and cannot do.** Off unless the host's owner gave the host a gateway
   (`createReverseHost({ gateway })`, `wsh --relay-gateway-allow`); then the **host** decides what is reachable (its destination rules,
   the address check after resolution, UDP, DNS and reverse tunnels each off unless turned on, connections and queued bytes bounded,
