@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.62.1 / Rust `rust-v0.26.1`
+
 ### A connection closed while a gateway call is being sent no longer leaves an unhandled rejection (#308; npm)
 
 - **What was wrong.** `openEndpoint`, `openTcp`, `openUnix`, `openUdp`, `listenTcp` and `listenUnix` created the promise that settles when the host answers before they awaited the send of the request. If the transport closed while that send was still in flight, or the caller's signal fired, or the timeout ran, the promise was rejected before anything was waiting on it: an unhandled `GatewayError: transport closed` that ends a Node process with status 1. It was there since the gateway's first release of these calls and showed up under load, when a link was closed while a dial was still opening.
