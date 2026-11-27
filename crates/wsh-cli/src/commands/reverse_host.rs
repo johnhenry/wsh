@@ -354,11 +354,15 @@ impl ReverseHostOptions {
 /// (its feature list is what the ack and the gateway read, and the operator's signed statement went into it); a relay that opens a second attach for
 /// the same operator must not replace it with an unproven one (wsh #327). An unproven bridge takes the new request, as before.
 fn reattach_request(
-    _stored: &ReverseConnectPayload,
-    _stored_proven: bool,
+    stored: &ReverseConnectPayload,
+    stored_proven: bool,
     incoming: ReverseConnectPayload,
 ) -> ReverseConnectPayload {
-    incoming
+    if stored_proven {
+        stored.clone()
+    } else {
+        incoming
+    }
 }
 
 fn same_reverse_request(left: &ReverseConnectPayload, right: &ReverseConnectPayload) -> bool {
@@ -805,6 +809,8 @@ struct ReverseHostRuntime {
     options: ReverseHostOptions,
     status_tx: Option<mpsc::Sender<ReverseHostStatusEvent>>,
     active_request: Option<ReverseConnectPayload>,
+    /// `active_request` is the request its operator PROVED itself with (wsh #327): a re-attach without proof leaves it as it is.
+    request_proven: bool,
     /// This runtime accepted its operator and has not ended the bridge (it outlives the operator's
     /// sessions: `active_request` is cleared with the last one). Only a host serving several
     /// operators reads it.
@@ -826,6 +832,7 @@ impl ReverseHostRuntime {
             event_tx: None,
             status_tx: None,
             active_request: None,
+            request_proven: false,
             bridged: false,
             sealing: None,
             pending_proof: None,
@@ -899,6 +906,11 @@ impl ReverseHostRuntime {
                     target = %request.target_fingerprint,
                     "reattaching reverse host connection"
                 );
+                // A proven bridge keeps the request it was proven with: the ack and the gateway read its feature list (wsh #327).
+                let request = match &self.active_request {
+                    Some(stored) => reattach_request(stored, self.request_proven, request),
+                    None => request,
+                };
                 self.active_request = Some(request.clone());
                 let client = self.client()?;
                 client
@@ -1014,6 +1026,7 @@ impl ReverseHostRuntime {
         }
         // (no proof: the relay's list is taken as before)
         self.active_request = Some(request.clone());
+        self.request_proven = proven.is_some();
         self.bridged = true;
         let client = self.client()?;
         client
@@ -1147,6 +1160,7 @@ impl ReverseHostRuntime {
         // This operator's connections and listeners go with it.
         self.gateway = None;
         self.active_request = None;
+        self.request_proven = false;
         self.bridged = false;
         Ok(())
     }
@@ -1646,6 +1660,7 @@ impl ReverseHostRuntime {
 
         if self.sessions.is_empty() {
             self.active_request = None;
+            self.request_proven = false;
         }
         self.emit_session_count().await;
     }
