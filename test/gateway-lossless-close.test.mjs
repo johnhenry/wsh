@@ -525,20 +525,28 @@ describe('an answering socket that finished its answer and is then reset: the en
     assert.equal(closes()[1].reason, GATEWAY_DISCARDED);
   });
 
-  it('host: an origin reset BEFORE it finished its answer is still a discard (the answer is cut: nothing is left to deliver)', async () => {
-    const socks = [];
-    const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.write(Buffer.alloc(10)); });
-    const port = await listen(origin); nets.push(origin);
-    const out = [];
-    const cfg = normalizeGateway({ allow: ['127.0.0.1'], allowPrivate: ['127.0.0.0/8'], halfCloseProbeMs: HOUR, halfCloseIdleMs: 0 });
-    const s = createGatewaySession(cfg, (m) => { out.push(m); }, () => {}); sessions.push(s);
-    s.setPeerFeatures(['gateway-credit', GATEWAY_LOSSLESS_FEATURE]);
-    await s.handle({ type: MSG.OPEN_TCP, gateway_id: 1, host: '127.0.0.1', port });
-    await until(() => out.some((m) => m.type === MSG.GATEWAY_DATA), 'the first bytes');
-    socks[0].resetAndDestroy();
-    await until(async () => { if (!out.some((m) => m.type === MSG.GATEWAY_CLOSE)) await s.handle({ type: MSG.GATEWAY_DATA, gateway_id: 1, data: new Uint8Array(1) }); return out.some((m) => m.type === MSG.GATEWAY_CLOSE); }, 'the connection to be concluded');
-    assert.equal(out.find((m) => m.type === MSG.GATEWAY_CLOSE).reason, GATEWAY_DISCARDED);
-  });
+  // Before its end of file the verdict is the failure's: an origin that reset the connection is gone (what the probe reports: released, so what it sent
+  // is delivered); with the feature not stated, or with the answering watch off, the same reset is a discard as it was.
+  for (const [what, features, extra, want] of [
+    ['both ends state the feature', ['gateway-credit', GATEWAY_LOSSLESS_FEATURE], {}, GATEWAY_RELEASED],
+    ['the client did not state the feature', ['gateway-credit'], {}, GATEWAY_DISCARDED],
+    ['halfCloseProbeAnswers: false', ['gateway-credit', GATEWAY_LOSSLESS_FEATURE], { halfCloseProbeAnswers: false }, GATEWAY_DISCARDED],
+  ]) {
+    it(`host: an origin reset BEFORE its end of file (${what}) is ${want}`, async () => {
+      const socks = [];
+      const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.write(Buffer.alloc(10)); });
+      const port = await listen(origin); nets.push(origin);
+      const out = [];
+      const cfg = normalizeGateway({ allow: ['127.0.0.1'], allowPrivate: ['127.0.0.0/8'], halfCloseProbeMs: HOUR, halfCloseIdleMs: 0, ...extra });
+      const s = createGatewaySession(cfg, (m) => { out.push(m); }, () => {}); sessions.push(s);
+      s.setPeerFeatures(features);
+      await s.handle({ type: MSG.OPEN_TCP, gateway_id: 1, host: '127.0.0.1', port });
+      await until(() => out.some((m) => m.type === MSG.GATEWAY_DATA), 'the first bytes');
+      socks[0].resetAndDestroy();
+      await until(async () => { if (!out.some((m) => m.type === MSG.GATEWAY_CLOSE)) await s.handle({ type: MSG.GATEWAY_DATA, gateway_id: 1, data: new Uint8Array(1) }); return out.some((m) => m.type === MSG.GATEWAY_CLOSE); }, 'the connection to be concluded');
+      assert.equal(out.find((m) => m.type === MSG.GATEWAY_CLOSE).reason, want);
+    });
+  }
 
   it('client (the local service of a reverse forward): a write to the service that fails after its end of file releases the connection, it does not discard it', async () => {
     const socks = [];
@@ -560,23 +568,27 @@ describe('an answering socket that finished its answer and is then reset: the en
     sock.destroy();
   });
 
-  it('client: a service reset before its end of file is still a discard', async () => {
-    const socks = [];
-    const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); });
-    const port = await listen(service); nets.push(service);
-    const calls = [];
-    let push;
-    const duplex = {
-      readable: new ReadableStream({ start(c) { push = c; } }), writable: new WritableStream({ write() {} }), closed: new Promise(() => {}),
-      lossless: true, peerReleased: false, release: () => calls.push('release'), destroy: () => calls.push('destroy'),
-    };
-    const sock = net.connect({ host: '127.0.0.1', port, allowHalfOpen: true });
-    await new Promise((r) => sock.once('connect', r));
-    await until(() => socks.length === 1, 'the service to have accepted');
-    pipe(sock, duplex, { probeMs: HOUR, answering: true });
-    socks[0].resetAndDestroy();
-    await until(() => { if (!calls.length) push.enqueue(new Uint8Array(1)); return calls.length > 0; }, 'the connection to be concluded');
-    assert.equal(calls[0], 'destroy');
-    sock.destroy();
-  });
+  // Before its end of file: a service that reset the connection is gone (released); the same reset is a discard where the service is not watched
+  // (`answering` is only given where the feature is negotiated and the probe is on).
+  for (const [what, options, want] of [['a watched service', { probeMs: HOUR, answering: true }, 'release'], ['an unwatched one', undefined, 'destroy']]) {
+    it(`client: ${what} reset before its end of file ends the connection with ${want}`, async () => {
+      const socks = [];
+      const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); });
+      const port = await listen(service); nets.push(service);
+      const calls = [];
+      let push;
+      const duplex = {
+        readable: new ReadableStream({ start(c) { push = c; } }), writable: new WritableStream({ write() {} }), closed: new Promise(() => {}),
+        lossless: true, peerReleased: false, release: () => calls.push('release'), destroy: () => calls.push('destroy'),
+      };
+      const sock = net.connect({ host: '127.0.0.1', port, allowHalfOpen: true });
+      await new Promise((r) => sock.once('connect', r));
+      await until(() => socks.length === 1, 'the service to have accepted');
+      pipe(sock, duplex, options);
+      socks[0].resetAndDestroy();
+      await until(() => { if (!calls.length) push.enqueue(new Uint8Array(1)); return calls.length > 0; }, 'the connection to be concluded');
+      assert.equal(calls[0], want);
+      sock.destroy();
+    });
+  }
 });

@@ -46,7 +46,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use wsh_core::messages::*;
-use wsh_core::peer_watch::PeerWatch;
+use wsh_core::peer_watch::{peer_gone_error, PeerWatch};
 
 use wsh_core::gateway_credit::SendCredit;
 pub use wsh_core::gateway_credit::{
@@ -233,6 +233,8 @@ struct Chan {
     remote_closed: AtomicBool,
     /// The origin's write side has been shut (the client's GatewayClose, passed on).
     write_shut: AtomicBool,
+    /// The origin's end of file has been read: it sent its whole answer.
+    origin_eof: AtomicBool,
     /// A UDP flow: it has no half-close, the client's GatewayClose ends it.
     is_udp: AtomicBool,
     /// The half-closed idle watcher is running.
@@ -805,6 +807,7 @@ impl Inner {
             sent_close: AtomicBool::new(false),
             remote_closed: AtomicBool::new(false),
             write_shut: AtomicBool::new(false),
+            origin_eof: AtomicBool::new(false),
             is_udp: AtomicBool::new(false),
             idle_armed: AtomicBool::new(false),
             born: std::time::Instant::now(),
@@ -838,13 +841,13 @@ impl Inner {
             let ready = ready.clone();
             tokio::spawn(async move {
                 ready.notified().await;
-                inner.read_loop(chan, rd, eof_tx).await;
+                inner.read_loop(chan, rd, eof_tx, answering).await;
             })
         };
         let writer = {
             let inner = self.clone();
             let chan = chan.clone();
-            tokio::spawn(async move { inner.write_loop(chan, wr, write_rx).await })
+            tokio::spawn(async move { inner.write_loop(chan, wr, write_rx, answering).await })
         };
         let mut tasks = vec![reader.abort_handle(), writer.abort_handle()];
         if let (Some(watch), Some(every)) = (watch, self.half_close_probe) {
@@ -919,16 +922,24 @@ impl Inner {
         chan: Arc<Chan>,
         mut rd: tokio::io::ReadHalf<BoxStream>,
         eof_tx: oneshot::Sender<()>,
+        answering: bool,
     ) {
         let mut buf = vec![0u8; MAX_FRAME];
         let mut eof = false;
+        // A watched answering origin that resets the connection is gone: what the watch reports, and what the kernel can report INSTEAD of the end of
+        // file when the host's bytes reached an origin that had already finished and closed.
+        let mut gone = false;
         'outer: loop {
             let n = match rd.read(&mut buf).await {
                 Ok(0) => {
                     eof = true;
+                    chan.origin_eof.store(true, Ordering::Release);
                     break;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    gone = answering && self.answering_watch() && peer_gone_error(&e);
+                    break;
+                }
                 Ok(n) => n,
             };
             let mut off = 0;
@@ -947,8 +958,13 @@ impl Inner {
             }
         }
         if !eof || chan.finished.load(Ordering::Acquire) {
-            // The origin failed (or the client is gone): the connection is over.
-            self.destroy(&chan, None);
+            // The origin failed (or the client is gone): the connection is over. An origin that is gone releases it (everything it sent has gone
+            // out above); any other failure is a discard.
+            if gone {
+                self.release(&chan);
+            } else {
+                self.destroy(&chan, None);
+            }
             return;
         }
         // The origin finished sending (its end of file), everything it sent has gone out: a
@@ -998,13 +1014,26 @@ impl Inner {
         chan: Arc<Chan>,
         mut wr: tokio::io::WriteHalf<BoxStream>,
         mut rx: mpsc::UnboundedReceiver<WriteCmd>,
+        answering: bool,
     ) {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 WriteCmd::Data(data) => {
                     let n = data.len();
-                    if wr.write_all(&data).await.is_err() {
-                        self.destroy(&chan, Some("write failed"));
+                    if let Err(e) = wr.write_all(&data).await {
+                        // The watch is not the only way the end of an answering origin is seen: a write that fails (the client's bytes, still
+                        // arriving, into an origin that has finished and gone) ends it too, and which is first is not up to us. An origin whose
+                        // end of file was read sent its WHOLE answer, and one that reset the connection is gone, which is what the watch
+                        // reports: either way it is released, because a second close of `discarded` would make the client drop what it has
+                        // received and not yet read. Any other failure is a discard, as it was.
+                        if answering
+                            && self.answering_watch()
+                            && (chan.origin_eof.load(Ordering::Acquire) || peer_gone_error(&e))
+                        {
+                            self.release(&chan);
+                        } else {
+                            self.destroy(&chan, Some("write failed"));
+                        }
                         return;
                     }
                     self.consumed(&chan, n).await;

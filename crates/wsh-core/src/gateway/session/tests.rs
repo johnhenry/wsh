@@ -2256,6 +2256,203 @@ mod lossless {
         wait_for_no_connections(&r).await;
     }
 
+    /// An origin made of two held halves, so that the order of its end of file and of a failed write is the test's, not the kernel's: what the test sends
+    /// through `peer` is what the host reads (and `peer`'s `shutdown` is the origin's end of file); a write fails once `fail_writes` is set, a read once
+    /// `fail_reads` is (send a byte through `peer` to wake a read that is waiting). 0 = no failure, 1 = the peer is gone (a broken pipe, a reset),
+    /// 2 = any other failure.
+    struct HeldOrigin {
+        read: tokio::io::DuplexStream,
+        fail_writes: Arc<std::sync::atomic::AtomicU8>,
+        fail_reads: Arc<std::sync::atomic::AtomicU8>,
+    }
+    fn failure(code: u8, gone: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::from(if code == 1 {
+            gone
+        } else {
+            std::io::ErrorKind::PermissionDenied
+        })
+    }
+    impl tokio::io::AsyncRead for HeldOrigin {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let f = self.fail_reads.load(Ordering::Acquire);
+            if f != 0 {
+                return std::task::Poll::Ready(Err(failure(
+                    f,
+                    std::io::ErrorKind::ConnectionReset,
+                )));
+            }
+            std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
+        }
+    }
+    impl tokio::io::AsyncWrite for HeldOrigin {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let f = self.fail_writes.load(Ordering::Acquire);
+            if f != 0 {
+                return std::task::Poll::Ready(Err(failure(f, std::io::ErrorKind::BrokenPipe)));
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A host session with an answering origin attached as connection 1, no kernel and no watch: only the origin's end of file and a failed write
+    /// can end it. Returns what the test needs to hold the origin.
+    fn held_origin(
+        features: &[&str],
+    ) -> (
+        Rig,
+        tokio::io::DuplexStream,
+        Arc<std::sync::atomic::AtomicU8>,
+        Arc<std::sync::atomic::AtomicU8>,
+    ) {
+        let r = rig_with(GatewayPolicy::default(), true, features);
+        let (host_side, peer) = tokio::io::duplex(1 << 20);
+        let fail_writes = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let fail_reads = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let origin = HeldOrigin {
+            read: host_side,
+            fail_writes: fail_writes.clone(),
+            fail_reads: fail_reads.clone(),
+        };
+        let inner = r.session.inner.clone();
+        let guard = inner.policy.acquire();
+        let ready = inner.attach_stream(1, Box::new(origin), guard, None, true);
+        ready.notify_one();
+        (r, peer, fail_writes, fail_reads)
+    }
+
+    /// Everything the host sends until `want` bytes and `closes` closes have arrived: (bytes, the close reasons).
+    async fn take(r: &mut Rig, want: usize, closes: usize) -> (Vec<u8>, Vec<Option<String>>) {
+        let (mut bytes, mut said) = (Vec::new(), Vec::new());
+        while bytes.len() < want || said.len() < closes {
+            match r.next().await.payload {
+                Payload::GatewayData(d) => {
+                    r.credit(1, d.data.len() as u32);
+                    bytes.extend(d.data);
+                }
+                Payload::GatewayClose(c) => said.push(c.reason),
+                other => panic!("{other:?}"),
+            }
+        }
+        (bytes, said)
+    }
+
+    /// The probe is skipped while a write is queued, so a failed write to an origin that has finished its answer can conclude the connection before
+    /// anything else does. The origin's end of file has gone out as the host's half-close; a second close of `discarded` would make the client drop what it has
+    /// received and not yet read, so it is `released` whichever sees the end first.
+    #[tokio::test]
+    async fn a_failed_write_after_the_origins_end_of_file_releases_the_connection_it_does_not_discard_it(
+    ) {
+        for code in [1u8, 2] {
+            // a broken pipe, and a failure of any other kind: after the end of file both are the end of a finished answer
+            let (mut r, mut peer, fail_writes, _) = held_origin(BOTH);
+            let answer: Vec<u8> = (0..100_000u32).map(|i| (i * 13 + 5) as u8).collect();
+            peer.write_all(&answer).await.unwrap();
+            peer.shutdown().await.unwrap(); // the origin's end of file
+            let (got, closes) = take(&mut r, answer.len(), 1).await;
+            assert_eq!(got, answer, "every byte, in order");
+            assert_eq!(closes, vec![None], "the half-close");
+            fail_writes.store(code, Ordering::Release);
+            r.data(1, vec![1]); // the caller's next bytes: the write to the finished origin fails
+            let (_, closes) = take(&mut r, 0, 1).await;
+            assert_eq!(closes, vec![Some(GATEWAY_RELEASED.to_string())], "{code}");
+            wait_for_no_connections(&r).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_failed_write_is_a_discard_where_the_feature_was_not_negotiated_or_the_answering_watch_is_off(
+    ) {
+        for (features, tweak) in [
+            (CREDIT, None),
+            (&[][..], None),
+            (
+                BOTH,
+                Some(
+                    (|p: &mut GatewayPolicy| p.half_close_probe_answers = false)
+                        as fn(&mut GatewayPolicy),
+                ),
+            ),
+        ] {
+            let mut policy = GatewayPolicy::default();
+            if let Some(t) = tweak {
+                t(&mut policy);
+            }
+            let mut r = rig_with(policy, true, features);
+            let (host_side, mut peer) = tokio::io::duplex(1 << 20);
+            let fail_writes = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let origin = HeldOrigin {
+                read: host_side,
+                fail_writes: fail_writes.clone(),
+                fail_reads: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            };
+            let inner = r.session.inner.clone();
+            let ready =
+                inner.attach_stream(1, Box::new(origin), inner.policy.acquire(), None, true);
+            ready.notify_one();
+            peer.write_all(&[5u8; 1000]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let (_, closes) = take(&mut r, 1000, 1).await;
+            assert_eq!(closes, vec![None]);
+            fail_writes.store(1, Ordering::Release);
+            r.data(1, vec![1]);
+            let (_, closes) = take(&mut r, 0, 1).await;
+            assert_eq!(closes, vec![Some(GATEWAY_DISCARDED.to_string())]);
+        }
+    }
+
+    /// Before the end of file the failure decides: an origin that reset the connection is gone (what the watch reports: released), any other failure cuts
+    /// the answer short and is still a discard. Reads and writes alike.
+    #[tokio::test]
+    async fn a_failure_before_the_end_of_file_releases_if_the_origin_is_gone_and_discards_otherwise(
+    ) {
+        for (code, released) in [(1u8, true), (2, false)] {
+            for on_write in [true, false] {
+                let (mut r, mut peer, fail_writes, fail_reads) = held_origin(BOTH);
+                peer.write_all(&[5u8; 1000]).await.unwrap(); // no end of file: the origin is still answering
+                let (got, closes) = take(&mut r, 1000, 0).await;
+                assert_eq!(got.len(), 1000);
+                assert!(closes.is_empty());
+                if on_write {
+                    fail_writes.store(code, Ordering::Release);
+                    r.data(1, vec![1]);
+                } else {
+                    fail_reads.store(code, Ordering::Release);
+                    peer.write_all(&[1]).await.unwrap(); // wakes the read that is waiting
+                }
+                let (_, closes) = take(&mut r, 0, 1).await;
+                let want = if released {
+                    GATEWAY_RELEASED.to_string()
+                } else if on_write {
+                    "write failed".to_string()
+                } else {
+                    GATEWAY_DISCARDED.to_string()
+                };
+                assert_eq!(closes, vec![Some(want)], "code {code}, write {on_write}");
+                wait_for_no_connections(&r).await;
+            }
+        }
+    }
+
     /// The receiving side: a client that RELEASES a connection (its answering socket vanished) has what it sent delivered, in order, to the
     /// caller of a reverse listener, which is then ended; nothing goes back. Without the feature the same close is an ordinary one.
     #[tokio::test]

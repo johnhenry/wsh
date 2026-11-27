@@ -60,7 +60,7 @@ import {
   GATEWAY_FAIL, gatewayFeatures, createGatewayCore, normalizeGatewayLimits, normalizeEndpoints,
 } from './gateway-core.mjs';
 import { DEFAULT_HALF_CLOSE_PROBE_MS } from '../gateway-channel.mjs';
-import { watchHalfClosed, answeringKeepAliveMs } from '../half-close-watch.mjs';
+import { watchHalfClosed, answeringKeepAliveMs, PEER_GONE_CODES } from '../half-close-watch.mjs';
 import { parseCidr, parseIp } from './address-guard.mjs';
 import { checkAddress, resolveChecked, dialChecked, dialUdpChecked, AddressGuardError } from '../address-guard.mjs';
 import { normalizeReverse, reversePortAllowed, reversePortRefusal, reverseBindAddress } from './reverse-policy.mjs';
@@ -457,7 +457,8 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       // socket paused: destroying it would drop the tail the peer sent, which is still being written. Any other failed write ends it.
       tail = channel.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => { if (!channel.peerReleased) sock.destroy(); });
     });
-    sock.on('error', (e) => log(`gateway ${id}: ${e.message}`));
+    let originReset = false;
+    sock.on('error', (e) => { if (answering && PEER_GONE_CODES.has(e?.code)) originReset = true; log(`gateway ${id}: ${e.message}`); });
     // The origin finished sending (its FIN): half-close towards the client once everything it sent has gone out, and keep
     // the other direction open (the socket is half-open, so Node does not end our side for us).
     const originEnded = () => { void tail.finally(() => channel.end()); };
@@ -476,19 +477,19 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     // answer, half-closed and closed completely (HTTP/1.0, `Connection: close`) loses no byte of it. `halfCloseProbeAnswers: false` turns this off.
     let originGone = false;
     let answering = false;
-    if (!watchPeer && !sock.isStreamSocket && channel.lossless && cfg.halfCloseProbeAnswers !== false) {
+    if (!watchPeer && !sock.isStreamSocket && channel.lossless && cfg.halfCloseProbeAnswers !== false && (cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS) > 0) {
       answering = true;
       const probe = cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS;
       watchHalfClosed(sock, probe, (e) => { originGone = true; log(`gateway ${id}: ${e.message}`); }, answeringKeepAliveMs(sock, probe, cfg.halfCloseProbeRemoteMs));
     }
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
-    // Two things can end the socket after its end of file: the probe above, and a write that fails (the client's request body, still uploading, into an
-    // origin that has been reset: an 'error', then 'close'). The probe is skipped while a write is queued, so either may be first, and the verdict must not
-    // depend on which: an origin that sent its WHOLE answer (its end of file was read, so nothing of it is left in the kernel to lose) is released either way,
-    // not discarded, because a second close of "discarded" makes the client drop what it has received and not yet read. An origin that failed before its end
-    // of file cut its answer short, and stays a discard.
-    sock.on('close', () => { void tail.finally(() => (originGone || (answering && sock.readableEnded) ? channel.release() : channel.destroy())); });
+    // The probe is not the only way the end of a watched answering origin is seen: a read or a write that fails (the client's request body, still uploading,
+    // into an origin that has been reset: an 'error', then 'close'; the kernel can report a reset INSTEAD of the end of file). The probe is skipped while a
+    // write is queued, so any of them may be first, and the verdict must not depend on which: an origin that is gone (it reset the connection) or that sent
+    // its WHOLE answer (its end of file was read) is released, not discarded, because a second close of "discarded" makes the client drop what it has
+    // received and not yet read. Any other failure stays a discard.
+    sock.on('close', () => { void tail.finally(() => (originGone || originReset || (answering && sock.readableEnded) ? channel.release() : channel.destroy())); });
     return channel;
   }
 

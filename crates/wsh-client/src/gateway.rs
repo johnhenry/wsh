@@ -555,6 +555,15 @@ impl GatewayStream {
             let last = last.clone();
             move || last.store(started.elapsed().as_millis() as u64, Ordering::Release)
         };
+        // The watch is not the only way the end of a watched ANSWERING service is seen. Two others, and the watch can be the later of the three:
+        //  - a write to it that fails (the host's bytes, still arriving, into a service that has finished and gone): where the service's end of file was
+        //    read it sent its WHOLE answer, and one that reset the connection is gone;
+        //  - a read that fails with a reset (the service closed with the host's bytes still arriving, which resets the connection; the kernel can report
+        //    that instead of the end of file).
+        // A service that is gone is what the watch reports, and the connection is RELEASED, as the watch would have done: a second close of `discarded`
+        // would make the host drop what its caller has not read yet. Any other failure is a discard, and an unwatched service (no feature, no probe) is
+        // as it was.
+        let answering_watched = answering && watch.is_some();
         let up = {
             let me = self.clone();
             let touch = touch.clone();
@@ -584,7 +593,11 @@ impl GatewayStream {
                             touch();
                         }
                         Err(e) => {
-                            me.destroy();
+                            if answering_watched && wsh_core::peer_watch::peer_gone_error(&e) {
+                                me.release();
+                            } else {
+                                me.destroy();
+                            }
                             break Err(e);
                         }
                     }
@@ -602,14 +615,22 @@ impl GatewayStream {
             let half = half.clone();
             let down_bytes = down_bytes.clone();
             let local_shut = local_shut.clone();
+            let local_eof = local_eof.clone();
             async move {
                 let mut buf = vec![0u8; GATEWAY_MAX_FRAME];
                 let result = loop {
                     match me.read(&mut buf).await {
                         Ok(0) => break Ok(()),
                         Ok(n) => {
-                            if lw.write_all(&buf[..n]).await.is_err() {
-                                me.destroy();
+                            if let Err(e) = lw.write_all(&buf[..n]).await {
+                                if answering_watched
+                                    && (local_eof.load(Ordering::Acquire)
+                                        || wsh_core::peer_watch::peer_gone_error(&e))
+                                {
+                                    me.release();
+                                } else {
+                                    me.destroy();
+                                }
                                 half.send_replace(true);
                                 return Ok::<(), std::io::Error>(());
                             }

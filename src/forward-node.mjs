@@ -6,7 +6,7 @@
 import net from 'node:net';
 import fsp from 'node:fs/promises';
 import { listenUnixSocket, removeIfIdentity } from './unix-listen.mjs';
-import { watchHalfClosed, answeringKeepAliveMs } from './half-close-watch.mjs';
+import { watchHalfClosed, answeringKeepAliveMs, PEER_GONE_CODES } from './half-close-watch.mjs';
 import { assertHalfCloseProbeMs } from './gateway-channel.mjs';
 
 /** A named endpoint: the CLI's rule (`valid_endpoint_name`): letters, digits, ".", "_", "-", starting with a letter or digit, at most 64. */
@@ -66,10 +66,10 @@ export function pipe(sock, duplex, { probeMs, onGone, answering = false, remoteM
   // closes completely (or is reset, as one is when the caller's request reaches a service that has already closed) right after its
   // last bytes would otherwise cost the caller the tail of the answer.
   let tail = Promise.resolve();
-  // The probe is not the only way the end of an answering socket is seen: a write that fails (the caller's bytes, still arriving, into a service that has been
-  // reset) closes it too, and the probe is skipped while a write is queued, so either may be first. A service that sent its WHOLE answer (its end of file was
-  // read) is released whichever it is: a second close of "discarded" would make the host drop what its caller has not read yet. One that failed before its end
-  // of file cut its answer short, and stays a discard.
+  // The probe is not the only way the end of an answering socket is seen: a read or a write that fails (the caller's bytes, still arriving, into a service that
+  // has been reset; the kernel can report a reset INSTEAD of the end of file) closes it too, and the probe is skipped while a write is queued, so any of them may
+  // be first. A service that is gone (it reset the connection: `released` is set by the 'error' below) or that sent its WHOLE answer (its end of file was read)
+  // is released whichever it is: a second close of "discarded" would make the host drop what its caller has not read yet. Any other failure stays a discard.
   const destroyAfterTail = () => { void tail.finally(() => ((released || (answering && sock.readableEnded)) && typeof duplex.release === 'function' ? duplex.release() : duplex.destroy())); };
   sock.on('data', (d) => {
     sock.pause();
@@ -81,7 +81,7 @@ export function pipe(sock, duplex, { probeMs, onGone, answering = false, remoteM
     });
   });
   sock.on('end', () => { void writer.close().catch(() => {}); });
-  sock.on('error', () => {});
+  sock.on('error', (e) => { if (answering && PEER_GONE_CODES.has(e?.code)) released = true; });
   sock.on('close', destroyAfterTail);
   (async () => {
     try {
