@@ -141,6 +141,10 @@ export class GatewayConnections {
       timer.unref?.();
       this.#opening.set(id, { channel, resolve, reject, timer });
     });
+    // Nothing awaits `done` until the request is sent. A transport that closes, a signal that fires or a timeout that runs while the send is
+    // still in flight rejects it first; the caller still gets that rejection from the `await done` below, and this handler only keeps
+    // it from being reported as one nobody saw (when the send itself fails, the caller gets that error instead).
+    done.catch(() => {});
     const onAbort = () => {
       const o = this.#opening.get(id);
       if (!o) return;
@@ -219,6 +223,7 @@ export class GatewayConnections {
       entry.timer = setTimeout(() => { this.#listeners.delete(id); reject(new GatewayError('the host did not answer the listen request in time', 5)); }, timeoutMs);
       entry.timer.unref?.();
     });
+    answered.catch(() => {}); // as `done` in #open: the caller gets the rejection from the `await answered` below, or the send's own error
     this.#listeners.set(id, entry);
     try {
       await this.#send(listenRequestMsg({ listenerId: id, port, ...(bindAddr === undefined ? {} : { bindAddr }) }));
@@ -252,6 +257,7 @@ export class GatewayConnections {
       entry.timer = setTimeout(() => { this.#listeners.delete(id); reject(new GatewayError('the host did not answer the listen request in time', 5)); }, timeoutMs);
       entry.timer.unref?.();
     });
+    answered.catch(() => {}); // as `done` in #open: the caller gets the rejection from the `await answered` below, or the send's own error
     this.#listeners.set(id, entry);
     try {
       await this.#send(listenUnixMsg({ listenerId: id, path, replace: replace === true ? true : undefined }));
