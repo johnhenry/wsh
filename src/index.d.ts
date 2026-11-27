@@ -2090,6 +2090,8 @@ export interface WshConnectReverseOptions {
   };
   /** List `operator-proof` in the registered capabilities (key logins only; default true): this peer can answer an operator's challenge. */
   operatorProof?: boolean;
+  /** List `gateway-lossless-close-signed` (#318): this peer reads a signed `gateway-lossless-close` in an operator's proof. Needs `operatorProof` and the `gateway` capability. Default false; `createReverseHost` sets it. */
+  gatewayLosslessSigned?: boolean;
   peerType?: string;
   shellBackend?: string;
   supportsAttach?: boolean;
@@ -2177,6 +2179,8 @@ export const E2E_SIGN_FEATURE: 'e2e-sign';
 
 /** Relay feature / operator feature: a `ReverseChallenge` / `ReverseProof` crosses the relay (#117). */
 export const OPERATOR_PROOF_FEATURE: 'operator-proof';
+/** #318: what a host lists in its registered capabilities when it reads a signed `gateway-lossless-close` in an operator's proof (`wsh-operator-proof-v2`). */
+export const GATEWAY_LOSSLESS_SIGNED_FEATURE: 'gateway-lossless-close-signed';
 /** Host feature (`ReverseAccept.features`): it takes a signed initiator half and a sealed bridge (#117). */
 export const E2E_SEALED_FEATURE: 'e2e-sealed';
 export function challengeTranscript(t: { peerPublicKey: Uint8Array; operatorFingerprint: string; nonce: Uint8Array; sessionId: string }): Uint8Array;
@@ -2370,8 +2374,15 @@ export interface WshGatewayDuplex {
    * Both ends stated `gateway-lossless-close` (#286): this connection may be RELEASED, and a close with the reason `released` ("I will read
    * nothing more and send nothing more; deliver what you already sent, in order, then finish") is understood. What a peer released is still
    * delivered to `readable` before it ends; writes fail from then on.
+   *
+   * #318: `true` only where no relay can forge or strip the release: a direct connection, or a SEALED bridge (`reverseConnect(fp, t, { sealed: true })`)
+   * on which the operator signed the statement for a host whose verified record lists `gateway-lossless-close-signed`. On an unsealed bridge it is
+   * `false`: the release is best-effort (see `releasable`), a `released` the operator did not negotiate ends the connection promptly, and none of it is a
+   * guarantee.
    */
   lossless?: boolean;
+  /** #318: the release is negotiated with the peer (so this side may send one), whether or not it is a guarantee (`lossless`). */
+  releasable?: boolean;
   /** The answering socket of this connection went away after finishing its side (a reverse forward's local service): end it with `released`, which loses nothing the peer has received. A discard where `lossless` is false. */
   release?(): void;
   /** Bytes received from the peer and not yet read from `readable`: what this end is holding for you. With credit it never exceeds the credit window (256 KiB). */

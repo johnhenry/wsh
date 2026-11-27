@@ -174,7 +174,7 @@ export async function forward(client, { local, remote, reverse = false, replace 
         // of a response, and the caller may still be reading it. A `discarded` close would drop what the caller has not read, so it is
         // watched only when the host and this client both stated `gateway-lossless-close` (#286): the close is then `released`, which loses
         // nothing. `halfCloseProbeAnswers: false` (or `halfCloseProbeMs: 0`) keeps it unwatched.
-        const watchService = probeMs > 0 && probeAnswers && duplex.lossless === true;
+        const watchService = probeMs > 0 && probeAnswers && (duplex.releasable ?? duplex.lossless) === true;
         sock.once('connect', () => { pipe(sock, duplex, watchService ? { probeMs, answering: true, remoteMs: probeRemoteMs } : undefined); sock.resume(); });
         // Only a failure to reach the local service is reported; a socket that ends later (EPIPE, a reset) is just the end of that connection.
         const failed = (e) => { sock.off('connect', failed); duplex.destroy(); report(e); };

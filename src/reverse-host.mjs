@@ -249,14 +249,23 @@ export function createReverseHostWith({
         if (!ok) { await refuse('not accepted', 'unauthorized'); return; }
         if (bridges.size >= operatorLimit()) { await refuse('not accepted'); return; }
         c.trustRelayPeer(from);
-        const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge, grant, Array.isArray(req.features) ? req.features : []);
+        // #318: what the operator stated about the lossless close. The guarantee holds on a SEALED bridge only (here: one this host requires proof and
+        // a seal for): there it is what the operator SIGNED, since a relay can add or strip the unsigned list and an operator that signs nothing (a 0.62.x
+        // one) is not believed. On any other bridge no carrier stops a relay forging a plain `released`: it stays best-effort as in 0.62, the relay's list
+        // (plus what was signed) is taken, and nothing is reported as a guarantee.
+        const reqFeatures = Array.isArray(req.features) ? req.features : [];
+        const signedLossless = (proven?.signedFeatures ?? []).filter((f) => f === GATEWAY_LOSSLESS_FEATURE);
+        const operatorFeatures = proven && requireOperatorProof
+          ? [...reqFeatures.filter((f) => f !== GATEWAY_LOSSLESS_FEATURE), ...signedLossless]
+          : [...new Set([...reqFeatures, ...signedLossless])];
+        const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge, grant, operatorFeatures);
         bridges.set(from, bridge);
         onLog(`[reverse] bridged to ${from.slice(0, 12)}${proven ? ' (operator proven)' : ''}${requireOperatorProof ? ', sealed' : ''}`);
         await answer(reverseAccept({
           targetFingerprint: myFingerprint, username, capabilities, peerType, shellBackend,
           supportsAttach: false, supportsReplay: false, supportsEcho: false, supportsTermSync: false,
           // `gateway-lossless-close-ack` (#286): only when the operator's own statement reached this host (the relay may drop it)
-          features: reportFeatures ? [...bridgeFeatures(c, e2eFor(c), manyOperators()), ...(proven && e2e !== false ? [E2E_SEALED_FEATURE] : []), ...(gatewayOn(c) && backends.gateway.cfg?.losslessClose !== false && Array.isArray(req.features) && req.features.includes(GATEWAY_LOSSLESS_FEATURE) ? [GATEWAY_LOSSLESS_ACK_FEATURE] : [])] : undefined,
+          features: reportFeatures ? [...bridgeFeatures(c, e2eFor(c), manyOperators()), ...(proven && e2e !== false ? [E2E_SEALED_FEATURE] : []), ...(gatewayOn(c) && backends.gateway.cfg?.losslessClose !== false && operatorFeatures.includes(GATEWAY_LOSSLESS_FEATURE) ? [GATEWAY_LOSSLESS_ACK_FEATURE] : [])] : undefined,
         }));
       } finally { reserved.delete(from); }
     };
@@ -382,6 +391,8 @@ export function createReverseHostWith({
     };
 
     await c.connectReverse(url, {
+      // #318: this host reads an operator's SIGNED `gateway-lossless-close` (an operator signs it only for a host whose record says so)
+      gatewayLosslessSigned: backends.gateway?.cfg?.losslessClose !== false,
       username, keyPair, expose, peerType, shellBackend,
       supportsAttach: false, supportsReplay: false, supportsEcho: false, supportsTermSync: false,
       ...connect,

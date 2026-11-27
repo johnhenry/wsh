@@ -238,6 +238,12 @@ impl ReverseHostOptions {
         let mut capabilities = self.capabilities.clone();
         if self.identity.is_some() {
             capabilities.push(wsh_core::operator_proof::OPERATOR_PROOF_FEATURE.to_string());
+            // wsh #318: this host reads an operator's SIGNED `gateway-lossless-close` (a `wsh-operator-proof-v2` proof); an operator signs it only
+            // for a host whose record says so, since a host that does not would not verify the proof.
+            if self.lossless_close && self.gateway.is_some() && self.has_capability("gateway") {
+                capabilities
+                    .push(wsh_core::operator_proof::GATEWAY_LOSSLESS_SIGNED_FEATURE.to_string());
+            }
         }
         let record = PeerRecord {
             username: username.clone(),
@@ -968,7 +974,7 @@ impl ReverseHostRuntime {
 
     async fn accept_request(
         &mut self,
-        request: ReverseConnectPayload,
+        mut request: ReverseConnectPayload,
         proven: Option<(wsh_core::operator_proof::ProvenOperator, String)>,
     ) -> Result<()> {
         info!(
@@ -981,6 +987,21 @@ impl ReverseHostRuntime {
             target_fingerprint: request.target_fingerprint.clone(),
         })
         .await;
+        // wsh #318: what the operator stated about the lossless close. The guarantee holds on a SEALED bridge only (here: a proven operator and
+        // `--require-operator-proof`, which seals every bridge): there it is what the operator SIGNED, since a relay can add or strip the unsigned list.
+        // Anywhere else no carrier stops a relay forging a plain `released`: behaviour is as in rust-v0.26 (the relay's list, plus what was signed).
+        if let Some((operator, _)) = &proven {
+            let signed = operator
+                .signed_features
+                .iter()
+                .any(|f| f == wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE);
+            request.features = operator_request_features(
+                request.features.take(),
+                signed,
+                self.options.require_operator_proof,
+            );
+        }
+        // (no proof: the relay's list is taken as before)
         self.active_request = Some(request.clone());
         self.bridged = true;
         let client = self.client()?;
@@ -2575,6 +2596,29 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
+/// What a host believes the operator stated in `ReverseConnect.features` (wsh #318). `signed`: the operator signed `gateway-lossless-close` into its
+/// proof. `sealed`: the bridge is sealed, so only the signed statement counts (the relay's list is dropped of the string); otherwise (best-effort,
+/// as in rust-v0.26) the relay's list is taken and what was signed is added.
+fn operator_request_features(
+    features: Option<Vec<String>>,
+    signed: bool,
+    sealed: bool,
+) -> Option<Vec<String>> {
+    let lossless = wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE;
+    if !sealed && !signed {
+        return features;
+    }
+    let mut out: Vec<String> = features
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| f != lossless)
+        .collect();
+    if signed {
+        out.push(lossless.to_string());
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
@@ -2584,10 +2628,55 @@ mod tests {
     use wsh_core::messages::{ChannelKind, ReverseConnectPayload};
 
     use super::{
-        append_replay, command_spec, same_reverse_request, try_parse_download_header,
-        try_parse_upload_header, LocalMcpBridge, LocalPty, ReverseHostFileSession,
-        ReverseHostOptions, ReverseHostPtySession, RuntimeEvent,
+        append_replay, command_spec, operator_request_features, same_reverse_request,
+        try_parse_download_header, try_parse_upload_header, LocalMcpBridge, LocalPty,
+        ReverseHostFileSession, ReverseHostOptions, ReverseHostPtySession, RuntimeEvent,
     };
+
+    const LOSSLESS: &str = "gateway-lossless-close";
+
+    fn feats(f: &[&str]) -> Option<Vec<String>> {
+        Some(f.iter().map(|x| x.to_string()).collect())
+    }
+
+    // wsh #318: the guarantee holds on a SEALED bridge only. There the host acts on what the operator signed; elsewhere it is best-effort, as in
+    // rust-v0.26 (the relay's list, plus what was signed).
+    #[test]
+    fn a_sealed_bridge_believes_the_signed_statement_and_not_the_relays_list() {
+        // relay adds, nothing signed: not believed
+        assert_eq!(
+            operator_request_features(feats(&[LOSSLESS]), false, true),
+            Some(vec![])
+        );
+        // relay strips, signed: still stated
+        assert_eq!(
+            operator_request_features(None, true, true),
+            feats(&[LOSSLESS])
+        );
+        // the operator-proof string and others are kept
+        assert_eq!(
+            operator_request_features(feats(&["operator-proof", LOSSLESS]), true, true),
+            feats(&["operator-proof", LOSSLESS])
+        );
+    }
+
+    #[test]
+    fn an_unsealed_bridge_takes_the_relays_list_as_in_rust_v0_26() {
+        assert_eq!(
+            operator_request_features(feats(&[LOSSLESS]), false, false),
+            feats(&[LOSSLESS])
+        );
+        assert_eq!(operator_request_features(None, false, false), None);
+        // signed, relay stripped the string: the signed statement is still acted on, once
+        assert_eq!(
+            operator_request_features(None, true, false),
+            feats(&[LOSSLESS])
+        );
+        assert_eq!(
+            operator_request_features(feats(&[LOSSLESS]), true, false),
+            feats(&[LOSSLESS])
+        );
+    }
 
     #[test]
     fn reverse_host_command_spec_uses_shell_c() {

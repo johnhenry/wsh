@@ -562,7 +562,8 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
       const { c, accepted } = await operator(url);
       assert.ok(accepted.features.includes('gateway-lossless-close') && accepted.features.includes('gateway-lossless-close-ack'), `the host states and acknowledges it: ${accepted.features}`);
       const v = await c.openTcp('127.0.0.1', port);
-      assert.equal(v.lossless, true);
+      assert.equal(v.lossless, false, 'behind a relay on an unsealed bridge the release is best-effort: no guarantee is reported (#318)');
+      assert.equal(v.releasable, true, 'but it is negotiated, so the origin is still watched');
       const reader = v.readable.getReader();
       let n = 0; let ok = true; let chunks = 0;
       for (;;) {
@@ -640,7 +641,7 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
       v.destroy();
     });
 
-    it('a relay that adds a statement the operator never made: the operator does not rely on it (a release it is sent is an ordinary close, nothing is lost)', async () => {
+    it('a relay that adds a statement the operator never made: the operator relies on nothing (no guarantee), and the release it is sent ends the connection promptly (#318)', async () => {
       rewriteConnect((m) => { m.features = ['gateway-lossless-close']; return m; });
       const closes = tapCloses();
       const { port, gone } = await vanishingOrigin();
@@ -652,7 +653,7 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
       await until(() => gone.length === 1, 'the origin to have been dialled');
       gone[0].resetAndDestroy();
       await until(() => closes.includes('released'), 'the host (which was told the operator stated it) to release');
-      assert.equal(await Promise.race([v.closed, sleep(500).then(() => 'open')]), 'open', 'the operator treats it as an ordinary reason: held, not released');
+      assert.equal(await Promise.race([v.closed, sleep(5000).then(() => 'open')]), 'released', 'an unexpected release ends it promptly instead of being held to the idle bound');
       v.destroy();
     });
 

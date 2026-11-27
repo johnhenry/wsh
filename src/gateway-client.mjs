@@ -59,8 +59,9 @@ export class GatewayConnections {
    * @param {(msg: object) => Promise<void>} o.send
    * @param {(feature: string) => boolean} o.hasFeature
    */
-  constructor({ send, hasFeature, datagrams = () => null, halfCloseIdleMs, statesLossless = () => true }) {
+  constructor({ send, hasFeature, datagrams = () => null, halfCloseIdleMs, statesLossless = () => true, guaranteesLossless = null }) {
     this.#statesLossless = statesLossless;
+    this.#guaranteesLossless = guaranteesLossless;
     this.#halfCloseIdleMs = assertHalfCloseIdleMs(halfCloseIdleMs);
     this.#send = send;
     this.#hasFeature = hasFeature;
@@ -69,6 +70,8 @@ export class GatewayConnections {
 
   #datagrams;
   #statesLossless;
+  /** #318: is the lossless close a guarantee on this connection (default: whenever it is negotiated)? */
+  #guaranteesLossless;
   #halfCloseIdleMs;
   /** @type {Map<number, UdpFlow>} */
   #udp = new Map();
@@ -95,6 +98,9 @@ export class GatewayConnections {
       credit: this.#hasFeature(GATEWAY_CREDIT_FEATURE),
       // #286: a close with the reason `released` means something only when both ends stated `gateway-lossless-close`.
       lossless: this.#statesLossless() && this.#hasFeature(GATEWAY_LOSSLESS_FEATURE),
+      guaranteed: this.#guaranteesLossless ? this.#guaranteesLossless() && this.#hasFeature(GATEWAY_LOSSLESS_FEATURE) : undefined,
+      // A client takes a `released` it did not negotiate as the end of the connection (#318), never as a guarantee.
+      tolerateRelease: true,
       // A GatewayClose from the host is a half-close: the application may keep writing, and may take as long as it likes
       // to finish, while anything moves in either direction. A half-closed connection with nothing moving for
       // `halfCloseIdleMs` is ended, so one nobody closes does not stay in the table forever.
@@ -120,7 +126,9 @@ export class GatewayConnections {
     return {
       readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise,
       /** #286: both ends stated `gateway-lossless-close`, so this connection may be released (see `release()`). */
-      lossless: channel.lossless,
+      lossless: channel.guaranteed,
+      /** #318: the release is negotiated, so this side may send one (best-effort unless `lossless`). */
+      releasable: channel.lossless,
       /** #286: the peer released this connection: it reads nothing more; a write now fails and what it sent is still delivered. */
       get peerReleased() { return channel.peerReleased; },
       /** Bytes received from the host and not yet read from `readable`, and the most that was ever held at once: what the credit window bounds. */
