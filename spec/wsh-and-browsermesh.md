@@ -1,7 +1,7 @@
 # wsh and browsermesh
 
 [browsermesh](https://github.com/johnhenry/browsermesh) has the counterpart of this page (`docs/wsh-and-browsermesh.md` there). This one is written from wsh's side: what wsh
-exports for browsermesh, what it checks, and what it has not seen. It describes wsh 0.52.0 and the browsermesh packages published on npm when it was written.
+exports for browsermesh, what it checks, and what it has not seen. It describes wsh 0.59.0 and the browsermesh packages published on npm on 2026-11-26 (refreshed from wsh 0.52.0).
 It is a guide, not a protocol; the protocol documents are the other files in this directory.
 
 ## What each is for
@@ -15,7 +15,7 @@ execution targets).
 other is the way between places.
 
 **wsh does not depend on browsermesh.** `@johnhenry/browsermesh-primitives` is a dev dependency of this repository (`^0.5.0`), used by a test of the pod id derivation
-(`test/identity.test.mjs`) and the gateway code table test (`test/gateway-errors.test.mjs`). Every package below depends on wsh, as a peer or a dev dependency, never the other way.
+(`test/identity.test.mjs`) and the gateway code table test (`test/gateway-errors.test.mjs`). Every package below that depends on wsh at all does so as a peer or a dev dependency, never the other way (apps and ingress have none of their own).
 
 ## Which browsermesh packages build on wsh
 
@@ -23,12 +23,15 @@ Read from the published packages (`npm view`, and the tarballs' `package.json` a
 
 | Package (version) | Relation to wsh | wsh entry points and exports it imports |
 | --- | --- | --- |
-| `@johnhenry/browsermesh-objects` 0.1.2 | peer `@johnhenry/wsh >=0.49.0 <1.0.0` | `@johnhenry/wsh/objects`: `createObjectsServer`, `createObjectsClient`, `createDuplexPeer`; `@johnhenry/wsh/identity`: `normalizeIdentity` |
-| `@johnhenry/browsermesh-mcp` 0.2.1 | peer `@johnhenry/wsh >=0.49.0 <1.0.0` | `@johnhenry/wsh/page`: `webmcpTools`, `serveMcpOverDuplex`; `@johnhenry/wsh/identity`: `podIdToFingerprint` |
-| `@johnhenry/browsermesh-transport` 0.12.0 | optional peer `@johnhenry/wsh` (`*`); the wsh code is behind its `/wsh` subpath (`./wsh`, and `./wsh-in-process` for tests), off unless constructed | `@johnhenry/wsh`: `WshClient`, `WebSocketTransport` (the peer link dials with them: `connect`, `sessionSealed`, `openEndpoint`); `/memory`: `createMemoryHost`, `createSocketPair`; `/page`: `webmcpTools`, `exposeObjects`; `/duplex`: `serveWshOverDuplex`, `connectWshOverDuplex` (the services and the relaying pod); `/pipe-relay`: `createPipeRelay` (in-process) |
-| `@johnhenry/browsermesh-netway` 0.3.0 | no runtime import and no peer; dev dependency `^0.52.0` | none: `GatewayBackend` is handed a `WshClient` and uses its `state`, `onGatewayMessage` and `sendControl` |
-| `@johnhenry/browsermesh-apps` 0.22.0 | none of its own; `createMeshNode({ wsh })` reaches wsh through the transport's `/wsh` subpath | none directly |
+| `@johnhenry/browsermesh-objects` 0.1.5 | peer `@johnhenry/wsh >=0.49.0 <1.0.0` (and `@johnhenry/browsermesh-apps >=0.21.0 <1.0.0`); dev dependency `^0.57.0` | `@johnhenry/wsh/objects`: `createObjectsServer`, `createObjectsClient`, `createDuplexPeer`; `@johnhenry/wsh/identity`: `normalizeIdentity` |
+| `@johnhenry/browsermesh-mcp` 0.2.4 | peer `@johnhenry/wsh >=0.49.0 <1.0.0` (and `@johnhenry/browsermesh-apps >=0.21.0 <1.0.0`); dev dependency `^0.57.0` | `@johnhenry/wsh/page`: `webmcpTools`, `serveMcpOverDuplex`; `@johnhenry/wsh/identity`: `podIdToFingerprint` |
+| `@johnhenry/browsermesh-transport` 0.12.3 | optional peer `@johnhenry/wsh` (`*`; dev dependency `^0.57.0`); the wsh code is behind its `/wsh` subpath (`./wsh`, and `./wsh-in-process` for tests), off unless constructed | `@johnhenry/wsh`: `WshClient`, `WebSocketTransport` (the peer link dials with them: `connect`, `sessionSealed`, `openEndpoint`); `/memory`: `createMemoryHost`, `createSocketPair`; `/page`: `webmcpTools`, `exposeObjects`; `/duplex`: `serveWshOverDuplex`, `connectWshOverDuplex` (the services and the relaying pod); `/pipe-relay`: `createPipeRelay` (in-process) |
+| `@johnhenry/browsermesh-netway` 0.4.0 | no runtime import and no peer; dev dependency `^0.57.0` | none: `GatewayBackend` is handed a `WshClient` and uses its `state`, `onGatewayMessage` and `sendControl` |
+| `@johnhenry/browsermesh-apps` 0.28.0 | none of its own; `createMeshNode({ wsh })` reaches wsh through the transport's `/wsh` subpath | none directly |
 | `@johnhenry/browsermesh-primitives` 0.7.0 | dev dependency `^0.52.0`; no runtime import | none: it implements the same conversions (see Identity) |
+| `@johnhenry/browsermesh-egress` 0.3.2 | optional peer `@johnhenry/wsh >=0.55.0 <1.0.0` (dev dependency `^0.57.0`), needed only by its `./node` entry; the consumer entry imports no wsh | `@johnhenry/wsh/address-guard`, loaded dynamically by `./node` (`nodeDialer`): `dialChecked`, `dialUdpChecked`, `resolveChecked`, `isPublicAddress`, `checkAddress`. The package says it classifies no address itself; every decision about a destination address is wsh's. It does not run a wsh gateway |
+| `@johnhenry/browsermesh-ingress` 0.6.0 | no peer on wsh and no wsh import; it asks only whether a link was a wsh peer link | none: it reads `node.wsh.links` (the transport's `WshPeerLinks`) to label a link's identity `verified: 'wsh'` (key-authenticated in both directions, sealed), as against `'bound'` or `'key'` |
+| `@johnhenry/browsermesh-meshctl` 0.1.0 | optional peers `@johnhenry/wsh >=0.55.0 <1.0.0` and `@johnhenry/browsermesh-transport` (dev dependency `^0.55.0`); no wsh import of its own | none directly: `--wsh-relay` reaches a host through a pipe relay over the transport's `WshPeerLinks` (sealed, key-authenticated, the host pinned to the pod id asked for), so wsh is used through `@johnhenry/browsermesh-transport/wsh` |
 
 The pieces, from the browsermesh side: the sealed **wsh peer link** (`WshPeerLinks`, a link between two pods is one wsh session carrying one endpoint), **`WshServices`** (a stock
 wsh client using a pod's objects and MCP tools), and the **relaying pod** (`WshRelay`: a pod carrying another pod's wsh session to a target, granted per target as
@@ -92,15 +95,15 @@ A reader that gets a 5 says "disabled, or a timeout from an older gateway"; a nu
 
 ## Which versions go together
 
-wsh **0.52.0** with the browsermesh packages published when this was written: apps **0.22.0**, transport **0.12.0**, primitives **0.7.0**, netway **0.3.0**, objects **0.1.2**, mcp **0.2.1**
-(all current on npm at the time). The declared ranges allow it: objects and mcp ask for wsh `>=0.49.0 <1.0.0` and apps `>=0.21.0`; transport asks for wsh `*` and primitives
-`>=0.6.0`; apps asks for transport `>=0.6.0` and primitives `>=0.5.0`. Five of the six (all but apps, which has no wsh dependency of its own) list `@johnhenry/wsh ^0.52.0` as a dev dependency, which is what that repository installs for its own tests.
+wsh **0.59.0** with the browsermesh packages published when this was written: apps **0.28.0**, transport **0.12.3**, primitives **0.7.0**, netway **0.4.0**, objects **0.1.5**, mcp **0.2.4**,
+egress **0.3.2**, ingress **0.6.0**, meshctl **0.1.0** (all current on npm at the time). The declared ranges allow it: objects and mcp ask for wsh `>=0.49.0 <1.0.0` and apps `>=0.21.0`; transport asks for wsh `*` and primitives
+`>=0.6.0`; egress and meshctl ask for wsh `>=0.55.0 <1.0.0` (egress also apps `>=0.21.0` and netway `>=0.3.0`); ingress asks for apps `>=0.21.0` only; apps asks for transport `>=0.6.0` and primitives `>=0.5.0`. The packages that list wsh as a dev dependency (what that repository installs for its own tests) are on `^0.57.0` (objects, mcp, transport, netway, egress), `^0.55.0` (meshctl) and `^0.52.0` (primitives); apps and ingress list none.
 Two floors inside transport: its services (`WshServices`) need wsh 0.50 or later, and its peer link says it needs 0.45. The netway codes need wsh 0.52.0 on the sending side to
 send 8 for a timeout; against an older Node gateway netway reads a 5 as described above.
 
 ## What is not verified
 
-- **I did not run any browsermesh package.** The table and the ranges above come from `npm view` and from reading the published tarballs; the claims about what the browsermesh test suites do (the capability
+- **I did not run any browsermesh package.** The table and the ranges above come from `npm view` and from reading the published tarballs and their READMEs (`npm pack`, `package.json`, `src/` and the READMEs of egress, ingress and meshctl for the rows added in the 0.59.0 refresh); the claims about what the browsermesh test suites do (the capability
   vectors, the netway parity test, a netway test against `createWshServer`) come from reading their test files at `origin/main`, not from running them.
 - **No browser.** What is run on the wsh side is in Node; the wsh peer link, `WshServices` and the relaying pod are exercised in browsermesh over in-process pipe relays and real wsh handshakes, by its own
   account, not in a browser against the real relay server. browsermesh's page says which of its pieces were run in Chromium, Firefox and WebKit; wsh has not repeated them.

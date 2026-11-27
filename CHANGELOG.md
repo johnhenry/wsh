@@ -117,6 +117,13 @@ The owner's decision of 2026-11-26 on #286: build it, negotiated. This is option
 - **Not changed.** The reverse host's connections have no credit flow control (it advertises no `gateway-credit`). The question of a lossless "nothing more will be read by me, deliver what you have" close for the origins that are not watched is a design question for the owner: #286.
 - Tests: `test/reverse-forward-full-close.test.mjs`, `test/gateway-settle-socket.test.mjs`, `test/rust/wsh-reverse-forward-full-close.test.mjs`, `test/rust/wsh-reverse-host-half-close.test.mjs`, and the `reverse_gateway` unit tests of `wsh-cli`.
 
+### Five more runnable examples, `npm run examples` runs all of them, and the browsermesh page is current (docs and examples only; no code or wire change)
+
+- **Examples 07 to 11** (`examples/`, each also `npm run example:NN`): remote objects over a memory host with per-root authorisation (values, an event, a handle, a callback); a page host serving WebMCP tools through the real `wsh-mcp` bridge (`runMcpStdioBridge`); a sealed session through the in-process pipe relay, showing the relay never held plaintext, a flipped bit closes the session and a substituted host fails the pinned host key; the gateway and `@johnhenry/wsh/address-guard` (one lookup, every answer classified, a local echo service as the only destination); a sealed, host-bound session over a `MessageChannel` with `@johnhenry/wsh/duplex`. Each prints one allowed and one refused line where there is a security story, and runs in about a second under plain Node.
+- **`npm run examples` glob.** It was `examples/0*.mjs`, which would have silently skipped `10-` and `11-`; it is now `examples/[0-9]*.mjs`, so CI (the `gate-commands` in `ci.yml`) runs every numbered example.
+- **`examples/README.md`** says Node >= 26, matching `engines`.
+- **`spec/wsh-and-browsermesh.md`** is refreshed from wsh 0.52.0 to 0.59.0 and the browsermesh versions on npm today (objects 0.1.5, mcp 0.2.4, transport 0.12.3, netway 0.4.0, apps 0.28.0), with rows for egress 0.3.2 (uses `@johnhenry/wsh/address-guard`), ingress 0.6.0 and meshctl 0.1.0, read from the published packages and their READMEs, not run.
+
 ## 0.59.0 / Rust `rust-v0.23.0`
 
 ### A local peer that half-closed and then went away is noticed by itself (#282; npm and Rust)
