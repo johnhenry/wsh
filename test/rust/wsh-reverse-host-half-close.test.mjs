@@ -220,6 +220,60 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       assert.equal(request, 'the request');
     });
 
+    // #286: the host's origins are watched where the operator and the host both state `gateway-lossless-close` (the operator in ReverseConnect, the host
+    // in ReverseAccept; both relays carry it). A vanished origin releases the operator's connection by itself, and a server that closed completely loses nothing.
+    it('lossless close through the relay: an origin that closed completely after 3 MiB loses nothing; a vanished origin releases the connection; a side that did not state it keeps today\'s behaviour', async () => {
+      const SIZE = 3 * 1024 * 1024;
+      const host = await hostIdentity();
+      const keyPair = await generateKeyPair(true);
+      const relay = await makeRelay(`${host.pub}\n${await exportPublicKeySSH(keyPair.publicKey)} op`);
+      const big = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 4), () => s.destroy()); });
+      const bigPort = await listen(big);
+      const gone = [];
+      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+      const vanishingPort = await listen(vanishing);
+      closers.push(async () => { big.close(); vanishing.close(); for (const s of gone) s.destroy(); });
+      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
+      const { op, res } = await connectOperator(relay, host, keyPair);
+      assert.ok(res.features.includes('gateway-lossless-close'), `the host states it: ${res.features}`);
+      const d = await op.openTcp('127.0.0.1', bigPort);
+      const reader = d.readable.getReader();
+      let n = 0; let chunks = 0;
+      for (;;) { const { value, done } = await reader.read(); if (done) break; n += value.length; if (++chunks % 8 === 0) await sleep(1); }
+      assert.equal(n, SIZE, 'every byte');
+      d.destroy();
+      const v = await op.openTcp('127.0.0.1', vanishingPort);
+      const vr = v.readable.getReader();
+      for (;;) { const { done } = await vr.read(); if (done) break; }
+      await until(() => gone.length === 1, 'the origin to have been dialled');
+      assert.equal(await Promise.race([v.closed, sleep(400).then(() => 'open')]), 'open', 'a half-closed origin that is alive is held');
+      gone[0].resetAndDestroy(); // the origin vanishes: a reset reaches the host
+      assert.equal(await Promise.race([v.closed, sleep(20_000).then(() => 'open')]), 'released');
+    });
+
+    it('lossless close through the relay: an operator that did not state the feature: the origin is not watched, as before', async () => {
+      const host = await hostIdentity();
+      const keyPair = await generateKeyPair(true);
+      const relay = await makeRelay(`${host.pub}\n${await exportPublicKeySSH(keyPair.publicKey)} op`);
+      const gone = [];
+      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+      const port = await listen(vanishing);
+      closers.push(async () => { vanishing.close(); for (const s of gone) s.destroy(); });
+      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
+      const op = new WshClient();
+      await op.connect(relay.url, { username: 'op', keyPair, gatewayLosslessClose: false });
+      closers.push(() => op.disconnect());
+      await until(async () => (await op.listPeers()).length, 'the host in the peer list');
+      assert.equal((await op.reverseConnect(host.fp)).type, MSG.REVERSE_ACCEPT);
+      const v = await op.openTcp('127.0.0.1', port);
+      const vr = v.readable.getReader();
+      for (;;) { const { done } = await vr.read(); if (done) break; }
+      await until(() => gone.length === 1, 'the origin to have been dialled');
+      gone[0].resetAndDestroy();
+      assert.equal(await Promise.race([v.closed, sleep(1500).then(() => 'open')]), 'open', 'not noticed: held, as before');
+      v.destroy();
+    });
+
     it('half-close the other way: the origin finishes first and what the operator sends afterwards still reaches it', async () => {
       const host = await hostIdentity();
       const keyPair = await generateKeyPair(true);

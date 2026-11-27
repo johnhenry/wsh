@@ -13,7 +13,7 @@ import {
   listenClose as listenCloseMsg, inboundAccept as inboundAcceptMsg, inboundReject as inboundRejectMsg,
   gatewayData as gatewayDataMsg, gatewayCredit as gatewayCreditMsg, gatewayClose as gatewayCloseMsg,
 } from './messages.mjs';
-import { GatewayChannel, GATEWAY_CREDIT_FEATURE, assertHalfCloseIdleMs } from './gateway-channel.mjs';
+import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE, assertHalfCloseIdleMs } from './gateway-channel.mjs';
 import { UdpFlow, decodeDatagram } from './gateway-datagram.mjs';
 import { GATEWAY_FAIL_FIVE_NOTE } from './gateway-errors.mjs';
 
@@ -59,7 +59,8 @@ export class GatewayConnections {
    * @param {(msg: object) => Promise<void>} o.send
    * @param {(feature: string) => boolean} o.hasFeature
    */
-  constructor({ send, hasFeature, datagrams = () => null, halfCloseIdleMs }) {
+  constructor({ send, hasFeature, datagrams = () => null, halfCloseIdleMs, statesLossless = () => true }) {
+    this.#statesLossless = statesLossless;
     this.#halfCloseIdleMs = assertHalfCloseIdleMs(halfCloseIdleMs);
     this.#send = send;
     this.#hasFeature = hasFeature;
@@ -67,6 +68,7 @@ export class GatewayConnections {
   }
 
   #datagrams;
+  #statesLossless;
   #halfCloseIdleMs;
   /** @type {Map<number, UdpFlow>} */
   #udp = new Map();
@@ -91,6 +93,8 @@ export class GatewayConnections {
     const channel = new GatewayChannel({
       id,
       credit: this.#hasFeature(GATEWAY_CREDIT_FEATURE),
+      // #286: a close with the reason `released` means something only when both ends stated `gateway-lossless-close`.
+      lossless: this.#statesLossless() && this.#hasFeature(GATEWAY_LOSSLESS_FEATURE),
       // A GatewayClose from the host is a half-close: the application may keep writing, and may take as long as it likes
       // to finish, while anything moves in either direction. A half-closed connection with nothing moving for
       // `halfCloseIdleMs` is ended, so one nobody closes does not stay in the table forever.
@@ -113,7 +117,13 @@ export class GatewayConnections {
     const flow = this.#udp.get(channel.id);
     if (flow) return flow;
     const { readable, writable } = channel.streams();
-    return { readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise };
+    return {
+      readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise,
+      /** #286: both ends stated `gateway-lossless-close`, so this connection may be released (see `release()`). */
+      lossless: channel.lossless,
+      /** #286: the answering socket of this connection went away after finishing its side: end it without making the peer drop what it was sent. */
+      release: () => channel.release(),
+    };
   }
 
   async #open(build, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, halfCloseIdleMs } = {}, kind) {

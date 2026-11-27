@@ -80,6 +80,12 @@ pub struct GatewayPolicy {
     /// after this long, then one per this long). `None` = no watch. Origins the host dialled are
     /// never watched.
     pub half_close_probe: Option<std::time::Duration>,
+    /// State `gateway-lossless-close` (wsh #286): understand the reason `released`, and, with the client's own statement, release a connection
+    /// instead of discarding it. `false` = not stated; connections behave as before the feature.
+    pub lossless_close: bool,
+    /// With `gateway-lossless-close` negotiated, also watch the ANSWERING socket (an origin the host dialled) once it has half-closed, with the
+    /// same schedule (`half_close_probe`); a vanished one releases the connection (wsh #286). `false` keeps origins unwatched.
+    pub half_close_probe_answers: bool,
 }
 
 /// Default for [`GatewayPolicy::half_close_idle`], in seconds (the same as the Node host: five minutes).
@@ -108,6 +114,8 @@ impl Default for GatewayPolicy {
             max_client_buffered_bytes: DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
             half_close_idle: Some(std::time::Duration::from_secs(DEFAULT_HALF_CLOSE_IDLE_SECS)),
             half_close_probe: Some(wsh_core::peer_watch::DEFAULT_HALF_CLOSE_PROBE),
+            lossless_close: true,
+            half_close_probe_answers: true,
         }
     }
 }
@@ -432,6 +440,16 @@ impl GatewayPolicyEnforcer {
     /// The schedule of the watch on a half-closed origin socket (`None` = no watch).
     pub fn half_close_probe(&self) -> Option<std::time::Duration> {
         self.policy.half_close_probe
+    }
+
+    /// Whether this gateway states `gateway-lossless-close` (wsh #286).
+    pub fn lossless_close(&self) -> bool {
+        self.policy.lossless_close
+    }
+
+    /// Whether the answering socket of a connection is watched too, where the feature is negotiated (wsh #286).
+    pub fn half_close_probe_answers(&self) -> bool {
+        self.policy.half_close_probe_answers
     }
 
     /// Count a connection if the limit allows it: the check and the count are one step, so

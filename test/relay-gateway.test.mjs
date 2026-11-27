@@ -112,9 +112,9 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
     await until(() => server.peerFingerprints().includes(keys.host.fp), 'the host to register');
     return { server, url, host: h };
   }
-  async function operator(url, { name = 'op', connectOptions } = {}) {
+  async function operator(url, { name = 'op', connectOptions, clientOptions } = {}) {
     const c = new WshClient();
-    await c.connect(url, { username: name, keyPair: keys[name].keyPair });
+    await c.connect(url, { username: name, keyPair: keys[name].keyPair, ...clientOptions });
     clients.push(c);
     const accepted = await c.reverseConnect(keys.host.fp, undefined, connectOptions);
     assert.equal(accepted.type, MSG.REVERSE_ACCEPT, accepted.reason);
@@ -544,6 +544,50 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
       const { n } = await drain(d, { slowEvery: 8 });
       assert.equal(n, SIZE, 'the whole answer');
       assert.equal(request, 'the request');
+    });
+
+    // #286: the answering side behind a relay. `gateway-lossless-close` crosses the bridge (the host states it in ReverseAccept, the operator in
+    // ReverseConnect, both only where the relay carries the gateway), and then an origin that finished sending and vanished is noticed and the
+    // operator's connection released, while one that sent everything and closed completely loses nothing.
+    it('the origin is watched through the relay: 3 MiB from a server that closed completely arrive whole, and a vanished origin releases the connection by itself', async () => {
+      const SIZE = 3 * 1024 * 1024;
+      const big = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 4), () => s.destroy()); });
+      const bigPort = await listen(big); nets.push(big);
+      const gone = [];
+      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+      const vanishingPort = await listen(vanishing); nets.push(vanishing);
+      const { url } = await setup({ gateway: { allow: ['127.0.0.1'], halfCloseIdleMs: 0, halfCloseProbeMs: 50 } });
+      const { c, accepted } = await operator(url);
+      assert.ok(accepted.features.includes('gateway-lossless-close'), `the host states it: ${accepted.features}`);
+      const d = await c.openTcp('127.0.0.1', bigPort);
+      assert.equal((await drain(d, { slowEvery: 8 })).n, SIZE, 'every byte');
+      d.destroy();
+      const v = await c.openTcp('127.0.0.1', vanishingPort);
+      assert.equal((await drain(v)).text, '', 'drain keeps no text'); // reads to the origin's end of file
+      await until(() => gone.length === 1, 'the origin to have been dialled');
+      assert.equal(await Promise.race([v.closed, sleep(300).then(() => 'open')]), 'open', 'a half-closed origin that is alive is held');
+      gone[0].resetAndDestroy(); // the origin vanishes (a reset reaches the host)
+      assert.equal(await Promise.race([v.closed, sleep(15000).then(() => 'open')]), 'released');
+    });
+
+    it('a side that did not state it: the relay carries nothing new and the origin is not watched', async () => {
+      const gone = [];
+      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+      const port = await listen(vanishing); nets.push(vanishing);
+      for (const [gateway, clientOptions] of [[{ losslessClose: false }, undefined], [{}, { gatewayLosslessClose: false }]]) {
+        gone.length = 0;
+        const { url } = await setup({ gateway: { allow: ['127.0.0.1'], halfCloseIdleMs: 0, halfCloseProbeMs: 50, ...gateway } });
+        const { c } = await operator(url, { clientOptions });
+        const v = await c.openTcp('127.0.0.1', port);
+        await drain(v);
+        await until(() => gone.length === 1, 'the origin to have been dialled');
+        gone[0].resetAndDestroy();
+        assert.equal(await Promise.race([v.closed, sleep(1500).then(() => 'open')]), 'open', 'held, as before');
+        v.destroy();
+        for (const cl of clients.splice(0)) await cl.disconnect().catch(() => {});
+        for (const h of hosts.splice(0)) await h.close().catch(() => {});
+        for (const s of servers.splice(0)) await s.close();
+      }
     });
 
     it('half-close the other way: the origin finishes, the operator can still send', async () => {

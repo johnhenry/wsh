@@ -20,6 +20,15 @@ pub const GATEWAY_CREDIT_FEATURE: &str = "gateway-credit";
 /// more): the peer ends its own direction too instead of waiting for the half-closed idle bound. A
 /// `GatewayClose` without it is a half-close.
 pub const GATEWAY_DISCARDED: &str = "discarded";
+/// Feature string (wsh #286): a side states it in `Hello.features` / `ServerHello.features` (behind a relay: `ReverseConnect.features` /
+/// `ReverseAccept.features`) when it understands the reason [`GATEWAY_RELEASED`]. Both ends stating it is what lets either send one.
+pub const GATEWAY_LOSSLESS_FEATURE: &str = "gateway-lossless-close";
+/// The reason on a `GatewayClose` that RELEASES the connection (wsh #286, only to a peer that stated [`GATEWAY_LOSSLESS_FEATURE`]): "I will read
+/// nothing more and send nothing more; deliver what you already sent, in order, then finish." Unlike [`GATEWAY_DISCARDED`] it drops nothing the
+/// receiver has: it is what the holder of an ANSWERING socket (an origin the host dialled, the local service of a reverse forward) sends when that
+/// socket half-closed and vanished, and a server that sent its whole answer and closed completely looks exactly like that. Sent as the second close
+/// of a connection whose first close was already sent, or as the first close.
+pub const GATEWAY_RELEASED: &str = "released";
 /// Largest `GatewayData` payload this implementation sends.
 pub const GATEWAY_MAX_FRAME: usize = 65_536;
 

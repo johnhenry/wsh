@@ -276,7 +276,7 @@ export function normalizeGateway(opts) {
     if (!c) throw new TypeError(`gateway.allowPrivate: ${JSON.stringify(r)} is not an address or CIDR block`);
     return c;
   });
-  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs } = normalizeGatewayLimits(opts);
+  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs, losslessClose, halfCloseProbeAnswers } = normalizeGatewayLimits(opts);
   let unix = null;
   if (opts.unix !== undefined && opts.unix !== null && opts.unix !== false) {
     if (opts.unix === true || typeof opts.unix !== 'object') throw new TypeError('gateway.unix needs explicit paths (default deny): { connect: [...], listen: [...] }');
@@ -292,6 +292,8 @@ export function normalizeGateway(opts) {
     maxClientBufferedBytes,
     halfCloseIdleMs,
     halfCloseProbeMs,
+    losslessClose,
+    halfCloseProbeAnswers,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     udpIdleMs: opts.udpIdleMs ?? DEFAULT_UDP_IDLE_MS,
     // `udp: false` turns UDP OFF (on the Node path too: it used to throw "must be an options object"); `true` or the bounds turn it on with them.
@@ -466,9 +468,16 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     // yet read, so it would cut the tail of the answer off.
     // (A socket of an injected network has no kernel to ask: its owner closes the stream when its peer is gone.)
     if (watchPeer && !sock.isStreamSocket) watchHalfClosed(sock, cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS, (e) => log(`gateway ${id}: ${e.message}`));
+    // ... unless BOTH ends stated `gateway-lossless-close` (#286): then the close that follows is `released`, which loses nothing (the client delivers
+    // what it has already received and then ends), so an origin that finished sending and vanished is noticed too, and a server that sent its whole
+    // answer, half-closed and closed completely (HTTP/1.0, `Connection: close`) loses no byte of it. `halfCloseProbeAnswers: false` turns this off.
+    let originGone = false;
+    if (!watchPeer && !sock.isStreamSocket && channel.lossless && cfg.halfCloseProbeAnswers !== false) {
+      watchHalfClosed(sock, cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS, (e) => { originGone = true; log(`gateway ${id}: ${e.message}`); });
+    }
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
-    sock.on('close', () => { void tail.finally(() => channel.destroy()); });
+    sock.on('close', () => { void tail.finally(() => (originGone ? channel.release() : channel.destroy())); });
     return channel;
   }
 

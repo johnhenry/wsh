@@ -166,8 +166,9 @@ export interface WshServerGatewayOptions {
   /**
    * How often the CALLER of one of this host's reverse listeners (a program that connected to a unix socket or TCP port the host
    * listens on for a client) that has half-closed (sent its end of file) is checked for having gone away (#282). An origin the host
-   * dialled is not watched: one that sent its whole answer and then closed completely is the normal end of a response, and the
-   * discard a watch sends would drop what the client has not read yet. The kernel tells a socket nothing about a peer that half-closed and then died
+   * dialled is watched only where both ends stated `gateway-lossless-close` (see `halfCloseProbeAnswers`, #286): one that sent its whole
+   * answer and then closed completely is the normal end of a response, and the discard a watch would send drops what the client has not
+   * read yet, so the connection is released instead. The kernel tells a socket nothing about a peer that half-closed and then died
    * until something is written to it, so while (and only while) a socket is half-closed the host writes zero bytes to it every
    * this many milliseconds: nothing reaches a live peer, and a dead one fails the write; the connection is then ended as a destroyed
    * one (the client is sent `GatewayClose` with the reason `discarded`). A TCP socket is also given keep-alive on this schedule
@@ -176,6 +177,18 @@ export interface WshServerGatewayOptions {
    * milliseconds from 0 to 2147483647, else a `TypeError`.
    */
   halfCloseProbeMs?: number;
+  /**
+   * `false` does not state `gateway-lossless-close` (#286): the host does not understand the `GatewayClose` reason `released` and never
+   * sends it, so its connections behave as they did before the feature. Default `true`. A non-boolean is a `TypeError`.
+   */
+  losslessClose?: boolean;
+  /**
+   * With `gateway-lossless-close` stated by both ends (#286) the ANSWERING socket of a connection (an origin the host dialled over the machine's
+   * sockets) is watched as well once it has half-closed, at `halfCloseProbeMs`: one that went away releases the connection (the client delivers what
+   * it has already received, then finishes) and one that sent its whole answer and closed completely loses nothing. `false` keeps origins
+   * unwatched, as before. A connection of an injected network (`network`) has no kernel to ask and is never probed. Default `true`.
+   */
+  halfCloseProbeAnswers?: boolean;
   /** Bytes received from a client for one connection and not yet taken by its origin before it is closed (default 4 MiB; at least 262144). */
   maxBufferedBytes?: number;
   /** The same, summed over one client's connections (default 32 MiB). */

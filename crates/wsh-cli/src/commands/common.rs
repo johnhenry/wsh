@@ -377,6 +377,9 @@ pub struct IdentityPolicy {
     pub relay_gateway_trust_relay: bool,
     /// Reverse host: connections one operator may hold open (0 = unset = the default).
     pub relay_gateway_max_connections: usize,
+    /// `--no-half-close-probe-answers` (wsh #286): do not watch the ANSWERING socket of a connection (a reverse host's origin, a `-R`'s local
+    /// service) for a vanished peer even where `gateway-lossless-close` is negotiated. Default: watched when negotiated.
+    pub no_probe_answers: bool,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
     pub operator_proof: OperatorProofMode,
     /// Reverse operator: seal the bridge (`--sealed` on `wsh reverse-connect`).

@@ -281,6 +281,8 @@ impl ReverseHostOptions {
                 wsh_core::RELAY_GATEWAY_FEATURE.to_string(),
                 "gateway".to_string(),
                 wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE.to_string(),
+                // The reason `released` on a GatewayClose (wsh #286), understood by this host's gateway session.
+                wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE.to_string(),
             ]);
         }
         if sealable {
@@ -1024,7 +1026,16 @@ impl ReverseHostRuntime {
             return Ok(false);
         }
         if fresh || self.gateway.is_none() {
-            self.gateway = Some(OperatorGateway::new(&options, client));
+            // The operator's own statement of `gateway-lossless-close` (wsh #286), as the relay passed it on in ReverseConnect.features.
+            let operator_lossless = self
+                .active_request
+                .as_ref()
+                .and_then(|r| r.features.as_ref())
+                .is_some_and(|f| {
+                    f.iter()
+                        .any(|x| x == wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE)
+                });
+            self.gateway = Some(OperatorGateway::new(&options, client, operator_lossless));
         }
         Ok(true)
     }

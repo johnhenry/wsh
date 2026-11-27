@@ -160,6 +160,33 @@ carries the same `GatewayFail` code 4 (policy) with a sentence that says which s
 (direct, through a pipe relay, a Node server, a reverse host behind a relay) and `test/browser/gateway-network.spec.mjs` (Chromium).
 Not tested against a release binary of the Rust CLI: stated from the wire, which this adds nothing to.
 
+## Worked case: the lossless close, `gateway-lossless-close` (#286)
+
+**One feature string, one reason text, no message and no field.** A side that understands the `GatewayClose` reason `released` ("I will read
+nothing more and send nothing more; deliver what you already sent, in order, then finish") states `gateway-lossless-close`: a client in
+`Hello.features` (the Rust client always, the JS client unless `gatewayLosslessClose: false`), a host in `ServerHello.features` (a gateway on
+`wsh-server` and the Node servers, unless `lossless_close = false` / `losslessClose: false`); behind a relay, the host in `ReverseAccept.features`
+and the operator in `ReverseConnect.features`. A side sends `released` **only to a peer that stated it** (and only when it holds an answering
+socket that half-closed and vanished, see the README), so a Rust decoder with `deny_unknown_fields` is never given anything new: the feature is a
+string in a list that already exists and the reason is the existing optional text of `GatewayClose`.
+
+| Host | Client / operator | What happens |
+| --- | --- | --- |
+| new | new | The feature is stated at both ends. The answering side (an origin the host dialled, a reverse forward's local service) is watched once half-closed; one that vanished releases its connection (`GatewayClose` `released`), one that closed completely after its whole answer loses nothing. |
+| new | released (0.61.0 JS, `rust-v0.25.0`) | The client does not state the feature, so the host does not send `released` and does not watch origins: exactly the behaviour before this change (an origin that vanished after its end of file is held until the client closes or the idle bound; one that closed completely loses nothing). Tested with `gatewayLosslessClose: false`, which is what a released client's `Hello` looks like. |
+| released | new | The host does not state the feature, so the client never sends `released` and does not watch a reverse forward's local service: as before. Tested with `losslessClose: false` / `lossless_close = false`. |
+| new | new, through the JS relay | The operator states the feature in `ReverseConnect.features` only when the relay lists `relay-gateway` and the host's registered record lists `gateway` (a host that can decode the field: a released peer of rust-v0.6 to v0.8 drops a connection on a field it does not know). The relay passes it on to a host that lists `gateway` (only that string) or `operator-proof` (the operator's features whole). A released JS relay (0.60.0, 0.61.0) strips it unless the host lists `operator-proof`: then nothing is negotiated and nothing changes. |
+| new | new, through the Rust relay | The Rust relay already carries `ReverseConnect.features` (bounded) unchanged: the released one too (`rust-v0.25.0`), so it carries this. |
+| new host | operator that did not state it, through a relay | The host sees no `gateway-lossless-close` in the request: its origins behind this bridge are not watched. |
+| a connection of an injected network (#299) | any | Never probed (there is no kernel to ask): unchanged, it ends when the network closes the stream; the feature is still stated, and a `released` close from the peer is understood. |
+
+What is tested: both ends new and each end declining (both implementations: `test/gateway-lossless-close.test.mjs`,
+`test/half-close-probe.test.mjs`, the `lossless` and `gateway` tests of `wsh-core` / `wsh-client`, `test/rust/wsh-half-close-probe.test.mjs`,
+`test/rust/wsh-reverse-forward-full-close.test.mjs` for the Rust `wsh -R`), through the JS relay and the Rust relay to a JS host and to the Rust CLI
+host (`test/relay-gateway.test.mjs`, `test/rust/wsh-relay-gateway.test.mjs`, `test/rust/wsh-reverse-host-half-close.test.mjs`), a TCP and a unix
+origin, 3 MiB through each, a slow reader, and an origin that vanished. Not tested against a released binary of either implementation: the old
+side is simulated by not stating the feature.
+
 ## What this policy does not promise
 
 - No peer older than the previous release of its implementation is tested. The CHANGELOG says what an older one does where it was known.

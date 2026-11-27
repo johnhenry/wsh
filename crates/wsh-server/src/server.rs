@@ -385,6 +385,8 @@ impl WshServer {
                 .then(|| std::time::Duration::from_secs(config.gateway_half_close_idle_secs)),
             half_close_probe: (config.gateway_half_close_probe_secs > 0)
                 .then(|| std::time::Duration::from_secs(config.gateway_half_close_probe_secs)),
+            lossless_close: config.gateway_lossless_close,
+            half_close_probe_answers: config.gateway_half_close_probe_answers,
         };
         let policy_enforcer = Arc::new(GatewayPolicyEnforcer::new(gateway_policy));
         let gateway_policy = policy_enforcer;
@@ -2605,6 +2607,11 @@ impl WshServer {
             features.push("gateway".to_string());
             // GatewayCredit flow control: used only when the client lists it too.
             features.push(crate::gateway::session::GATEWAY_CREDIT_FEATURE.to_string());
+            // The reason `released` on a `GatewayClose` (wsh #286): used only when the client lists it too. `[gateway] lossless_close =
+            // false` does not state it.
+            if self.config.gateway_lossless_close {
+                features.push(crate::gateway::session::GATEWAY_LOSSLESS_FEATURE.to_string());
+            }
             // OpenUnix / ListenUnix, only when the operator listed sockets.
             if self.gateway_policy.unix().is_enabled() {
                 features.push(crate::gateway::session::GATEWAY_UNIX_FEATURE.to_string());
@@ -5601,6 +5608,8 @@ mod wisp_reverse_connect_e2e_tests {
                 crate::gateway::policy::DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
             gateway_half_close_idle_secs: crate::gateway::policy::DEFAULT_HALF_CLOSE_IDLE_SECS,
             gateway_half_close_probe_secs: wsh_core::peer_watch::DEFAULT_HALF_CLOSE_PROBE.as_secs(),
+            gateway_lossless_close: true,
+            gateway_half_close_probe_answers: true,
             password_hashes: std::collections::HashMap::new(),
             rpc_enabled: true,
             rpc_max_message_bytes: crate::rpc::RPC_DEFAULT_MAX_MESSAGE,

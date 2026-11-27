@@ -220,6 +220,32 @@ describe('the JS reverse host behind the Rust relay', () => {
     for (const r of results) { assert.equal(r.n, SIZE); assert.ok(r.ok, 'bytes in order'); }
   });
 
+  it('gateway-lossless-close crosses the Rust relay to the JS host (#286): 3 MiB from an origin that closed completely arrive whole, a vanished origin releases the connection', async () => {
+    const SIZE = 3 * 1024 * 1024;
+    const big = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 4), () => s.destroy()); });
+    const bigPort = await listen(big);
+    const gone = [];
+    const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+    const vanishingPort = await listen(vanishing);
+    closers.push(async () => { big.close(); vanishing.close(); for (const s of gone) s.destroy(); });
+    const { op, keys } = await start(rustRelay, {}, { gateway: { allow: ['127.0.0.1'], halfCloseIdleMs: 0, halfCloseProbeMs: 50 } });
+    const res = await op.reverseConnect(keys.hostFp);
+    assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
+    assert.ok(res.features.includes('gateway-lossless-close'), `${res.features}`);
+    const d = await op.openTcp('127.0.0.1', bigPort);
+    const reader = d.readable.getReader();
+    let n = 0; let chunks = 0;
+    for (;;) { const { value, done } = await reader.read(); if (done) break; n += value.length; if (++chunks % 8 === 0) await sleep(1); }
+    assert.equal(n, SIZE);
+    d.destroy();
+    const v = await op.openTcp('127.0.0.1', vanishingPort);
+    const vr = v.readable.getReader();
+    for (;;) { const { done } = await vr.read(); if (done) break; }
+    await until(() => gone.length === 1, 'the origin to have been dialled');
+    gone[0].resetAndDestroy();
+    assert.equal(await Promise.race([v.closed, sleep(20_000).then(() => 'open')]), 'released');
+  });
+
   it('with the bridge sealed, through the Rust relay', async () => {
     const origin = await echoOrigin();
     const { op, keys } = await start(rustRelay, {}, { gateway: { allow: ['127.0.0.1'] }, requireOperatorProof: true });

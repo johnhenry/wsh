@@ -561,6 +561,135 @@ async fn a_second_discarded_close_from_the_host_ends_the_connection_and_nothing_
     );
 }
 
+// ── gateway-lossless-close (wsh #286): the reason `released` ──────
+
+fn host_lossless(lossless: bool) -> Host {
+    let h = host(true);
+    h.hub.set_lossless(lossless);
+    h
+}
+
+#[tokio::test]
+async fn a_host_that_released_the_connection_still_has_what_it_sent_delivered_in_order_and_nothing_goes_back(
+) {
+    for second in [false, true] {
+        let mut h = host_lossless(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        h.data(id, &[1u8; 10]).await;
+        h.data(id, &[2u8; 20]).await;
+        if second {
+            host_close(&h, id, None).await; // its end of file
+        }
+        host_close(&h, id, Some(GATEWAY_RELEASED)).await;
+        assert!(s.write_all(b"x").await.is_err(), "it reads nothing more");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 7];
+        loop {
+            let n = s.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        let want: Vec<u8> = [vec![1u8; 10], vec![2u8; 20]].concat();
+        assert_eq!(got, want, "everything, in order (second={second})");
+        drop(s);
+        assert!(
+            h.sent_within(100).await.is_none(),
+            "a release is not answered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_the_feature_released_is_an_ordinary_close() {
+    let mut h = host_lossless(false);
+    let s = open(&mut h).await;
+    let id = s.id();
+    host_close(&h, id, Some(GATEWAY_RELEASED)).await; // a half-close
+    s.write_all(b"still").await.unwrap();
+    let _ = h.sent().await;
+    host_close(&h, id, Some(GATEWAY_RELEASED)).await; // a repeated close with another reason: ignored
+    assert!(!s.is_closed());
+    s.write_all(b"again").await.unwrap();
+}
+
+#[tokio::test]
+async fn releasing_sends_the_reason_as_the_second_close_or_the_first_and_only_once() {
+    let mut h = host_lossless(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    s.shutdown().await;
+    expect_close(&mut h, id, None).await;
+    s.release();
+    expect_close(&mut h, id, Some(GATEWAY_RELEASED)).await;
+    s.release();
+    drop(s);
+    assert!(h.sent_within(100).await.is_none(), "only once");
+    let t = open(&mut h).await;
+    let tid = t.id();
+    t.release();
+    expect_close(&mut h, tid, Some(GATEWAY_RELEASED)).await;
+}
+
+#[tokio::test]
+async fn releasing_against_a_host_that_did_not_state_the_feature_is_a_discard() {
+    let mut h = host_lossless(false);
+    let s = open(&mut h).await;
+    let id = s.id();
+    s.shutdown().await;
+    expect_close(&mut h, id, None).await;
+    s.release();
+    expect_close(&mut h, id, Some(GATEWAY_DISCARDED)).await;
+}
+
+/// The local service of a `-R` that half-closed and went away: noticed, and the connection released (never discarded).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_local_service_that_half_closed_and_vanished_releases_the_connection() {
+    let mut h = host_lossless(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    let (local, mut service) = tokio::net::UnixStream::pair().unwrap();
+    let pump = tokio::spawn(s.pump_answering(local, None, Some(Duration::from_millis(50))));
+    service.write_all(b"answer").await.unwrap();
+    service.shutdown().await.unwrap(); // its end of file
+    match h.sent().await.payload {
+        Payload::GatewayData(d) => assert_eq!(d.data, b"answer"),
+        other => panic!("{other:?}"),
+    }
+    expect_close(&mut h, id, None).await;
+    assert!(
+        h.sent_within(300).await.is_none(),
+        "a half-closed service that is alive is held"
+    );
+    drop(service); // gone
+    expect_close(&mut h, id, Some(GATEWAY_RELEASED)).await;
+    assert!(pump.await.unwrap().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn without_the_feature_or_without_a_probe_the_service_is_not_watched() {
+    for (lossless, probe) in [(false, Some(Duration::from_millis(50))), (true, None)] {
+        let mut h = host_lossless(lossless);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut service) = tokio::net::UnixStream::pair().unwrap();
+        let pump = tokio::spawn(s.pump_answering(local, None, probe));
+        service.shutdown().await.unwrap();
+        expect_close(&mut h, id, None).await;
+        drop(service);
+        assert!(
+            h.sent_within(500).await.is_none(),
+            "not noticed: held, as before"
+        );
+        assert!(!pump.is_finished());
+        pump.abort();
+    }
+}
+
 #[tokio::test]
 async fn a_repeated_close_without_the_reason_changes_nothing() {
     let mut h = host(true);

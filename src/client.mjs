@@ -48,7 +48,7 @@ import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, verifyReverseChallenge, cre
 import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
 import { GatewayConnections, GatewayError, assertHalfCloseIdleMs } from './gateway-client.mjs';
-import { GATEWAY_CREDIT_FEATURE } from './gateway-channel.mjs';
+import { GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE } from './gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from './gateway-datagram.mjs';
 import { RpcCreditLink, rpcCreditId, rpcChannelOfCredit } from './rpc-virtual.mjs';
 import { cborDecode, cborEncode } from './cbor.mjs';
@@ -397,6 +397,10 @@ export class WshClient {
   /** @type {GatewayConnections|null} Created by the first openUnix()/openEndpoint()/openTcp()/listenUnix(). */
   #gateway = null;
   #gatewayHalfCloseIdleMs = undefined;
+  /** #286: state `gateway-lossless-close` (Hello; to a host behind a relay, ReverseConnect). `connect(url, { gatewayLosslessClose: false })` does not. */
+  #gatewayLosslessClose = true;
+  /** Whether the bridge now up was asked for with `gateway-lossless-close` stated to the host. */
+  #bridgeStatedLossless = false;
 
   /** @type {number|null} Ping interval handle. */
   #pingTimer = null;
@@ -689,13 +693,15 @@ export class WshClient {
    *   anything moves in either direction, and is ended after this many milliseconds with nothing moving. `0` never.
    * @returns {Promise<string>} The server-assigned session ID
    */
-  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, requireChannelBinding = false, sealSession = 'auto', gatewayHalfCloseIdleMs, ...hostKeyOpts } = {}) {
+  async connect(url, { username, keyPair, signer, password, transport: transportHint, webTransport, timeout = DEFAULT_AUTH_TIMEOUT, requireChannelBinding = false, sealSession = 'auto', gatewayHalfCloseIdleMs, gatewayLosslessClose = true, ...hostKeyOpts } = {}) {
     if (this.#state !== STATE_DISCONNECTED && this.#state !== STATE_CLOSED) {
       throw new Error(`Client already ${this.#state}`);
     }
     if (!username) {
       throw new Error('username is required');
     }
+    if (typeof gatewayLosslessClose !== 'boolean') throw new TypeError('gatewayLosslessClose must be a boolean');
+    this.#gatewayLosslessClose = gatewayLosslessClose;
     assertSealSession(sealSession);
     assertHalfCloseIdleMs(gatewayHalfCloseIdleMs, 'gatewayHalfCloseIdleMs');
     this.#gatewayHalfCloseIdleMs = gatewayHalfCloseIdleMs;
@@ -732,7 +738,7 @@ export class WshClient {
       const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
       await transport.sendControl(
-        hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE, ...(transport.supportsDatagrams ? [GATEWAY_DATAGRAM_FEATURE] : [])] })
+        hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE, ...(this.#gatewayLosslessClose ? [GATEWAY_LOSSLESS_FEATURE] : []), ...(transport.supportsDatagrams ? [GATEWAY_DATAGRAM_FEATURE] : [])] })
       );
       const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
@@ -1236,6 +1242,7 @@ export class WshClient {
     this.#stopPing();
     this.#state = STATE_CLOSED;
     this.#bridgedFeatures = null;
+    this.#bridgeStatedLossless = false;
     this.#gateway?.abandonAll('client disconnected');
 
     // Close all sessions concurrently.
@@ -1564,6 +1571,7 @@ export class WshClient {
 
     let response = null;
     let challenge = null;
+    let offerLossless = false;
     try {
       // A released peer (rust-v0.6 to v0.8) drops the connection on a ReverseConnect with a field it does not know, so the
       // offer is made only to a peer whose registered record lists `operator-proof` ('auto'), or when the caller insists
@@ -1582,6 +1590,17 @@ export class WshClient {
         }
       }
       const offerProof = proof !== false && relayCarriesProof && !!this.#signer && peerCanProve;
+      // #286: say `gateway-lossless-close` to a host that has a gateway behind a relay that carries it. Only to a peer whose registered record lists
+      // `gateway` (a host that can decode `ReverseConnect.features`: a released peer drops the connection on a field it does not know).
+      if (this.#gatewayLosslessClose && this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE)) {
+        let lossCaps = peerCapabilities;
+        if (!Array.isArray(lossCaps)) {
+          const peers = await this.listPeers(timeout).catch(() => []);
+          const hits = peers.filter((p) => p.fingerprint === targetFingerprint || (targetFingerprint.length >= 8 && String(p.fingerprint ?? '').startsWith(targetFingerprint)));
+          lossCaps = hits.length === 1 ? hits[0].capabilities : [];
+        }
+        offerLossless = Array.isArray(lossCaps) && lossCaps.includes('gateway');
+      }
 
       const ownFingerprint = this.#signer ? await computeFingerprint(this.#signer.publicKeyRaw) : null;
       // Register before sending: the answer can follow the request closely.
@@ -1592,7 +1611,8 @@ export class WshClient {
       );
       first.catch(() => {});
       const connectMsg = reverseConnectMsg({ targetFingerprint, username: '', fromFingerprint: '' });
-      if (offerProof) connectMsg.features = [OPERATOR_PROOF_FEATURE]; // only a relay that lists it may be sent the field
+      // only a relay that lists it may be sent the field (proof); `gateway-lossless-close` only to a host whose record lists `gateway` (see above)
+      if (offerProof || offerLossless) connectMsg.features = [...(offerProof ? [OPERATOR_PROOF_FEATURE] : []), ...(offerLossless ? [GATEWAY_LOSSLESS_FEATURE] : [])];
       // fromFingerprint is ignored by the server -- it overwrites it with
       // this connection's own authenticated fingerprint before forwarding.
       await plainSend(connectMsg);
@@ -1646,6 +1666,7 @@ export class WshClient {
       this.#bridgedFeatures = Array.isArray(response.features) && response.features.every((f) => typeof f === 'string')
         ? [...response.features]
         : null;
+      this.#bridgeStatedLossless = offerLossless;
     }
 
     return response;
@@ -1746,6 +1767,8 @@ export class WshClient {
     return (this.#gateway ??= new GatewayConnections({
       send: (m) => this.#sendGateway(m),
       hasFeature: (f) => this.hasFeature(f),
+      // #286: a connection may be released only if THIS side stated `gateway-lossless-close` too (to the host, or behind a bridge in ReverseConnect).
+      statesLossless: () => (this.#bridgedFeatures ? this.#bridgeStatedLossless : this.#gatewayLosslessClose),
       halfCloseIdleMs: this.#gatewayHalfCloseIdleMs,
       // Datagrams for UDP flows: only on a transport that has them AND a host that listed "gateway-datagram".
       datagrams: () => {
@@ -3203,7 +3226,7 @@ export class WshClient {
     try {
       const authMethod = cred ? AUTH_METHOD.PUBKEY : AUTH_METHOD.PASSWORD;
       const hostKeyNonce = newHostKeyNonce();
-      await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE, ...(this.#transport.supportsDatagrams ? [GATEWAY_DATAGRAM_FEATURE] : [])] }));
+      await this.#transport.sendControl(hello({ username, authMethod, features: [HOST_KEY_NONCE_PREFIX + hostKeyNonce, GATEWAY_CREDIT_FEATURE, ...(this.#gatewayLosslessClose ? [GATEWAY_LOSSLESS_FEATURE] : []), ...(this.#transport.supportsDatagrams ? [GATEWAY_DATAGRAM_FEATURE] : [])] }));
       const hostCtx = { ...hostKeyOpts, url, username, nonce: hostKeyNonce };
 
       const firstResponse = await this.#waitForMessage(
@@ -3673,6 +3696,7 @@ export class WshClient {
     this.#state = STATE_CLOSED;
     this.#closeInfo = normalizeCloseInfo(info);
     this.#bridgedFeatures = null;
+    this.#bridgeStatedLossless = false;
     this.#gateway?.abandonAll('transport closed');
     this.#stopPing();
     this.#rejectAllWaiters(new Error('Transport closed'));

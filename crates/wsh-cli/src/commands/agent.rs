@@ -708,6 +708,9 @@ fn startup_command_arguments(
             args.push(flag.to_string());
         }
     }
+    if policy.no_probe_answers {
+        args.push("--no-half-close-probe-answers".to_string());
+    }
     if policy.relay_gateway_max_connections != 0 {
         args.push("--relay-gateway-max-connections".to_string());
         args.push(policy.relay_gateway_max_connections.to_string());
@@ -1085,6 +1088,7 @@ mod tests {
             relay_gateway_listen: true,
             relay_gateway_trust_relay: true,
             relay_gateway_max_connections: 7,
+            no_probe_answers: true,
             ..Default::default()
         };
         let args = super::startup_command_arguments(
@@ -1104,6 +1108,7 @@ mod tests {
         assert_eq!(cli.cert_hashes, policy.cert_hashes);
         assert_eq!(cli.allow_operators, policy.allow_operators);
         assert_eq!(cli.relay_gateway_allow, policy.relay_gateway_allow);
+        assert_eq!(cli.no_half_close_probe_answers, policy.no_probe_answers);
         assert_eq!(cli.relay_gateway_udp, policy.relay_gateway_udp);
         assert_eq!(cli.relay_gateway_dns, policy.relay_gateway_dns);
         assert_eq!(cli.relay_gateway_listen, policy.relay_gateway_listen);
