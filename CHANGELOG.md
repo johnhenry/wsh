@@ -27,11 +27,11 @@
   top-level map), non-shortest integers, tags, duplicate keys or invalid UTF-8, or that appends bytes to a frame, is now refused. No released wsh
   encoder does any of those (the audit: `spec/cbor-vectors.json` holds every message type from the JS encoder, the current and the released Rust
   encoder; `scripts/cbor-interop-old.mjs` runs older `@johnhenry/wsh` encoders against the decoder). The previous `cborDecode` also accepted a
-  tag and returned its inner value, an `undefined` simple value, and a stray break as `undefined`; those are errors now.
+  tag and returned its inner value, any simple value (as its number) and a stray break (as `undefined`); those are errors now.
 - **A released peer.** A released JS or Rust peer reading what this release sends: unchanged (the JS encoder is untouched; the Rust encoder writes a
   definite map, which every released decoder reads). This release reading a released peer: everything the released encoders wrote is accepted
   (`test/cbor-vectors.test.mjs`, and the `test/rust` suite against the released `rust-v0.9.0` and `rust-v0.26.2` binaries; see the PR). The one thing
-  a released JS encoder (0.0.0 to 0.45.0) wrote that is refused is the value 2^64 as a zero in the wrong form, which it could not carry anyway.
+  a released JS encoder (0.0.0 to 0.45.0) wrote that is refused is the value 2^64 as `1b 00..00` (a zero in the wrong form, an encoder bug fixed in 0.47.0); no message carries it.
 - **Malformed frames on a control stream.** A frame that does not decode is reported as an error and dropped; the length prefix keeps the stream in
   step. On a sealed session the next frame then fails the strict counter and ends the session (unchanged; #314 makes a frame that is not this
   session's end it at once). A transport that wants a malformed frame to end the connection can do it from the `CborError`.

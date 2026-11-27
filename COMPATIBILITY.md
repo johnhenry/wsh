@@ -136,8 +136,7 @@ an indefinite-length rpc item, and its decoders refuse one.
 **An older peer.** What the released encoders write is recorded and checked: `test/cbor-vectors.test.mjs` (JS encoder, current Rust
 encoder and the released Rust encoder, every message type), `scripts/cbor-interop-old.mjs` (the encoder of an older `@johnhenry/wsh` install
 against this decoder: 0.47.0 to 0.62.2 are byte-identical to this encoder over 291 values; 0.0.0 to 0.45.0 differ only for the value 2^64,
-which they wrote as the non-canonical zero `1b 00..00` (a bug fixed in 0.47.0; no wsh message carries a number that large) and for -0 and
--2^63 (a different but equivalent encoding)). A peer written by someone else that emits indefinite lengths, non-shortest integers, tags
+which they wrote as the non-canonical zero `1b 00..00`, for -2^63 (one too low) and for -0 (as 0): bugs fixed in 0.47.0, in values no wsh message carries). A peer written by someone else that emits indefinite lengths, non-shortest integers, tags
 or duplicate keys is refused: that is the change, and it is listed as breaking in the CHANGELOG.
 
 ## Worked case: the gateway through a relay (`relay-gateway`, #289)

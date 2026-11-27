@@ -453,6 +453,40 @@ mod tests {
     }
 
     #[test]
+    fn decode_envelope_is_strict_a_stray_byte_a_long_head_and_a_cut_frame_are_errors() {
+        let v = vectors();
+        let ping = v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "Ping" && x["kind"] == "min")
+            .unwrap();
+        let good = ping["js"].as_str().unwrap().to_string();
+        assert!(
+            decode_envelope(&hex::decode(&good).unwrap()).is_ok(),
+            "{good}"
+        );
+        // a byte after the envelope
+        assert!(decode_envelope(&hex::decode(format!("{good}00")).unwrap()).is_err());
+        // the type (0x21) in the four-byte form instead of the shortest one
+        let longer = good.replacen("1821", "1a00000021", 1);
+        assert_ne!(longer, good, "the vector holds type 0x21 as 18 21");
+        assert!(decode_envelope(&hex::decode(longer).unwrap()).is_err());
+        // cut one byte short
+        assert!(decode_envelope(&hex::decode(&good[..good.len() - 2]).unwrap()).is_err());
+        // the same malformed bytes in an indefinite-length envelope (the legacy shape)
+        let legacy = format!("bf{}ff", &good[2..]);
+        assert!(
+            decode_envelope(&hex::decode(&legacy).unwrap()).is_ok(),
+            "the legacy shape of the same message"
+        );
+        assert!(
+            decode_envelope(&hex::decode(legacy.replacen("1821", "1a00000021", 1)).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn a_released_rust_peers_indefinite_map_envelope_is_still_read() {
         let v = vectors();
         for vec in v["vectors"]
