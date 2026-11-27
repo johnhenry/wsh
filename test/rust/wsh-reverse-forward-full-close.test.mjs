@@ -132,7 +132,9 @@ describe('the Rust wsh-server with this repo\'s JS client: the same two shapes',
   it('a JS reverse forward on the server: the caller half-closed, the service answers at length and closes completely', async () => {
     const dir = scratchDir('rffcj');
     const client = await login(dir);
-    const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 7), () => s.destroy()); });
+    // The service reads the whole request before it answers (as in the Node-host tests): one that answers and closes at once is reset by the kernel when the
+    // request reaches it, and the reset discards the unread tail of the answer (128000 of 3 MiB here), with no wsh code involved.
+    const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); s.once('end', () => s.end(Buffer.alloc(SIZE, 7), () => s.destroy())); s.resume(); });
     await new Promise((r) => service.listen(0, '127.0.0.1', r));
     closers.push(async () => service.close());
     const remote = path.join(dir, 'r.sock');
