@@ -39,6 +39,8 @@ const OPEN_TYPE: i128 = 0x10;
 /// reject the message. This looks at the raw map instead, leaving the spec and
 /// codegen untouched.
 pub fn peek_rpc_open(raw: &[u8]) -> Option<String> {
+    // only a payload the strict decoder (#317) would also accept is an rpc Open
+    wsh_core::cbor_strict::validate(raw).ok()?;
     let v: ciborium::value::Value = ciborium::from_reader(raw).ok()?;
     let ty = match super::get(&v, "type")? {
         ciborium::value::Value::Integer(i) => i128::from(*i),

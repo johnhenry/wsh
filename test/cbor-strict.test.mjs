@@ -36,7 +36,7 @@ describe('strict decoding: the shared table of malformed and accepted inputs', (
 describe('strict decoding: what the decoder still does', () => {
   it('round-trips what the encoder writes, for every kind of value the encoder takes', () => {
     const samples = [0, 1, 23, 24, 255, 256, 65535, 65536, 2 ** 32 - 1, 2 ** 32, 2 ** 53 - 1, -1, -24, -25, -256, -257, -65537, -(2 ** 32) - 1,
-      0.5, 1.5, -2.25, 1e300, Infinity, -Infinity, '', 'x', 'héllo 世界 \u{1f600}', 'a'.repeat(23), 'a'.repeat(24), 'a'.repeat(256), 'a'.repeat(70000),
+      0.5, 1.5, -2.25, 1e300, Infinity, -Infinity, '', 'x', '\ufeffx', 'x\ufeff', 'héllo 世界 \u{1f600}', 'a'.repeat(23), 'a'.repeat(24), 'a'.repeat(256), 'a'.repeat(70000),
       true, false, null, [], [1, [2, [3]]], {}, { a: 1, b: { c: [true, null, 'x'] } }, { type: 0x8f, channel_id: 1, nonce: new Uint8Array(12), ciphertext: new Uint8Array(40), session_id: 'abc' }];
     for (const v of samples) assert.deepEqual(cborDecode(cborEncode(v)), v);
     assert.ok(Number.isNaN(cborDecode(cborEncode(NaN))));
@@ -118,7 +118,7 @@ describe('the prefix API and the framing layer', () => {
 
   it('cborDecodePrefix is as strict as cborDecode about the value itself', () => {
     assert.throws(() => cborDecodePrefix(bytes('1800ff')), (e) => e.code === 'non-shortest');
-    assert.throws(() => cborDecodePrefix(bytes('7a0000001061')), (e) => e.code === 'length-exceeds-buffer');
+    assert.throws(() => cborDecodePrefix(bytes('7a00011170')), (e) => e.code === 'length-exceeds-buffer');
     assert.throws(() => cborDecodePrefix(bytes('00'), { offset: 5 }), (e) => e.code === 'truncated');
   });
 

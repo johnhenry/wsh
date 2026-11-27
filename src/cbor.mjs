@@ -13,7 +13,7 @@ const MT_BYTES    = 2;
 const MT_TEXT     = 3;
 const MT_ARRAY    = 4;
 const MT_MAP      = 5;
-const MT_TAG      = 6; // unused but recognized
+const MT_TAG      = 6; // refused by the decoder: the protocol uses no tags
 const MT_SIMPLE   = 7;
 
 const SIMPLE_FALSE = 20;
@@ -22,7 +22,6 @@ const SIMPLE_NULL  = 22;
 const FLOAT_16     = 25;
 const FLOAT_32     = 26;
 const FLOAT_64     = 27;
-const BREAK        = 31;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -152,184 +151,196 @@ function encodeHead(majorType, value) {
 }
 
 // ── Decoder ───────────────────────────────────────────────────────────
+//
+// Strict (#317). The decoder accepts exactly one well-formed, canonical encoding of every value wsh sends, and nothing else:
+//
+//   - every declared length (string, bytes, array, map) must fit in what is left of the buffer, checked BEFORE anything is allocated or looped over
+//     (an array needs one byte per element, a map two per pair), so a head that claims 2^32 elements fails at once;
+//   - after the top-level item there must be no bytes (`cborDecodePrefix` is the explicit way to read one item out of a longer buffer);
+//   - integers and lengths use the shortest form of their head; indefinite-length strings, arrays and maps are refused (RFC 8949 section 4.2.1);
+//   - no tags, no simple values but false/true/null, no reserved additional-info values, no stray break;
+//   - a map has text keys only, each once (so the order of keys is not meaningful: the JS encoder writes insertion order and the Rust encoder field order,
+//     and neither is sorted, so sorted order is NOT required);
+//   - text is valid UTF-8; nesting is at most MAX_DEPTH deep;
+//   - floats of any width are read (the JS encoder writes float64 for every float, the Rust encoder the shortest form that is exact).
+//
+// One legacy exception, switched off with `legacyIndefiniteMap: false`: the TOP-LEVEL item may be an indefinite-length map. Every released wsh Rust encoder
+// wrote its message envelope that way (serde's `flatten` made ciborium use an indefinite-length map), so a decoder that refused it would refuse every
+// message a released Rust peer sends. The Rust encoder in this tree writes a definite-length map; the exception exists for peers that predate it.
+// It covers the top-level map only: whatever it contains is held to every rule above. See COMPATIBILITY.md.
+
+/** The most deeply nested items a message may have. The rpc channel's scanner (src/rpc.mjs) uses the same bound. */
+export const CBOR_MAX_DEPTH = 128;
 
 /**
- * Decode CBOR bytes into a JS value.
- * @param {Uint8Array} data
- * @returns {*}
+ * A malformed input. `code` names the rule: `truncated`, `length-exceeds-buffer`, `trailing-bytes`, `non-shortest`, `indefinite-length`,
+ * `unexpected-break`, `reserved-additional-info`, `duplicate-key`, `non-text-key`, `tag`, `simple-value`, `invalid-utf8`, `too-deep`.
  */
-export function cborDecode(data) {
-  const state = { data, offset: 0 };
-  const result = decodeValue(state);
-  return result;
+export class CborError extends Error {
+  /** @param {string} code @param {string} message @param {number} [offset] byte offset the rule was broken at */
+  constructor(code, message, offset) {
+    super(`cborDecode: ${message}${offset === undefined ? '' : ` (at byte ${offset})`}`);
+    this.name = 'CborError';
+    this.code = code;
+    this.offset = offset;
+  }
 }
 
-function decodeValue(state) {
-  if (state.offset >= state.data.length) throw new Error('cborDecode: unexpected end');
-  const byte = state.data[state.offset++];
-  const mt = byte >> 5;
-  const ai = byte & 0x1f;
+const strictUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/**
+ * Decode CBOR bytes into a JS value. The whole buffer must be exactly one item; see the notes above for what is refused (a {@link CborError}).
+ * @param {Uint8Array} data
+ * @param {{ legacyIndefiniteMap?: boolean }} [options]
+ * @returns {*}
+ */
+export function cborDecode(data, options) {
+  const { value, end } = cborDecodePrefix(data, options);
+  if (end !== data.length) throw new CborError('trailing-bytes', `${data.length - end} byte(s) after the value`, end);
+  return value;
+}
+
+/**
+ * Decode ONE item that starts at `offset` and say where it ended, leaving whatever follows to the caller. Every rule that applies to the item
+ * applies; only the check that nothing follows it is left out. Nothing in wsh needs this today (the framing layer hands the decoder exactly one
+ * item); it is the explicit API for a caller that reads a sequence out of one buffer.
+ * @param {Uint8Array} data
+ * @param {{ offset?: number, legacyIndefiniteMap?: boolean }} [options]
+ * @returns {{ value: *, end: number }}
+ */
+export function cborDecodePrefix(data, { offset = 0, legacyIndefiniteMap = true } = {}) {
+  const state = { data, offset, legacy: legacyIndefiniteMap !== false, view: new DataView(data.buffer, data.byteOffset, data.byteLength) };
+  const value = decodeItem(state, 0);
+  return { value, end: state.offset };
+}
+
+/** The argument of a head whose additional info is `ai` (a number; exact up to 2^53, and anything larger is far past any buffer). */
+function readArgument(state, ai, start) {
+  if (ai < 24) return ai;
+  const { data, view } = state;
+  const size = ai === 24 ? 1 : ai === 25 ? 2 : ai === 26 ? 4 : 8;
+  if (state.offset + size > data.length) throw new CborError('truncated', 'the head is cut off', start);
+  let arg;
+  if (size === 1) arg = data[state.offset];
+  else if (size === 2) arg = view.getUint16(state.offset);
+  else if (size === 4) arg = view.getUint32(state.offset);
+  else {
+    const hi = view.getUint32(state.offset);
+    arg = hi * 0x100000000 + view.getUint32(state.offset + 4);
+    if (hi === 0) throw new CborError('non-shortest', 'an 8-byte argument below 2^32', start);
+  }
+  state.offset += size;
+  if ((size === 1 && arg < 24) || (size === 2 && arg < 0x100) || (size === 4 && arg < 0x10000)) throw new CborError('non-shortest', `${arg} is not in its shortest form`, start);
+  return arg;
+}
+
+/** A length: the argument, and it must fit what is left (`perItem` bytes at least for each of the `arg` items) before anything is made for it. */
+function readLength(state, ai, start, perItem) {
+  const len = readArgument(state, ai, start);
+  if (len * perItem > state.data.length - state.offset) throw new CborError('length-exceeds-buffer', `a length of ${len} with ${state.data.length - state.offset} byte(s) left`, start);
+  return len;
+}
+
+function decodeItem(state, depth) {
+  const { data } = state;
+  if (depth > CBOR_MAX_DEPTH) throw new CborError('too-deep', `nested more than ${CBOR_MAX_DEPTH} deep`, state.offset);
+  const start = state.offset;
+  if (start >= data.length) throw new CborError('truncated', 'unexpected end', start);
+  const initial = data[state.offset++];
+  const mt = initial >> 5;
+  const ai = initial & 0x1f;
+  if (ai >= 28 && ai <= 30) throw new CborError('reserved-additional-info', `additional info ${ai} is reserved`, start);
+  if (ai === 31) {
+    if (mt === MT_UNSIGNED || mt === MT_NEGATIVE || mt === MT_TAG) throw new CborError('reserved-additional-info', `additional info 31 on major type ${mt}`, start);
+    if (mt === MT_SIMPLE) throw new CborError('unexpected-break', 'a break outside an indefinite-length item', start);
+    if (mt === MT_MAP && depth === 0 && state.legacy) return decodeLegacyIndefiniteMap(state, depth);
+    throw new CborError('indefinite-length', 'indefinite-length items are not accepted', start);
+  }
 
   switch (mt) {
-    case MT_UNSIGNED: return decodeUint(state, ai);
+    case MT_UNSIGNED: return readArgument(state, ai, start);
     case MT_NEGATIVE: {
       if (ai === 27) {
         // Past 2^53 `-1 - n` would round twice (n, then the sum): take the nearest double of the exact value once.
-        const view = new DataView(state.data.buffer, state.data.byteOffset + state.offset, 8);
-        state.offset += 8;
-        return Number(-1n - view.getBigUint64(0));
+        readArgument(state, ai, start); // the shortest-form check; the exact value is read below
+        return Number(-1n - state.view.getBigUint64(state.offset - 8));
       }
-      return -1 - decodeUint(state, ai);
+      return -1 - readArgument(state, ai, start);
     }
     case MT_BYTES: {
-      if (ai === BREAK) return decodeIndefiniteBytes(state);
-      const len = decodeUint(state, ai);
-      const bytes = state.data.slice(state.offset, state.offset + len);
+      const len = readLength(state, ai, start, 1);
+      const bytes = data.slice(state.offset, state.offset + len);
       state.offset += len;
       return bytes;
     }
     case MT_TEXT: {
-      if (ai === BREAK) return decodeIndefiniteText(state);
-      const len = decodeUint(state, ai);
-      const text = decoder.decode(state.data.subarray(state.offset, state.offset + len));
+      const len = readLength(state, ai, start, 1);
+      let text;
+      try { text = strictUtf8.decode(data.subarray(state.offset, state.offset + len)); } catch { throw new CborError('invalid-utf8', 'a text string is not valid UTF-8', start); }
       state.offset += len;
       return text;
     }
     case MT_ARRAY: {
-      if (ai === BREAK) return decodeIndefiniteArray(state);
-      const len = decodeUint(state, ai);
+      const len = readLength(state, ai, start, 1);
       const arr = new Array(len);
-      for (let i = 0; i < len; i++) arr[i] = decodeValue(state);
+      for (let i = 0; i < len; i++) arr[i] = decodeItem(state, depth + 1);
       return arr;
     }
     case MT_MAP: {
-      if (ai === BREAK) return decodeIndefiniteMap(state);
-      const len = decodeUint(state, ai);
+      const len = readLength(state, ai, start, 2);
       const obj = {};
-      for (let i = 0; i < len; i++) {
-        const key = decodeValue(state);
-        setOwn(obj, key, decodeValue(state));
-      }
+      const seen = new Set();
+      for (let i = 0; i < len; i++) addPair(state, depth, obj, seen);
       return obj;
     }
-    case MT_TAG: {
-      // skip tag number, return inner value
-      decodeUint(state, ai);
-      return decodeValue(state);
-    }
-    case MT_SIMPLE: {
+    case MT_TAG:
+      throw new CborError('tag', 'tags are not used by the protocol', start);
+    default: { // MT_SIMPLE
       if (ai === SIMPLE_FALSE) return false;
       if (ai === SIMPLE_TRUE) return true;
       if (ai === SIMPLE_NULL) return null;
-      if (ai === FLOAT_16) {
-        // half-precision float
-        const half = (state.data[state.offset] << 8) | state.data[state.offset + 1];
-        state.offset += 2;
-        return decodeFloat16(half);
+      if (ai === FLOAT_16 || ai === FLOAT_32 || ai === FLOAT_64) {
+        const size = ai === FLOAT_16 ? 2 : ai === FLOAT_32 ? 4 : 8;
+        if (state.offset + size > data.length) throw new CborError('truncated', 'the float is cut off', start);
+        const at = state.offset;
+        state.offset += size;
+        return ai === FLOAT_16 ? decodeFloat16(state.view.getUint16(at)) : ai === FLOAT_32 ? state.view.getFloat32(at) : state.view.getFloat64(at);
       }
-      if (ai === FLOAT_32) {
-        const view = new DataView(state.data.buffer, state.data.byteOffset + state.offset, 4);
-        state.offset += 4;
-        return view.getFloat32(0);
-      }
-      if (ai === FLOAT_64) {
-        const view = new DataView(state.data.buffer, state.data.byteOffset + state.offset, 8);
-        state.offset += 8;
-        return view.getFloat64(0);
-      }
-      if (ai === BREAK) return undefined; // break code
-      return ai; // simple value
+      if (ai === 24 && state.offset >= data.length) throw new CborError('truncated', 'the simple value is cut off', start);
+      throw new CborError('simple-value', `simple value ${ai === 24 ? data[state.offset] : ai} is not used by the protocol`, start);
     }
-    default:
-      throw new Error(`cborDecode: unknown major type ${mt}`);
   }
 }
 
-function decodeIndefiniteBytes(state) {
-  const chunks = [];
-  while (!consumeBreak(state)) {
-    const chunk = decodeValue(state);
-    if (!(chunk instanceof Uint8Array)) {
-      throw new Error('cborDecode: invalid chunk in indefinite byte string');
-    }
-    chunks.push(chunk);
-  }
-  return concat(chunks);
+/** One key and its value into `obj`: the key must be a text string and not seen in this map. */
+function addPair(state, depth, obj, seen) {
+  const keyAt = state.offset;
+  if (keyAt < state.data.length && (state.data[keyAt] >> 5) !== MT_TEXT) throw new CborError('non-text-key', 'map keys are text strings', keyAt);
+  const key = decodeItem(state, depth + 1);
+  if (seen.has(key)) throw new CborError('duplicate-key', `the key ${JSON.stringify(key)} is in the map twice`, keyAt);
+  seen.add(key);
+  setOwn(obj, key, decodeItem(state, depth + 1));
 }
 
-function decodeIndefiniteText(state) {
-  let text = '';
-  while (!consumeBreak(state)) {
-    const chunk = decodeValue(state);
-    if (typeof chunk !== 'string') {
-      throw new Error('cborDecode: invalid chunk in indefinite text string');
-    }
-    text += chunk;
-  }
-  return text;
-}
-
-function decodeIndefiniteArray(state) {
-  const arr = [];
-  while (!consumeBreak(state)) {
-    arr.push(decodeValue(state));
-  }
-  return arr;
-}
-
-function decodeIndefiniteMap(state) {
+/** The legacy exception: the top-level item is a map with no count and a break at its end (what a released wsh Rust encoder wrote). Its contents are strict. */
+function decodeLegacyIndefiniteMap(state, depth) {
   const obj = {};
-  while (!consumeBreak(state)) {
-    const key = decodeValue(state);
-    setOwn(obj, key, decodeValue(state));
+  const seen = new Set();
+  for (;;) {
+    if (state.offset >= state.data.length) throw new CborError('truncated', 'the indefinite-length map is not closed', state.offset);
+    if (state.data[state.offset] === 0xff) { state.offset += 1; return obj; }
+    addPair(state, depth, obj, seen);
   }
-  return obj;
 }
 
 /**
  * Set a decoded map entry as plain own data. A key is untrusted wire input: `obj['__proto__'] = value` would run the
- * prototype setter and change what the object inherits, so that one key is defined as an own property instead (the key is
- * coerced to a string first, because `obj[['__proto__']]` reaches the same setter). Every other key, `constructor` and
+ * prototype setter and change what the object inherits, so that one key is defined as an own property instead. Every other key, `constructor` and
  * `prototype` included, is an ordinary assignment: it creates an own property and inherits no setter.
  */
-function setOwn(obj, key, value) {
-  const name = typeof key === 'string' ? key : String(key);
+function setOwn(obj, name, value) {
   if (name === '__proto__') Object.defineProperty(obj, name, { value, writable: true, enumerable: true, configurable: true });
   else obj[name] = value;
-}
-
-function consumeBreak(state) {
-  if (state.offset >= state.data.length) {
-    throw new Error('cborDecode: unexpected end in indefinite value');
-  }
-  if (state.data[state.offset] === 0xff) {
-    state.offset += 1;
-    return true;
-  }
-  return false;
-}
-
-function decodeUint(state, ai) {
-  if (ai < 24) return ai;
-  if (ai === 24) return state.data[state.offset++];
-  if (ai === 25) {
-    const val = (state.data[state.offset] << 8) | state.data[state.offset + 1];
-    state.offset += 2;
-    return val;
-  }
-  if (ai === 26) {
-    const view = new DataView(state.data.buffer, state.data.byteOffset + state.offset, 4);
-    state.offset += 4;
-    return view.getUint32(0);
-  }
-  if (ai === 27) {
-    const view = new DataView(state.data.buffer, state.data.byteOffset + state.offset, 8);
-    state.offset += 8;
-    const hi = view.getUint32(0);
-    const lo = view.getUint32(4);
-    return hi * 0x100000000 + lo;
-  }
-  throw new Error(`cborDecode: invalid additional info ${ai}`);
 }
 
 function decodeFloat16(half) {

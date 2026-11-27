@@ -339,13 +339,35 @@ pub const PROTOCOL_VERSION: &str = "wsh-v1";
 // ── Message payloads ──────────────────────────────────────────────────
 
 /// Envelope: every control message has a `type` plus a payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Serialization is written by hand below: `#[serde(flatten)]` makes serde call `serialize_map(None)`, which ciborium writes as an
+/// INDEFINITE-length map (0xbf ... 0xff), and RFC 8949 section 4.2 deterministic encoding (what the strict decoder, #317, expects) has no such
+/// map. Every wsh Rust release before this wrote that form, so the decoders still read it (`cbor_strict::Options::legacy_indefinite_map`).
+#[derive(Debug, Clone, Deserialize)]
 pub struct Envelope {
     #[serde(rename = "type")]
     pub msg_type: MsgType,
 
     #[serde(flatten)]
     pub payload: Payload,
+}
+
+impl Serialize for Envelope {
+    /// A definite-length map: `type` first, then the payload fields in declaration order (the same bytes as before, with a counted head).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeMap};
+        let entries = match ciborium::value::Value::serialized(&self.payload).map_err(S::Error::custom)? {
+            ciborium::value::Value::Map(entries) => entries,
+            ciborium::value::Value::Null => Vec::new(),
+            other => return Err(S::Error::custom(format!("envelope payload is not a map: {other:?}"))),
+        };
+        let mut map = serializer.serialize_map(Some(entries.len() + 1))?;
+        map.serialize_entry("type", &self.msg_type)?;
+        for (key, value) in &entries {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
 }
 
 /// All possible message payloads (untagged for CBOR compatibility).

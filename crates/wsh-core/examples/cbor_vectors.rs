@@ -8,7 +8,9 @@ use serde_json::Value as J;
 
 fn main() {
     let path = "spec/cbor-vectors.json";
-    let mut doc: J = serde_json::from_str(&std::fs::read_to_string(path).expect("run from the repo root")).unwrap();
+    let mut doc: J =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("run from the repo root"))
+            .unwrap();
     let mut failures = 0;
     for v in doc["vectors"].as_array_mut().unwrap() {
         let js = hex::decode(v["js"].as_str().unwrap()).unwrap();
@@ -36,5 +38,9 @@ fn main() {
         }
     }
     std::fs::write(path, serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();
-    eprintln!("{} vectors, {} the Rust decoder refused", doc["vectors"].as_array().unwrap().len(), failures);
+    eprintln!(
+        "{} vectors, {} the Rust decoder refused",
+        doc["vectors"].as_array().unwrap().len(),
+        failures
+    );
 }

@@ -19,7 +19,17 @@ pub fn frame_encode<T: serde::Serialize>(value: &T) -> WshResult<Vec<u8>> {
 }
 
 /// Decode a CBOR payload (without length prefix) into a typed value.
+///
+/// Strict (#317, [`crate::cbor_strict`]): `data` must be exactly one well-formed, canonical item. A declared length past the end of the buffer, a
+/// byte after the item, a non-shortest integer or length, an indefinite-length string or array, a duplicate or non-text map key, a tag and invalid UTF-8
+/// are errors. The one legacy exception is an indefinite-length map as the top-level item, which every wsh Rust encoder before this one wrote.
 pub fn cbor_decode<T: serde::de::DeserializeOwned>(data: &[u8]) -> WshResult<T> {
+    crate::cbor_strict::validate(data).map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
+    decode_checked(data)
+}
+
+/// Deserialize bytes that [`crate::cbor_strict::validate`] has already accepted.
+fn decode_checked<T: serde::de::DeserializeOwned>(data: &[u8]) -> WshResult<T> {
     let cursor = Cursor::new(data);
     let value: T = ciborium::from_reader(cursor)?;
     Ok(value)
@@ -40,8 +50,9 @@ pub fn decode_envelope(data: &[u8]) -> WshResult<Envelope> {
         msg_type: MsgType,
     }
 
-    let header: EnvelopeTypeOnly = cbor_decode(data)?;
-    let value: ciborium::value::Value = cbor_decode(data)?;
+    crate::cbor_strict::validate(data).map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
+    let header: EnvelopeTypeOnly = decode_checked(data)?;
+    let value: ciborium::value::Value = decode_checked(data)?;
     let payload_value = match value {
         ciborium::value::Value::Map(entries) => ciborium::value::Value::Map(
             entries
@@ -385,14 +396,25 @@ mod tests {
     fn cbor_decode_is_strict_a_stray_byte_a_bad_length_and_a_long_head_are_errors() {
         use ciborium::value::Value;
         assert!(cbor_decode::<Value>(&[0x00]).is_ok());
-        for bad in [&[0x00u8, 0x00][..], &[0x61][..], &[0x18, 0x01][..], &[0x7a, 0, 0, 0, 0x10][..], &[0xf7][..], &[0xc0, 0x00][..]] {
+        for bad in [
+            &[0x00u8, 0x00][..],
+            &[0x61][..],
+            &[0x18, 0x01][..],
+            &[0x7a, 0, 0, 0, 0x10][..],
+            &[0xf7][..],
+            &[0xc0, 0x00][..],
+        ] {
             assert!(cbor_decode::<Value>(bad).is_err(), "{bad:02x?}");
         }
     }
 
     #[test]
     fn a_frame_with_a_stray_byte_after_the_value_is_an_error_not_a_message() {
-        let mut frame = frame_encode(&TestMsg { name: "x".into(), value: 1 }).unwrap();
+        let mut frame = frame_encode(&TestMsg {
+            name: "x".into(),
+            value: 1,
+        })
+        .unwrap();
         frame.push(0x00);
         let len = (frame.len() - 4) as u32;
         frame[..4].copy_from_slice(&len.to_be_bytes());
@@ -404,14 +426,24 @@ mod tests {
     fn an_encoded_envelope_is_a_definite_length_map_not_serdes_indefinite_flatten_map() {
         let v = vectors();
         let mut n = 0;
-        for vec in v["vectors"].as_array().unwrap().iter().filter(|x| x["layer"] == "control") {
+        for vec in v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["layer"] == "control")
+        {
             let js = hex::decode(vec["js"].as_str().unwrap()).unwrap();
             let env = decode_envelope(&js).unwrap();
             let out = cbor_encode(&env).unwrap();
             assert_ne!(out[0], 0xbf, "{}: indefinite-length map", vec["name"]);
             assert_eq!(out[0] >> 5, 5, "{}: a map", vec["name"]);
-            crate::cbor_strict::validate_with(&out, &crate::cbor_strict::Options { legacy_indefinite_map: false })
-                .unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
+            crate::cbor_strict::validate_with(
+                &out,
+                &crate::cbor_strict::Options {
+                    legacy_indefinite_map: false,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
             // and what it says is unchanged
             let back = decode_envelope(&out).unwrap();
             assert_eq!(back.msg_type, env.msg_type);
@@ -423,7 +455,12 @@ mod tests {
     #[test]
     fn a_released_rust_peers_indefinite_map_envelope_is_still_read() {
         let v = vectors();
-        for vec in v["vectors"].as_array().unwrap().iter().filter(|x| x["layer"] == "control") {
+        for vec in v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["layer"] == "control")
+        {
             let old = hex::decode(vec["rust_released"].as_str().unwrap()).unwrap();
             assert_eq!(old[0], 0xbf);
             let env = decode_envelope(&old).unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));

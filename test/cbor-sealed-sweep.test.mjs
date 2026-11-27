@@ -48,9 +48,10 @@ async function trial({ flip = null, capture = null } = {}) {
   armed = true;
   void client.openSession({ type: 'exec', command: 'sweep-a' }).catch(() => {});
   await pause(110);
+  const endedAtOnce = refused.length > 0 || clientClosed; // before any later frame: ended by the tampered frame itself
   void client.openSession({ type: 'exec', command: 'sweep-b' }).catch(() => {});
   await pause(110);
-  const result = { ran: ran.slice(), refused: refused.slice(), clientClosed, tampered: done };
+  const result = { ran: ran.slice(), refused: refused.slice(), clientClosed, tampered: done, endedAtOnce };
   await link.close().catch(() => {});
   await host.close().catch(() => {});
   return result;
@@ -85,8 +86,11 @@ describe('a bit flipped anywhere in a sealed EncryptedFrame in flight (#317)', (
       }
     }));
 
-    const ranSomething = results.filter((r) => r.ran.length);
-    assert.deepEqual(ranSomething.map((r) => `offset ${r.offset - cborStart} bit ${r.bit}: ran ${r.ran}`), [], 'no flip leaves a frame that runs');
+    // The 4-byte length prefix and the frame itself: no flip leaves anything that runs. (The bytes before the prefix are the QMux record header; a
+    // few of its bits are not read by the transport at all, so a flip there changes nothing. That is the transport's business, not the frame's.)
+    const ranSomething = results.filter((r) => r.ran.length && r.offset >= cborStart - 4);
+    assert.deepEqual(ranSomething.map((r) => `offset ${r.offset - cborStart} bit ${r.bit}: ran ${r.ran}`), [], 'no flip in the length prefix or the frame leaves a frame that runs');
+    assert.ok(results.some((r) => r.offset < cborStart - 4), 'the QMux header was swept too');
 
     const outcome = (r) => (r.refused.length || r.clientClosed ? 'closed' : 'dropped');
     const by = (pred) => results.filter(pred);
@@ -99,8 +103,9 @@ describe('a bit flipped anywhere in a sealed EncryptedFrame in flight (#317)', (
       const rows = {};
       for (const r of results) { const k = r.offset < cborStart ? 'outside the frame (qmux + length prefix)' : 'inside the frame'; rows[k] ??= { closed: 0, dropped: 0 }; rows[k][outcome(r)]++; }
       console.log(JSON.stringify({ cborLength: captured.length - cborStart, sessionIdLengthOffset: sessionIdLen - cborStart, rows }, null, 1));
-      const dropped = [...new Set(by((r) => outcome(r) === 'dropped' && r.offset >= cborStart).map((r) => r.offset - cborStart))].sort((a, b) => a - b);
-      console.log('offsets inside the frame where a flip was dropped without ending the session:', dropped.join(','));
+      const list = (pred) => [...new Set(by((r) => r.offset >= cborStart && pred(r)).map((r) => r.offset - cborStart))].sort((a, b) => a - b).join(',');
+      console.log('offsets inside the frame (any bit) whose flip ended the session at once:', list((r) => r.endedAtOnce));
+      console.log('offsets inside the frame whose flip was dropped, the session ended by the NEXT frame (counter gap):', list((r) => !r.endedAtOnce));
     }
   });
 });
@@ -121,7 +126,7 @@ describe('a bit flipped anywhere in a plain frame is refused or is the canonical
         assert.equal(Buffer.from(cborEncode(value)).toString('hex'), Buffer.from(f).toString('hex'), `offset ${i} bit ${bit} was accepted but is not the canonical encoding of what it decodes to`);
       }
     }
-    assert.ok(refused > accepted / 4 && accepted > 0, `${refused} refused, ${accepted} accepted`);
+    assert.ok(refused > 200 && accepted > 200, `${refused} refused, ${accepted} accepted`); // the rest of the accepted ones flipped a character of a text or a byte of a byte string
   });
 
   it('the session-id length byte of an EncryptedFrame: every one of the 8 bits is refused, but the one that turns the text into a byte string of the same length (which the frame check then fails on)', () => {

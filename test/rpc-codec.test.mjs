@@ -53,11 +53,11 @@ describe('CborSequenceDecoder', () => {
     assert.deepEqual(out.blob, big);
   });
 
-  it('handles indefinite-length items and tags', () => {
-    const d = new CborSequenceDecoder();
-    // [_ 1, 2] , {_ "a": 1} , (_ h'01', h'02') , tag(1)(5)
-    const bytes = new Uint8Array([0x9f, 1, 2, 0xff, 0xbf, 0x61, 0x61, 1, 0xff, 0x5f, 0x41, 1, 0x41, 2, 0xff, 0xc1, 5]);
-    assert.deepEqual(d.feed(bytes), [[1, 2], { a: 1 }, new Uint8Array([1, 2]), 5]);
+  it('refuses indefinite-length items and tags (strict since #317; no released encoder wrote one on an rpc channel)', () => {
+    // [_ 1, 2] , {_ "a": 1} , (_ h'01', h'02') , tag(1)(5): each is a parse error on its own
+    for (const bytes of [[0x9f, 1, 2, 0xff], [0xbf, 0x61, 0x61, 1, 0xff], [0x5f, 0x41, 1, 0x41, 2, 0xff], [0xc1, 5]]) {
+      assert.throws(() => new CborSequenceDecoder().feed(new Uint8Array(bytes)), (e) => e instanceof RpcError && e.code === RPC_ERROR.PARSE, `${bytes}`);
+    }
   });
 
   it('rejects an item larger than the limit as soon as its head says so', () => {

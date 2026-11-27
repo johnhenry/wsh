@@ -2801,7 +2801,7 @@ so options the platform gains later need no change here.
 | `MSG` | 110 message type constants (hex opcodes) |
 | `CHANNEL_KIND` | Channel types: `pty`, `exec`, `meta`, `file`, `tcp`, `udp`, `job` |
 | `AUTH_METHOD` | Auth methods: `pubkey`, `password` |
-| `cborEncode` / `cborDecode` | CBOR codec (maps, arrays, strings, ints, bytes, bools, null, floats) |
+| `cborEncode` / `cborDecode` / `cborDecodePrefix` / `CborError` | CBOR codec (maps, arrays, strings, ints, bytes, bools, null, floats). The decoder is strict: one canonical item, lengths within the buffer, no tags, indefinite lengths or duplicate keys (see COMPATIBILITY.md rule 7) |
 | `frameEncode` / `FrameDecoder` | 4-byte big-endian length-prefixed framing |
 | `QMuxConnection` + QMux primitives | QMux stream state machine, error codes, and stream-id helpers for building alternate servers |
 

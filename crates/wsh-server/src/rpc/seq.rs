@@ -185,6 +185,14 @@ impl CborSequenceDecoder {
                 if end - off > self.max {
                     return Err(RpcError::too_large("message", end - off, self.max));
                 }
+                // each item is held to the strict rules (#317) before it is read: the scan above only finds where it ends
+                wsh_core::cbor_strict::validate_with(
+                    &self.buf[off..end],
+                    &wsh_core::cbor_strict::Options {
+                        legacy_indefinite_map: false,
+                    },
+                )
+                .map_err(|e| RpcError::new(code::PARSE, format!("malformed cbor: {e}")))?;
                 let item: Value = ciborium::from_reader(&self.buf[off..end])
                     .map_err(|e| RpcError::new(code::PARSE, format!("malformed cbor: {e}")))?;
                 out.push(item);
@@ -276,15 +284,22 @@ mod tests {
     }
 
     #[test]
-    fn indefinite_strings_and_maps_decode() {
+    fn indefinite_lengths_are_refused_the_decoder_is_strict_since_317() {
+        // (_ "a", "b"), {_ "k": 1} and [_ 1]: each is a parse error (the control envelope's legacy exception does not apply to rpc items)
+        for bytes in [
+            &[0x7f, 0x61, b'a', 0x61, b'b', 0xff][..],
+            &[0xbf, 0x61, b'k', 0x01, 0xff][..],
+            &[0x9f, 0x01, 0xff][..],
+        ] {
+            let mut d = CborSequenceDecoder::new(64);
+            let e = d.feed(bytes).unwrap_err();
+            assert_eq!(e.code, code::PARSE, "{bytes:02x?}");
+        }
         let mut d = CborSequenceDecoder::new(64);
-        // (_ "a", "b")  and {_ "k": 1}
-        let items = d
-            .feed(&[
-                0x7f, 0x61, b'a', 0x61, b'b', 0xff, 0xbf, 0x61, b'k', 0x01, 0xff,
-            ])
-            .unwrap();
-        assert_eq!(items[0], Value::Text("ab".into()));
-        assert_eq!(items.len(), 2);
+        assert_eq!(
+            d.feed(&[0x01, 0x61, b'a']).unwrap().len(),
+            2,
+            "canonical items are still read"
+        );
     }
 }

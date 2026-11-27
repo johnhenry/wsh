@@ -2,9 +2,9 @@
  "note": "Shared table for the strict CBOR decoder (#317). Read by test/cbor-strict.test.mjs and by wsh-core codec::tests. `error` is the rule code a decoder must report, null if the bytes are accepted. `legacy: false` runs the case with legacyIndefiniteMap off.",
  "cases": [
   {
-   "hex": "7a00000010",
+   "hex": "7a00011170",
    "error": "length-exceeds-buffer",
-   "why": "text string declaring 16 bytes with none left (#317: the session-id length byte)"
+   "why": "text string declaring 70000 bytes (a 4-byte length) with none left (#317: the session-id length byte)"
   },
   {
    "hex": "616100",
@@ -42,9 +42,9 @@
    "why": "text string declaring 2^32 bytes"
   },
   {
-   "hex": "9a0000010000",
+   "hex": "9a0001000000",
    "error": "length-exceeds-buffer",
-   "why": "array declaring 256 elements with 1 byte left"
+   "why": "array declaring 65536 elements with 1 byte left"
   },
   {
    "hex": "9b000000010000000000",
@@ -484,7 +484,7 @@
    "why": "keys in any order: wsh has no canonical key order (the JS encoder writes insertion order, Rust writes field order)"
   },
   {
-   "hex": "a2616101a1616101",
+   "hex": "a26161016162a1616101",
    "error": null,
    "why": "the same key in different maps is fine"
   },
@@ -702,6 +702,11 @@
    "hex": "a1646e616d656161",
    "error": null,
    "why": "a map with one text pair (name: \"a\")"
+  },
+  {
+   "hex": "7a0000001061",
+   "error": "non-shortest",
+   "why": "text length 16 in the four-byte form (#317 session-id length byte flipped into a long form)"
   }
  ]
 }

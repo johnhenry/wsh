@@ -102,6 +102,44 @@ last release is breaking in the sense of rule "versions" above even when no depl
 - If you change `spec/wsh-v1.yaml`: `npm run codegen`, then the matrix with `npm run matrix`; `npm run codegen:check` and
   `npm run matrix:check` are both CI gates.
 
+### 7. CBOR is read strictly, and the two decoders are one rule set (#317)
+
+A message is accepted only if it is exactly one well-formed, canonical CBOR item. `cborDecode` (`src/cbor.mjs`) and `cbor_decode` /
+`cbor_strict::validate` (`crates/wsh-core/src/cbor_strict.rs`) refuse, with the same rule code (`CborError.code`, `StrictCode::as_str()`), the
+same inputs (`spec/cbor-strict-cases.json` is the shared table; `test/rust/cbor-differential.test.mjs` compares the two on 20000 mutations):
+
+| Rule | Code |
+|---|---|
+| a declared string, byte-string, array or map length past the end of the buffer (an array needs a byte per element, a map two per pair; checked before anything is allocated) | `length-exceeds-buffer` |
+| a head or item cut off | `truncated` |
+| a byte after the top-level item (`cborDecodePrefix` / `item_end` read one item out of a longer buffer) | `trailing-bytes` |
+| an integer or length that is not in the shortest form of its head | `non-shortest` |
+| an indefinite-length string, array or map (except the legacy exception below); a break outside one | `indefinite-length`, `unexpected-break` |
+| reserved additional info (28 to 30; 31 on integers and tags) | `reserved-additional-info` |
+| a map key twice in one map; a map key that is not text | `duplicate-key`, `non-text-key` |
+| any tag; any simple value but `false`, `true`, `null` | `tag`, `simple-value` |
+| a text string that is not UTF-8; nesting deeper than 128 | `invalid-utf8`, `too-deep` |
+
+What is **not** required, because the two encoders disagree and refusing it would break a released peer: **the order of map keys** (the JS encoder
+writes insertion order, the Rust encoder field order; neither is the RFC 8949 length-first order), and **the width of a float** (the JS encoder
+writes every float as float64, ciborium the shortest exact width; all three widths are read).
+
+**The one legacy exception.** Every released `wsh-core` encoder wrote a message envelope as an **indefinite-length map** (`0xbf ... 0xff`):
+`Envelope` has a `#[serde(flatten)]` payload, which makes serde ask for an unsized map and ciborium write the indefinite form. All 110
+message types did this (`spec/cbor-vectors.json`, `rust_released`), so refusing it would refuse every message a released `wsh`,
+`wsh-server` or `wsh-client` sends. Decoders therefore accept an indefinite-length map as the **top-level item** (`legacyIndefiniteMap`,
+default true), and nowhere else; what is inside it is held to every rule above. The Rust encoder in this tree writes a definite-length
+map (`Envelope` serializes by hand, generated from `spec/codegen.mjs`), so the exception is only for peers that predate it, and can be
+removed once none is supported. The rpc channel (a CBOR sequence of JSON-RPC messages) never had the exception: no released encoder wrote
+an indefinite-length rpc item, and its decoders refuse one.
+
+**An older peer.** What the released encoders write is recorded and checked: `test/cbor-vectors.test.mjs` (JS encoder, current Rust
+encoder and the released Rust encoder, every message type), `scripts/cbor-interop-old.mjs` (the encoder of an older `@johnhenry/wsh` install
+against this decoder: 0.47.0 to 0.62.2 are byte-identical to this encoder over 291 values; 0.0.0 to 0.45.0 differ only for the value 2^64,
+which they wrote as the non-canonical zero `1b 00..00` (a bug fixed in 0.47.0; no wsh message carries a number that large) and for -0 and
+-2^63 (a different but equivalent encoding)). A peer written by someone else that emits indefinite lengths, non-shortest integers, tags
+or duplicate keys is refused: that is the change, and it is listed as breaking in the CHANGELOG.
+
 ## Worked case: the gateway through a relay (`relay-gateway`, #289)
 
 `OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their answers (`DnsResult`, `ListenOk`, `ListenFail`, `ListenClose`, `InboundOpen`,
