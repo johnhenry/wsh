@@ -116,12 +116,13 @@ describe('a bit flipped anywhere in a plain frame is refused or is the canonical
       cborEncode(openMsg({ channelId: 7, kind: 'exec', command: 'echo hi', cols: 80, rows: 24 })),
       cborEncode({ type: MSG.ENCRYPTED_FRAME, channel_id: 0, nonce: new Uint8Array(12).fill(1), ciphertext: new Uint8Array(60).fill(2), session_id: 'abcdef0123456789' }),
     ];
+    // strict (every legacy option off): the compatibility window would also read a flip that only reorders keys or widens a float
     let refused = 0; let accepted = 0;
     for (const frame of frames) {
       for (let i = 0; i < frame.length; i++) for (let bit = 0; bit < 8; bit++) {
         const f = frame.slice(); f[i] ^= 1 << bit;
         let value;
-        try { value = cborDecode(f); } catch (e) { assert.ok(e instanceof CborError, `${i}/${bit}: ${e.message}`); refused++; continue; }
+        try { value = cborDecode(f, { strict: true, unsafeIntegers: 'bigint' }); } catch (e) { assert.ok(e instanceof CborError, `${i}/${bit}: ${e.message}`); refused++; continue; }
         accepted++;
         assert.equal(Buffer.from(cborEncode(value)).toString('hex'), Buffer.from(f).toString('hex'), `offset ${i} bit ${bit} was accepted but is not the canonical encoding of what it decodes to`);
       }

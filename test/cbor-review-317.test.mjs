@@ -87,11 +87,10 @@ describe('cborDecodePrefix: the offset (#324 review)', () => {
     }
     assert.throws(() => cborDecodePrefix(data, { offset: data.length }), (e) => e instanceof CborError && e.code === 'truncated', 'an offset AT the end is in range, and there is nothing there');
   });
-  it('accepts the legacy top-level indefinite map at any offset: the item the call reads is its own top level', () => {
+  it('reads the legacy top-level indefinite map at offset 0 only (#326): after another item, or anywhere else, it is an indefinite-length map like any other', () => {
     const legacy = Uint8Array.from([0xbf, 0x61, 0x61, 0x01, 0xff]);
-    const r = cborDecodePrefix(cat(Uint8Array.of(9, 9, 9), legacy), { offset: 3 });
-    assert.deepEqual(r.value, { a: 1 });
-    assert.equal(r.end, 8);
+    assert.deepEqual(cborDecodePrefix(cat(legacy, Uint8Array.of(9)), {}), { value: { a: 1 }, end: 5 });
+    assert.throws(() => cborDecodePrefix(cat(Uint8Array.of(9, 9, 9), legacy), { offset: 3 }), (e) => e instanceof CborError && e.code === 'indefinite-length' && e.offset === 3);
   });
 });
 

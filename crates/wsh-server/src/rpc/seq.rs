@@ -190,6 +190,8 @@ impl CborSequenceDecoder {
                     &self.buf[off..end],
                     &wsh_core::cbor_strict::Options {
                         legacy_indefinite_map: false,
+                        // the canonical rules stay in their compatibility window here too: released rpc peers wrote insertion/field order and float64
+                        ..wsh_core::cbor_strict::Options::default()
                     },
                 )
                 .map_err(|e| RpcError::new(code::PARSE, format!("malformed cbor: {e}")))?;

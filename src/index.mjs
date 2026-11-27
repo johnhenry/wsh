@@ -6,7 +6,7 @@
  */
 
 // CBOR codec + framing
-export { cborEncode, cborDecode, cborDecodePrefix, CborError, CBOR_MAX_DEPTH, frameEncode, FrameDecoder, FrameSizeError, DEFAULT_MAX_FRAME_SIZE } from './cbor.mjs';
+export { cborEncode, cborDecode, cborDecodePrefix, CborError, CBOR_MAX_DEPTH, CBOR_MAX_CONTAINERS, frameEncode, FrameDecoder, FrameSizeError, DEFAULT_MAX_FRAME_SIZE } from './cbor.mjs';
 
 // Protocol messages
 export {

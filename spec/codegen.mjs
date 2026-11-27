@@ -681,7 +681,7 @@ function emitRust(schema) {
   out.push('}');
   out.push('');
   out.push('impl Serialize for Envelope {');
-  out.push('    /// A definite-length map: `type` first, then the payload fields in declaration order (the same bytes as before, with a counted head).');
+  out.push('    /// A definite-length map: `type` first, then the payload fields in declaration order, with a counted head. Written through `cbor_encode` / `frame_encode` its keys are then sorted (`cbor_canon`), so this order is not the wire order.');
   out.push('    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {');
   out.push('        use serde::ser::{Error, SerializeMap};');
   out.push('        let entries = match ciborium::value::Value::serialized(&self.payload).map_err(S::Error::custom)? {');

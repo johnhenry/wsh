@@ -7,6 +7,7 @@
 // names this crate as `wsh_core::...`; that path works inside the crate too.
 extern crate self as wsh_core;
 
+pub mod cbor_canon;
 pub mod cbor_strict;
 pub mod channel_binding;
 pub mod codec;
@@ -41,7 +42,9 @@ pub const RELAY_MULTI_OPERATOR_FEATURE: &str = "relay-multi-operator";
 pub const RELAY_GATEWAY_FEATURE: &str = "relay-gateway";
 
 // Re-export commonly used items at crate root.
-pub use codec::{cbor_decode, cbor_encode, decode_envelope, frame_encode, FrameDecoder};
+pub use codec::{
+    cbor_decode, cbor_decode_with, cbor_encode, decode_envelope, frame_encode, FrameDecoder,
+};
 pub use error::{WshError, WshResult};
 pub use identity::{fingerprint, short_fingerprint, FingerprintIndex};
 pub use messages::{AuthMethod, ChannelKind, MsgType, PROTOCOL_VERSION};

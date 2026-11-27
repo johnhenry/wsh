@@ -353,7 +353,7 @@ pub struct Envelope {
 }
 
 impl Serialize for Envelope {
-    /// A definite-length map: `type` first, then the payload fields in declaration order (the same bytes as before, with a counted head).
+    /// A definite-length map: `type` first, then the payload fields in declaration order, with a counted head. Written through `cbor_encode` / `frame_encode` its keys are then sorted (`cbor_canon`), so this order is not the wire order.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::{Error, SerializeMap};
         let entries = match ciborium::value::Value::serialized(&self.payload).map_err(S::Error::custom)? {
