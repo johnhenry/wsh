@@ -648,7 +648,7 @@ export function createConnectionFactory(cfg) {
         gateway?.setPeerFeatures(m.features);
         const features = hostFeatures(sealMode === cfg.sealSession ? cfg : { ...cfg, sealSession: sealMode }, { dataStreams });
         // UDP over datagrams only where this transport has them and the gateway serves (and allows) UDP.
-        if (datagrams && cfg.gateway?.tcp && cfg.gateway.udp?.datagrams) features.push(GATEWAY_DATAGRAM_FEATURE);
+        if (datagrams && cfg.gateway?.tcp && cfg.gateway.udpOn !== false && cfg.gateway.udp?.datagrams) features.push(GATEWAY_DATAGRAM_FEATURE);
         let hostFingerprint;
         if (cfg.hostKey) {
           hostFingerprint = cfg.hostKey.fingerprint;

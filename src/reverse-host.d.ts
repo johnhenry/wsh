@@ -19,6 +19,11 @@ export interface WshBrowserReverseHostOptions extends Omit<WshReverseHostOptions
   rpc?: Record<string, ((channel: import('./index.js').RpcChannel, ctx: import('./server/index.js').WshRpcContext) => void | Promise<void>) | false | null | undefined>;
   rpcMaxMessageBytes?: number;
   rpcMaxInflight?: number;
+  /**
+   * #299: the gateway (#289) for an operator behind the relay, over a network you supply (`gateway.network`; this entry has no sockets). Off unless given; the
+   * owner's separate switches (`udp`, `dns`, `reverse`) and `trustRelayIdentity` / `requireOperatorProof` are those of `@johnhenry/wsh/server`'s reverse host.
+   */
+  gateway?: import('./gateway.js').WshNetworkReverseGatewayOptions;
 }
 
 /**

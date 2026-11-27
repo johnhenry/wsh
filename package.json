@@ -13,6 +13,10 @@
       "types": "./src/server/index.d.ts",
       "import": "./src/server/index.mjs"
     },
+    "./gateway": {
+      "types": "./src/gateway.d.ts",
+      "import": "./src/gateway.mjs"
+    },
     "./address-guard": {
       "types": "./src/address-guard.d.ts",
       "import": "./src/address-guard.mjs"

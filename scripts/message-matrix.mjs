@@ -34,7 +34,7 @@ export const COLUMNS = [
  */
 export const FILES = {
   js: {
-    host: ['src/server/', 'src/host.mjs', 'src/host-backends.mjs', 'src/memory-host.mjs', 'src/reverse-host.mjs', 'src/session-registry.mjs', 'src/shares.mjs', 'src/recording.mjs', 'src/refusal.mjs'],
+    host: ['src/server/', 'src/host.mjs', 'src/host-backends.mjs', 'src/memory-host.mjs', 'src/reverse-host.mjs', 'src/reverse-gateway.mjs', 'src/session-registry.mjs', 'src/shares.mjs', 'src/recording.mjs', 'src/refusal.mjs'],
     client: [
       'src/client.mjs', 'src/session.mjs', 'src/file-transfer.mjs', 'src/forward-node.mjs', 'src/gateway-channel.mjs', 'src/gateway-client.mjs',
       'src/gateway-datagram.mjs', 'src/mcp-bridge.mjs', 'src/mcp-stdio.mjs', 'src/keystore.mjs', 'src/known-hosts.mjs', 'src/control-listener.mjs',
@@ -45,7 +45,7 @@ export const FILES = {
       'src/key-options.mjs', 'src/operator-proof.mjs', 'src/rpc.mjs', 'src/rpc-virtual.mjs', 'src/rpc-mcp.mjs', 'src/stream-frame.mjs', 'src/virtual-session.mjs',
     ],
     ignored: ['src/index.mjs', 'src/testing.mjs', 'src/errors.mjs', 'src/messages.mjs', 'src/messages.gen.mjs', 'src/cbor.mjs', 'src/mlkem.mjs', 'src/pipe-relay.mjs', 'src/pipe-relay-node.mjs', 'src/objects.mjs', 'src/objects-core.mjs', 'src/objects-types.mjs', 'src/objects-type-text.mjs', 'src/objects-mcp.mjs', 'src/objects-schema.mjs', 'src/page-host.mjs', 'src/webmcp.mjs', 'src/qmux.mjs', 'src/qmux-connection.mjs',
-      'src/capabilities.mjs', 'src/identity.mjs', 'src/key-names.mjs', 'src/gateway-errors.mjs', 'src/address-class.mjs', 'src/address-guard.mjs', 'src/mcp-duplex.mjs', 'src/testing-doubles.mjs', 'src/duplex.mjs', 'src/unix-listen.mjs', 'src/half-close-watch.mjs'],
+      'src/capabilities.mjs', 'src/identity.mjs', 'src/key-names.mjs', 'src/gateway-errors.mjs', 'src/gateway.mjs', 'src/address-class.mjs', 'src/address-guard.mjs', 'src/mcp-duplex.mjs', 'src/testing-doubles.mjs', 'src/duplex.mjs', 'src/unix-listen.mjs', 'src/half-close-watch.mjs'],
   },
   rust: {
     host: ['crates/wsh-server/src/'],

@@ -28,6 +28,7 @@ import { RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
 import { createConnectionFactory, hostFeatures } from './server/connection.mjs';
 import { validateOnShare } from './shares.mjs';
 import { refusalNotifier, validateOnRefused } from './refusal.mjs';
+import { buildReverseGateway } from './reverse-gateway.mjs';
 
 const BACKOFF_START_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
@@ -87,12 +88,11 @@ const BACKOFF_MAX_MS = 30_000;
  * @param {(line: string) => void} [options.onLog]
  */
 export function createReverseHost(options = {}) {
-  if (options.gateway !== undefined && options.gateway !== null && options.gateway !== false) {
-    throw new TypeError('createReverseHost: gateway dials sockets, so it needs createReverseHost from @johnhenry/wsh/server (this one is browser-safe)');
-  }
+  // A gateway here dials only a network the embedder supplies (`gateway.network`): this entry has no sockets of its own (#299).
+  const gateway = buildReverseGateway(options.gateway, options, { requireNetwork: true });
   const rpc = options.rpc === undefined || options.rpc === null ? null
     : createRpcTable(options.rpc, options.rpcMaxMessageBytes ?? RPC_DEFAULT_MAX_MESSAGE, options.rpcMaxInflight ?? 64, 'createReverseHost');
-  return createReverseHostWith(options, { ...resolveBackends(options), rpc });
+  return createReverseHostWith(options, { ...resolveBackends(options), rpc, gateway });
 }
 
 /**

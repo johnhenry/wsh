@@ -2,36 +2,36 @@
   "note": "Browser bundle budget: `npm run size -- --update` rewrites it. A bundle may exceed its gzip figure by 10% before the test fails.",
   "entries": {
     ".": {
-      "raw": 170157,
-      "gzip": 51624
+      "raw": 173288,
+      "gzip": 52642
     },
     "./memory": {
-      "raw": 239302,
-      "gzip": 74836
+      "raw": 290052,
+      "gzip": 90264
     },
     "./host": {
-      "raw": 131217,
-      "gzip": 43216
+      "raw": 135638,
+      "gzip": 44550
     },
     "./reverse": {
-      "raw": 227379,
-      "gzip": 70370
+      "raw": 283823,
+      "gzip": 87935
     },
     "./pipe-relay": {
       "raw": 8195,
       "gzip": 3430
     },
     "./testing": {
-      "raw": 248418,
-      "gzip": 78329
+      "raw": 299182,
+      "gzip": 93809
     },
     "./page": {
-      "raw": 339780,
-      "gzip": 108441
+      "raw": 392172,
+      "gzip": 124464
     },
     "./objects": {
-      "raw": 211136,
-      "gzip": 65259
+      "raw": 214175,
+      "gzip": 66204
     },
     "./objects-types": {
       "raw": 10487,
@@ -46,12 +46,16 @@
       "gzip": 5848
     },
     "./duplex": {
-      "raw": 145046,
-      "gzip": 44026
+      "raw": 148120,
+      "gzip": 45015
     },
     "./address-guard": {
       "raw": 9286,
       "gzip": 3669
+    },
+    "./gateway": {
+      "raw": 56700,
+      "gzip": 18211
     },
     "./testing (encodeRecord only)": {
       "raw": 1887,
@@ -62,16 +66,16 @@
       "gzip": 324
     },
     ". (WshClient only)": {
-      "raw": 140766,
-      "gzip": 42371
+      "raw": 143802,
+      "gzip": 43339
     },
     "./address-guard (isPublicAddress only)": {
       "raw": 3144,
       "gzip": 1333
     },
     "./host (createConnectionFactory only)": {
-      "raw": 107356,
-      "gzip": 35072
+      "raw": 110010,
+      "gzip": 35858
     }
   }
 }
