@@ -817,11 +817,12 @@ async fn a_failed_write_to_the_local_service_after_its_end_of_file_releases_the_
     }
 }
 
-/// Negative cases: no feature, no probe for answering services are discards, as they were; so is a failure of another kind before the end of file; and
-/// a service that is gone (a reset, a broken pipe) before its end of file releases the connection, on a write or on a read, as the watch would.
+/// Negative cases: no feature and no probe for answering services are discards, as they were. And `released` tells the host "deliver what you have, then
+/// finish": for a service reset in the MIDDLE of its answer (its end of file never read) that would make a truncated answer look like a complete one to the
+/// caller, so a failure before the end of file, a reset included, on a write or on a read, is a discard, never a clean end.
 #[cfg(unix)]
 #[tokio::test]
-async fn the_same_failures_are_discards_without_the_feature_or_the_probe_and_a_service_that_is_gone_releases_before_its_end_of_file(
+async fn a_reset_before_the_end_of_file_is_not_a_clean_end_for_the_caller_and_the_same_failures_are_discards_without_the_feature_or_the_probe(
 ) {
     // (lossless, probe, end of file first, failure code, on a write, expected close)
     let cases = [
@@ -856,7 +857,7 @@ async fn the_same_failures_are_discards_without_the_feature_or_the_probe_and_a_s
             false,
             1,
             true,
-            GATEWAY_RELEASED,
+            GATEWAY_DISCARDED,
         ),
         (
             true,
@@ -864,7 +865,7 @@ async fn the_same_failures_are_discards_without_the_feature_or_the_probe_and_a_s
             false,
             1,
             false,
-            GATEWAY_RELEASED,
+            GATEWAY_DISCARDED,
         ),
         (
             false,

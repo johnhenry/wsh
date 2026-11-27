@@ -46,12 +46,6 @@ function goneError(cause) {
   return e;
 }
 
-/**
- * The `error.code`s of a socket whose peer is gone (it reset the connection, or closed it while we were still writing): the same event the watch reports for a
- * half-closed peer. A read or write that fails this way on a watched ANSWERING socket ends its connection as the watch would, with `released` (#311).
- */
-export const PEER_GONE_CODES = new Set(['ECONNRESET', 'EPIPE', 'ECONNABORTED']);
-
 /** A write error that says the peer is gone (not "the stream was already closed", which is somebody else's doing). */
 const peerGone = (err) => err && typeof err.code === 'string' && !err.code.startsWith('ERR_');
 

@@ -2420,12 +2420,12 @@ mod lossless {
         }
     }
 
-    /// Before the end of file the failure decides: an origin that reset the connection is gone (what the watch reports: released), any other failure cuts
-    /// the answer short and is still a discard. Reads and writes alike.
+    /// `released` tells the caller "deliver what you have, then finish": for an origin reset in the MIDDLE of its answer (its end of file never read) that
+    /// would make a truncated answer look like a complete one (a close-delimited response cut by an origin crash would read as a clean end). So a failure
+    /// before the end of file, a reset included, is an error end (`discarded`, or the reason of the failed write), never a clean one. Reads and writes alike.
     #[tokio::test]
-    async fn a_failure_before_the_end_of_file_releases_if_the_origin_is_gone_and_discards_otherwise(
-    ) {
-        for (code, released) in [(1u8, true), (2, false)] {
+    async fn a_reset_before_the_end_of_file_is_not_a_clean_end_for_the_caller_it_is_a_discard() {
+        for (code, released) in [(1u8, false), (2, false)] {
             for on_write in [true, false] {
                 let (mut r, mut peer, fail_writes, fail_reads) = held_origin(BOTH);
                 peer.write_all(&[5u8; 1000]).await.unwrap(); // no end of file: the origin is still answering

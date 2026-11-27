@@ -28,17 +28,6 @@ use std::time::Duration;
 /// long, then one per this long, three in all. (Also the default of `[gateway] half_close_probe_secs`.)
 pub const DEFAULT_HALF_CLOSE_PROBE: Duration = Duration::from_secs(2);
 
-/// Is this the error of a socket whose peer is gone (it reset the connection, or closed it while we were still writing)? The same event the watch reports
-/// for a half-closed peer; a read or write that fails this way on a watched answering socket ends its connection as the watch would (wsh #311).
-pub fn peer_gone_error(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::BrokenPipe
-    )
-}
-
 /// A local socket whose half-closed peer can be watched. `None` where the platform cannot.
 pub trait WatchablePeer {
     fn peer_watch(&self) -> Option<PeerWatch>;

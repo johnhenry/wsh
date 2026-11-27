@@ -525,14 +525,15 @@ describe('an answering socket that finished its answer and is then reset: the en
     assert.equal(closes()[1].reason, GATEWAY_DISCARDED);
   });
 
-  // Before its end of file the verdict is the failure's: an origin that reset the connection is gone (what the probe reports: released, so what it sent
-  // is delivered); with the feature not stated, or with the answering watch off, the same reset is a discard as it was.
+  // `released` tells the caller "deliver what you have, then finish": for an origin reset in the MIDDLE of its answer (its end of file never read) that would
+  // make a truncated answer look like a complete one (a close-delimited response cut by an origin crash would read as a clean end). So a reset before the end
+  // of file is an error end whatever was negotiated: the close reason is `discarded`, and the caller (the client's stream) can tell.
   for (const [what, features, extra, want] of [
-    ['both ends state the feature', ['gateway-credit', GATEWAY_LOSSLESS_FEATURE], {}, GATEWAY_RELEASED],
+    ['both ends state the feature', ['gateway-credit', GATEWAY_LOSSLESS_FEATURE], {}, GATEWAY_DISCARDED],
     ['the client did not state the feature', ['gateway-credit'], {}, GATEWAY_DISCARDED],
     ['halfCloseProbeAnswers: false', ['gateway-credit', GATEWAY_LOSSLESS_FEATURE], { halfCloseProbeAnswers: false }, GATEWAY_DISCARDED],
   ]) {
-    it(`host: an origin reset BEFORE its end of file (${what}) is ${want}`, async () => {
+    it(`host: a reset before the end of file is NOT a clean end for the caller (${what}): the close is ${want}, never released`, async () => {
       const socks = [];
       const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.write(Buffer.alloc(10)); });
       const port = await listen(origin); nets.push(origin);
@@ -568,10 +569,10 @@ describe('an answering socket that finished its answer and is then reset: the en
     sock.destroy();
   });
 
-  // Before its end of file: a service that reset the connection is gone (released); the same reset is a discard where the service is not watched
-  // (`answering` is only given where the feature is negotiated and the probe is on).
-  for (const [what, options, want] of [['a watched service', { probeMs: HOUR, answering: true }, 'release'], ['an unwatched one', undefined, 'destroy']]) {
-    it(`client: ${what} reset before its end of file ends the connection with ${want}`, async () => {
+  // The same on the client: a service reset in the MIDDLE of its answer (its end of file never read) must not end the connection with `release`, which would
+  // make a truncated answer look like a complete one to the host's caller; it is a destroy (a discard), watched or not.
+  for (const [what, options, want] of [['a watched service', { probeMs: HOUR, answering: true }, 'destroy'], ['an unwatched one', undefined, 'destroy']]) {
+    it(`client: a reset before the end of file is NOT a clean end for the caller (${what}): the connection is destroyed, never released`, async () => {
       const socks = [];
       const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); });
       const port = await listen(service); nets.push(service);

@@ -46,7 +46,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use wsh_core::messages::*;
-use wsh_core::peer_watch::{peer_gone_error, PeerWatch};
+use wsh_core::peer_watch::PeerWatch;
 
 use wsh_core::gateway_credit::SendCredit;
 pub use wsh_core::gateway_credit::{
@@ -841,7 +841,7 @@ impl Inner {
             let ready = ready.clone();
             tokio::spawn(async move {
                 ready.notified().await;
-                inner.read_loop(chan, rd, eof_tx, answering).await;
+                inner.read_loop(chan, rd, eof_tx).await;
             })
         };
         let writer = {
@@ -922,13 +922,9 @@ impl Inner {
         chan: Arc<Chan>,
         mut rd: tokio::io::ReadHalf<BoxStream>,
         eof_tx: oneshot::Sender<()>,
-        answering: bool,
     ) {
         let mut buf = vec![0u8; MAX_FRAME];
         let mut eof = false;
-        // A watched answering origin that resets the connection is gone: what the watch reports, and what the kernel can report INSTEAD of the end of
-        // file when the host's bytes reached an origin that had already finished and closed.
-        let mut gone = false;
         'outer: loop {
             let n = match rd.read(&mut buf).await {
                 Ok(0) => {
@@ -936,10 +932,7 @@ impl Inner {
                     chan.origin_eof.store(true, Ordering::Release);
                     break;
                 }
-                Err(e) => {
-                    gone = answering && self.answering_watch() && peer_gone_error(&e);
-                    break;
-                }
+                Err(_) => break,
                 Ok(n) => n,
             };
             let mut off = 0;
@@ -958,13 +951,9 @@ impl Inner {
             }
         }
         if !eof || chan.finished.load(Ordering::Acquire) {
-            // The origin failed (or the client is gone): the connection is over. An origin that is gone releases it (everything it sent has gone
-            // out above); any other failure is a discard.
-            if gone {
-                self.release(&chan);
-            } else {
-                self.destroy(&chan, None);
-            }
+            // The origin failed before its end of file (a reset included), or the client is gone: the connection is over, as an error. The answer
+            // is not known to be complete, so it is not released (that would make a cut answer look like a finished one to the caller).
+            self.destroy(&chan, None);
             return;
         }
         // The origin finished sending (its end of file), everything it sent has gone out: a
@@ -1020,15 +1009,15 @@ impl Inner {
             match cmd {
                 WriteCmd::Data(data) => {
                     let n = data.len();
-                    if let Err(e) = wr.write_all(&data).await {
+                    if wr.write_all(&data).await.is_err() {
                         // The watch is not the only way the end of an answering origin is seen: a write that fails (the client's bytes, still
                         // arriving, into an origin that has finished and gone) ends it too, and which is first is not up to us. An origin whose
-                        // end of file was read sent its WHOLE answer, and one that reset the connection is gone, which is what the watch
-                        // reports: either way it is released, because a second close of `discarded` would make the client drop what it has
-                        // received and not yet read. Any other failure is a discard, as it was.
+                        // end of file was read sent its WHOLE answer, so it is released either way: a second close of `discarded` would make the
+                        // client drop what it has received and not yet read. A failure before the end of file (a reset included) is not a complete
+                        // answer, and `released` would make a cut answer look like a finished one: it stays a discard.
                         if answering
                             && self.answering_watch()
-                            && (chan.origin_eof.load(Ordering::Acquire) || peer_gone_error(&e))
+                            && chan.origin_eof.load(Ordering::Acquire)
                         {
                             self.release(&chan);
                         } else {
