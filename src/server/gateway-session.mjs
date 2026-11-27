@@ -995,6 +995,20 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       inbound.clear();
       for (const id of [...listeners.keys()]) void closeListener(id).catch(() => {});
     },
+    /**
+     * #297: the grant behind this connection expired. Every open connection of every kind (TCP, unix, UDP, endpoint, an accepted
+     * inbound one) is ended with `reason`, the listeners stop (nothing more is accepted for a grant that is over), and a connect or lookup still in
+     * flight on an injected network is told to stop.
+     */
+    endAll(reason) {
+      if (closed) return;
+      core.endAll(reason);
+      for (const ac of aborts) ac.abort();
+      aborts.clear();
+      for (const { sock, timer } of inbound.values()) { clearTimeout(timer); sock.destroy(); }
+      inbound.clear();
+      for (const id of [...listeners.keys()]) void closeListener(id).catch(() => {});
+    },
     /** The peer is going away but its queued messages are still to be served: tell the injected network what it is still working on (a connect, a lookup, a listen). */
     abortPending() { for (const ac of aborts) ac.abort(); aborts.clear(); },
     get size() { return conns.size; },

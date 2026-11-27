@@ -1395,6 +1395,18 @@ messages:
         peer that predates it "released" is an ordinary reason text (a
         half-close as a first close, ignored as a second).  No field is
         added.
+
+        A host ends the gateway connections of a grant that has run out
+        (wsh #297): a key's `expires`, or the `expires` of what an
+        authorize or accept callback granted, passes while connections it
+        opened are still open.  Each is ended with GatewayClose reason
+        "key expired" and then, as a side that has lost its reader does, a
+        second GatewayClose with reason "discarded"; reverse listeners of
+        that connection stop (there is no message for that).  A peer that
+        knows "discarded" frees the connection at once; one that predates
+        it sees the first as an ordinary half-close and ignores the
+        second, so its own half-close bounds apply as for any other close.
+        No field or feature string is added.
       fields:
         gateway_id:
           type: u32

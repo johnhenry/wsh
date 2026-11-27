@@ -87,6 +87,9 @@ pub enum Route {
 pub struct Departed {
     /// A multi-operator peer to tell, with `ReverseClose`, that this operator left: `(peer conn, operator fingerprint)`.
     pub reverse_close: Option<(u64, String)>,
+    /// Operators bridged to a departing peer that carried a gateway (wsh #297): the relay tells each the bridge is over and closes its
+    /// connection, as the JS relay does for every peer.
+    pub end_operators: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -281,7 +284,16 @@ impl Bridges {
         let mut out = Departed::default();
         // conn as a peer: whatever it was answering, and everyone bridged to it
         self.pending.remove(&conn);
-        self.peer_operators.remove(&conn);
+        let operators = self.peer_operators.remove(&conn);
+        // A peer that carried a gateway (wsh #297): its operators may have connections open that nothing else would end, so
+        // they are told the bridge is over. A peer that did not is left as it always was.
+        if self.gateway.contains(&conn) {
+            out.end_operators = operators
+                .into_iter()
+                .flatten()
+                .map(|(operator, _)| operator)
+                .collect();
+        }
         self.operator_peer.retain(|_, peer| *peer != conn);
         self.multi.remove(&conn);
         self.gateway.remove(&conn);
@@ -432,7 +444,8 @@ mod tests {
         assert_eq!(
             b.depart(OP_A),
             Departed {
-                reverse_close: Some((PEER, "fa".into()))
+                reverse_close: Some((PEER, "fa".into())),
+                ..Departed::default()
             }
         );
         assert_eq!(b.recipient(PEER, None), Route::To(OP_B));
@@ -622,5 +635,34 @@ mod tests {
             "another peer's operator is not carried for"
         );
         assert!(!b.carries_gateway(PEER2));
+    }
+
+    #[test]
+    fn a_departing_peer_that_carried_a_gateway_names_its_operators_to_end_and_one_that_did_not_does_not(
+    ) {
+        let mut b = Bridges::new(2);
+        bridged(&mut b, OP_A, "fa", PEER, true);
+        bridged(&mut b, OP_B, "fb", PEER, true);
+        bridged(&mut b, OP_C, "fc", PEER2, false);
+        b.note_gateway(PEER, true);
+        let mut ended = b.depart(PEER).end_operators;
+        ended.sort_unstable();
+        assert_eq!(
+            ended,
+            vec![OP_A, OP_B],
+            "every operator of the peer, and no other"
+        );
+        assert!(
+            b.depart(PEER2).end_operators.is_empty(),
+            "a peer that stated no gateway leaves its operator connected (as since #93)"
+        );
+    }
+
+    #[test]
+    fn an_operator_leaving_ends_nobody() {
+        let mut b = Bridges::new(1);
+        bridged(&mut b, OP_A, "fa", PEER, false);
+        b.note_gateway(PEER, true);
+        assert!(b.depart(OP_A).end_operators.is_empty());
     }
 }

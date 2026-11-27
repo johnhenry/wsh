@@ -1716,6 +1716,196 @@ mod unix {
     }
 }
 
+// ── a grant that runs out (#297) ──────────────────────────────────
+
+mod expiry {
+    use super::*;
+
+    /// A service that echoes and says, on `gone`, each time a connection of it ended.
+    async fn echo_noting_ends() -> (u16, mpsc::UnboundedReceiver<()>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(());
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    fn closes_of(msgs: &[Envelope], id: u32) -> Vec<Option<String>> {
+        msgs.iter()
+            .filter_map(|m| match &m.payload {
+                Payload::GatewayClose(c) if c.gateway_id == id => Some(c.reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn open_two(r: &mut Rig, port: u16) {
+        for id in [1u32, 2] {
+            r.open_tcp(id, port);
+            r.expect_ok(id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn end_all_ends_every_connection_with_the_reason_and_then_discarded() {
+        let (port, mut gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        open_two(&mut r, port).await;
+        r.session.end_all("key expired");
+        let msgs = r.drain(500).await;
+        for id in [1, 2] {
+            assert_eq!(
+                closes_of(&msgs, id),
+                vec![
+                    Some("key expired".to_string()),
+                    Some(GATEWAY_DISCARDED.to_string())
+                ],
+                "connection {id}: the reason first, then the second close that frees a peer which knows it"
+            );
+        }
+        wait_for_no_connections(&r).await;
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), gone.recv())
+                .await
+                .expect("the origin saw its connection end")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_client_had_already_closed_gets_the_reason_only() {
+        let (port, _held) = mute_service().await; // it neither answers nor ends, so the connection stays half-closed
+        let mut r = rig(CREDIT);
+        r.open_tcp(1, port);
+        r.expect_ok(1).await;
+        r.close(1);
+        assert!(
+            r.drain(200).await.is_empty(),
+            "the host has nothing to say yet"
+        );
+        r.session.end_all("key expired");
+        let msgs = r.drain(300).await;
+        assert!(
+            got_close(&msgs).is_some(),
+            "the half-closed connection is ended too: {msgs:?}"
+        );
+        assert_eq!(
+            closes_of(&msgs, 1),
+            vec![Some("key expired".to_string())],
+            "the client had closed: nothing more than the reason"
+        );
+        wait_for_no_connections(&r).await;
+    }
+
+    #[tokio::test]
+    async fn end_after_ends_what_is_open_when_the_time_comes_and_not_before() {
+        let (port, _gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        open_two(&mut r, port).await;
+        r.session
+            .end_after(Duration::from_millis(400), "key expired");
+        // Not before: a quiet 150 ms with both connections still there.
+        assert!(r.drain(150).await.is_empty());
+        assert_eq!(conns(&r).await, 2);
+        // Then: both are ended with the reason.
+        let msgs = r.drain(1500).await;
+        for id in [1, 2] {
+            assert_eq!(
+                closes_of(&msgs, id).first().cloned(),
+                Some(Some("key expired".to_string()))
+            );
+        }
+        wait_for_no_connections(&r).await;
+    }
+
+    #[tokio::test]
+    async fn end_after_arms_one_timer_however_often_it_is_asked() {
+        let (port, _gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        r.open_tcp(1, port);
+        r.expect_ok(1).await;
+        // The first call decides; asking again (once per request that opens something) arms no second timer.
+        r.session
+            .end_after(Duration::from_secs(3600), "key expired");
+        for _ in 0..20 {
+            r.session
+                .end_after(Duration::from_millis(100), "key expired");
+        }
+        let msgs = r.drain(1000).await;
+        assert!(
+            msgs.is_empty() && conns(&r).await == 1,
+            "no later call armed another timer: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listener_stops_and_what_it_had_accepted_is_ended() {
+        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut r = rig_with(reverse_policy(lo), true, CREDIT);
+        let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+            Payload::ListenOk(ok) => ok.actual_port,
+            other => panic!("{other:?}"),
+        };
+        let _caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        assert!(r.drain(150).await.is_empty());
+        r.session.end_all("key expired");
+        let msgs = r.drain(500).await;
+        assert_eq!(
+            closes_of(&msgs, 9).first().cloned(),
+            Some(Some("key expired".to_string()))
+        );
+        // The listener is gone: nothing accepts any more.
+        let t0 = std::time::Instant::now();
+        while TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "still listening");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_that_finishes_behind_the_expiry_is_ended_too() {
+        // The connect is in flight when the grant runs out: it must not outlive it.
+        let (port, _gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        r.session.end_all("key expired"); // nothing open yet: marks the session as expired
+        r.open_tcp(1, port);
+        let msgs = r.drain(800).await;
+        assert!(
+            got_close(&msgs).is_some()
+                || matches!(
+                    msgs.first().map(|m| &m.payload),
+                    Some(Payload::GatewayFail(_))
+                ),
+            "a request after the expiry opens nothing that lasts: {msgs:?}"
+        );
+        wait_for_no_connections(&r).await;
+    }
+}
+
 // ── reverse TCP listeners ─────────────────────────────────────────
 
 async fn listen_tcp(r: &mut Rig, id: u32, requested_bind: &str) -> Envelope {

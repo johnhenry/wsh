@@ -50,8 +50,8 @@ use wsh_core::peer_watch::PeerWatch;
 
 use wsh_core::gateway_credit::SendCredit;
 pub use wsh_core::gateway_credit::{
-    GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED, GATEWAY_LOSSLESS_FEATURE,
-    GATEWAY_RELEASED,
+    GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED, GATEWAY_EXPIRED,
+    GATEWAY_LOSSLESS_FEATURE, GATEWAY_RELEASED,
 };
 use wsh_core::gateway_datagram::{
     decode_datagram, encode_datagram, DATAGRAM_HEADER_BYTES, GATEWAY_DATAGRAM_FEATURE,
@@ -322,6 +322,11 @@ struct Inner {
     /// The flows that take datagrams from the client, by gateway_id.
     udp_datagram_flows: Mutex<HashMap<u32, UdpFlowHandle>>,
     closed: AtomicBool,
+    /// The grant behind this connection ran out (wsh #297): the reason connections and listeners were ended with. What a connect
+    /// still in flight at that moment opens is ended as soon as it is there.
+    expired: Mutex<Option<String>>,
+    /// The one timer of the grant (see [`GatewaySession::end_after`]).
+    expiry_timer: Mutex<Option<AbortHandle>>,
 }
 
 /// The gateway of one client connection. Dropping it closes everything it opened.
@@ -400,6 +405,8 @@ impl GatewaySession {
                 listeners: Mutex::new(HashMap::new()),
                 pending_listeners: Mutex::new(HashSet::new()),
                 closed: AtomicBool::new(false),
+                expired: Mutex::new(None),
+                expiry_timer: Mutex::new(None),
             }),
         }
     }
@@ -455,6 +462,34 @@ impl GatewaySession {
     /// Bytes received from the client and not yet taken by an origin.
     pub fn buffered_bytes(&self) -> usize {
         self.inner.budget.load(Ordering::Acquire)
+    }
+
+    /// The grant behind this connection has run out (wsh #297): end every open connection (TCP, unix socket, UDP flow, one a
+    /// reverse listener accepted) with `reason`, stop the listeners, and end whatever a connect still in flight opens. Each
+    /// connection's peer is told `GatewayClose` with `reason` and then, as a side that has lost its reader does, once more with
+    /// "discarded": a peer that knows that frees the connection at once, and one that predates it sees the first as an ordinary
+    /// half-close and ignores the second. What is queued for the peer is not waited for; an expiry is a cut.
+    pub fn end_all(&self, reason: &str) {
+        self.inner.end_all(reason);
+    }
+
+    /// Arm the ONE timer of this connection's grant: after `after`, [`GatewaySession::end_all`] runs with `reason`. The first call
+    /// decides; asking again (the caller asks once per request that opens something) does nothing, so a connection holds one timer
+    /// however many connections it opens, and none per connection. Dropping the session cancels it.
+    pub fn end_after(&self, after: Duration, reason: &str) {
+        let mut timer = self.inner.expiry_timer.lock().expect("expiry timer");
+        if timer.is_some() || self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let reason = reason.to_string();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            if let Some(inner) = weak.upgrade() {
+                inner.end_all(&reason);
+            }
+        });
+        *timer = Some(handle.abort_handle());
     }
 
     /// Handle one gateway message. Answers go out through the connection's outbound queue, never
@@ -595,7 +630,13 @@ impl Inner {
             let result = open(inner.clone(), id, guard).await;
             inner.reserved.lock().expect("reserved").remove(&id);
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    // A connect that finished behind the expiry of the grant does not outlive it.
+                    let expired = inner.expired.lock().expect("expired").clone();
+                    if let Some(reason) = expired {
+                        inner.end_all(&reason);
+                    }
+                }
                 Err((code, message)) => inner.send(fail(id, code, &message)).await,
             }
         });
@@ -1699,10 +1740,77 @@ impl Inner {
         }
     }
 
+    /// The grant ran out (wsh #297; see [`GatewaySession::end_all`]).
+    fn end_all(self: &Arc<Self>, reason: &str) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        *self.expired.lock().expect("expired") = Some(reason.to_string());
+        let chans: Vec<Arc<Chan>> = self
+            .conns
+            .lock()
+            .expect("conns")
+            .values()
+            .cloned()
+            .collect();
+        for chan in chans {
+            if chan.finished.load(Ordering::Acquire) {
+                continue;
+            }
+            // The two closes go out in this order from one task (separate tasks could overtake each other); `destroy` then has
+            // nothing of its own to say, which it does not once the client's close is marked as received.
+            let mut said = Vec::new();
+            if !chan.sent_close.swap(true, Ordering::AcqRel) {
+                said.push(close_msg(chan.id, Some(reason)));
+            }
+            if !chan.remote_closed.load(Ordering::Acquire) {
+                said.push(close_msg(chan.id, Some(GATEWAY_DISCARDED)));
+            }
+            chan.remote_closed.store(true, Ordering::Release);
+            self.destroy(&chan, None);
+            if !said.is_empty() {
+                let inner = self.clone();
+                tokio::spawn(async move {
+                    for m in said {
+                        inner.send(m).await;
+                    }
+                });
+            }
+        }
+        self.drop_pending_and_listeners();
+    }
+
+    /// Unanswered inbound connections are dropped and the listeners stopped.
+    fn drop_pending_and_listeners(&self) {
+        let ids: Vec<u32> = self
+            .inbound
+            .lock()
+            .expect("inbound")
+            .keys()
+            .copied()
+            .collect();
+        for id in ids {
+            self.drop_pending(id);
+        }
+        let listeners: Vec<Listener> = self
+            .listeners
+            .lock()
+            .expect("listeners")
+            .drain()
+            .map(|(_, l)| l)
+            .collect();
+        for l in listeners {
+            self.stop_listener(l);
+        }
+    }
+
     /// The connection is gone: close everything silently.
     fn close_all(self: &Arc<Self>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if let Some(timer) = self.expiry_timer.lock().expect("expiry timer").take() {
+            timer.abort();
         }
         let chans: Vec<Arc<Chan>> = self
             .conns
