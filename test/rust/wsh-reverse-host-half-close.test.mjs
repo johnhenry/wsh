@@ -100,8 +100,10 @@ async function rustRelay(authorizedKeys) {
 /** Start `wsh reverse` against the relay with `extra` arguments; resolves once it registered. */
 async function startHost(relay, host, extraIn = [], operatorKeyPair = null) {
   // The owner's other two choices come with the gateway: the operator named, and the relay's word trusted (no proof here).
+  // (`--require-operator-proof`, #318: a SEALED host: the operator is proven and named, the relay's word is not trusted)
+  const sealedHost = extraIn.includes('--require-operator-proof');
   const extra = extraIn.includes('--relay-gateway-allow') && operatorKeyPair
-    ? [...extraIn, '--allow-operator', await fingerprint(await exportPublicKeyRaw(operatorKeyPair.publicKey)), '--relay-gateway-trust-relay']
+    ? [...extraIn, '--allow-operator', await fingerprint(await exportPublicKeyRaw(operatorKeyPair.publicKey)), ...(sealedHost ? [] : ['--relay-gateway-trust-relay'])]
     : extraIn;
   const h = relay.host(host.home);
   const proc = spawn(WSH_BIN, ['-t', 'ws', '--accept-new-host-key', ...extra, 'reverse', h.target, '--capability', 'exec', '--capability', 'gateway'], { env: h.env, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -238,7 +240,8 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       const { op, res } = await connectOperator(relay, host, keyPair);
       assert.ok(res.features.includes('gateway-lossless-close') && res.features.includes('gateway-lossless-close-ack'), `the host states and acknowledges it: ${res.features}`);
       const v = await op.openTcp('127.0.0.1', port);
-      assert.equal(v.lossless, true);
+      assert.equal(v.lossless, false, 'unsealed bridge: best-effort, no guarantee (#318)');
+      assert.equal(v.releasable, true);
       const reader = v.readable.getReader();
       let n = 0; let ok = true; let chunks = 0;
       for (;;) {
@@ -281,9 +284,10 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       v.destroy();
     });
 
-    // #318: on a bridge where the operator proves itself, the statement is signed into the proof and the host acts only on that. A relay that ADDS the
-    // statement for an operator that never made it (and the operator-proof it listed is intact) is not believed: no acknowledgement, no watching.
-    (kind === 'JS' ? it : it.skip)('lossless close through the relay (#318): a relay that adds the statement for an operator that declined it is not believed (the proof is what counts)', async () => {
+    // #318: the guarantee holds on a SEALED bridge only. On a sealed Rust host (--require-operator-proof) the statement is what the operator signed in its
+    // proof: a relay that ADDS it for an operator that declined it is not believed (no acknowledgement, no watching); an operator that signed it gets the
+    // release and reports the guarantee. An unsealed host stays best-effort as in rust-v0.26 (the relay's list is taken).
+    (kind === 'JS' ? it : it.skip)('lossless close through the relay (#318): a SEALED host does not believe a statement a relay added for an operator that declined it', async () => {
       const original = RelayHub.prototype.connect;
       RelayHub.prototype.connect = function adding(operator, msg) { return original.call(this, operator, { ...msg, features: [...(msg.features ?? []), 'gateway-lossless-close'] }); };
       closers.push(async () => { RelayHub.prototype.connect = original; });
@@ -294,13 +298,13 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
       const port = await listen(vanishing);
       closers.push(async () => { vanishing.close(); for (const s of gone) s.destroy(); });
-      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
+      await startHost(relay, host, ['--require-operator-proof', '--relay-gateway-allow', '127.0.0.1'], keyPair);
       const op = new WshClient();
       await op.connect(relay.url, { username: 'op', keyPair, gatewayLosslessClose: false });
       closers.push(() => op.disconnect());
       await until(async () => (await op.listPeers()).length, 'the host in the peer list');
-      const res = await op.reverseConnect(host.fp);
-      assert.equal(res.type, MSG.REVERSE_ACCEPT);
+      const res = await op.reverseConnect(host.fp, undefined, { sealed: true });
+      assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
       assert.ok(!res.features.includes('gateway-lossless-close-ack'), `the host did not believe the relay: ${res.features}`);
       const v = await op.openTcp('127.0.0.1', port);
       const vr = v.readable.getReader();
@@ -311,7 +315,32 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
       v.destroy();
     });
 
-    it('the Rust host lists `gateway-lossless-close-signed` in its record, and an operator that signs the statement gets it acknowledged (#318)', async () => {
+    it('lossless close through the relay (#318): a SEALED Rust host reads the signed statement: acknowledged, the vanished origin releases the connection, and the operator reports the guarantee', async () => {
+      const host = await hostIdentity();
+      const keyPair = await generateKeyPair(true);
+      const relay = await makeRelay(`${host.pub}\n${await exportPublicKeySSH(keyPair.publicKey)} op`);
+      const gone = [];
+      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+      const port = await listen(vanishing);
+      closers.push(async () => { vanishing.close(); for (const s of gone) s.destroy(); });
+      await startHost(relay, host, ['--require-operator-proof', '--relay-gateway-allow', '127.0.0.1'], keyPair);
+      const op = new WshClient();
+      await op.connect(relay.url, { username: 'op', keyPair });
+      closers.push(() => op.disconnect());
+      await until(async () => (await op.listPeers()).length, 'the host in the peer list');
+      const res = await op.reverseConnect(host.fp, undefined, { sealed: true });
+      assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
+      assert.ok(res.features.includes('gateway-lossless-close-ack'), `${res.features}`);
+      const v = await op.openTcp('127.0.0.1', port);
+      assert.equal(v.lossless, true);
+      const vr = v.readable.getReader();
+      for (;;) { const { done } = await vr.read(); if (done) break; }
+      await until(() => gone.length === 1, 'the origin to have been dialled');
+      gone[0].resetAndDestroy();
+      assert.equal(await Promise.race([v.closed, sleep(15000).then(() => 'open')]), 'released');
+    });
+
+    it('the Rust host lists `gateway-lossless-close-signed` in its record; an UNSEALED bridge stays best-effort: the unsigned statement is acknowledged, and no guarantee is reported (#318)', async () => {
       const host = await hostIdentity();
       const keyPair = await generateKeyPair(true);
       const relay = await makeRelay(`${host.pub}\n${await exportPublicKeySSH(keyPair.publicKey)} op`);

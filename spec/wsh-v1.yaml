@@ -1385,21 +1385,23 @@ messages:
         treats the feature as negotiated for that bridge only when it
         stated it AND received the acknowledgement (the host: only when it
         received the statement).  A relay that drops the statement thus
-        leaves both sides on the earlier behaviour.  Where the operator
-        proves itself (operator-proof, wsh #117) the statement is
-        authenticated (wsh #318): the operator signs it into its
-        ReverseProof (the signed bytes begin "wsh-operator-proof-v2\0"
-        and the statement, "gateway-lossless-close", follows the session
-        id as a length-prefixed string; a proof with no statement is the
-        unchanged v1 proof), only for a host whose registered
-        capabilities list "gateway-lossless-close-signed", and the host
-        acts on the statement it finds signed, never on the unsigned
-        list.  A relay that adds a statement the operator never made is
-        then not believed, and one that strips it changes nothing.  With
-        no proof (the relay is trusted for identity) there is nothing to
-        sign with, a relay that adds the statement makes the host believe
-        in it, and the operator, which did not state it, treats
-        "released" as an ordinary reason (nothing is lost).
+        leaves both sides on the earlier behaviour.  The guarantee that
+        a vanished origin ends the connection without losing what was
+        sent holds on a SEALED bridge only (wsh #318): there the
+        operator signs the statement into its ReverseProof (the signed
+        bytes begin "wsh-operator-proof-v2\0" and the statement,
+        "gateway-lossless-close", follows the session id as a
+        length-prefixed string; a proof with no statement is the
+        unchanged v1 proof), only for a host whose VERIFIED registered
+        record lists "gateway-lossless-close-signed", the host acts on
+        the statement it finds signed, never on the unsigned list, and
+        the unsigned acknowledgement is ignored.  On an unsealed bridge,
+        or with no proof, no carrier can stop a relay forging or
+        stripping a plain "released": it is best-effort as before (the
+        host takes the relay's list), no guarantee is reported, and an
+        operator that receives "released" ends the connection promptly
+        (what was sent is delivered first) instead of holding it to the
+        idle bound.
         It is sent by the side that holds an ANSWERING socket (an origin
         a host dialled, the local service of a reverse forward) when that
         socket has half-closed and then vanished (the watch of #282,

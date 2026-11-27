@@ -401,6 +401,8 @@ export class WshClient {
   #gatewayLosslessClose = true;
   /** Whether the bridge now up was asked for with `gateway-lossless-close` stated to the host. */
   #bridgeStatedLossless = false;
+  /** #318: whether the lossless close is a GUARANTEE on the bridge now up: sealed, the statement signed into a v2 proof for a host whose VERIFIED record lists it. */
+  #bridgeLosslessGuaranteed = false;
 
   /** @type {number|null} Ping interval handle. */
   #pingTimer = null;
@@ -1243,6 +1245,7 @@ export class WshClient {
     this.#state = STATE_CLOSED;
     this.#bridgedFeatures = null;
     this.#bridgeStatedLossless = false;
+    this.#bridgeLosslessGuaranteed = false;
     this.#gateway?.abandonAll('client disconnected');
 
     // Close all sessions concurrently.
@@ -1581,13 +1584,14 @@ export class WshClient {
       // offer is made only to a peer whose registered record lists `operator-proof` ('auto'), or when the caller insists
       // (`proof: true`). The relay checks the same on its side and strips the field for a peer that did not advertise it.
       let peerCanProve = proof === true;
-      // The peer's registered capabilities, looked up once (given by the caller, or listed).
+      // The peer's registered capabilities, looked up once (given by the caller, who vouches for them, or listed). A listed record counts only if its
+      // signature VERIFIED (#318): the list is the relay's to edit, and what a record says decides what this side states and signs.
       let peerCaps = Array.isArray(peerCapabilities) ? peerCapabilities : null;
       const capsOfPeer = async () => {
         if (!peerCaps) {
           const peers = await this.listPeers(timeout).catch(() => []);
           const hits = peers.filter((p) => p.fingerprint === targetFingerprint || (targetFingerprint.length >= 8 && String(p.fingerprint ?? '').startsWith(targetFingerprint)));
-          peerCaps = hits.length === 1 && Array.isArray(hits[0].capabilities) ? hits[0].capabilities : [];
+          peerCaps = hits.length === 1 && hits[0].verified === true && Array.isArray(hits[0].capabilities) ? hits[0].capabilities : [];
         }
         return peerCaps;
       };
@@ -1604,9 +1608,10 @@ export class WshClient {
       if (this.#gatewayLosslessClose && this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE)) {
         const lossCaps = await capsOfPeer();
         offerLossless = lossCaps.includes('gateway');
-        // #318: with proof, the statement is SIGNED into the proof when the host's record says it reads one; a host that does not list that (a 0.62.x
-        // peer) is told as before, unsigned, and a current host does not act on an unsigned statement behind a proof.
-        signLossless = offerLossless && offerProof && lossCaps.includes(GATEWAY_LOSSLESS_SIGNED_FEATURE);
+        // #318: the guarantee holds on a SEALED bridge only: there the statement is SIGNED into a v2 proof, and only for a host whose verified record says
+        // it reads one (a 0.62.x host would not verify it). On an unsealed bridge nothing is signed (no carrier stops a relay forging a plain `released`):
+        // the statement is made as before, unsigned, and what follows is best-effort.
+        signLossless = offerLossless && offerProof && !!sealOpts && lossCaps.includes(GATEWAY_LOSSLESS_SIGNED_FEATURE);
       }
 
       const ownFingerprint = this.#signer ? await computeFingerprint(this.#signer.publicKeyRaw) : null;
@@ -1673,8 +1678,10 @@ export class WshClient {
       this.#bridgedFeatures = Array.isArray(response.features) && response.features.every((f) => typeof f === 'string')
         ? [...response.features]
         : null;
-      // Negotiated for this bridge only if the host SAID it saw the statement (a relay may have dropped it).
-      this.#bridgeStatedLossless = offerLossless && (this.#bridgedFeatures?.includes(GATEWAY_LOSSLESS_ACK_FEATURE) ?? false);
+      // Sealed: negotiated and GUARANTEED when the statement went out signed (the host acts on the signature; the unsigned acknowledgement is ignored, a
+      // relay can strip or add it). Unsealed: negotiated if the host SAID it saw the statement (a relay may have dropped it), and never a guarantee.
+      this.#bridgeLosslessGuaranteed = signLossless;
+      this.#bridgeStatedLossless = sealOpts ? signLossless : offerLossless && (this.#bridgedFeatures?.includes(GATEWAY_LOSSLESS_ACK_FEATURE) ?? false);
     }
 
     return response;
@@ -1777,6 +1784,8 @@ export class WshClient {
       hasFeature: (f) => this.hasFeature(f),
       // #286: a connection may be released only if THIS side stated `gateway-lossless-close` too (to the host, or behind a bridge in ReverseConnect).
       statesLossless: () => (this.#bridgedFeatures ? this.#bridgeStatedLossless : this.#gatewayLosslessClose),
+      // #318: reported as a guarantee (`lossless`) only where no relay can forge or strip it: a direct connection, or a sealed bridge with a signed statement.
+      guaranteesLossless: () => (this.#bridgedFeatures ? this.#bridgeLosslessGuaranteed : this.#gatewayLosslessClose),
       halfCloseIdleMs: this.#gatewayHalfCloseIdleMs,
       // Datagrams for UDP flows: only on a transport that has them AND a host that listed "gateway-datagram".
       datagrams: () => {
@@ -3705,6 +3714,7 @@ export class WshClient {
     this.#closeInfo = normalizeCloseInfo(info);
     this.#bridgedFeatures = null;
     this.#bridgeStatedLossless = false;
+    this.#bridgeLosslessGuaranteed = false;
     this.#gateway?.abandonAll('transport closed');
     this.#stopPing();
     this.#rejectAllWaiters(new Error('Transport closed'));

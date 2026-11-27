@@ -180,35 +180,43 @@ string in a list that already exists and the reason is the existing optional tex
 | new host | operator that did not state it, through a relay | The host sees no `gateway-lossless-close` in the request: it does not acknowledge, and its origins behind this bridge are not watched. |
 | new | new, through a relay that DROPS the operator's statement (a released JS relay, 0.60 / 0.61, for a host without `operator-proof`; or a hostile one) | The host never sees it, so it does not list `gateway-lossless-close-ack`; the operator, which relies on the feature behind a relay only with that answer, does not either. Both sides are on the earlier behaviour (tested). |
 | new host | operator that did not state it, through a relay that ADDS a statement, on a bridge with NO proof (`trustRelayIdentity` / `--relay-gateway-trust-relay`, or an operator without a key) | The host believes it, acknowledges and watches, and sends `released`; the operator did not state the feature, so it treats `released` as an ordinary reason (a half-close as a first close, ignored as a second): nothing is lost, its connection waits for its own close or the idle bound (tested, pinned as unchanged). With no operator signature there is nothing to authenticate the statement with; the relay is trusted for identity on such a bridge. |
-| new host | operator that did not state it, through a relay that ADDS a statement, on a bridge where the operator PROVES itself (sealed or not) (#318) | The host acts only on what the operator signed in its proof: nothing was signed, so it does not acknowledge, watch or release. Tested sealed and unsealed. |
+| new host | operator that did not state it, through a relay that ADDS a statement | On a SEALED bridge the host acts only on what the operator signed: nothing was signed, so it does not acknowledge, watch or release. On an unsealed bridge it is best-effort as before (the relay's list is taken; see the #318 table). |
 | any | the Rust `wsh reverse-connect` operator | It does not state the feature, so behind a relay it never gets the lossless close. A Rust reverse host can decline to state or acknowledge it with `--no-lossless-close`. |
 
-### Authenticated statement (#318): the combinations
+### The lossless-close guarantee is SEALED-ONLY (#318): the combinations
 
-Where the operator proves itself (`operator-proof`; sealed or not) an operator that states `gateway-lossless-close` **signs the statement into its
-proof**: the label of the signed bytes becomes `wsh-operator-proof-v2` and the statement is appended (a proof that states nothing stays byte for byte
-the v1 proof of 0.62.x). It does so only for a host whose **registered capabilities** list `gateway-lossless-close-signed`, which a host lists when it
-reads such a proof and states the feature: a host that does not (0.62.x, or one declining the feature) would not verify a v2 proof, so it is never
-sent one. The new string is a capability, not a wire field: it rides in a list that already exists, and a peer that does not know it ignores it. The
-host acts on `signedFeatures` of the verified proof, never on the unsigned list. `gateway-lossless-close` and `-ack` keep their meaning.
+The guarantee ("a vanished origin ends the connection without dropping what was sent") holds on a **sealed** bridge only. On an unsealed bridge no carrier
+can stop a relay forging or stripping the plain `GatewayClose{reason:"released"}`, so nothing there is reported as a guarantee; it stays best-effort.
+
+On a sealed bridge an operator that states `gateway-lossless-close` **signs the statement into its proof**: the label of the signed bytes becomes
+`wsh-operator-proof-v2` and the statement is appended (a proof that states nothing stays byte for byte the v1 proof of 0.62.x). It does so only for a
+host whose **verified** registered record lists `gateway-lossless-close-signed` (a record whose signature does not verify is not believed, so a relay
+cannot add the string), which a host lists when it reads such a proof and states the feature: a host that does not (0.62.x, or one declining the
+feature) would not verify a v2 proof, so it is never sent one. The string is a capability, not a wire field: it rides in a list that already exists, and
+a peer that does not know it ignores it. The operator reports the connection as lossless (`lossless === true`) only then; the host acts on
+`signedFeatures` of the verified proof, never on the unsigned list, and the unsigned `-ack` is ignored on a sealed bridge.
+
+An unsealed bridge (or none that is proven): nothing is signed (a v1 proof, as 0.62.x). The host behaves as in 0.62.x / rust-v0.26.x (the relay's list is
+taken, `-ack` is sent, the origin is watched and released), the operator reports `lossless === false`, and a `released` it receives ends the connection
+promptly (what was sent is delivered first), whether or not it negotiated it, instead of holding it to the idle bound (the #318 symptom).
 
 | Operator | Host | Bridge | Relay | Result |
 | --- | --- | --- | --- | --- |
-| new | new | proven (sealed or not) | honest | Signed, acknowledged, negotiated, released. |
-| new | new | proven | adds the statement; operator declined it | Not believed: no acknowledgement, not watched (tested sealed and unsealed). |
-| new | new | proven | strips the statement only | The host reads it from the signature: negotiated (the relay can no longer defeat it that way). |
-| new | new | proven | strips the whole list | No proof is asked for, so it is the no-proof row: both on the earlier behaviour. |
-| new | 0.62.x | any | any | The record lacks `gateway-lossless-close-signed`: the operator states it unsigned as before, the old host acts on it as before. Nothing fails. |
-| 0.62.x | new | proven | honest | The operator's statement is unsigned, so the new host does not act on it and does not acknowledge: earlier behaviour on both sides. An old operator that signed nothing cannot be told from a relay that added the string. |
-| 0.62.x | new | proven | any | The bridge works; no lossless close. |
-| new or 0.62.x | new | no proof (the relay is trusted for identity) | honest | Earlier behaviour: the unsigned statement is taken as stated and acknowledged. |
-| new or 0.62.x | new | no proof | adds the statement | The earlier behaviour, unchanged (see the first table): the host is fooled, nothing is lost. |
+| new | new | sealed | honest | Signed (v2 proof), negotiated, released; `lossless` true. |
+| new | new | sealed | adds the statement; operator declined it | Not believed: no acknowledgement, not watched, not released. |
+| new | new | sealed | strips the statement only, or the `-ack` | The signature carries it: negotiated, released; `lossless` true. |
+| new | new | sealed | strips `operator-proof` (and adds the statement) | A sealed host refuses the bridge. |
+| new | new | proven but unsealed | honest | Best-effort: released, `lossless` false, nothing signed. |
+| new | new | unsealed or no proof | adds or forges the statement or a `released` | The host (relay's list) may watch and release; the operator reports no guarantee and ends promptly on the `released`. Nothing is lost beyond what a relay can always do. |
+| new | new | unsealed or no proof | strips the statement | Not released (held, best-effort); no guarantee. |
+| new | 0.62.x | any | any | The record lacks the capability: the operator states it unsigned as before. Nothing fails; best-effort, `lossless` false on a bridge. |
+| 0.62.x | new | sealed | honest | The unsigned statement is not acted on by a sealed host: no release, the bridge works. |
+| 0.62.x | new | unsealed or no proof | honest | Earlier behaviour: the unsigned statement is taken as stated and acknowledged. |
 
-What is not covered: the host's `-ack` in `ReverseAccept.features` is not signed (the host's challenge precedes the operator's statement), so a relay
-that adds it to a bridge whose host did not see the statement makes the operator send `released` to a host that reads it as an ordinary reason (the same
-harm as the first table, mirrored). A hostile relay that adds `gateway-lossless-close-signed` to the record of a 0.62.x host makes a new operator send a v2
-proof that host cannot verify: the bridge is refused (a relay can always refuse a bridge). The Rust `wsh reverse-connect` operator does not state the
-feature at all, so it has nothing to sign.
+What is not covered: on an unsealed bridge everything about the release is relay-editable (a relay can also close the bridge). A hostile relay that adds
+`gateway-lossless-close-signed` to the record of a 0.62.x host is not believed by a new operator (the record's signature does not verify). Rust
+`wsh reverse-connect` states nothing, so it signs nothing. A Rust re-attach that overwrites the active request (#327) is separate and harmless for #318
+now that the guarantee is sealed-only.
 
 **Behind a relay the negotiation is two-sided, with one more string:** `gateway-lossless-close-ack`, listed by a host in `ReverseAccept.features` only
 when it actually received the operator's `gateway-lossless-close`; a peer that does not know it ignores it (an unknown entry of a list of strings: the

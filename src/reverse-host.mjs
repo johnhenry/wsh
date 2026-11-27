@@ -249,13 +249,15 @@ export function createReverseHostWith({
         if (!ok) { await refuse('not accepted', 'unauthorized'); return; }
         if (bridges.size >= operatorLimit()) { await refuse('not accepted'); return; }
         c.trustRelayPeer(from);
-        // #318: what the operator stated about the lossless close. Behind a proof it is what the operator SIGNED (a relay can add or strip the
-        // unsigned list, and an operator that does not sign - a 0.62.x one - is not believed); with no proof there is nothing to check it against
-        // and the relay's list is taken as before (the relay is trusted for identity on such a bridge).
+        // #318: what the operator stated about the lossless close. The guarantee holds on a SEALED bridge only (here: one this host requires proof and
+        // a seal for): there it is what the operator SIGNED, since a relay can add or strip the unsigned list and an operator that signs nothing (a 0.62.x
+        // one) is not believed. On any other bridge no carrier stops a relay forging a plain `released`: it stays best-effort as in 0.62, the relay's list
+        // (plus what was signed) is taken, and nothing is reported as a guarantee.
         const reqFeatures = Array.isArray(req.features) ? req.features : [];
-        const operatorFeatures = proven
-          ? [...reqFeatures.filter((f) => f !== GATEWAY_LOSSLESS_FEATURE), ...(proven.signedFeatures ?? []).filter((f) => f === GATEWAY_LOSSLESS_FEATURE)]
-          : reqFeatures;
+        const signedLossless = (proven?.signedFeatures ?? []).filter((f) => f === GATEWAY_LOSSLESS_FEATURE);
+        const operatorFeatures = proven && requireOperatorProof
+          ? [...reqFeatures.filter((f) => f !== GATEWAY_LOSSLESS_FEATURE), ...signedLossless]
+          : [...new Set([...reqFeatures, ...signedLossless])];
         const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge, grant, operatorFeatures);
         bridges.set(from, bridge);
         onLog(`[reverse] bridged to ${from.slice(0, 12)}${proven ? ' (operator proven)' : ''}${requireOperatorProof ? ', sealed' : ''}`);

@@ -161,7 +161,7 @@ describe('the Rust CLI reverse host grants its gateway per operator (#296)', () 
     ]);
     for (const n of ['a', 'b', 'c']) assert.ok(accepts[n].features.includes('gateway-lossless-close-ack'), `${n}: ${accepts[n].features}`);
     const va = await clients.a.openTcp('127.0.0.1', pa); const vb = await clients.b.openTcp('127.0.0.1', pb);
-    assert.ok(va.lossless && vb.lossless);
+    assert.ok(va.releasable && vb.releasable && !va.lossless && !vb.lossless, 'unsealed: negotiated, best-effort (#318)');
     for (const v of [va, vb]) { const r = v.readable.getReader(); for (;;) { const { done } = await r.read(); if (done) break; } }
     await until(() => gone.a.length === 1 && gone.b.length === 1, 'both origins to have been dialled');
     gone.a[0].resetAndDestroy();
