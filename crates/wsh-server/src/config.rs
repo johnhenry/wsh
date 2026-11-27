@@ -460,6 +460,13 @@ pub struct GatewaySection {
     /// Default: `true`.
     #[serde(default = "default_true")]
     pub half_close_probe_answers: bool,
+    /// The TCP keep-alive schedule, in seconds, of a half-closed ANSWERING socket on ANOTHER machine (wsh #286): first probe after this long, then one
+    /// per this long. A live origin behind a short network partition is then not released (and the client's remaining upload dropped) where TCP
+    /// retransmission would have ridden it out. Loopback and unix origins keep `half_close_probe_secs`. `0` = the same as `half_close_probe_secs`.
+    ///
+    /// Default: `30`.
+    #[serde(default = "default_half_close_probe_remote_secs")]
+    pub half_close_probe_remote_secs: u64,
 }
 
 impl Default for GatewaySection {
@@ -492,6 +499,7 @@ impl Default for GatewaySection {
             half_close_probe_secs: default_half_close_probe_secs(),
             lossless_close: true,
             half_close_probe_answers: true,
+            half_close_probe_remote_secs: default_half_close_probe_remote_secs(),
         }
     }
 }
@@ -537,6 +545,9 @@ fn default_max_client_buffered_bytes() -> usize {
 }
 fn default_half_close_idle_secs() -> u64 {
     crate::gateway::policy::DEFAULT_HALF_CLOSE_IDLE_SECS
+}
+fn default_half_close_probe_remote_secs() -> u64 {
+    crate::gateway::policy::DEFAULT_HALF_CLOSE_PROBE_REMOTE_SECS
 }
 fn default_half_close_probe_secs() -> u64 {
     wsh_core::peer_watch::DEFAULT_HALF_CLOSE_PROBE.as_secs()
@@ -699,6 +710,8 @@ pub struct ServerConfig {
     pub gateway_lossless_close: bool,
     /// See [`GatewaySection::half_close_probe_answers`].
     pub gateway_half_close_probe_answers: bool,
+    /// See [`GatewaySection::half_close_probe_remote_secs`].
+    pub gateway_half_close_probe_remote_secs: u64,
     /// Username → usable password hash, for password auth. Entries that could not be
     /// used (an unsalted `sha256:` without `allow_legacy_sha256`, anything unparsable)
     /// are logged at start-up and left out, so those users cannot log in.
@@ -915,6 +928,7 @@ impl ServerConfig {
             gateway_half_close_probe_secs: file_config.gateway.half_close_probe_secs,
             gateway_lossless_close: file_config.gateway.lossless_close,
             gateway_half_close_probe_answers: file_config.gateway.half_close_probe_answers,
+            gateway_half_close_probe_remote_secs: file_config.gateway.half_close_probe_remote_secs,
             password_hashes,
             rpc_enabled: file_config.rpc.enabled,
             rpc_max_message_bytes: file_config.rpc.max_message_bytes,
@@ -1119,6 +1133,9 @@ mod tests {
     fn the_lossless_close_and_the_answering_watch_are_on_by_default_and_each_can_be_turned_off() {
         let on = load("[gateway]\nenabled = true\n");
         assert!(on.gateway_lossless_close && on.gateway_half_close_probe_answers);
+        assert_eq!(on.gateway_half_close_probe_remote_secs, 30);
+        let long = load("[gateway]\nenabled = true\nhalf_close_probe_remote_secs = 90\n");
+        assert_eq!(long.gateway_half_close_probe_remote_secs, 90);
         let off = load(
             "[gateway]\nenabled = true\nlossless_close = false\nhalf_close_probe_answers = false\n",
         );

@@ -82,3 +82,46 @@ describe('pipe: what was read from the local socket is delivered before the conn
     assert.ok(t.got.length > 0);
   });
 });
+
+// #286: after the peer RELEASED the connection ("deliver what I sent, then finish") what it sent is delivered whole: a late byte from the local
+// socket (a request body still uploading after the server replied and closed) is dropped on its own, and never destroys the socket while the
+// tail of the answer is still unflushed.
+describe('pipe: a released connection delivers its whole tail, whatever the local socket sends after the release', () => {
+  let dir; const socks = [];
+  afterEach(() => { for (const s of socks.splice(0)) s.destroy(); if (dir) { fs.rmSync(dir, { recursive: true, force: true }); dir = undefined; } });
+
+  it('the local socket sends one more byte after the release while 16 MiB of the answer is still queued for it: every byte arrives', async () => {
+    const server = net.createServer({ allowHalfOpen: true });
+    const accepted = new Promise((r) => server.once('connection', r));
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const local = net.connect({ port: server.address().port, host: '127.0.0.1', allowHalfOpen: true });
+    await new Promise((r) => local.once('connect', r));
+    const service = await accepted;
+    server.close();
+    service.on('error', () => {});
+    socks.push(local, service);
+    service.pause(); // the reader of the answer reads nothing yet: what the host sent stays queued on the forward's socket
+    let released = false; let pushIn;
+    const events = [];
+    const readable = new ReadableStream({ start(c) { pushIn = c; } });
+    const writable = new WritableStream({
+      write() { if (released) throw new Error('gateway connection closed'); }, // after a release our writes fail (as the channel's do)
+      close() { events.push('half-close'); },
+    });
+    const duplex = { readable, writable, destroy() { events.push('destroy'); }, closed: new Promise(() => {}), get peerReleased() { return released; }, release() { events.push('release'); } };
+    pipe(local, duplex);
+    local.resume();
+    const TOTAL = 16 * 1024 * 1024; const CHUNK = 64 * 1024;
+    for (let n = 0; n < TOTAL; n += CHUNK) pushIn.enqueue(new Uint8Array(CHUNK).fill(3));
+    await until(() => local.writableNeedDrain, 'the answer to back up behind the unread socket');
+    released = true; pushIn.close(); // the peer released: everything it sent is queued, nothing more comes
+    await new Promise((r) => service.write(Buffer.from('x'), r)); // a late byte from the local side
+    await until(() => local.isPaused() || local.destroyed, 'the pipe to have read the late byte');
+    assert.equal(local.destroyed, false, 'the socket with an unflushed tail was not destroyed over a byte that can no longer be sent');
+    let got = 0;
+    const done = new Promise((resolve) => { service.on('data', (b) => { got += b.length; }); service.once('end', resolve); });
+    service.resume();
+    await Promise.race([done, sleep(30_000).then(() => { throw new Error(`the tail never ended; ${got} of ${TOTAL} arrived`); })]);
+    assert.equal(got, TOTAL, 'every byte of the answer');
+  });
+});

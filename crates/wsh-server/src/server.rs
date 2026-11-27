@@ -387,6 +387,9 @@ impl WshServer {
                 .then(|| std::time::Duration::from_secs(config.gateway_half_close_probe_secs)),
             lossless_close: config.gateway_lossless_close,
             half_close_probe_answers: config.gateway_half_close_probe_answers,
+            half_close_probe_remote: std::time::Duration::from_secs(
+                config.gateway_half_close_probe_remote_secs,
+            ),
         };
         let policy_enforcer = Arc::new(GatewayPolicyEnforcer::new(gateway_policy));
         let gateway_policy = policy_enforcer;
@@ -5664,6 +5667,8 @@ mod wisp_reverse_connect_e2e_tests {
             gateway_half_close_probe_secs: wsh_core::peer_watch::DEFAULT_HALF_CLOSE_PROBE.as_secs(),
             gateway_lossless_close: true,
             gateway_half_close_probe_answers: true,
+            gateway_half_close_probe_remote_secs:
+                crate::gateway::policy::DEFAULT_HALF_CLOSE_PROBE_REMOTE_SECS,
             password_hashes: std::collections::HashMap::new(),
             rpc_enabled: true,
             rpc_max_message_bytes: crate::rpc::RPC_DEFAULT_MAX_MESSAGE,

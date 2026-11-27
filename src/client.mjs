@@ -48,7 +48,7 @@ import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, verifyReverseChallenge, cre
 import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
 import { GatewayConnections, GatewayError, assertHalfCloseIdleMs } from './gateway-client.mjs';
-import { GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE } from './gateway-channel.mjs';
+import { GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE, GATEWAY_LOSSLESS_ACK_FEATURE } from './gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from './gateway-datagram.mjs';
 import { RpcCreditLink, rpcCreditId, rpcChannelOfCredit } from './rpc-virtual.mjs';
 import { cborDecode, cborEncode } from './cbor.mjs';
@@ -1666,7 +1666,8 @@ export class WshClient {
       this.#bridgedFeatures = Array.isArray(response.features) && response.features.every((f) => typeof f === 'string')
         ? [...response.features]
         : null;
-      this.#bridgeStatedLossless = offerLossless;
+      // Negotiated for this bridge only if the host SAID it saw the statement (a relay may have dropped it).
+      this.#bridgeStatedLossless = offerLossless && (this.#bridgedFeatures?.includes(GATEWAY_LOSSLESS_ACK_FEATURE) ?? false);
     }
 
     return response;

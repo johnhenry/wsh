@@ -384,6 +384,9 @@ pub struct IdentityPolicy {
     /// `--no-half-close-probe-answers` (wsh #286): do not watch the ANSWERING socket of a connection (a reverse host's origin, a `-R`'s local
     /// service) for a vanished peer even where `gateway-lossless-close` is negotiated. Default: watched when negotiated.
     pub no_probe_answers: bool,
+    /// `--no-lossless-close` (wsh #286): a reverse host does not state `gateway-lossless-close` (nor acknowledge an operator's), so its operators' connections
+    /// behave as before the feature. Default: stated.
+    pub no_lossless_close: bool,
     /// Reverse operator: how to treat `operator-proof` (see [`OperatorProofMode`]).
     pub operator_proof: OperatorProofMode,
     /// Reverse operator: seal the bridge (`--sealed` on `wsh reverse-connect`).
@@ -470,6 +473,7 @@ pub fn apply_host_policy(
         .map(|a| a.to_ascii_lowercase())
         .collect();
     options.gateway = relay_gateway_from_policy(&p, options)?;
+    options.lossless_close = !p.no_lossless_close;
     options.identity = Some(crate::commands::reverse_host::IdentityKey(
         std::sync::Arc::new(key.clone()),
     ));

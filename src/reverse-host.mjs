@@ -19,6 +19,7 @@ import { exportPublicKeyRaw, fingerprint } from './auth.mjs';
 import { MSG, reverseAccept, reverseReject, reverseChallenge } from './messages.gen.mjs';
 import { MULTI_OPERATOR_FEATURE } from './server/relay.mjs';
 import { RELAY_GATEWAY_FEATURE } from './features.mjs';
+import { GATEWAY_LOSSLESS_FEATURE, GATEWAY_LOSSLESS_ACK_FEATURE } from './gateway-channel.mjs';
 import { grantPermissions } from './key-options.mjs';
 import { E2E_SIGN_FEATURE, E2EResponder } from './e2e-exchange.mjs';
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyOperatorProof } from './operator-proof.mjs';
@@ -254,7 +255,8 @@ export function createReverseHostWith({
         await answer(reverseAccept({
           targetFingerprint: myFingerprint, username, capabilities, peerType, shellBackend,
           supportsAttach: false, supportsReplay: false, supportsEcho: false, supportsTermSync: false,
-          features: reportFeatures ? [...bridgeFeatures(c, e2eFor(c), manyOperators()), ...(proven && e2e !== false ? [E2E_SEALED_FEATURE] : [])] : undefined,
+          // `gateway-lossless-close-ack` (#286): only when the operator's own statement reached this host (the relay may drop it)
+          features: reportFeatures ? [...bridgeFeatures(c, e2eFor(c), manyOperators()), ...(proven && e2e !== false ? [E2E_SEALED_FEATURE] : []), ...(gatewayOn(c) && backends.gateway.cfg?.losslessClose !== false && Array.isArray(req.features) && req.features.includes(GATEWAY_LOSSLESS_FEATURE) ? [GATEWAY_LOSSLESS_ACK_FEATURE] : [])] : undefined,
         }));
       } finally { reserved.delete(from); }
     };

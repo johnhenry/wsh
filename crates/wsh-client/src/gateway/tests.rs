@@ -603,6 +603,34 @@ async fn a_host_that_released_the_connection_still_has_what_it_sent_delivered_in
 }
 
 #[tokio::test]
+async fn a_second_released_close_ends_a_pump_whose_local_side_is_still_open() {
+    for second in [true, false] {
+        let mut h = host_lossless(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut app) = duplex(1 << 16);
+        // no idle bound: only the release can end it, and the application keeps its end open and silent
+        let pump = tokio::spawn(s.pump_with_idle(local, None));
+        h.data(id, b"tail").await;
+        if second {
+            host_close(&h, id, None).await;
+        }
+        host_close(&h, id, Some(GATEWAY_RELEASED)).await;
+        let mut got = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut app, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, b"tail");
+        let r = tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the release ends the exchange even though the local side is still open")
+            .unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        drop(app);
+    }
+}
+
+#[tokio::test]
 async fn without_the_feature_released_is_an_ordinary_close() {
     let mut h = host_lossless(false);
     let s = open(&mut h).await;

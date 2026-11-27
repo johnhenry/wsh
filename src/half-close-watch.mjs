@@ -17,6 +17,19 @@
  * The socket is untouched for a connection that is not half-closed: no timer, no keep-alive change.
  */
 
+const LOOPBACK = /^(127\.|::1$|::ffff:127\.)/i;
+
+/**
+ * The keep-alive schedule for a half-closed ANSWERING socket (#286): a loopback socket (or a unix one, which has none) keeps the short one of `probeMs`, a
+ * socket to another machine gets `remoteMs` (a live origin behind a short network partition must not be released and the rest of the client's upload
+ * dropped, where TCP retransmission would have ridden it out). `0` for `remoteMs` means the same as `probeMs`.
+ */
+export function answeringKeepAliveMs(sock, probeMs, remoteMs) {
+  const a = sock?.remoteAddress;
+  if (typeof a !== 'string' || LOOPBACK.test(a)) return probeMs;
+  return remoteMs > 0 ? remoteMs : probeMs;
+}
+
 /** Sockets being watched now, for tests: a probe exists exactly while its socket is half-closed and open. */
 const watching = new Set();
 export const halfCloseWatchCount = () => watching.size;
@@ -43,7 +56,7 @@ const peerGone = (err) => err && typeof err.code === 'string' && !err.code.start
  * @param {number} probeMs  milliseconds between probes; 0 or less = do nothing
  * @param {(err: Error) => void} [onGone]  called once, with `code` "WSH_LOCAL_PEER_GONE", just before the socket is destroyed
  */
-export function watchHalfClosed(sock, probeMs, onGone) {
+export function watchHalfClosed(sock, probeMs, onGone, keepAliveMs = probeMs) {
   if (!(probeMs > 0) || typeof sock?.on !== 'function') return;
   const token = {};
   let timer = null;
@@ -74,7 +87,7 @@ export function watchHalfClosed(sock, probeMs, onGone) {
     watching.add(token);
     if (typeof sock.remoteAddress === 'string') {
       // TCP. Whole seconds (the kernel's unit), at least one.
-      const secs = Math.max(1, Math.ceil(probeMs / 1000));
+      const secs = Math.max(1, Math.ceil((keepAliveMs > 0 ? keepAliveMs : probeMs) / 1000));
       try { sock.setKeepAlive(true, secs * 1000, secs * 1000, 3); } catch { /* the platform refused: the probe still runs */ }
     }
     timer = setInterval(probe, probeMs);

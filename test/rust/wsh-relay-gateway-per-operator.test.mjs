@@ -110,7 +110,7 @@ async function setup(hostArgs) {
   proc.stdin.on('error', () => {});
   await until(() => /Registered as peer/.test(out) || /error|failed/i.test(err), `the host to register (${err})`);
   assert.match(out, /Registered as peer/, err);
-  const clients = {};
+  const clients = {}; const accepts = {};
   for (const [name, o] of Object.entries(ops)) {
     const c = new WshClient();
     await c.connect(relay.url, { username: name, keyPair: o.keyPair });
@@ -119,8 +119,9 @@ async function setup(hostArgs) {
     const res = await c.reverseConnect(host.fp);
     assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
     clients[name] = c;
+    accepts[name] = res;
   }
-  return { ops, clients, logs: () => `${out}${err}` };
+  return { ops, clients, accepts, logs: () => `${out}${err}` };
 }
 
 const refused = (p, re) => assert.rejects(p, (e) => e.code === 4 && re.test(e.message), `expected a policy refusal matching ${re}`);
@@ -142,6 +143,30 @@ describe('the Rust CLI reverse host grants its gateway per operator (#296)', () 
     await refused(clients.c.openTcp('127.0.0.1', ob.port), /no gateway rule for this operator/);
     assert.equal(oa.sockets.length, 1);
     assert.equal(ob.sockets.length, 1);
+  });
+
+  it('gateway-lossless-close is negotiated per operator: an operator with a rule gets it (each acknowledged), and its vanished origin releases only its own connection (#286)', async () => {
+    const gone = { a: [], b: [] };
+    const mk = async (tag) => {
+      const s = net.createServer((x) => { x.on('error', () => {}); gone[tag].push(x); x.end('bye'); });
+      await new Promise((r) => s.listen(0, '127.0.0.1', r));
+      closers.push(async () => { s.close(); for (const x of gone[tag]) x.destroy(); });
+      return s.address().port;
+    };
+    const pa = await mk('a'); const pb = await mk('b');
+    const { clients, accepts } = await setup((fp) => [
+      '--allow-operator', fp.a, '--allow-operator', fp.b, '--allow-operator', fp.c,
+      '--relay-gateway-allow', `${fp.a.slice(0, 12)}=127.0.0.1:${pa}`,
+      '--relay-gateway-allow', `${fp.b.slice(0, 12)}=127.0.0.1:${pb}`,
+    ]);
+    for (const n of ['a', 'b', 'c']) assert.ok(accepts[n].features.includes('gateway-lossless-close-ack'), `${n}: ${accepts[n].features}`);
+    const va = await clients.a.openTcp('127.0.0.1', pa); const vb = await clients.b.openTcp('127.0.0.1', pb);
+    assert.ok(va.lossless && vb.lossless);
+    for (const v of [va, vb]) { const r = v.readable.getReader(); for (;;) { const { done } = await r.read(); if (done) break; } }
+    await until(() => gone.a.length === 1 && gone.b.length === 1, 'both origins to have been dialled');
+    gone.a[0].resetAndDestroy();
+    assert.equal(await Promise.race([va.closed, sleep(20_000).then(() => 'open')]), 'released');
+    assert.equal(await Promise.race([vb.closed, sleep(400).then(() => 'open')]), 'open', 'B\'s origin is alive: B\'s connection is untouched');
   });
 
   it('an unscoped rule is still every allowed operator\'s, and a scoped one adds to it for one operator', async () => {

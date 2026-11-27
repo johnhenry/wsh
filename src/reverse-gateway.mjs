@@ -12,7 +12,7 @@ import { checkGatewayShape, checkReverseTrust } from './gateway-shape.mjs';
 
 const GATEWAY_OPTIONS = new Set([
   'allow', 'allowPrivate', 'maxConnections', 'maxBufferedBytes', 'maxClientBufferedBytes', 'connectTimeoutMs', 'halfCloseIdleMs',
-  'halfCloseProbeMs', 'losslessClose', 'halfCloseProbeAnswers', 'socks', 'udp', 'dns', 'reverse', 'udpIdleMs', 'log', 'trustRelayIdentity', 'network',
+  'halfCloseProbeMs', 'losslessClose', 'halfCloseProbeAnswers', 'halfCloseProbeRemoteMs', 'socks', 'udp', 'dns', 'reverse', 'udpIdleMs', 'log', 'trustRelayIdentity', 'network',
 ]);
 
 /**

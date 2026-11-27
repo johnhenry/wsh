@@ -64,6 +64,15 @@ export const GATEWAY_DISCARDED = 'discarded';
 export const GATEWAY_LOSSLESS_FEATURE = 'gateway-lossless-close';
 
 /**
+ * Behind a relay the statement of an operator travels in `ReverseConnect.features`, which a relay can drop or add. So a host answers it: it lists this in
+ * `ReverseAccept.features` ONLY when it actually received the operator's `gateway-lossless-close`, and an operator treats the feature as negotiated for a
+ * bridge only when it stated it AND got this back (the host: only when it received the statement). A relay that strips the statement therefore leaves
+ * both sides on the earlier behaviour. (A relay that ADDS one an operator never made makes the host believe in it; the operator, which did not state it,
+ * treats `released` as an ordinary reason. Nothing is lost either way; see COMPATIBILITY.md.)
+ */
+export const GATEWAY_LOSSLESS_ACK_FEATURE = 'gateway-lossless-close-ack';
+
+/**
  * The reason on a GatewayClose that RELEASES the connection (#286, only to a peer that stated `gateway-lossless-close`): "I will read nothing more and
  * send nothing more; deliver what you already sent, in order, then finish." Where `discarded` makes the receiver drop what it has received and not yet
  * read (the sender is gone and nobody will read it), `released` loses nothing: it is what the side that holds an ANSWERING socket (an origin the host
@@ -170,7 +179,8 @@ export class GatewayChannel {
     // `released` means something only between two sides that both stated `gateway-lossless-close`; to any other it is an ordinary reason text.
     const released = reason === GATEWAY_RELEASED && this.#o.lossless;
     if (this.#gotClose && released) {
-      if (!this.#released) this.#peerReleased();
+      // (a connection the peer already DISCARDED stays a discard)
+      if (!this.#released && !this.#discarded) this.#peerReleased();
       return;
     }
     if (this.#gotClose) {
@@ -205,6 +215,9 @@ export class GatewayChannel {
     if (this.#queue.length === 0) this.#finish(GATEWAY_RELEASED, true);
     else this.#watchIdle();
   }
+
+  /** The peer released the connection (#286): it reads nothing more, and what it sent is still being delivered. */
+  get peerReleased() { return this.#released; }
 
   /** Does this connection use the lossless close (both ends stated `gateway-lossless-close`)? Only then may it be released. */
   get lossless() { return this.#o.lossless; }

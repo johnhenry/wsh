@@ -159,12 +159,17 @@ impl ConnShared {
             if released && !self.sent_close.swap(true, Ordering::AcqRel) {
                 self.data_ready.notify_one();
                 self.send.wake();
+                // Nothing more can be sent: whoever feeds this connection is told (the inbox is kept; what the host sent is still read).
+                self.closed_tx.send_replace(true);
                 self.retire();
             }
             return;
         }
         if discarded || released {
             self.sent_close.store(true, Ordering::Release);
+        }
+        if released {
+            self.closed_tx.send_replace(true);
         }
         self.data_ready.notify_one();
         self.send.wake();
@@ -662,7 +667,17 @@ impl GatewayStream {
                 if !local_eof.load(Ordering::Acquire) {
                     return std::future::pending::<()>().await;
                 }
-                watch.arm(every);
+                if answering {
+                    // A local service on another machine gets the longer keep-alive schedule (wsh #286)
+                    watch.arm_answering(
+                        every,
+                        Duration::from_secs(
+                            wsh_core::gateway::policy::DEFAULT_HALF_CLOSE_PROBE_REMOTE_SECS,
+                        ),
+                    );
+                } else {
+                    watch.arm(every);
+                }
                 watch.gone().await;
                 if local_shut.load(Ordering::Acquire) {
                     // The hang-up is our own shutdown of the write side: the exchange is ending,

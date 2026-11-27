@@ -1378,6 +1378,17 @@ messages:
         "gateway-lossless-close" (a client in Hello.features, a host in
         ServerHello.features; behind a relay, the operator in
         ReverseConnect.features and the host in ReverseAccept.features).
+        Behind a relay the operator's statement can be dropped or added by
+        the relay, so the host answers it: it lists
+        "gateway-lossless-close-ack" in ReverseAccept.features only when
+        it actually received the operator's statement, and the operator
+        treats the feature as negotiated for that bridge only when it
+        stated it AND received the acknowledgement (the host: only when it
+        received the statement).  A relay that drops the statement thus
+        leaves both sides on the earlier behaviour; one that adds a
+        statement the operator never made makes the host believe in it,
+        and the operator, which did not state it, treats "released" as an
+        ordinary reason (nothing is lost).
         It is sent by the side that holds an ANSWERING socket (an origin
         a host dialled, the local service of a reverse forward) when that
         socket has half-closed and then vanished (the watch of #282,

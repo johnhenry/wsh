@@ -195,6 +195,20 @@ fn close_msg(gateway_id: u32, reason: Option<&str>) -> Envelope {
     }
 }
 
+/// The watch of an answering socket, or none: each costs one extra descriptor (the connection's socket is split between the read and write halves, so
+/// the watch holds a duplicate); one that cannot be had (a descriptor limit) is logged once, and the connection is served unwatched as before.
+fn answering_peer_watch(made: std::io::Result<PeerWatch>) -> Option<PeerWatch> {
+    match made {
+        Ok(w) => Some(w),
+        Err(e) => {
+            if wsh_core::peer_watch::note_watch_failed() {
+                warn!(error = %e, "could not watch an answering socket for a vanished peer (a descriptor limit?); such connections are served unwatched");
+            }
+            None
+        }
+    }
+}
+
 enum WriteCmd {
     Data(Vec<u8>),
     Shutdown,
@@ -297,6 +311,8 @@ struct Inner {
     /// While a reverse listener's caller is half-closed, wait for the kernel's hang-up of it and
     /// give a TCP socket keep-alive on this schedule (`None` = no watch). See [`PeerWatch`].
     half_close_probe: Option<Duration>,
+    /// The keep-alive schedule of a half-closed ANSWERING TCP socket on another machine (wsh #286; zero = the same as `half_close_probe`).
+    half_close_probe_remote: Duration,
     /// Both ends stated `gateway-lossless-close` (wsh #286): a connection may be released, and a close with the reason `released` is understood.
     lossless: bool,
     /// Also watch the ANSWERING socket (an origin the host dialled) once it is half-closed, when `lossless` (`[gateway] half_close_probe_answers`).
@@ -366,6 +382,7 @@ impl GatewaySession {
         let (max_conn_bytes, max_client_bytes) = policy.buffer_limits();
         let policy_idle = policy.half_close_idle();
         let policy_probe = policy.half_close_probe();
+        let policy_probe_remote = policy.half_close_probe_remote();
         let lossless = enabled
             && policy.lossless_close()
             && client_features
@@ -395,6 +412,7 @@ impl GatewaySession {
                 max_client_bytes,
                 half_close_idle: policy_idle,
                 half_close_probe: policy_probe,
+                half_close_probe_remote: policy_probe_remote,
                 lossless,
                 probe_answers,
                 budget: AtomicUsize::new(0),
@@ -673,7 +691,7 @@ impl Inner {
         // `discarded` close would. Without the feature (wsh #282) only the callers of a reverse listener are watched.
         let watch = self
             .answering_watch()
-            .then(|| PeerWatch::tcp(&stream).ok())
+            .then(|| answering_peer_watch(PeerWatch::tcp(&stream)))
             .flatten();
         let ready = self.attach_stream(id, Box::new(stream), guard, watch, true);
         self.send(ok(id, Some(resolved))).await;
@@ -867,7 +885,12 @@ impl Inner {
         if eof.await.is_err() {
             return; // the origin never half-closed (the read loop ended another way)
         }
-        watch.arm(every);
+        if answering {
+            // An origin on another machine gets the longer keep-alive schedule (wsh #286): a live one behind a short partition is not released.
+            watch.arm_answering(every, self.half_close_probe_remote);
+        } else {
+            watch.arm(every);
+        }
         watch.gone().await;
         if answering {
             debug!(
@@ -1853,7 +1876,9 @@ async fn connect_unix_path(path: &std::path::Path, watch: bool) -> Result<Origin
     match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(path)).await {
         // Watched only where the close that follows loses nothing: see `open_tcp`.
         Ok(Ok(s)) => {
-            let watch = watch.then(|| PeerWatch::unix(&s).ok()).flatten();
+            let watch = watch
+                .then(|| answering_peer_watch(PeerWatch::unix(&s)))
+                .flatten();
             Ok((Box::new(s), watch))
         }
         Ok(Err(e)) => Err((
@@ -1896,7 +1921,9 @@ async fn connect_unix_abstract(name: &str, watch: bool) -> Result<Origin, (u32, 
         .map_err(|e| (FAIL_UNREACHABLE, e.to_string()))?;
     let s = tokio::net::UnixStream::from_std(std_stream)
         .map_err(|e| (FAIL_UNREACHABLE, e.to_string()))?;
-    let watch = watch.then(|| PeerWatch::unix(&s).ok()).flatten();
+    let watch = watch
+        .then(|| answering_peer_watch(PeerWatch::unix(&s)))
+        .flatten();
     Ok((Box::new(s), watch))
 }
 

@@ -171,6 +171,9 @@ pub struct ReverseHostOptions {
     /// The gateway for an operator behind the relay (wsh #289): `None` (the default) serves none, and the host does not say
     /// `relay-gateway`. Set by `--relay-gateway-allow`; needs the `gateway` capability.
     pub gateway: Option<RelayGateway>,
+    /// State `gateway-lossless-close` to the operator (wsh #286). `--no-lossless-close` sets it false: neither the statement nor the
+    /// acknowledgement is made, and the operator's connections behave as before the feature. Default true.
+    pub lossless_close: bool,
 }
 
 impl Default for ReverseHostOptions {
@@ -189,6 +192,7 @@ impl Default for ReverseHostOptions {
             identity: None,
             hybrid: true,
             gateway: None,
+            lossless_close: true,
         }
     }
 }
@@ -284,9 +288,21 @@ impl ReverseHostOptions {
                 wsh_core::RELAY_GATEWAY_FEATURE.to_string(),
                 "gateway".to_string(),
                 wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE.to_string(),
-                // The reason `released` on a GatewayClose (wsh #286), understood by this host's gateway session.
-                wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE.to_string(),
             ]);
+            // The reason `released` on a GatewayClose (wsh #286), understood by this host's gateway session; `--no-lossless-close` does not state it.
+            if self.lossless_close {
+                features.push(wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE.to_string());
+            }
+            // The acknowledgement (wsh #286): only when the operator's own `gateway-lossless-close` reached this host (a relay may have dropped it),
+            // so an operator relies on the feature behind a relay only when this is here. `--no-lossless-close` states neither.
+            if self.lossless_close
+                && request.features.as_ref().is_some_and(|f| {
+                    f.iter()
+                        .any(|x| x == wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE)
+                })
+            {
+                features.push(wsh_core::gateway_credit::GATEWAY_LOSSLESS_ACK_FEATURE.to_string());
+            }
         }
         if sealable {
             features.extend([
@@ -1030,14 +1046,15 @@ impl ReverseHostRuntime {
         }
         if fresh || self.gateway.is_none() {
             // The operator's own statement of `gateway-lossless-close` (wsh #286), as the relay passed it on in ReverseConnect.features.
-            let operator_lossless = self
-                .active_request
-                .as_ref()
-                .and_then(|r| r.features.as_ref())
-                .is_some_and(|f| {
-                    f.iter()
-                        .any(|x| x == wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE)
-                });
+            let operator_lossless = self.options.lossless_close
+                && self
+                    .active_request
+                    .as_ref()
+                    .and_then(|r| r.features.as_ref())
+                    .is_some_and(|f| {
+                        f.iter()
+                            .any(|x| x == wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE)
+                    });
             // Per operator (wsh #296): the rules scoped to this operator and the unscoped ones. An operator no rule reaches gets none,
             // and its requests are refused with a sentence that says so. The host still states `relay-gateway` (it is a statement about
             // the host, which the relay keeps per peer connection: a statement that differed per operator would switch the relay's

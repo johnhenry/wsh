@@ -28,6 +28,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createWshServer } from '@johnhenry/wsh/server';
+import { RelayHub } from '../../src/server/relay.mjs';
 import { WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint, MSG, RELAY_GATEWAY_FEATURE } from '@johnhenry/wsh';
 import { openTcp, openUdp, resolveDns, listenRequest } from '../../src/messages.gen.mjs';
 import { freePort } from '../helpers/free-port.mjs';
@@ -222,33 +223,62 @@ for (const [kind, makeRelay] of [['JS', jsRelay], ['Rust', rustRelay]]) {
 
     // #286: the host's origins are watched where the operator and the host both state `gateway-lossless-close` (the operator in ReverseConnect, the host
     // in ReverseAccept; both relays carry it). A vanished origin releases the operator's connection by itself, and a server that closed completely loses nothing.
-    it('lossless close through the relay: an origin that closed completely after 3 MiB loses nothing; a vanished origin releases the connection; a side that did not state it keeps today\'s behaviour', async () => {
+    // ONE connection proves both halves. (A TCP origin that merely exits and closes cleanly is reported by the kernel only after about a minute, so
+    // that is not provable in bounded time; a reset is, so the origin resets once the operator has read the whole answer.)
+    it('lossless close through the relay: a 3 MiB answer arrives byte-exact and the connection is released by itself when the origin vanishes', async () => {
       const SIZE = 3 * 1024 * 1024;
       const host = await hostIdentity();
       const keyPair = await generateKeyPair(true);
       const relay = await makeRelay(`${host.pub}\n${await exportPublicKeySSH(keyPair.publicKey)} op`);
-      const big = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 4), () => s.destroy()); });
-      const bigPort = await listen(big);
       const gone = [];
-      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
-      const vanishingPort = await listen(vanishing);
-      closers.push(async () => { big.close(); vanishing.close(); for (const s of gone) s.destroy(); });
+      const origin = net.createServer((s) => { s.on('error', () => {}); gone.push(s); const b = Buffer.alloc(SIZE); for (let i = 0; i < SIZE; i += 4096) b.writeUInt32LE(i, i); s.end(b); });
+      const port = await listen(origin);
+      closers.push(async () => { origin.close(); for (const s of gone) s.destroy(); });
       await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
       const { op, res } = await connectOperator(relay, host, keyPair);
-      assert.ok(res.features.includes('gateway-lossless-close'), `the host states it: ${res.features}`);
-      const d = await op.openTcp('127.0.0.1', bigPort);
-      const reader = d.readable.getReader();
-      let n = 0; let chunks = 0;
-      for (;;) { const { value, done } = await reader.read(); if (done) break; n += value.length; if (++chunks % 8 === 0) await sleep(1); }
+      assert.ok(res.features.includes('gateway-lossless-close') && res.features.includes('gateway-lossless-close-ack'), `the host states and acknowledges it: ${res.features}`);
+      const v = await op.openTcp('127.0.0.1', port);
+      assert.equal(v.lossless, true);
+      const reader = v.readable.getReader();
+      let n = 0; let ok = true; let chunks = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (let i = 0; i < value.length; i += 4096) { if ((n + i) % 4096 === 0 && Buffer.from(value.buffer, value.byteOffset, value.length).readUInt32LE(i) !== (n + i)) ok = false; }
+        n += value.length;
+        if (++chunks % 8 === 0) await sleep(1);
+      }
       assert.equal(n, SIZE, 'every byte');
-      d.destroy();
-      const v = await op.openTcp('127.0.0.1', vanishingPort);
-      const vr = v.readable.getReader();
-      for (;;) { const { done } = await vr.read(); if (done) break; }
-      await until(() => gone.length === 1, 'the origin to have been dialled');
+      assert.ok(ok, 'in order, byte-exact');
       assert.equal(await Promise.race([v.closed, sleep(400).then(() => 'open')]), 'open', 'a half-closed origin that is alive is held');
       gone[0].resetAndDestroy(); // the origin vanishes: a reset reaches the host
       assert.equal(await Promise.race([v.closed, sleep(20_000).then(() => 'open')]), 'released');
+    });
+
+    // The relay is the JS one, in this process, so it can be made to drop the operator's statement (as a released JS relay does for a host without
+    // operator proof, or a hostile one): the host never sees it, so it does not acknowledge it, and neither side watches or releases.
+    (kind === 'JS' ? it : it.skip)('lossless close through the relay: a relay that strips the operator\'s statement leaves both sides on the earlier behaviour', async () => {
+      const original = RelayHub.prototype.connect;
+      RelayHub.prototype.connect = function stripping(operator, msg) { const m = { ...msg }; delete m.features; return original.call(this, operator, m); };
+      closers.push(async () => { RelayHub.prototype.connect = original; });
+      const host = await hostIdentity();
+      const keyPair = await generateKeyPair(true);
+      const relay = await makeRelay(`${host.pub}\n${await exportPublicKeySSH(keyPair.publicKey)} op`);
+      const gone = [];
+      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+      const port = await listen(vanishing);
+      closers.push(async () => { vanishing.close(); for (const s of gone) s.destroy(); });
+      await startHost(relay, host, ['--relay-gateway-allow', '127.0.0.1'], keyPair);
+      const { op, res } = await connectOperator(relay, host, keyPair);
+      assert.ok(!res.features.includes('gateway-lossless-close-ack'), `nothing was acknowledged: ${res.features}`);
+      const v = await op.openTcp('127.0.0.1', port);
+      assert.equal(v.lossless, false);
+      const vr = v.readable.getReader();
+      for (;;) { const { done } = await vr.read(); if (done) break; }
+      await until(() => gone.length === 1, 'the origin to have been dialled');
+      gone[0].resetAndDestroy();
+      assert.equal(await Promise.race([v.closed, sleep(1500).then(() => 'open')]), 'open', 'not watched: held, as before');
+      v.destroy();
     });
 
     it('lossless close through the relay: an operator that did not state the feature: the origin is not watched, as before', async () => {

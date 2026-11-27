@@ -80,7 +80,7 @@ export { WshClient, MCP_CALL_ID_FEATURE, MCP_CANCEL_FEATURE, STREAM_ANNOUNCE_FEA
 // Gateway forwarding (unix sockets, named endpoints, flow control) -- wsh #120, #123
 export { GatewayError } from './gateway-client.mjs';
 export { GATEWAY_FAIL, GATEWAY_FAIL_TABLE, GATEWAY_FAIL_LOCAL, gatewayFailName } from './gateway-errors.mjs';
-export { GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, GATEWAY_LOSSLESS_FEATURE, GATEWAY_RELEASED } from './gateway-channel.mjs';
+export { GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, GATEWAY_LOSSLESS_FEATURE, GATEWAY_LOSSLESS_ACK_FEATURE, GATEWAY_RELEASED } from './gateway-channel.mjs';
 export { GATEWAY_DATAGRAM_FEATURE } from './gateway-datagram.mjs';
 
 // End-to-end key exchange (responder side, feature names, signed transcript) -- wsh #90

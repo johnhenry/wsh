@@ -29,6 +29,10 @@ pub const GATEWAY_LOSSLESS_FEATURE: &str = "gateway-lossless-close";
 /// socket half-closed and vanished, and a server that sent its whole answer and closed completely looks exactly like that. Sent as the second close
 /// of a connection whose first close was already sent, or as the first close.
 pub const GATEWAY_RELEASED: &str = "released";
+/// Behind a relay an operator's `gateway-lossless-close` travels in `ReverseConnect.features`, which a relay can drop or add. A host therefore answers
+/// it: it lists this in `ReverseAccept.features` ONLY when it actually received the operator's statement, and an operator treats the feature as
+/// negotiated for a bridge only when it stated it AND got this back (wsh #286).
+pub const GATEWAY_LOSSLESS_ACK_FEATURE: &str = "gateway-lossless-close-ack";
 /// The reason a host puts on the `GatewayClose` of a connection it ends because the grant behind it (a key's `expires`) ran out (wsh #297).
 /// It is followed by a second close saying "discarded". Nothing is negotiated: to a peer that predates it the first is an ordinary half-close.
 pub const GATEWAY_EXPIRED: &str = "key expired";

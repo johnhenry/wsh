@@ -38,7 +38,9 @@ export function normalizeGatewayLimits(opts) {
   const flag = (v, what) => { if (v !== undefined && typeof v !== 'boolean') throw new TypeError(`${what} must be a boolean`); return v !== false; };
   const losslessClose = flag(opts.losslessClose, 'gateway.losslessClose');
   const halfCloseProbeAnswers = flag(opts.halfCloseProbeAnswers, 'gateway.halfCloseProbeAnswers');
-  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs, losslessClose, halfCloseProbeAnswers };
+  // #286: the keep-alive schedule of a half-closed answering socket on ANOTHER machine (default 30 s; 0 = the short one of halfCloseProbeMs)
+  const halfCloseProbeRemoteMs = opts.halfCloseProbeRemoteMs === undefined ? 30_000 : assertHalfCloseProbeMs(opts.halfCloseProbeRemoteMs, 'gateway.halfCloseProbeRemoteMs');
+  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs, losslessClose, halfCloseProbeAnswers, halfCloseProbeRemoteMs };
 }
 
 export { normalizeEndpoints } from './gateway-features.mjs';

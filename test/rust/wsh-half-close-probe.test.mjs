@@ -295,8 +295,12 @@ describe('the Rust wsh-server: a caller that finished sending and was killed is 
     assert.equal(await stateAfter(d.closed, BOUND_MS), 'released');
   });
 
-  it('a TCP origin that sent 3 MiB and closed completely: every byte arrives (the kernel tells the server nothing about it for a minute)', async () => {
-    const origin = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 6), () => s.destroy()); });
+  // A TCP origin that sends 3 MiB and CLOSES CLEANLY is not provable in bounded time: the server's kernel reports nothing about it for about a minute (the
+  // keep-alive probe after that is what reports it), so such a connection is held for the client, and every byte arrives. What IS provable at once is a
+  // reset, so the same connection proves both halves: the whole answer arrives byte-exact, and when the origin then resets, the server releases it.
+  it('a TCP origin that sent 3 MiB: every byte arrives (a slow reader), and when the origin then vanishes with a reset the server releases the connection by itself', async () => {
+    const socks = [];
+    const origin = net.createServer((s) => { s.on('error', () => {}); socks.push(s); s.end(Buffer.alloc(SIZE, 6)); });
     await new Promise((r) => origin.listen(0, '127.0.0.1', r));
     closers.push(async () => origin.close());
     const port = origin.address().port;
@@ -304,8 +308,9 @@ describe('the Rust wsh-server: a caller that finished sending and was killed is 
     const d = await client.openTcp('127.0.0.1', port);
     await sleep(500);
     assert.equal(await slowRead(d), SIZE);
-    await d.writable.getWriter().close();
-    assert.notEqual(await d.closed, 'discarded');
+    assert.equal(await stateAfter(d.closed, 400), 'open', 'a half-closed origin that is alive is held');
+    socks[0].resetAndDestroy(); // after the client has everything: a reset that reaches the server's kernel earlier would purge what it had not read
+    assert.equal(await stateAfter(d.closed, BOUND_MS), 'released');
   });
 
   it('with a client that did not state the feature, with lossless_close = false, with half_close_probe_answers = false or half_close_probe_secs = 0: not watched, as before', async () => {

@@ -211,6 +211,9 @@ describe('a half-closed local peer that is killed is noticed with the far side s
     caller.resume();
     await ended;
     assert.equal(n, SIZE);
+    // The caller's `end` also comes on the service's FIRST close, watched or not. What the release adds is that the host then ends the
+    // connection by itself: it closes its socket completely (a mere half-close would leave a write from the caller succeeding for ever).
+    await until(() => { if (!caller.destroyed) caller.write('x', () => {}); return caller.destroyed; }, 'the host to close the connection completely', BOUND_MS);
     caller.destroy();
   });
 

@@ -549,24 +549,33 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
     // #286: the answering side behind a relay. `gateway-lossless-close` crosses the bridge (the host states it in ReverseAccept, the operator in
     // ReverseConnect, both only where the relay carries the gateway), and then an origin that finished sending and vanished is noticed and the
     // operator's connection released, while one that sent everything and closed completely loses nothing.
-    it('the origin is watched through the relay: 3 MiB from a server that closed completely arrive whole, and a vanished origin releases the connection by itself', async () => {
+    // ONE connection proves both halves: the whole 3 MiB answer arrives byte-exact (a slow reader), and when the origin then vanishes (a TCP reset, which the kernel
+    // reports at once; a TCP origin that merely exits and closes cleanly is only reported by the kernel after about a minute, so it is not provable in bounded
+    // time) the host noticed and released the connection by itself, with the operator never closing it. (The reset follows the operator's last byte read, as a
+    // reset reaching the host's kernel while it still holds unread bytes would purge them: that is the kernel, not the host.)
+    it('the origin is watched through the relay: a 3 MiB answer arrives byte-exact and the connection is then released by itself when the origin vanishes', async () => {
       const SIZE = 3 * 1024 * 1024;
-      const big = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 4), () => s.destroy()); });
-      const bigPort = await listen(big); nets.push(big);
       const gone = [];
-      const vanishing = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
-      const vanishingPort = await listen(vanishing); nets.push(vanishing);
+      const origin = net.createServer((s) => { s.on('error', () => {}); gone.push(s); const b = Buffer.alloc(SIZE); for (let i = 0; i < SIZE; i += 4096) b.writeUInt32LE(i, i); s.end(b); });
+      const port = await listen(origin); nets.push(origin);
       const { url } = await setup({ gateway: { allow: ['127.0.0.1'], halfCloseIdleMs: 0, halfCloseProbeMs: 50 } });
       const { c, accepted } = await operator(url);
-      assert.ok(accepted.features.includes('gateway-lossless-close'), `the host states it: ${accepted.features}`);
-      const d = await c.openTcp('127.0.0.1', bigPort);
-      assert.equal((await drain(d, { slowEvery: 8 })).n, SIZE, 'every byte');
-      d.destroy();
-      const v = await c.openTcp('127.0.0.1', vanishingPort);
-      assert.equal((await drain(v)).text, '', 'drain keeps no text'); // reads to the origin's end of file
-      await until(() => gone.length === 1, 'the origin to have been dialled');
+      assert.ok(accepted.features.includes('gateway-lossless-close') && accepted.features.includes('gateway-lossless-close-ack'), `the host states and acknowledges it: ${accepted.features}`);
+      const v = await c.openTcp('127.0.0.1', port);
+      assert.equal(v.lossless, true);
+      const reader = v.readable.getReader();
+      let n = 0; let ok = true; let chunks = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (let i = 0; i < value.length; i += 4096) { if ((n + i) % 4096 === 0 && Buffer.from(value.buffer, value.byteOffset, value.length).readUInt32LE(i) !== (n + i)) ok = false; }
+        n += value.length;
+        if (++chunks % 8 === 0) await sleep(1);
+      }
+      assert.equal(n, SIZE, 'every byte');
+      assert.ok(ok, 'in order, byte-exact');
       assert.equal(await Promise.race([v.closed, sleep(300).then(() => 'open')]), 'open', 'a half-closed origin that is alive is held');
-      gone[0].resetAndDestroy(); // the origin vanishes (a reset reaches the host)
+      gone[0].resetAndDestroy(); // the origin vanishes
       assert.equal(await Promise.race([v.closed, sleep(15000).then(() => 'open')]), 'released');
     });
 
@@ -588,6 +597,63 @@ describe('a relay carries the gateway of a reverse host that turned it on (#289)
         for (const h of hosts.splice(0)) await h.close().catch(() => {});
         for (const s of servers.splice(0)) await s.close();
       }
+    });
+
+    // The operator's statement travels in ReverseConnect.features, which a relay can drop or add; the host answers it with `gateway-lossless-close-ack`
+    // only when it really received it, and the operator relies on the feature behind a relay only with that answer.
+    function tapCloses() {
+      const original = RelayHub.prototype.forward;
+      const closes = [];
+      RelayHub.prototype.forward = function spy(handle, msg) {
+        if (msg.type === MSG.GATEWAY_CLOSE) closes.push(msg.reason);
+        return original.call(this, handle, msg);
+      };
+      spies.push(() => { RelayHub.prototype.forward = original; });
+      return closes;
+    }
+    function rewriteConnect(rewrite) {
+      const original = RelayHub.prototype.connect;
+      RelayHub.prototype.connect = function spy(operator, msg) { return original.call(this, operator, rewrite({ ...msg })); };
+      spies.push(() => { RelayHub.prototype.connect = original; });
+    }
+    async function vanishingOrigin() {
+      const gone = [];
+      const server = net.createServer((s) => { s.on('error', () => {}); gone.push(s); s.end('bye'); });
+      const port = await listen(server); nets.push(server);
+      return { port, gone };
+    }
+
+    it('a relay that strips the operator\'s statement: the host does not acknowledge, neither side watches or releases, the connection is held as before', async () => {
+      rewriteConnect((m) => { delete m.features; return m; });
+      const closes = tapCloses();
+      const { port, gone } = await vanishingOrigin();
+      const { url } = await setup({ gateway: { allow: ['127.0.0.1'], halfCloseIdleMs: 0, halfCloseProbeMs: 50 } });
+      const { c, accepted } = await operator(url);
+      assert.ok(!accepted.features.includes('gateway-lossless-close-ack'), 'nothing to acknowledge');
+      const v = await c.openTcp('127.0.0.1', port);
+      assert.equal(v.lossless, false);
+      await drain(v);
+      await until(() => gone.length === 1, 'the origin to have been dialled');
+      gone[0].resetAndDestroy();
+      assert.equal(await Promise.race([v.closed, sleep(1500).then(() => 'open')]), 'open');
+      assert.ok(!closes.includes('released'), `the host sent no release: ${JSON.stringify(closes)}`);
+      v.destroy();
+    });
+
+    it('a relay that adds a statement the operator never made: the operator does not rely on it (a release it is sent is an ordinary close, nothing is lost)', async () => {
+      rewriteConnect((m) => { m.features = ['gateway-lossless-close']; return m; });
+      const closes = tapCloses();
+      const { port, gone } = await vanishingOrigin();
+      const { url } = await setup({ gateway: { allow: ['127.0.0.1'], halfCloseIdleMs: 0, halfCloseProbeMs: 50 } });
+      const { c } = await operator(url, { clientOptions: { gatewayLosslessClose: false } });
+      const v = await c.openTcp('127.0.0.1', port);
+      assert.equal(v.lossless, false, 'the operator never stated it, so it never relies on it');
+      assert.equal((await drain(v)).n, 3, 'the answer arrived');
+      await until(() => gone.length === 1, 'the origin to have been dialled');
+      gone[0].resetAndDestroy();
+      await until(() => closes.includes('released'), 'the host (which was told the operator stated it) to release');
+      assert.equal(await Promise.race([v.closed, sleep(500).then(() => 'open')]), 'open', 'the operator treats it as an ordinary reason: held, not released');
+      v.destroy();
     });
 
     it('half-close the other way: the origin finishes, the operator can still send', async () => {

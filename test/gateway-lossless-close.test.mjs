@@ -18,7 +18,7 @@ import { createWshServer } from '@johnhenry/wsh/server';
 import { normalizeGateway } from '@johnhenry/wsh/gateway';
 import { WshClient, generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
 import { GatewayChannel, GATEWAY_RELEASED, GATEWAY_DISCARDED, GATEWAY_LOSSLESS_FEATURE } from '../src/gateway-channel.mjs';
-import { halfCloseWatchCount } from '../src/half-close-watch.mjs';
+import { halfCloseWatchCount, watchHalfClosed, answeringKeepAliveMs } from '../src/half-close-watch.mjs';
 import { until, listen } from './gateway-fixture.mjs';
 
 const CHILD = fileURLToPath(new URL('./half-close-probe-child.mjs', import.meta.url));
@@ -61,6 +61,17 @@ describe('GatewayChannel: a peer that released the connection', () => {
     assert.deepEqual(got.map((c) => [c.length, c[0]]), [[10, 1], [20, 2], [30, 3]]);
     assert.equal(await ch.closedPromise, GATEWAY_RELEASED);
     assert.deepEqual(sent.close, [], 'nothing is sent back');
+  });
+
+  it('after a first close of "discarded" a second one with "released" changes nothing (the connection stays a discard)', async () => {
+    let graceful;
+    const { ch } = make({ onClose: (_r, g) => { graceful = g; } });
+    ch.receive(bytes(10));
+    ch.remoteClosed(GATEWAY_DISCARDED);
+    ch.remoteClosed(GATEWAY_RELEASED);
+    await readAll(ch);
+    assert.notEqual(await ch.closedPromise, GATEWAY_RELEASED);
+    assert.equal(graceful, false, 'not a graceful finish');
   });
 
   it('as a first close: the same', async () => {
@@ -165,6 +176,39 @@ describe('GatewayChannel: releasing a connection', () => {
   });
 });
 
+// ── a remote answering socket gets a longer keep-alive than a loopback or unix one ──────────────────────────────────────────────────────
+describe('the keep-alive of a half-closed answering socket (#286)', () => {
+  const fake = (remoteAddress) => {
+    const calls = [];
+    const handlers = {};
+    return {
+      calls, remoteAddress, readableEnded: false, destroyed: false, writableEnded: false, connecting: false, writableLength: 0, writableNeedDrain: false,
+      on(ev, fn) { handlers[ev] = fn; return this; }, once(ev, fn) { handlers[ev] = fn; return this; },
+      setKeepAlive(...a) { calls.push(a); }, write(_b, cb) { cb?.(); }, destroy() { this.destroyed = true; },
+      emit(ev) { handlers[ev]?.(); },
+    };
+  };
+
+  it('a loopback or unix socket keeps the short schedule, a remote one the longer; only once it is half-closed', () => {
+    for (const [addr, remote, want] of [['127.0.0.1', 30_000, 2000], ['::1', 30_000, 2000], ['::ffff:127.0.0.1', 30_000, 2000], [undefined, 30_000, 2000], ['203.0.113.7', 30_000, 30_000], ['2001:db8::1', 45_000, 45_000]]) {
+      assert.equal(answeringKeepAliveMs({ remoteAddress: addr }, 2000, remote), want, `${addr}`);
+      const s = fake(addr);
+      watchHalfClosed(s, 2000, undefined, answeringKeepAliveMs(s, 2000, remote));
+      assert.deepEqual(s.calls, [], 'nothing is touched before the peer half-closes');
+      s.emit('end');
+      if (addr === undefined) assert.deepEqual(s.calls, [], 'a unix socket has no keep-alive');
+      else assert.deepEqual(s.calls, [[true, want, want, 3]]);
+    }
+  });
+
+  it('is an option of the host and of a reverse forward, validated like the other millisecond options', () => {
+    assert.equal(normalizeGateway({ allow: [] }).halfCloseProbeRemoteMs, 30_000);
+    assert.equal(normalizeGateway({ allow: [], halfCloseProbeRemoteMs: 90_000 }).halfCloseProbeRemoteMs, 90_000);
+    assert.throws(() => normalizeGateway({ allow: [], halfCloseProbeRemoteMs: -1 }), /halfCloseProbeRemoteMs/);
+    assert.throws(() => normalizeGateway({ allow: [], halfCloseProbeRemoteMs: 1.5 }), /halfCloseProbeRemoteMs/);
+  });
+});
+
 // ── the host and the client against real sockets ──────────────────────────────────────────────────────────────────────────────────────
 
 describe('the answering side is watched, and nothing is lost (#286)', () => {
@@ -231,15 +275,20 @@ describe('the answering side is watched, and nothing is lost (#286)', () => {
     assert.equal(await stateAfter(d.closed, BOUND), GATEWAY_RELEASED);
   });
 
-  it('a TCP ORIGIN that sent 3 MiB and closed completely: every byte arrives (the kernel tells the host nothing for a minute, so it waits for the client)', async () => {
-    const origin = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 6), () => s.destroy()); });
+  // A TCP origin that sends 3 MiB and then CLOSES CLEANLY cannot be proved released in bounded time: its kernel keeps the half-closed socket for about a
+  // minute before a keep-alive probe reports it (the Node probe test file covers that minute). A reset is reported at once, so the same connection proves both
+  // halves: every byte arrives (a slow reader), and when the origin then resets the host releases the connection by itself.
+  it('a TCP ORIGIN that sent 3 MiB: every byte arrives, and when it then vanishes with a reset the connection is released by itself', async () => {
+    const socks = [];
+    const origin = net.createServer((s) => { s.on('error', () => {}); socks.push(s); s.end(Buffer.alloc(SIZE, 6)); });
     const port = await listen(origin); nets.push(origin);
     const { client } = await setup({ allow: [`127.0.0.1:${port}`] });
     const d = await client.openTcp('127.0.0.1', port);
     await sleep(500);
     assert.equal(await readAllSlow(d), SIZE);
-    await d.writable.getWriter().close();
-    assert.notEqual(await d.closed, GATEWAY_DISCARDED);
+    assert.equal(await stateAfter(d.closed, 300), 'open', 'a half-closed origin that is alive is held');
+    socks[0].resetAndDestroy();
+    assert.equal(await stateAfter(d.closed, BOUND), GATEWAY_RELEASED);
   });
 
   it('a unix origin that half-closed and then vanished (killed) is noticed within the probe bound and the connection freed; the slot is usable again', async () => {
@@ -297,6 +346,30 @@ describe('the answering side is watched, and nothing is lost (#286)', () => {
     });
   }
 
+  it('a client that released the connection: what it sent is delivered to the caller of its reverse listener whole, whatever the caller sends after the release', async () => {
+    const hostSock = path.join(tmp(), 'lr.sock');
+    const { client } = await setup({ allow: [], unix: { listen: [hostSock] } });
+    const opened = [];
+    await client.listenUnix(hostSock, { onConnection: (d) => { opened.push(d); } });
+    const caller = net.connect({ path: hostSock, allowHalfOpen: true });
+    caller.on('error', () => {});
+    caller.pause(); // reads nothing yet: what the host writes to it queues on the host beyond the kernel's buffers
+    await until(() => opened.length === 1, 'the connection');
+    const w = opened[0].writable.getWriter();
+    let sent = 0;
+    for (let i = 0; i < 4; i++) { await w.write(new Uint8Array(64 * 1024).fill(i + 1)); sent += 64 * 1024; } // the whole credit window
+    opened[0].release(); // the client's service is gone: nothing more is read or sent
+    caller.write('x'); // the caller's request body, still uploading
+    await sleep(300); // the host reads it and (before the fix) destroyed the socket with the tail unflushed
+    let got = 0;
+    const ended = new Promise((r) => caller.once('end', r));
+    caller.on('data', (b) => { got += b.length; });
+    caller.resume();
+    assert.equal(await stateAfter(ended, BOUND).then((v) => (v === 'open' ? 'open' : 'ended')), 'ended');
+    assert.equal(got, sent, 'every byte the client sent reached the caller');
+    caller.destroy();
+  });
+
   describe('the local service of a reverse forward', () => {
     it('that sent everything and closed completely: a slow caller gets every byte and the connection ends by itself', async () => {
       const hostSock = path.join(tmp(), 'r.sock');
@@ -316,6 +389,9 @@ describe('the answering side is watched, and nothing is lost (#286)', () => {
       caller.resume();
       await ended;
       assert.equal(n, SIZE);
+      // The caller's `end` also comes on the service's FIRST close, watched or not. What the release adds, and what proves the service WAS watched, is that
+      // the host then ends the connection by itself: it closes its socket completely (a mere half-close would leave a write from the caller succeeding).
+      await until(() => { if (!caller.destroyed) caller.write('x', () => {}); return caller.destroyed; }, 'the host to close the connection completely', BOUND);
       caller.destroy();
     });
 

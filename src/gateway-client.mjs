@@ -121,6 +121,8 @@ export class GatewayConnections {
       readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise,
       /** #286: both ends stated `gateway-lossless-close`, so this connection may be released (see `release()`). */
       lossless: channel.lossless,
+      /** #286: the peer released this connection: it reads nothing more; a write now fails and what it sent is still delivered. */
+      get peerReleased() { return channel.peerReleased; },
       /** #286: the answering socket of this connection went away after finishing its side: end it without making the peer drop what it was sent. */
       release: () => channel.release(),
     };

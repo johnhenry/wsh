@@ -2301,6 +2301,8 @@ export interface WshForwardOptions {
    * `false` keeps the local service unwatched, as before the feature. Default `true`; a non-boolean is a `TypeError`.
    */
   halfCloseProbeAnswers?: boolean;
+  /** For `reverse: true` (#286): the keep-alive schedule of a half-closed local service on another machine, in milliseconds (default 30000; loopback and unix keep `halfCloseProbeMs`; `0` = the same). */
+  halfCloseProbeRemoteMs?: number;
   onError?: (err: Error) => void;
 }
 
@@ -2389,6 +2391,8 @@ export function gatewayFailName(code: number): string | null;
 export const GATEWAY_CREDIT_FEATURE: 'gateway-credit';
 /** The feature a side states when it understands the `GatewayClose` reason `released` (#286). */
 export const GATEWAY_LOSSLESS_FEATURE: 'gateway-lossless-close';
+/** What a reverse host lists in `ReverseAccept.features` when the operator's `gateway-lossless-close` really reached it (a relay can drop the statement); an operator relies on the feature behind a relay only with this (#286). */
+export const GATEWAY_LOSSLESS_ACK_FEATURE: 'gateway-lossless-close-ack';
 /** The `GatewayClose` reason of a connection one side releases: it reads and sends nothing more, and what it already sent is still delivered (#286). */
 export const GATEWAY_RELEASED: 'released';
 /** Credit, in bytes, each direction of a gateway connection starts with. */

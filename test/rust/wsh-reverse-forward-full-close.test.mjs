@@ -204,8 +204,10 @@ for (const [label, makeHost] of [['a Node host', nodeHost], ['the Rust wsh-serve
       closers.push(async () => service.close());
       const remote = path.join(dir, 'ru.sock');
       await startWsh([...host.args, '-N', '-R', `${remote}:${svc}`, host.target], { home: h.home, env: host.env });
-      // The caller does NOT half-close: only the service has finished, so the exchange stays open on the caller's side and it is the
-      // watch of the service (and its release) that has to end it, without costing the caller the tail it has not read yet.
+      // The caller does NOT half-close. Its `end` comes on the service's FIRST close, with or without any watch, and proves only that the bytes
+      // arrived. What proves the service was watched and released is that the host then closes the connection COMPLETELY by itself, with the
+      // caller still open: a write from the caller then fails (a mere half-close at the host would leave it succeeding), and the tail the caller
+      // had not read when the service vanished is still all there (a discard would have dropped it).
       const caller = net.connect({ path: remote, allowHalfOpen: true });
       caller.on('error', () => {});
       let n = 0;
@@ -213,9 +215,10 @@ for (const [label, makeHost] of [['a Node host', nodeHost], ['the Rust wsh-serve
       caller.on('data', (b) => { n += b.length; caller.pause(); setTimeout(() => caller.resume(), 5); });
       caller.write('request');
       const verdict = await Promise.race([ended.then(() => 'ended'), sleep(30_000).then(() => 'still open')]);
-      caller.destroy();
       assert.equal(verdict, 'ended', `the caller's stream did not end; it had ${n} of ${SIZE} bytes`);
       assert.equal(n, SIZE);
+      await until(() => { if (!caller.destroyed) caller.write('x', () => {}); return caller.destroyed; }, 'the host to close the connection completely');
+      caller.destroy();
     });
 
     it('with --no-half-close-probe-answers the service of a -R is not watched, as before (#286): the same exchange loses nothing either', async () => {

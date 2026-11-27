@@ -189,6 +189,12 @@ export interface WshServerGatewayOptions {
    * unwatched, as before. A connection of an injected network (`network`) has no kernel to ask and is never probed. Default `true`.
    */
   halfCloseProbeAnswers?: boolean;
+  /**
+   * The TCP keep-alive schedule (#286) of a half-closed ANSWERING socket (an origin) on ANOTHER machine, in milliseconds (rounded up to whole seconds). Loopback and
+   * unix origins keep the short schedule of `halfCloseProbeMs`; a remote one gets this longer one, so a live origin behind a short network partition is not
+   * released (and the client's remaining upload dropped) where TCP retransmission would have ridden it out. Default 30000; `0` = the same as `halfCloseProbeMs`.
+   */
+  halfCloseProbeRemoteMs?: number;
   /** Bytes received from a client for one connection and not yet taken by its origin before it is closed (default 4 MiB; at least 262144). */
   maxBufferedBytes?: number;
   /** The same, summed over one client's connections (default 32 MiB). */
