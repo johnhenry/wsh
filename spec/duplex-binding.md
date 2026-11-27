@@ -53,7 +53,8 @@ authentication instead:
   the real host rejects. This is the default of `connectWshOverDuplex`.
 - **The sealed session.** After login a signed key exchange (X25519 and ML-KEM-768, both halves signed by the login key and the host key) keys an
   authenticated encryption of every message but the keepalive, with a role tag and a counter: a frame that does not open ends the session, a
-  replayed, reflected or reordered one does not open, and an unsealed message after sealing is dropped.
+  replayed, reflected or reordered one does not open, an `EncryptedFrame` carrying another session id or another channel ends the session too (it does not
+  open; on a sealed bridge, where several bridges share one connection, such a frame is dropped instead), and an unsealed message after sealing is dropped.
 
 ## What a hop on the duplex can and cannot do
 

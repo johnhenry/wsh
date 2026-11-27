@@ -785,7 +785,17 @@ export function createConnectionFactory(cfg) {
     async function sealedInput(m) {
       if (sealed.bridge) {
         if (m.type === MSG.PING) return m;
-        if (!sealed.bridge.isFrame(m)) { log(`dropped a plaintext message (type ${m.type}) on a sealed session`); return undefined; }
+        if (!sealed.bridge.isFrame(m)) {
+          // A message that claims to be a sealed frame but is not this session's (its session id or channel was changed; the last
+          // byte of a frame on the wire is the end of its session id, #292) is a frame that does not open: close, as for a bad tag.
+          if (m.type === MSG.ENCRYPTED_FRAME) {
+            log('an encrypted frame that is not a frame of this session (its session id or channel was changed): closing the session');
+            reportRefused('seal-failed', 'a sealed frame did not open: it is not a frame of this session');
+            shutdown('sealed frame did not open');
+            return undefined;
+          }
+          log(`dropped a plaintext message (type ${m.type}) on a sealed session`); return undefined;
+        }
         try { return await sealed.bridge.open(m); } catch (e) {
           log(`a sealed frame did not open (${e.message}): closing the session`);
           reportRefused('seal-failed', `a sealed frame did not open: ${e.message}`);

@@ -213,6 +213,14 @@ impl SealGate {
                     return Gated::deliver(msg);
                 }
                 if !bridge.is_frame(&msg) {
+                    // A message that claims to be a sealed frame but is not this session's (its session id or channel was changed; the last
+                    // byte of a frame on the wire is the end of its session id, #292) is a frame that does not open: the session ends.
+                    if msg.msg_type == MsgType::EncryptedFrame {
+                        tracing::warn!("an encrypted frame that is not a frame of this session: the session is closed");
+                        *mode = Mode::Failed;
+                        self.failed.notify_one();
+                        return Gated::default();
+                    }
                     tracing::warn!(msg_type = ?msg.msg_type, "dropping a plaintext message on a sealed session");
                     return Gated::default();
                 }
@@ -623,6 +631,60 @@ mod tests {
         // plain is not heard, and nothing leaves a failed session
         assert!(g.incoming_direct(close(1)).deliver.is_none());
         assert!(g.outgoing(frame_encode(&close(3)).unwrap()).is_none());
+    }
+
+    #[test]
+    fn an_encrypted_frame_that_is_not_this_sessions_ends_the_session() {
+        // #292: the last byte of a frame on the wire is the end of its session id. A frame whose session id was changed is not
+        // "plain": it is a sealed frame that does not open, and the session ends. A plain message of another type is still just dropped.
+        let g = host_gate(true);
+        let secret = x25519_dalek::EphemeralSecret::random();
+        let gated = g.incoming_direct(round_one("sid", &secret));
+        let Payload::KeyExchange(reply) = &gated.replies[0].payload else {
+            panic!("a key exchange reply");
+        };
+        let theirs: [u8; 32] = reply.public_key.clone().unwrap().try_into().unwrap();
+        let key = *secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(theirs))
+            .as_bytes();
+        let mut initiator =
+            SealedBridge::with_scope(key, "sid".into(), RoleTag::Initiator, Scope::Session);
+        // a plain message is dropped and the session carries on
+        assert!(g.incoming_direct(close(1)).deliver.is_none());
+        assert!(!g.has_failed(), "a plain message does not end the session");
+        // the same frame with its session id changed (its last byte) ends it, and is not delivered
+        let mut frame = initiator.seal(&close(9)).unwrap();
+        if let Payload::EncryptedFrame(f) = &mut frame.payload {
+            f.session_id = "sie".into();
+        }
+        assert!(g.incoming_direct(frame).deliver.is_none());
+        assert!(g.has_failed(), "a frame that is not this session's ends it");
+    }
+
+    #[test]
+    fn an_encrypted_frame_of_another_channel_ends_the_session() {
+        // #292: pins that a foreign CHANNEL closes too, not only a foreign session id (kills "only the session id closes").
+        let g = host_gate(true);
+        let secret = x25519_dalek::EphemeralSecret::random();
+        let gated = g.incoming_direct(round_one("sid", &secret));
+        let Payload::KeyExchange(reply) = &gated.replies[0].payload else {
+            panic!("a key exchange reply");
+        };
+        let theirs: [u8; 32] = reply.public_key.clone().unwrap().try_into().unwrap();
+        let key = *secret
+            .diffie_hellman(&x25519_dalek::PublicKey::from(theirs))
+            .as_bytes();
+        let mut initiator =
+            SealedBridge::with_scope(key, "sid".into(), RoleTag::Initiator, Scope::Session);
+        let mut frame = initiator.seal(&close(9)).unwrap();
+        if let Payload::EncryptedFrame(f) = &mut frame.payload {
+            f.channel_id = 1;
+        }
+        assert!(g.incoming_direct(frame).deliver.is_none());
+        assert!(
+            g.has_failed(),
+            "a frame of another channel ends the session"
+        );
     }
 
     #[test]

@@ -2067,6 +2067,17 @@ messages:
         (see src/e2e-frame.mjs); session_id is bound as AEAD additional
         authenticated data so a relay can't splice ciphertext across
         sessions.
+
+        Receiver rule on a sealed connection. On a SEALED SESSION (the
+        whole connection is one session) an EncryptedFrame whose
+        session_id or channel_id is not the session's (channel 0) does not
+        open: it ends the session, like any frame that fails to
+        authenticate. On a sealed BRIDGE (one connection that carries
+        several accepted relay peers, each with its own bridge key and
+        session_id) such a frame is DROPPED instead, because a frame of
+        another bridge on the same connection can be legitimate there.
+        A message of any other type that is not plain-allowed is dropped on
+        both. No wire change: this states the rule implementations enforce.
       fields:
         channel_id:
           type: u32

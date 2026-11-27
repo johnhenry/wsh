@@ -3158,6 +3158,13 @@ export class WshClient {
     if (!seal || msg.type === MSG.PING || msg.type === MSG.PONG) { this.#handleControl(msg); return; }
     if (seal.bridge) {
       if (!seal.bridge.isFrame(msg)) {
+        // A message that CLAIMS to be a sealed frame (an EncryptedFrame) but is not one of this session's (its session id or channel
+        // was changed: the last byte of a frame on the wire is the end of its session id, #292) is a frame that does not open, not a
+        // plain message a relay injected: end the connection. Any other message type is plain, and is dropped.
+        if (msg.type === MSG.ENCRYPTED_FRAME) {
+          this.#sealedFrameFailed(seal, new Error('an encrypted frame that is not a frame of this session (its session id or channel was changed)'));
+          return;
+        }
         this.#countDrop({ reason: 'plaintext-on-sealed-session', messageType: msg.type });
         return;
       }
@@ -3364,6 +3371,8 @@ export class WshClient {
       // only the key exchange that sets the bridge up (while it is pending) and frames of the bridge are heard.
       const sealState = this.#sealState;
       if (sealState) {
+        // A frame of another session id is dropped below, not fatal (unlike a sealed SESSION, #292): several bridges share this connection,
+        // so a frame of another bridge can be legitimate here.
         if (sealState.bridge?.isFrame(inner)) {
           this.#trackOpen(sealState.bridge.open(inner)
             .then((opened) => this.#handleControl(opened, msg.from_fingerprint))

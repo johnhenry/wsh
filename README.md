@@ -1915,7 +1915,11 @@ accepted with `dataStreams: false`) seals the WHOLE session end to end. After lo
 transcripts of the sealed bridge, bound to both identities and both ephemeral keys; hybrid X25519+ML-KEM-768). From then on every
 message but the keepalive -- control messages, `GatewayData` for TCP / unix sockets / named endpoints, `GatewayCredit` -- is an
 authenticated encrypted frame (`EncryptedFrame`, channel 0), so flow-control credit works as before. A plain message is not heard
-once the session is sealed, and a frame that does not open (flipped bit, replay, reorder) closes it. Features: `e2e-session`
+once the session is sealed, and a frame that does not open (flipped bit, replay, reorder) closes it. So does an `EncryptedFrame` that is not this session's (#292): the
+session id is the last field of a frame on the wire, so a relay that changes the last byte makes a frame whose id is not the session's; that used to be dropped as if it were a plain
+message and now closes the session like any frame that does not open (on a sealed bridge, where several bridges share one connection, a frame of another id is dropped instead). A tampered TYPE field or an undecodable frame is still dropped (logged as plaintext or a decode error) and only noticed at the next frame, which fails the strict counter; a message of another type (a plain one a relay wrote) is dropped, counted and never acted on. A relay that drops a
+frame outright is not silent either: the next frame fails the strict counter and ends the session (a frame withheld at the very end of the traffic is just a lost message, the denial
+of service a relay can always do). Features: `e2e-session`
 (offered), `e2e-session-required` (the host serves nothing on a session that is not sealed, and no password login). The Rust CLI
 seals with `--sealed` (or on its own when the host says `e2e-session-required`) and refuses a host that does not offer it: no silent
 downgrade. Only `--sealed` is a guarantee: sealing "on its own" rests on a `ServerHello` feature that a relay can strip before

@@ -197,10 +197,14 @@ describe('a session over a duplex', () => {
     const client = await link.connected;
     flip = true;
     const got = [];
-    const s = await Promise.race([client.openSession({ type: 'exec', command: 'wanted' }), new Promise((r) => setTimeout(() => r(null), 400))]);
-    if (s) s.onData = (d) => got.push(dec.decode(d));
+    // The last byte of a frame is the end of its session id (#292): a frame that is not this session's ends the session, so the open fails
+    // (it used to be dropped as plain and the open timed out with the session still up).
+    const s = await Promise.race([client.openSession({ type: 'exec', command: 'wanted' }).catch((e) => e), new Promise((r) => setTimeout(() => r(null), 400))]);
+    if (s && !(s instanceof Error)) s.onData = (d) => got.push(dec.decode(d));
     await new Promise((r) => setTimeout(r, 200));
     assert.deepEqual(got, [], 'the client never hears the altered answer');
+    assert.ok(s instanceof Error, `the session ended instead of carrying on: ${s}`);
+    assert.equal(client.state, 'closed');
   });
 
   it('a middle that repeats a sealed message from the client: the command runs once', async () => {
