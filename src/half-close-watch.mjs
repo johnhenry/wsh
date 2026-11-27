@@ -70,7 +70,8 @@ export function watchHalfClosed(sock, probeMs, onGone, keepAliveMs = probeMs) {
   const gone = (cause) => {
     if (over) return;
     stop();
-    try { onGone?.(goneError(cause)); } catch { /* the caller's callback threw */ }
+    // The caller's callback may throw, or be an async function that rejects: neither is the watch's to raise (a rejection nobody holds ends the process).
+    try { const r = onGone?.(goneError(cause)); if (typeof r?.then === 'function') r.then(undefined, () => {}); } catch { /* the caller's callback threw */ }
     sock.destroy();
   };
   const probe = () => {
