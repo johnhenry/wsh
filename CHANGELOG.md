@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.61.0 / Rust `rust-v0.25.0`
+
 ### A host that runs in a browser page can offer the gateway over a network its embedder supplies (#299; npm only)
 
 - **What changes.** The gateway (TCP, DNS, UDP, reverse tunnels) is no longer tied to the machine's sockets. `gateway.network` names the network a host dials: `{ connectTcp({ host, port, signal }), resolve({ name, family, signal }), openUdp({ host, port, signal }), listenTcp({ port, bindAddr, signal, onConnection }) }`, each optional (one required), the bytes as web streams. `createMemoryHost({ gateway: { network, allow, ... } })` (a host in a page; named `endpoints` work alongside), the browser-safe `createReverseHost({ gateway: { network, ... } })` (`@johnhenry/wsh/reverse`), `createWshServer({ gateway: { network } })` and the Node `createReverseHost` all take it. The new entry point `@johnhenry/wsh/gateway` is the gateway session and policy with no `node:*` import (it bundles for the browser; types `WshGatewayNetwork`, `WshNetworkDuplex`), for a host built on `@johnhenry/wsh/host`. **Off unless the embedder passes a gateway; default deny; nothing that works today changes.**
