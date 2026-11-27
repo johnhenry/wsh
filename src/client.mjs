@@ -44,7 +44,7 @@ import {
 import { resolveSigner, signChallengeWith, signPeerRecordWith, verifyPeerRecord, importPublicKeyRaw, fingerprint as computeFingerprint } from './auth.mjs';
 import { generateMlKemKeyPair, mlKemEncapsulate, mlKemDecapsulate } from './mlkem.mjs';
 import { compareBytes, combineHybridSecret, verifyKeyExchangeSignature, initiatorTranscript } from './e2e-exchange.mjs';
-import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, verifyReverseChallenge, createOperatorProof } from './operator-proof.mjs';
+import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, GATEWAY_LOSSLESS_SIGNED_FEATURE, verifyReverseChallenge, createOperatorProof } from './operator-proof.mjs';
 import { SealedBridge } from './bridge-seal.mjs';
 import { WshSession } from './session.mjs';
 import { GatewayConnections, GatewayError, assertHalfCloseIdleMs } from './gateway-client.mjs';
@@ -1397,6 +1397,7 @@ export class WshClient {
     supportsEcho,
     supportsTermSync,
     operatorProof = true,
+    gatewayLosslessSigned = false,
     ...hostKeyOpts
   } = {}) {
     // Authenticate normally first.
@@ -1418,6 +1419,8 @@ export class WshClient {
     // A peer that can answer an operator's challenge says so in its signed record: a released peer cannot decode
     // `ReverseConnect.features`, so an operator (and the relay) states the field only to a peer that lists this.
     if (cred && operatorProof) capabilities.push(OPERATOR_PROOF_FEATURE);
+    // #318: this peer reads a signed `gateway-lossless-close` in an operator's proof (only meaningful where it asks for proof, and states the feature).
+    if (cred && operatorProof && gatewayLosslessSigned && capabilities.includes('gateway')) capabilities.push(GATEWAY_LOSSLESS_SIGNED_FEATURE);
     this.#signer = cred;
     this.#loginUsername = username;
     let publicKey = null;
@@ -1572,18 +1575,24 @@ export class WshClient {
     let response = null;
     let challenge = null;
     let offerLossless = false;
+    let signLossless = false;
     try {
       // A released peer (rust-v0.6 to v0.8) drops the connection on a ReverseConnect with a field it does not know, so the
       // offer is made only to a peer whose registered record lists `operator-proof` ('auto'), or when the caller insists
       // (`proof: true`). The relay checks the same on its side and strips the field for a peer that did not advertise it.
       let peerCanProve = proof === true;
-      if (!peerCanProve && proof === 'auto' && relayCarriesProof && this.#signer) {
-        let caps = peerCapabilities;
-        if (!Array.isArray(caps)) {
+      // The peer's registered capabilities, looked up once (given by the caller, or listed).
+      let peerCaps = Array.isArray(peerCapabilities) ? peerCapabilities : null;
+      const capsOfPeer = async () => {
+        if (!peerCaps) {
           const peers = await this.listPeers(timeout).catch(() => []);
           const hits = peers.filter((p) => p.fingerprint === targetFingerprint || (targetFingerprint.length >= 8 && String(p.fingerprint ?? '').startsWith(targetFingerprint)));
-          caps = hits.length === 1 ? hits[0].capabilities : [];
+          peerCaps = hits.length === 1 && Array.isArray(hits[0].capabilities) ? hits[0].capabilities : [];
         }
+        return peerCaps;
+      };
+      if (!peerCanProve && proof === 'auto' && relayCarriesProof && this.#signer) {
+        const caps = await capsOfPeer();
         peerCanProve = caps.includes(OPERATOR_PROOF_FEATURE);
         if ((sealOpts || requirePeerProof) && !peerCanProve) {
           throw new Error(`reverseConnect: the peer does not advertise "${OPERATOR_PROOF_FEATURE}" in its registered record (a host older than operator proof, or one that cannot answer a challenge), so ${sealOpts ? 'a sealed bridge' : 'proof'} is not available -- nothing was sent`);
@@ -1593,13 +1602,11 @@ export class WshClient {
       // #286: say `gateway-lossless-close` to a host that has a gateway behind a relay that carries it. Only to a peer whose registered record lists
       // `gateway` (a host that can decode `ReverseConnect.features`: a released peer drops the connection on a field it does not know).
       if (this.#gatewayLosslessClose && this.#serverFeatures.includes(RELAY_GATEWAY_FEATURE)) {
-        let lossCaps = peerCapabilities;
-        if (!Array.isArray(lossCaps)) {
-          const peers = await this.listPeers(timeout).catch(() => []);
-          const hits = peers.filter((p) => p.fingerprint === targetFingerprint || (targetFingerprint.length >= 8 && String(p.fingerprint ?? '').startsWith(targetFingerprint)));
-          lossCaps = hits.length === 1 ? hits[0].capabilities : [];
-        }
-        offerLossless = Array.isArray(lossCaps) && lossCaps.includes('gateway');
+        const lossCaps = await capsOfPeer();
+        offerLossless = lossCaps.includes('gateway');
+        // #318: with proof, the statement is SIGNED into the proof when the host's record says it reads one; a host that does not list that (a 0.62.x
+        // peer) is told as before, unsigned, and a current host does not act on an unsigned statement behind a proof.
+        signLossless = offerLossless && offerProof && lossCaps.includes(GATEWAY_LOSSLESS_SIGNED_FEATURE);
       }
 
       const ownFingerprint = this.#signer ? await computeFingerprint(this.#signer.publicKeyRaw) : null;
@@ -1627,7 +1634,7 @@ export class WshClient {
         answer.catch(() => {});
         try {
           challenge = await verifyReverseChallenge(response, { target: targetFingerprint, ownFingerprint });
-          await plainSend(reverseProofMsg({ targetFingerprint: challenge.peerFingerprint, ...await createOperatorProof(this.#signer, challenge, this.#loginUsername) }));
+          await plainSend(reverseProofMsg({ targetFingerprint: challenge.peerFingerprint, ...await createOperatorProof(this.#signer, challenge, this.#loginUsername, signLossless ? [GATEWAY_LOSSLESS_FEATURE] : []) }));
         } catch (e) { answer.catch(() => {}); throw e; }
         response = await answer;
       }

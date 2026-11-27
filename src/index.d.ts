@@ -2067,6 +2067,8 @@ export interface WshConnectReverseOptions {
   };
   /** List `operator-proof` in the registered capabilities (key logins only; default true): this peer can answer an operator's challenge. */
   operatorProof?: boolean;
+  /** List `gateway-lossless-close-signed` (#318): this peer reads a signed `gateway-lossless-close` in an operator's proof. Needs `operatorProof` and the `gateway` capability. Default false; `createReverseHost` sets it. */
+  gatewayLosslessSigned?: boolean;
   peerType?: string;
   shellBackend?: string;
   supportsAttach?: boolean;
@@ -2154,6 +2156,8 @@ export const E2E_SIGN_FEATURE: 'e2e-sign';
 
 /** Relay feature / operator feature: a `ReverseChallenge` / `ReverseProof` crosses the relay (#117). */
 export const OPERATOR_PROOF_FEATURE: 'operator-proof';
+/** #318: what a host lists in its registered capabilities when it reads a signed `gateway-lossless-close` in an operator's proof (`wsh-operator-proof-v2`). */
+export const GATEWAY_LOSSLESS_SIGNED_FEATURE: 'gateway-lossless-close-signed';
 /** Host feature (`ReverseAccept.features`): it takes a signed initiator half and a sealed bridge (#117). */
 export const E2E_SEALED_FEATURE: 'e2e-sealed';
 export function challengeTranscript(t: { peerPublicKey: Uint8Array; operatorFingerprint: string; nonce: Uint8Array; sessionId: string }): Uint8Array;

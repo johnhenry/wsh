@@ -89,7 +89,7 @@ export { E2E_FEATURE, E2E_SIGN_FEATURE, keyExchangeTranscript, verifyKeyExchange
 // The operator proves its identity to the peer; sealed bridges -- wsh #117
 export {
   OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyReverseChallenge, createOperatorProof, verifyOperatorProof,
-  challengeTranscript, proofTranscript,
+  challengeTranscript, proofTranscript, GATEWAY_LOSSLESS_SIGNED_FEATURE,
 } from './operator-proof.mjs';
 export { SealedBridge, BRIDGE_CHANNEL_ID } from './bridge-seal.mjs';
 
