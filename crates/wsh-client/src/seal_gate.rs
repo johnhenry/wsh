@@ -213,6 +213,14 @@ impl SealGate {
                     return Gated::deliver(msg);
                 }
                 if !bridge.is_frame(&msg) {
+                    // A message that claims to be a sealed frame but is not this session's (its session id or channel was changed; the last
+                    // byte of a frame on the wire is the end of its session id, #292) is a frame that does not open: the session ends.
+                    if msg.msg_type == MsgType::EncryptedFrame {
+                        tracing::warn!("an encrypted frame that is not a frame of this session: the session is closed");
+                        *mode = Mode::Failed;
+                        self.failed.notify_one();
+                        return Gated::default();
+                    }
                     tracing::warn!(msg_type = ?msg.msg_type, "dropping a plaintext message on a sealed session");
                     return Gated::default();
                 }
