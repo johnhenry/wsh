@@ -350,6 +350,17 @@ impl ReverseHostOptions {
     }
 }
 
+/// The request a same-operator re-attach (one that offers no proof) is served from. A bridge that was PROVEN keeps the request it was proven with
+/// (its feature list is what the ack and the gateway read, and the operator's signed statement went into it); a relay that opens a second attach for
+/// the same operator must not replace it with an unproven one (wsh #327). An unproven bridge takes the new request, as before.
+fn reattach_request(
+    _stored: &ReverseConnectPayload,
+    _stored_proven: bool,
+    incoming: ReverseConnectPayload,
+) -> ReverseConnectPayload {
+    incoming
+}
+
 fn same_reverse_request(left: &ReverseConnectPayload, right: &ReverseConnectPayload) -> bool {
     left.username == right.username && left.target_fingerprint == right.target_fingerprint
 }
@@ -2731,6 +2742,31 @@ mod tests {
 
         assert!(same_reverse_request(&left, &right));
         assert!(!same_reverse_request(&left, &wrong_user));
+    }
+
+    fn request_with(features: Option<Vec<String>>) -> ReverseConnectPayload {
+        ReverseConnectPayload {
+            target_fingerprint: "fp".into(),
+            username: "alice".into(),
+            from_fingerprint: "operator".into(),
+            features,
+        }
+    }
+
+    // wsh #327: a proven bridge, then a same-operator re-attach with no proof offered: the stored (proven) request stays.
+    #[test]
+    fn a_reattach_without_proof_keeps_the_proven_request() {
+        let proven = request_with(feats(&["operator-proof", LOSSLESS]));
+        let unproven = request_with(None);
+        let served = super::reattach_request(&proven, true, unproven);
+        assert_eq!(served.features, feats(&["operator-proof", LOSSLESS]));
+    }
+
+    #[test]
+    fn a_reattach_to_an_unproven_bridge_takes_the_new_request() {
+        let old = request_with(feats(&[LOSSLESS]));
+        let new = request_with(None);
+        assert_eq!(super::reattach_request(&old, false, new).features, None);
     }
 
     #[test]
