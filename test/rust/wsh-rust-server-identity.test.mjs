@@ -176,7 +176,7 @@ describe('Rust wsh-server host key (JS client)', () => {
     const out = await new Promise((resolve) => {
       const proc = spawn(SERVER_BIN, ['--port', String(port),'--generate-cert', '--config', path.join(home, '.wsh', 'config.toml')], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
       let logs = ''; proc.stdout.on('data', (d) => { logs += d; }); proc.stderr.on('data', (d) => { logs += d; });
-      proc.once('exit', (code) => resolve({ code, logs }));
+      proc.once('close', (code) => resolve({ code, logs }));
       setTimeout(() => { proc.kill(); resolve({ code: null, logs }); }, 8000);
     });
     assert.notEqual(out.code, null, 'the server must not keep running');
