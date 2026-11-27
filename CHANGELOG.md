@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.62.0 / Rust `rust-v0.26.0`
+
 ### The answering side of a gateway connection is watched, losslessly: `gateway-lossless-close` and the close reason `released` (#286, #283; npm and Rust)
 
 The owner's decision of 2026-11-26 on #286: build it, negotiated. This is option 3 of that issue, the one with the least new surface: no message and no field.
