@@ -59,8 +59,9 @@ async function meet() {
 /** A sealed session through the message-level hostile relay (test/helpers/hostile-relay.mjs): it can drop, change and write plain messages. */
 async function through(hooks = {}) {
   const ran = []; const logs = [];
+  let sealedAtHost = false;
   const host = createMemoryHost({
-    auth: { authorizedKeys: [raw] }, hostKey: hostPair, dataStreams: false, sealSession: 'require', onLog: (l) => logs.push(l),
+    auth: { authorizedKeys: [raw] }, hostKey: hostPair, dataStreams: false, sealSession: 'require', onLog: (l) => logs.push(l), onSealed: () => { sealedAtHost = true; },
     exec: async (command, io) => { ran.push(command); await io.write(`out:${command}\n`); return 0; },
   });
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -73,6 +74,11 @@ async function through(hooks = {}) {
   client.onError = (e) => state.errors.push(e);
   closers.push(async () => { await client.disconnect().catch(() => {}); await relay.close(); for (const c of wss.clients) c.terminate(); wss.close(); await host.close(); });
   await client.connect(relay.url, { username: 'alice', keyPair, transport: 'ws', sealSession: true });
+  // The client finishes connecting when it has SENT its half of the key exchange; the host has the key only once it has processed it. This relay
+  // forwards each message through an async hop, and a message the test writes straight after connect() can overtake that last half and reach the
+  // host before it is sealed: a plain message is then refused and the connection ended (a host that requires sealing, working as it should; the
+  // flake of #292's CI run). So the test waits until the host says the session is sealed before it does anything.
+  await until(() => sealedAtHost, 'the host to seal the session');
   return { ran, logs, relay, client, state };
 }
 
@@ -168,11 +174,17 @@ const assertOnlySent = (ran, where) => {
 describe('(b) a message that is not sealed is never accepted on a sealed session (#292)', () => {
   it('a plain Open (a command) injected toward the host is not run, and the session carries on', async () => {
     const s = await through();
-    s.relay.context().injectToRelay(open({ kind: 'exec', command: 'injected-by-relay' }));
-    await sleep(200);
-    await s.client.openSession({ type: 'exec', command: 'real' });
-    await sleep(200);
-    assert.deepEqual(s.ran, ['real'], 'only the sealed command ran');
+    // Nothing is in flight when the plain message is written (a warm-up round trip has finished), and the test waits for the host to say what it
+    // did with it instead of sleeping; whatever closes the client is named in the failure.
+    await s.client.openSession({ type: 'exec', command: 'warm-up' });
+    await until(() => s.ran.includes('warm-up'), 'the warm-up command to run');
+    await s.relay.context().injectToRelay(open({ kind: 'exec', command: 'injected-by-relay' }));
+    await until(() => s.logs.some((l) => /dropped a plaintext message/.test(l)) || s.state.closed, 'the host to drop (or refuse) the plain message');
+    const diag = () => `closed=${s.state.closed} errors=${s.state.errors.map((x) => x.message)} host log: ${s.logs.slice(-6).join(' ; ')}`;
+    assert.equal(s.state.closed, false, `the session is still open after the plain message: ${diag()}`);
+    await s.client.openSession({ type: 'exec', command: 'real' }).catch((e) => { throw new Error(`${e.message}: ${diag()}`); });
+    await until(() => s.ran.includes('real'), 'the sealed command to run');
+    assert.deepEqual(s.ran, ['warm-up', 'real'], 'only the sealed commands ran');
     assert.ok(s.logs.some((l) => /dropped a plaintext message/.test(l)), 'the host named what it dropped');
     assert.equal(s.state.closed, false, 'a plain message is dropped and the session carries on (as before)');
   });
