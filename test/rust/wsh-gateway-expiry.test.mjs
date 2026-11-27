@@ -13,7 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { WshClient, generateKeyPair, exportPublicKeySSH, MSG } from '../../src/index.mjs';
-import { freePort } from '../helpers/free-port.mjs';
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -53,15 +53,14 @@ describe('the Rust server ends the gateway connections of a key that expires (#2
     writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${lines.join('\n')}\n`);
     const configPath = path.join(home, '.wsh', 'config.toml');
     writeFileSync(configPath, `[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1:${echoPort}"]\nenable_reverse_tunnels = true\n`);
-    const port = await freePort();
-    proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath], {
+    proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath], {
       env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     proc.stdout.on('data', (d) => logs.push(stripAnsi(d.toString())));
     proc.stderr.on('data', (d) => logs.push(stripAnsi(d.toString())));
-    url = `wss://127.0.0.1:${port}`;
-    await until(() => logs.some((l) => l.includes('WebSocket TLS listener started')), 'the server to start', 15_000);
+    await until(() => listeningPort(logs), 'the server to start', 15_000);
+    url = `wss://127.0.0.1:${listeningPort(logs)}`;
   });
   after(async () => {
     for (const c of clients.splice(0)) await c.disconnect().catch(() => {});

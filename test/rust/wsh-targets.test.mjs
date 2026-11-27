@@ -24,7 +24,7 @@ import { buildBackends } from '../../src/server/backends.mjs';
 import { createConnectionFactory } from '../../src/server/connection.mjs';
 import { generateSelfSignedCertificate } from '../../src/server/self-signed.mjs';
 import { WshClient, generateKeyPair, fingerprint, MSG, TARGETS_FEATURE, open as openMsg, fileOp, listTargets } from '@johnhenry/wsh';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -170,12 +170,11 @@ describe('the Rust wsh-server has no targets', () => {
     scratch.push(serverHome);
     mkdirSync(path.join(serverHome, '.wsh'));
     writeFileSync(path.join(serverHome, '.wsh', 'authorized_keys'), `${alice.ssh}\n`);
-    const p = await freePort();
-    const proc = spawn(SERVER_BIN, ['--port', String(p), '--generate-cert', '--config', '/dev/null/none'], { env: cleanEnv(serverHome), stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', '/dev/null/none'], { env: cleanEnv(serverHome), stdio: ['ignore', 'pipe', 'pipe'] });
     procs.push(proc);
     let logs = '';
-    await new Promise((resolve, reject) => {
-      const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+    const p = await new Promise((resolve, reject) => {
+      const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
       proc.stdout.on('data', onData); proc.stderr.on('data', onData);
       proc.once('exit', (c) => reject(new Error(`wsh-server exited (${c}): ${logs}`)));
       setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);
@@ -213,12 +212,11 @@ describe('the Rust wsh-server has no targets', () => {
     const keyPair = await generateKeyPair(true);
     const { exportPublicKeySSH } = await import('@johnhenry/wsh');
     writeFileSync(path.join(serverHome, '.wsh', 'authorized_keys'), `${await exportPublicKeySSH(keyPair.publicKey)} js\n`);
-    const p = await freePort();
-    const proc = spawn(SERVER_BIN, ['--port', String(p), '--generate-cert', '--config', '/dev/null/none'], { env: cleanEnv(serverHome), stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', '/dev/null/none'], { env: cleanEnv(serverHome), stdio: ['ignore', 'pipe', 'pipe'] });
     procs.push(proc);
     let logs = '';
-    await new Promise((resolve, reject) => {
-      const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+    const p = await new Promise((resolve, reject) => {
+      const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
       proc.stdout.on('data', onData); proc.stderr.on('data', onData);
       proc.once('exit', (c) => reject(new Error(`wsh-server exited (${c}): ${logs}`)));
       setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);

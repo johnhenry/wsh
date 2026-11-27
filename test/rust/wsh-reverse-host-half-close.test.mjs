@@ -31,7 +31,7 @@ import { createWshServer } from '@johnhenry/wsh/server';
 import { RelayHub } from '../../src/server/relay.mjs';
 import { WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint, MSG, RELAY_GATEWAY_FEATURE } from '@johnhenry/wsh';
 import { openTcp, openUdp, resolveDns, listenRequest } from '../../src/messages.gen.mjs';
-import { freePort } from '../helpers/free-port.mjs';
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -83,12 +83,11 @@ async function rustRelay(authorizedKeys) {
   const home = scratchHome();
   mkdirSync(path.join(home, '.wsh'));
   writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${authorizedKeys}\n`);
-  const port = await freePort();
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--enable-relay', '--config', '/dev/null/none'], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--enable-relay', '--config', '/dev/null/none'], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(proc);
   let logs = '';
-  await new Promise((resolve, reject) => {
-    const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+  const port = await new Promise((resolve, reject) => {
+    const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
     proc.stdout.on('data', onData); proc.stderr.on('data', onData);
     proc.once('exit', (c) => reject(new Error(`wsh-server exited (${c}): ${logs}`)));
     setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);

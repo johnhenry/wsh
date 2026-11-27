@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 import { WshClient, generateKeyPair, exportPublicKeySSH, MSG } from '../../src/index.mjs';
 import { GatewayError } from '../../src/gateway-client.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -97,14 +97,13 @@ describe('Rust wsh-server: gateway credit, unix sockets and listeners (the Node 
     }
     const configPath = path.join(home, '.wsh', 'config.toml');
     fs.writeFileSync(configPath, config);
-    const port = await freePort();
-    const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath], {
+    const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath], {
       env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config') }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     procs.push(proc);
     let logs = '';
-    await new Promise((resolve, reject) => {
-      const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+    const port = await new Promise((resolve, reject) => {
+      const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
       proc.stdout.on('data', onData); proc.stderr.on('data', onData);
       proc.once('exit', (c) => reject(new Error(`wsh-server exited (${c}): ${logs}`)));
       setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);
@@ -306,7 +305,7 @@ describe('Rust wsh-server: gateway credit, unix sockets and listeners (the Node 
           const code = await new Promise((resolve) => {
             const p = spawn(SERVER_BIN, ['--port', String(9), '--generate-cert', '--config', path.join(home, '.wsh', 'config.toml')], { env: { PATH: process.env.PATH, HOME: home }, stdio: ['ignore', 'pipe', 'pipe'] });
             p.stdout.on('data', (d) => { out += d; }); p.stderr.on('data', (d) => { out += d; });
-            p.on('exit', resolve);
+            p.on('close', resolve); // 'close', not 'exit': 'exit' can fire before the last of the output has been read, and `out` is asserted on
             setTimeout(() => { p.kill(); resolve('still running'); }, 5000);
           });
           assert.notEqual(code, 'still running', `${bad}: ${out}`);

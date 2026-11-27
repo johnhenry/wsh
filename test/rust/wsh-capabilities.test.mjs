@@ -17,7 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint, MSG } from '../../src/index.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -53,16 +53,15 @@ async function startServer({ caps, config = '', args = [] }) {
   writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${lines.join('\n')}\n`);
   const configPath = path.join(home, '.wsh', 'config.toml');
   writeFileSync(configPath, config);
-  const port = await freePort();
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath, ...args], {
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath, ...args], {
     env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), USER: 'tester' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const logs = [];
   proc.stdout.on('data', (d) => logs.push(stripAnsi(d.toString())));
   proc.stderr.on('data', (d) => logs.push(stripAnsi(d.toString())));
-  const url = `wss://127.0.0.1:${port}`;
-  await until(() => logs.some((l) => l.includes('WebSocket TLS listener started')), 'the server to start', 15_000);
+  await until(() => listeningPort(logs), 'the server to start', 15_000);
+  const url = `wss://127.0.0.1:${listeningPort(logs)}`;
   const clients = []; const connected = new Map();
   return {
     url, keys, logs: () => logs.join(''), home, clients,

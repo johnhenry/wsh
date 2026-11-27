@@ -88,7 +88,8 @@ describe('wsh-mcp: an MCP client reaches an MCP server behind a wsh host (#127)'
     const lines = []; const rawOut = []; let stderr = ''; let buf = '';
     proc.stdout.on('data', (d) => { rawOut.push(d.toString()); buf += d; let i; while ((i = buf.indexOf('\n')) >= 0) { lines.push(buf.slice(0, i)); buf = buf.slice(i + 1); } });
     proc.stderr.on('data', (d) => { stderr += d; });
-    const exited = new Promise((resolve) => proc.once('exit', (code, signal) => resolve({ code, signal })));
+    // 'close', not 'exit': 'exit' can fire before the last of stdout/stderr has been read, and both are asserted on after it
+    const exited = new Promise((resolve) => proc.once('close', (code, signal) => resolve({ code, signal })));
     cleanups.push(async () => { proc.kill('SIGKILL'); });
     const api = {
       proc, exited, lines, stderr: () => stderr,

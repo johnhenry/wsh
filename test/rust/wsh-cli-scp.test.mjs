@@ -18,7 +18,7 @@ import { WebSocket as WsClient } from 'ws';
 
 import { createPipeRelay, newRendezvousId, pipeUrl } from '@johnhenry/wsh/pipe-relay';
 import { createWshServer } from '@johnhenry/wsh/server';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -76,16 +76,15 @@ async function nodeHostViaRelay(h) {
 
 /** The Rust wsh-server on a fresh port, serving the real filesystem. */
 async function rustServer(h) {
-  const port = await freePort();
   const serverHome = mkdtempSync(path.join(tmpdir(), 'wsh-cli-scp-server-'));
   scratch.push(serverHome);
   mkdirSync(path.join(serverHome, '.wsh'));
   writeFileSync(path.join(serverHome, '.wsh', 'authorized_keys'), `${h.pub}\n`);
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert'], { env: cleanEnv(serverHome), stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert'], { env: cleanEnv(serverHome), stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(proc);
-  await new Promise((resolve, reject) => {
+  const port = await new Promise((resolve, reject) => {
     let seen = '';
-    const onData = (d) => { seen += d; if (seen.includes('WebSocket TLS listener started')) resolve(); };
+    const onData = (d) => { seen += d; const p = listeningPort(seen); if (p) resolve(p); };
     proc.stdout.on('data', onData); proc.stderr.on('data', onData);
     proc.once('exit', (c) => reject(new Error(`wsh-server exited early (${c}): ${seen}`)));
     setTimeout(() => reject(new Error(`wsh-server not ready: ${seen}`)), 10_000);

@@ -23,7 +23,7 @@ import {
   reverseAccept, relayForward, sessionData,
 } from '@johnhenry/wsh';
 import { BUSY_PEER, BUSY_OPERATOR, busyPeerFull, MULTI_OPERATOR_FEATURE } from '../../src/server/relay.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248)
+import { listeningPort } from './helpers/listening.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WSH_BIN = process.env.WSH_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh');
@@ -83,12 +83,11 @@ async function rustRelay(identities, { max } = {}) {
     config = path.join(home, '.wsh', 'config.toml');
     writeFileSync(config, `[relay]\nmax_operators_per_peer = ${max}\n`);
   }
-  const port = await freePort();
-  const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--enable-relay', '--config', config], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+  const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--enable-relay', '--config', config], { env: cleanEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
   procs.push(proc);
   let logs = '';
-  await new Promise((resolve, reject) => {
-    const onData = (d) => { logs += d; if (logs.includes('WebSocket TLS listener started')) resolve(); };
+  const port = await new Promise((resolve, reject) => {
+    const onData = (d) => { logs += d; const p = listeningPort(logs); if (p) resolve(p); };
     proc.stdout.on('data', onData); proc.stderr.on('data', onData);
     proc.once('exit', (c) => reject(new Error(`wsh-server exited (${c}): ${logs}`)));
     setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);
@@ -142,7 +141,7 @@ describe('Rust relay: several operators per peer (#93)', () => {
     for (const bad of ['0', '1000']) {
       writeFileSync(path.join(home, '.wsh', 'config.toml'), `[relay]\nmax_operators_per_peer = ${bad}\n`);
       let failed = false;
-      try { execFileSync(SERVER_BIN, ['--port', String(await freePort()), '--generate-cert', '--enable-relay', '--config', path.join(home, '.wsh', 'config.toml')], { env: cleanEnv(home), stdio: 'pipe', timeout: 5000 }); } catch (e) { failed = /max_operators_per_peer/.test(String(e.stderr) + String(e.stdout)); }
+      try { execFileSync(SERVER_BIN, ['--port', '0', '--generate-cert', '--enable-relay', '--config', path.join(home, '.wsh', 'config.toml')], { env: cleanEnv(home), stdio: 'pipe', timeout: 5000 }); } catch (e) { failed = /max_operators_per_peer/.test(String(e.stderr) + String(e.stdout)); }
       assert.ok(failed, `${bad} is refused with a message naming the option`);
     }
   });

@@ -18,7 +18,8 @@ import { fileURLToPath } from 'node:url';
 
 import { WshClient, generateKeyPair, exportPublicKeySSH } from '../../src/index.mjs';
 import { GatewayError } from '../../src/gateway-client.mjs';
-import { freePort } from '../helpers/free-port.mjs'; // free for TCP and UDP: the server binds both (#248); the gateway listeners below bind TCP only, where it is merely stricter
+import { freePort } from '../helpers/free-port.mjs'; // only for ports the server is asked to LISTEN on for a client (reverse-tunnel policy tests); the server's own port is bound by the server (#320)
+import { listeningPort } from './helpers/listening.mjs'; // the server binds port 0 and prints the port it got (#320)
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SERVER_BIN = process.env.WSH_SERVER_BIN || path.join(REPO_ROOT, 'target', 'release', 'wsh-server');
@@ -67,18 +68,18 @@ describe('Rust wsh-server: reverse tunnels are bounded as on the Node host (#145
     fs.writeFileSync(path.join(home, '.wsh', 'authorized_keys'), `${await exportPublicKeySSH(kp.publicKey)}\n`);
     const configPath = path.join(home, '.wsh', 'config.toml');
     fs.writeFileSync(configPath, `[gateway]\nenabled = true\nenable_reverse_tunnels = true\n${gatewayLines}\n`);
-    const port = await freePort();
-    const proc = spawn(SERVER_BIN, ['--port', String(port), '--generate-cert', '--config', configPath], {
+    const proc = spawn(SERVER_BIN, ['--port', '0', '--generate-cert', '--config', configPath], {
       env: { PATH: process.env.PATH, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config') }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     procs.push(proc);
     let logs = '';
-    const exited = new Promise((resolve) => proc.once('exit', (code) => resolve(code)));
+    // 'close', not 'exit': 'exit' can fire before the last of the output has been read, and the logs are asserted on
+    const exited = new Promise((resolve) => proc.once('close', (code) => resolve(code)));
     proc.stdout.on('data', (d) => { logs += d; }); proc.stderr.on('data', (d) => { logs += d; });
     if (expectExit) return { code: await Promise.race([exited, sleep(10_000).then(() => 'still running')]), logs: () => logs };
-    await until(() => logs.includes('WebSocket TLS listener started') || (proc.exitCode !== null && (() => { throw new Error(`wsh-server exited: ${logs}`); })()), 'the server to start', 10_000);
+    await until(() => listeningPort(logs) || (proc.exitCode !== null && (() => { throw new Error(`wsh-server exited: ${logs}`); })()), 'the server to start', 10_000);
     const client = new WshClient();
-    await client.connect(`wss://127.0.0.1:${port}`, { username: 'tester', keyPair: kp });
+    await client.connect(`wss://127.0.0.1:${listeningPort(logs)}`, { username: 'tester', keyPair: kp });
     clients.push(client);
     return { client, logs: () => logs };
   }

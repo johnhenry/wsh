@@ -477,22 +477,53 @@ impl WshServer {
     pub async fn run(self, tls_config: Arc<rustls::ServerConfig>) -> WshResult<()> {
         let server = Arc::new(self);
 
-        let quic_addr: SocketAddr = format!("0.0.0.0:{}", server.config.port)
-            .parse()
-            .map_err(|e| WshError::Other(format!("invalid address: {e}")))?;
-        let ws_addr: SocketAddr = format!("0.0.0.0:{}", server.config.port)
-            .parse()
-            .map_err(|e| WshError::Other(format!("invalid address: {e}")))?;
+        let any_addr = |port: u16| -> WshResult<SocketAddr> {
+            format!("0.0.0.0:{port}")
+                .parse()
+                .map_err(|e| WshError::Other(format!("invalid address: {e}")))
+        };
 
-        // Start WebTransport listener
-        let (_endpoint, mut wt_rx) = webtransport::start_listener(
-            quic_addr,
-            &server.config.cert_path,
-            &server.config.key_path,
-        )
-        .await?;
+        // The port the listeners really got. `--port 0` (#320) lets the operating system choose it, so
+        // a test (or a supervisor) never has to pick a number ahead of the bind: the TCP socket is bound
+        // first, the WebTransport (UDP) one is bound to the same number, and a number that UDP holds is
+        // skipped. A fixed port keeps the order it always had (WebTransport, then WebSocket).
+        let requested_port = server.config.port;
+        let (port, _endpoint, mut wt_rx, ws_listener) = if requested_port == 0 {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let tcp = tokio::net::TcpListener::bind(any_addr(0)?)
+                    .await
+                    .map_err(|e| WshError::Transport(format!("WSS bind failed: {e}")))?;
+                let port = tcp
+                    .local_addr()
+                    .map_err(|e| WshError::Transport(format!("WSS local_addr failed: {e}")))?
+                    .port();
+                match webtransport::start_listener(
+                    any_addr(port)?,
+                    &server.config.cert_path,
+                    &server.config.key_path,
+                )
+                .await
+                {
+                    Ok((endpoint, wt_rx)) => break (port, endpoint, wt_rx, Some(tcp)),
+                    Err(e) if attempt < 32 => {
+                        warn!(port, error = %e, "port taken for UDP, choosing another");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        } else {
+            let (endpoint, wt_rx) = webtransport::start_listener(
+                any_addr(requested_port)?,
+                &server.config.cert_path,
+                &server.config.key_path,
+            )
+            .await?;
+            (requested_port, endpoint, wt_rx, None)
+        };
 
-        // Start WebSocket listener on the same configured port over TCP/TLS.
+        // Start WebSocket listener on the same port over TCP/TLS.
         // Also routes #38 Phase 2's WISP guest tunnels and reverse-connect
         // bridge requests, which share the same TCP/TLS listener but are
         // distinguished by request path (see `transport::websocket::parse_route`).
@@ -500,7 +531,13 @@ impl WshServer {
             mut ws_rx,
             mut wisp_guest_rx,
             mut wisp_connect_rx,
-        } = websocket::start_listener(ws_addr, tls_config, server.login_timeout()).await?;
+        } = match ws_listener {
+            Some(tcp) => websocket::start_listener_on(tcp, tls_config, server.login_timeout())?,
+            None => {
+                websocket::start_listener(any_addr(port)?, tls_config, server.login_timeout())
+                    .await?
+            }
+        };
 
         // Start session GC + idle warning task
         let gc_sessions = server.sessions.clone();
@@ -665,11 +702,17 @@ impl WshServer {
         });
 
         info!(
-            webtransport_port = server.config.port,
-            websocket_port = server.config.port,
+            webtransport_port = port,
+            websocket_port = port,
             relay = server.config.enable_relay,
             "wsh-server ready"
         );
+        if requested_port == 0 {
+            // For a supervisor that asked for an OS-chosen port (#320): this line, on stdout, comes
+            // after both listeners are bound. Printed only for `--port 0`, so a server started on a
+            // fixed port prints exactly what it always did.
+            println!("listening on 0.0.0.0:{port}");
+        }
 
         // Accept connections from both transports
         loop {
