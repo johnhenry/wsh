@@ -486,7 +486,8 @@ building a host takes it, with one meaning and one validation (a whole number of
 endpoint that carries long-lived quiet streams (an attached process's output) can have `0` or a long one while a
 request/response endpoint keeps a short one. On the client, `openEndpoint(name, { halfCloseIdleMs })` (and the other `open*`
 calls) bounds one connection; `host.connect({ ..., gatewayHalfCloseIdleMs })` on a memory host is `connect()`'s option. A page
-host (`createPageHost`), a reverse host and a pipe-relay pairing serve no gateway, so they have no such clock. A
+host (`createPageHost`) and a pipe-relay pairing serve no gateway, so they have no such clock; a reverse host that was given a gateway
+(#289, #299) has the gateway's `halfCloseIdleMs` like any other, and one without a gateway serves none. A
 connection that is not half-closed has no idle bound of this kind; a reverse listener keeps its own `idleMs`, a UDP flow
 its `udpIdleMs`. Not covered: an origin that closed its socket completely, without the client having closed, stays open
 (until the client closes or the idle bound) because the host cannot tell a full close from a half-close.
@@ -649,6 +650,111 @@ application consumes data, so a slow reader stops its peer (the origin socket is
 are honoured) instead of making the host buffer. Against a peer without the feature the host still holds the origin back
 by the transport's own backpressure and bounds what a client can make it hold with `maxBufferedBytes` (default 4 MiB per
 connection) and `maxClientBufferedBytes` (default 32 MiB per client), closing a connection that exceeds them.
+
+#### The gateway over a network you supply: a host in a page (#299)
+
+The gateway above dials the machine's own network (`node:net`, `node:dgram`, `node:dns`), so a host that runs in a browser page had
+none to offer. The same session, destination policy, credit flow control, half-close rules and bounds now run over **a network the
+embedder passes in**, in `createMemoryHost`, in the browser-safe `createReverseHost` (`@johnhenry/wsh/reverse`), in
+`createWshServer` and the Node `createReverseHost` (instead of the machine's), and in a host you build yourself on
+`@johnhenry/wsh/host` with `@johnhenry/wsh/gateway`. The Node server's default network is still the machine's, and nothing about
+it changed.
+
+```js
+import { createMemoryHost } from '@johnhenry/wsh/memory';
+
+const host = createMemoryHost({
+  auth: { authorizedKeys: [rawPublicKey] },
+  gateway: {
+    network: {                                  // every method optional (one required); bytes are web streams
+      async connectTcp({ host, port, signal }) { return { readable, writable }; },   // `host` is an IP address, never a name
+      async resolve({ name, family, signal }) { return ['10.0.0.5']; },              // the only place a name becomes an address
+      async openUdp({ host, port, signal }) { return { readable, writable }; },       // each chunk is one datagram
+      async listenTcp({ port, bindAddr, signal, onConnection }) {                    // onConnection(duplex, { peerAddr, peerPort })
+        return { port, close() {} };
+      },
+    },
+    allow: ['db.internal:5432'],                // required, default deny: an empty list reaches nothing
+    allowPrivate: ['10.0.0.0/8'],               // the network's own address space, named by YOU
+    dns: true, udp: true, reverse: true,        // each off unless given, and each also needs its network method
+  },
+  endpoints: { /* named endpoints work alongside */ },
+});
+```
+
+- **Off unless given, deny by default.** No `gateway`, no gateway feature. `allow` is required (`"*"`, `"host"`, `"host:port"`), and
+  the limits and defaults are those of `createWshServer({ gateway })`: `maxConnections` (32), `maxBufferedBytes`, `maxClientBufferedBytes`,
+  `connectTimeoutMs`, `halfCloseIdleMs`, `udp` bounds, `reverse` policy (ports, bind address, listeners). `socks`, `unix` and `tcp: false` are
+  the machine's and are refused with a network, and an option that is not one of the gateway's (a typo such as `allowPrivte`) or a wrongly
+  typed `dns` / `udp` / `reverse` is a `TypeError` on every host that takes a network. A key's `gateway:...` capabilities decide who may ask, as ever.
+  **`allowPrivate: ["0.0.0.0/0"]` or `["::/0"]` permits every class of address** (loopback, private, link-local, metadata, multicast, ...): name
+  the ranges your network really has, not everything.
+- **What the policy sees (the address that is dialled).** wsh applies the destination policy itself, *before* the network is called:
+  the name the caller sent must match `allow`; then the network's `resolve` is asked ONCE and **its answers are what is classified**
+  (answers that are not plain IP literals are ignored: a zone id, a trailing dot or surrounding space makes it not an address; at most 64
+  are taken from one answer, from the first 1024 entries) and what `connectTcp` / `openUdp` then receive, one permitted address at a
+  time, in the order the network gave them, all within ONE `connectTimeoutMs` deadline for the lookup and every candidate together (as
+  the machine's `dialChecked` has): the name is never passed on, so there is no second lookup to disagree with the first. A caller who sent an
+  IP literal is checked as it is and the network is not asked to resolve. **A name the network cannot resolve is refused** (no `resolve`
+  method: "this network cannot resolve names"; a name it does not know: name not found). `ResolveDns` answers are filtered the same way.
+- **The network may have address space of its own, and you name it.** Private-looking addresses are normal inside a virtual network, but
+  wsh refuses every address that is not public (loopback, private, link-local, CGNAT, ULA, ...) until you say otherwise: `allowPrivate:
+  ['10.0.0.0/8']`, or an IP literal in `allow` (`'10.0.0.5:80'`). `"*"` never names them. There is no implicit allowance, so a
+  virtual network that uses a public-looking range is trusted to be what it says, and one that uses a private range is unreachable until
+  the embedder opens that range.
+- **UDP, DNS and listening need the switch and the method.** `udp: true` (or the bounds) and `network.openUdp`; `dns: true` and
+  `network.resolve`; `reverse: true` (or its policy) and `network.listenTcp`. Either missing is a refusal with a sentence that says which
+  ("UDP is not enabled on this gateway", "this network cannot open UDP flows", "this network cannot listen for connections").
+- **Cleanup, and a network that never answers.** Every `signal` the network is given aborts when wsh is done with what it was given (the
+  caller closed it or went away, the host closed, the connect, lookup or listen timed out), and wsh closes or aborts the streams: release
+  the connection then. A request is bounded by `connectTimeoutMs` (a lookup, a connect, a `listenTcp`, and the handle's `close()`), so a
+  network that never settles cannot hold the client's message loop or a listener slot; what it hands over after that (a connection, a
+  listener that binds late) is released, not kept. A session that ends while the network is still working tells it at once, even with
+  messages still queued. A connection the network delivers after the listener was closed is released and never announced; what the
+  network says about a peer in an inbound connection is bounded (an IP literal and a port, else empty and 0), and a listen whose reported
+  port is not 1-65535 fails. A network whose stream ends is a half-close towards the caller, exactly as an origin's FIN is; one that errors
+  or aborts a stream is noticed even while nothing reads it. The bytes handed to your writable are a copy; the streams a malformed
+  duplex came with are cancelled or aborted as far as they go.
+- **Flow control and bounds are the Node path's, from the same code.** The credit window and per-connection and per-client byte bounds
+  are the gateway channel's; wsh reads one chunk at a time and not while the caller is not reading, and hands the network's writable one
+  chunk at a time only as the network takes them, so a slow reader or a slow origin stops the other side (the stream's own backpressure
+  reaches your network). A connection of the network is not watched for a half-closed peer that vanished (there is no kernel to ask):
+  close the stream when the far end is gone.
+- **Errors.** A thrown or rejected error is reported by its `code`: a number of `GATEWAY_FAIL` (1 refused, 2 unreachable, 3 name not found,
+  8 timeout) or a Node-style name (`ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`); anything else is "unreachable".
+- **Wire.** Nothing new: the host states the gateway features it always has, and only what it can serve. `gateway` is stated when the
+  network can serve any of TCP (`connectTcp`), UDP (`openUdp` and `udp`), DNS (`resolve` and `dns: true`) or listening (`listenTcp` and
+  `reverse`): a released client checks `gateway` for all four, so a network with only `openUdp` still states it and a TCP open is refused
+  with "this network cannot open TCP connections"; a network that can serve none states nothing. `gateway-datagram` is stated only where
+  the transport has datagrams (WebTransport; never an in-page host's) and the network has `openUdp` with UDP on; then UDP rides
+  datagrams over an injected network as over the machine's, and a sink that does not keep up DROPS datagrams (the `highWaterMark` of
+  your writable is the queue: give it room for a burst, e.g. `new WritableStream(sink, { highWaterMark: 32 })`), counted in
+  `server.gatewayStats().udp.backpressureDropped`, never queued without bound. A released client works with it.
+- **A reverse host in a page.** `createReverseHost({ ..., gateway: { network, allow, trustRelayIdentity | requireOperatorProof, udp, dns,
+  reverse } })` from `@johnhenry/wsh/reverse` is the browser-safe form of the reverse host's gateway (#289), with the same owner switches
+  and per-operator grants; without `gateway.network` it refuses to start (a page has no sockets).
+- **Types and bundle: the session is loaded on demand.** `WshGatewayNetwork` and friends are in `@johnhenry/wsh/gateway` (`src/gateway.d.ts`);
+  that entry point bundles for the browser with nothing from Node. `createMemoryHost` and the browser-safe `createReverseHost` fetch the
+  gateway session (about 13 kB gzipped, with the address guard and the UDP and reverse-tunnel policies) by a dynamic `import()` **only when
+  a `gateway` is given**, so a bundler (esbuild with `splitting`, Rollup, webpack, Vite) puts it in a chunk of its own and a page host that
+  passes none never loads it: the entry points' sizes in the table below are the eager part, and `node scripts/bundle-size.mjs` prints the lazy
+  chunk beside them. What that means at run time: the shape of `gateway` (a `network` object with at least one method, an `allow` array, no
+  `socks`/`unix`/`tcp`; for a reverse host also `requireOperatorProof` or `trustRelayIdentity`) is checked by `createMemoryHost` /
+  `createReverseHost` themselves and **throws at once**; the values (`maxConnections`, `allowPrivate`, ...) are validated when the module has
+  loaded, and a bad one fails loudly: `host.ready` rejects (new, resolves when the host is set up), every `accept()` rejects, a connection
+  through `host.connect()` / `host.WebSocket` is closed at once with the reason and `onLog` is told; a reverse host's `start()` rejects before
+  it dials. The first connections wait for the load (several racing it are fine). To control the loading yourself, build the host on
+  `@johnhenry/wsh/host` and pass `createConnectionFactory({ gateway: normalizeGateway(...), createGatewaySession })` from
+  `@johnhenry/wsh/gateway`: no dynamic import.
+
+**Not covered:** wsh cannot vouch for what your network reaches (see the Security model). Not built: a Node-side adapter that
+exposes the machine's own network as a `network` object (the machine's is the built-in default), and UNIX sockets over a network. The
+`@johnhenry/wsh/gateway` entry's `normalizeGateway` refuses a configuration with no `network` in an environment without Node (a page,
+a Worker), with a sentence, instead of failing at a `node:` import; in Node a configuration without one is the machine's.
+
+**Changed on the machine's gateway (an addition, not a break):** `gateway: { udp: false }` used to throw ("must be an options object"); it
+now turns UDP off (opens are refused with "UDP is not enabled on this gateway" and `gateway-datagram` is not stated), and `gateway: { dns:
+false }`, which was ignored, now turns `ResolveDns` off. A reverse host with UDP not turned on no longer states `gateway-datagram`.
 
 #### Unix-domain sockets (streamlocal) and named endpoints
 
@@ -863,9 +969,11 @@ session.onData = (d) => console.log(new TextDecoder().decode(d));   // "ran hi"
 It is the real connection handler speaking QMux over an in-memory socket pair, so the client code you test is the code
 you ship. `host.createClient()` / `host.WebSocket` / `host.accept(socket)` / `createSocketPair()` are the lower-level pieces.
 Supported: `auth`, `exec` (a function; there is no shell), `pty`, `fs` and `hostKey` (injected, below), `mcp`,
-`extensions`, `rpc`, `sessions` (below) and `endpoints` ([named virtual endpoints](#unix-domain-sockets-streamlocal-and-named-endpoints):
-`endpoints: { api: (duplex, who) => ... }`, reached with `client.openEndpoint('api')`, with flow control). Not available
-in memory: the TCP, DNS, UDP and unix-socket parts of `gateway`, `relay`, WebTransport, `exec: true` and
+`extensions`, `rpc`, `sessions` (below), `endpoints` ([named virtual endpoints](#unix-domain-sockets-streamlocal-and-named-endpoints):
+`endpoints: { api: (duplex, who) => ... }`, reached with `client.openEndpoint('api')`, with flow control) and the TCP, DNS, UDP and
+listening parts of `gateway` **over a network you supply** (`gateway: { network, allow, ... }`,
+[#299](#the-gateway-over-a-network-you-supply-a-host-in-a-page-299); a page has no sockets, so without a `network` there is
+no gateway). Not available in memory: the unix-socket part of `gateway`, `relay`, WebTransport, `exec: true` and
 `fs: { root }` (they need Node) and the `wsh-host` / `wsh-fs` rpc built-ins (use `@johnhenry/wsh/server`).
 
 **Injected backends**, shaped like the Node host's, so a page can be a real host (#114):
@@ -921,7 +1029,8 @@ bundler drop what you do not use.
 | `@johnhenry/wsh` | the client (`WshClient`, `WshKeyStore`, ...) |
 | `@johnhenry/wsh/memory` | `createMemoryHost()`, a host in this realm (above) |
 | `@johnhenry/wsh/host` | the pieces under it, for your own transport: `createConnectionFactory(config)` -- the connection handler `createWshServer`, `createMemoryHost` and `createReverseHost` all run -- plus `bindSocket(socket, ready, { dataStreams })`, `resolveBackends()`, `resolveHostKey()`, `buildAuthorizer()` and `authMethods()`. It does not import the client |
-| `@johnhenry/wsh/reverse` | `createReverseHost()` for a page or Worker: dial out to a relay and serve the operator it bridges. The same function `@johnhenry/wsh/server` exports, minus `exec: true` and `fs: { root }` |
+| `@johnhenry/wsh/reverse` | `createReverseHost()` for a page or Worker: dial out to a relay and serve the operator it bridges. The same function `@johnhenry/wsh/server` exports, minus `exec: true` and `fs: { root }`; its `gateway` dials only a `network` you supply (#299) |
+| `@johnhenry/wsh/gateway` | the gateway session and its policy with no Node under it (#299): `normalizeGateway`, `createGatewaySession`, `GATEWAY_FAIL`, and the `WshGatewayNetwork` types of the network you pass to `createMemoryHost({ gateway })`, the reverse host or your own `createConnectionFactory` |
 | `@johnhenry/wsh/testing` | the QMux record and frame codec (`encodeStream`, `encodeRecord`, `RecordDecoder`, `decodeFrames`, the varint and the other frame encoders), for a test that reads, alters and re-wraps what travels on a connection; and two test doubles for code that embeds wsh: `createInProcessPipeRelay({ tap })` (the real pipe relay in this process, with a `WebSocket` that dials it, a record of every message it copied, and a `tap` that may change, drop, repeat or add to what it writes, like a hostile relay) and `createMemoryPair({ host, username })` (a memory host and a client already logged in to it). **Experimental: not part of the stable API**; it may change or disappear in any release. Importing only the codec costs under 1 kB: the doubles are separate exports a bundler drops |
 | `@johnhenry/wsh/identity` | a key in its four spellings, and `authorized_keys` lines: `fingerprint` and `podId` of a raw key, `fingerprintToPodId` / `podIdToFingerprint`, `rawKeyToOpenSsh` / `openSshToRawKey` / `parseOpenSshKey` / `publicKeyToOpenSsh`, `identityOf`, `normalizeIdentity`, `authorizedKeyLine`. Stable; see [Identity and capabilities for other implementations](#identity-and-capabilities-for-other-implementations-220) |
 | `@johnhenry/wsh/duplex` | a full wsh session over a duplex of messages another library provides: `serveWshOverDuplex(host, { send })`, `connectWshOverDuplex({ send }, credentials)`, `createDuplexSocket`. Sealed by default; see [wsh over a duplex](#wsh-over-a-duplex-220) |
@@ -951,24 +1060,25 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 <!-- bundle-size:start (generated by `npm run size -- --update`; do not edit) -->
 | browser bundle | minified | gzip |
 | --- | ---: | ---: |
-| `@johnhenry/wsh` (whole entry point) | 166.2 kB | 50.4 kB |
-| `@johnhenry/wsh/memory` (whole entry point) | 233.7 kB | 73.1 kB |
-| `@johnhenry/wsh/host` (whole entry point) | 128.1 kB | 42.2 kB |
-| `@johnhenry/wsh/reverse` (whole entry point) | 222.0 kB | 68.7 kB |
+| `@johnhenry/wsh` (whole entry point) | 169.2 kB | 51.4 kB |
+| `@johnhenry/wsh/memory` (whole entry point) | 246.4 kB | 77.3 kB |
+| `@johnhenry/wsh/host` (whole entry point) | 132.7 kB | 43.6 kB |
+| `@johnhenry/wsh/reverse` (whole entry point) | 235.2 kB | 73.3 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 8.0 kB | 3.3 kB |
-| `@johnhenry/wsh/testing` (whole entry point) | 242.6 kB | 76.5 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 331.8 kB | 105.9 kB |
-| `@johnhenry/wsh/objects` (whole entry point) | 206.2 kB | 63.7 kB |
+| `@johnhenry/wsh/testing` (whole entry point) | 255.3 kB | 80.8 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 346.0 kB | 110.8 kB |
+| `@johnhenry/wsh/objects` (whole entry point) | 209.2 kB | 64.7 kB |
 | `@johnhenry/wsh/objects-types` (whole entry point) | 10.2 kB | 4.2 kB |
 | `@johnhenry/wsh/capabilities` (whole entry point) | 10.6 kB | 3.8 kB |
 | `@johnhenry/wsh/identity` (whole entry point) | 15.7 kB | 5.7 kB |
-| `@johnhenry/wsh/duplex` (whole entry point) | 141.6 kB | 43.0 kB |
+| `@johnhenry/wsh/duplex` (whole entry point) | 144.6 kB | 44.0 kB |
 | `@johnhenry/wsh/address-guard` (whole entry point) | 9.1 kB | 3.6 kB |
+| `@johnhenry/wsh/gateway` (whole entry point) | 57.9 kB | 18.6 kB |
 | `import { encodeRecord } from '@johnhenry/wsh/testing'` | 1.8 kB | 0.9 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
-| `import { WshClient } from '@johnhenry/wsh'` | 137.5 kB | 41.4 kB |
+| `import { WshClient } from '@johnhenry/wsh'` | 140.4 kB | 42.3 kB |
 | `import { isPublicAddress } from '@johnhenry/wsh/address-guard'` | 3.1 kB | 1.3 kB |
-| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 104.8 kB | 34.3 kB |
+| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 107.7 kB | 35.1 kB |
 <!-- bundle-size:end -->
 
 ### Signing with a page-held signer
@@ -2810,6 +2920,7 @@ than left to be found.
 | Unix-domain socket forwarding, both directions; named endpoints (#120) | `client.openUnix()`, `listenUnix()`, `forwardUnix()` (Node: `-L`/`-R` shapes with unix and TCP ends mixed), `openEndpoint()`, `forwardEndpoint()` (Node: the CLI's `-L SOCK:endpoint=NAME`); host: `gateway: { unix, endpoints }`, `createMemoryHost({ endpoints })` | `wsh-server` serves `OpenUnix`/`ListenUnix` (`[gateway] unix_connect`, `unix_listen`, `unix_replace_stale`, `unix_max_listeners`; same policy as the Node host); `wsh-client` has `open_tcp`/`open_unix`/`open_endpoint`/`listen_unix`/`listen_tcp`; CLI `wsh -L` / `-R` / `-N` with TCP, unix and `endpoint=NAME` ends, also through `--via` | **Wire-unified, both directions** (#145). A Rust host does not offer named endpoints (an in-page host does); the CLI reaches them. See [Forwarding with `wsh -L`](#forwarding-with-wsh--l---r---n) |
 | Gateway flow control (#123) | credit per connection (`GatewayCredit`, feature `gateway-credit`); host caps for peers without it | `wsh-server` and `wsh-client`: 256 KiB per direction when both list `gateway-credit`; without it, per-connection and per-client byte caps (`max_buffered_bytes` 4 MiB, `max_client_buffered_bytes` 32 MiB) close the connection that exceeds them | **Wire-unified, negotiated**; an older peer on either side keeps working under the caps. `OpenUdp` flows are metered too (a datagram without credit is dropped) |
 | The gateway of a reverse host, through a relay (#289): `OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their answers carried to a host that turned it on | Operator: `client.openTcp()`, `openUdp()`, `listenTcp()` after `reverseConnect()` (refused locally unless relay and host state `relay-gateway`). Host: `createReverseHost({ gateway })` from `@johnhenry/wsh/server` (`allow`, `allowPrivate`, bounds; `udp`, `dns`, `reverse` each off unless given; `accept` returns `{ capabilities }` per operator). Relay: `relay: { carryGateway }` | Host: `wsh --relay-gateway-allow RULE [--relay-gateway-udp\|-dns\|-listen] [--relay-gateway-max-connections N] reverse\|agent run --capability gateway` (the `wsh-server` gateway, `wsh_core::gateway`). Relay: `wsh-server` `[relay] carry_gateway` (default true). **No Rust operator**: `wsh reverse-connect` has no forwarding, and `wsh-client` has no `open_tcp` over a bridge | **Wire-unified, negotiated (`relay-gateway`, implies `gateway-credit`), off unless the host's owner turns it on.** Both relays carry it to both hosts; sealed bridges carry it as sealed frames. Differences: the JS host grants per operator (`accept` -> capabilities), the Rust host has one allow list for the operators it lets in; the Rust host serves `OpenTcp`/`OpenUdp`/`ResolveDns`/`ListenRequest` only (as the JS one: no unix sockets or endpoints over a relay); `agent install` writes the flags into the unit |
+| The gateway over a network the embedder supplies (#299): TCP, DNS, UDP and listening for a host with no sockets | `createMemoryHost({ gateway: { network, allow, allowPrivate, udp, dns, reverse } })`, the browser-safe `createReverseHost({ gateway: { network, ... } })`, and `createWshServer({ gateway: { network } })` (`@johnhenry/wsh/gateway` for your own host); the session, policy, credit and bounds are the Node gateway's, from the same code | No: the Rust `wsh-server` and CLI dial the machine's network only | **Wire-unchanged**: no new message, field or feature string (the host states `gateway`, `gateway-credit` as ever) |
 | Gateway half-close (#271) | `GatewayClose` is a half-close in both directions: nothing ends a connection but both sides having closed, an error, or `gateway.halfCloseIdleMs` (default 300000, `0` = never) of silence in BOTH directions on a half-closed one; the same bound on a memory host `createMemoryHost({ gatewayHalfCloseIdleMs })`, per named endpoint `{ open, halfCloseIdleMs }` (host and target endpoints), client `connect(url, { gatewayHalfCloseIdleMs })` and per connection `openEndpoint(name, { halfCloseIdleMs })` (JS only: `wsh-server` has the global `half_close_idle_secs` only, no per-endpoint or in-page form); origin FINs are passed on as a half-close and the client's later bytes still reach the origin | `wsh-server`: the same rule, `[gateway] half_close_idle_secs` (default 300, `0` = never); `wsh-client` `GatewayStream::pump` / `pump_with_idle(local, idle)` keep a half-closed exchange open the same way (they used to end it 200 ms after the host closed) and `write_all` works after the host's close; so do `wsh -L` / `-R`. The CLI's reverse host (`wsh reverse`, `wsh agent run`) holds an `OpenTcp` connection by the same rule since #285 (it ended it at the first `GatewayClose`, or at the origin's first end of file, before); a UDP flow there still ends at the operator's close, the half-close idle bound is its fixed 300 s, and its connections have no credit flow control. `OpenTcp` / `OpenUdp` / `ResolveDns` / `ListenRequest` are not on the spec's relay-forwardable list, so neither relay carries them to a reverse host: an operator behind a relay cannot open a gateway connection on one at all, whatever its `gateway` capability | **Wire-unified, nothing negotiated** (no message, field or feature string): a release before this one ended a half-closed connection a fixed time after the first `GatewayClose` (host: 1 s after the client's; client: 5 s), so against an older host a client that half-closes still loses what the origin sends later than a second, and an older client against a newer host is served as before (it half-closes and its own timer may end it sooner). Not protected: a peer that keeps one byte in either direction inside the bound holds its connection (and its slot under `maxConnections`) open; the connection cap and the byte budgets still apply. A side that had already half-closed and then loses its reader (destroy, a socket error or reset, an origin that is gone) sends a second `GatewayClose` with the reason `"discarded"` (no new field or feature string); an older peer ignores it, so against one the old behaviour (its idle bound, or never with `0`) stays. A program that half-closed and was killed is noticed since #282 (next row) |
 | A half-closed local peer that went away (#282) | A forward's local program (the connector of a `-L`), or the caller of a Node host's reverse listener, that half-closed (FIN) and was then killed is noticed by a zero-length write probe every `halfCloseProbeMs` (default 2000, `0` = off; `forwardUnix` / `forwardEndpoint` per forward, `gateway.halfCloseProbeMs` per host) while the socket is half-closed, plus keep-alive on that schedule for TCP (Node 26 `setKeepAlive(true, delay, interval, count)`); on detection the socket is destroyed and the existing second `GatewayClose` `"discarded"` goes out; the forward reports `error.code === 'WSH_LOCAL_PEER_GONE'` to `onError` | `wsh-client` `GatewayStream::pump_watched` (the CLI's `-L` uses it; `-R` does not) and `wsh-server` for a reverse listener's callers wait for the kernel's hang-up on a duplicate of the descriptor (tokio `Ready::is_write_closed`: nothing is written, no interval) and give a TCP socket keep-alive on `[gateway] half_close_probe_secs` (default 2, `0` = off) once it is half-closed; `wsh_core::peer_watch` | **Wire-unified, nothing added** (the existing second `discarded` close carries the news; an older peer ignores a repeated close as before). Speed: unix at once (Node: within the probe interval); TCP killed with data unread at once (Node: within the probe interval); TCP exited with nothing unread when the peer's kernel drops the half-closed socket, about 60 s by default, then a keep-alive probe is reset. Asymmetries: Node is a timer, Rust is event driven, and only Node has a per-forward interval. Not watched on purpose: an origin the host dialled and the local service of a `-R` / `listenUnix` (a complete close after the last byte is the normal end of a response, and the discard would drop what the other end has not read). Not covered: a peer that is frozen rather than gone; Windows (not watched: unchanged behaviour); a black-holed path |
 | TCP reverse tunnels (`ListenRequest`, #98) | `@johnhenry/wsh/server` `gateway.reverse` (off by default; loopback unless the operator lists addresses; port allow-list, nothing below 1024 unless named; bounded listeners/connections/backlog/idle); client `listenTcp(port, { onConnection })` | `wsh-server` `[gateway] enable_reverse_tunnels` + `reverse_bind_addr` (off by default, loopback, client `bind_addr` ignored); **`reverse_ports`** (default `[0, "1024-65535"]`, a list replaces it), **`reverse_max_listeners`** 4, **`reverse_max_connections_per_listener`** 16, **`reverse_backlog`** 8, **`reverse_idle_secs`** 300, with the Node host's defaults and refusal sentences (the next `rust-v` release; **breaking** for a deployment that listened below 1024 or kept a quiet tunnel for more than 5 minutes, see the CHANGELOG) | **Wire-unified** (`ListenRequest`/`ListenOk`/`ListenFail`/`InboundOpen`/`InboundAccept`; the JS host sends the real `peer_addr`/`peer_port`); **same bounds on both hosts**. Accepted connections are metered by `gateway-credit`. The Rust idle limit watches only a connection the relay is reading (one parked on the client's credit is bounded by the credit window and the caps instead) |
@@ -3018,6 +3129,18 @@ out explicitly below rather than left to be discovered.
   checked one, and does not itself limit rates, bytes or connections or follow a later redirect to another address.
   Unix-domain sockets (`gateway.unix`) and named endpoints (`gateway.endpoints`) are off unless configured, are listed
   paths or names only, and sockets the host creates are `0600`.
+- **An injected network (#299, `gateway.network`): wsh's policy runs before the network is called, and wsh cannot vouch for what the
+  network reaches.** Off unless the embedder passes a gateway with a network and an `allow` list (required; empty reaches nothing).
+  The destination policy is wsh's: the name must match `allow`, the network's `resolve` is asked once and its answers (IP addresses only)
+  are classified by the same rules as the machine's (not public = refused), and `connectTcp` / `openUdp` receive the address that passed
+  and never the name; a name the network cannot resolve is refused. The network's own non-public ranges are refused until `allowPrivate`
+  or an IP-literal rule names them (`"*"` does not): there is no implicit allowance. UDP, DNS and listening need the embedder's switch
+  AND the network's method. What wsh does NOT know is what the network does with an address it was given: a virtual network that routes
+  `93.184.216.7` to somewhere else, a `connectTcp` that opens a socket to its own idea of "the name", or a network that is itself a proxy
+  to the real internet, is the embedder's to account for; the policy classifies the answers of `resolve`, it cannot check that they are
+  the truth, and `allow: ['*']` over a network that reaches the internet is an open proxy as it is on a machine. A connection of such a
+  network is not probed for a half-closed peer that has gone (no kernel to ask): the network closes the stream. A key's `gateway:...`
+  capabilities, the connection and byte bounds and the credit rules are the ones every gateway has.
 - **TCP reverse tunnels (`gateway.reverse`) are off unless configured, bind where the operator says, and cap what they open.**
   A reverse listener is a port of the HOST that other machines can connect to, with the authenticated client on the other
   end of every connection. The host binds `reverse.bindAddr` (default `127.0.0.1`) and ignores the address the client

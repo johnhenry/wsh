@@ -12,7 +12,10 @@
  * Backends are injected, shaped like the Node host's: `pty` (`{ spawn }`, node-pty shaped), `fs` (an object of file
  * operations, not a root path), `hostKey` (a `CryptoKeyPair`, which may be non-extractable, or a signer
  * `{ publicKey, sign }`).
- * Not available: the TCP, DNS, UDP and unix-socket parts of `gateway` (named `endpoints` are), `relay`, WebTransport,
+ * The TCP, DNS, UDP and listening parts of the gateway are served over a NETWORK THE EMBEDDER SUPPLIES (`gateway: { network, allow, ... }`, #299):
+ * a page has no sockets, so the embedder says what the host's network is (a virtual network in the page, a relay, a service worker) and wsh
+ * applies the same destination policy, connection cap, credit flow control and half-close rules to it that `createWshServer` applies to the machine's.
+ * Not available: the unix-socket part of `gateway` (named `endpoints` are), `relay`, WebTransport,
  * `exec: true` and `fs: { root }` (they need Node), the `wsh-host` / `wsh-fs` rpc built-ins (use `@johnhenry/wsh/server`).
  *
  * To serve a socket someone else upgraded (a WebSocket the page opened to a relay, a byte pipe) use `host.accept(socket)`;
@@ -37,6 +40,7 @@ import { assertEd25519HostKey } from './host-key.mjs';
 import { resolveBackends, resolveHostKey, createRpcTable } from './host-backends.mjs';
 import { bindSocket } from './server/socket.mjs';
 import { normalizeEndpointGateway, createEndpointGatewaySession } from './server/gateway-core.mjs';
+import { checkGatewayShape } from './gateway-shape.mjs';
 import { assertHalfCloseIdleMs } from './gateway-channel.mjs';
 import { CHANNEL_BINDING_KINDS } from './channel-binding.mjs';
 import { RPC_DEFAULT_MAX_MESSAGE } from './rpc.mjs';
@@ -172,6 +176,15 @@ function createRegistry(sessions, log) {
  *   backpressure) and `who` is the authenticated `{ username, fingerprint }`, so the handler can authorise per call:
  *   throw synchronously to refuse, or give `{ open, authorize(who) }`. Only the names listed here exist (an allow-list by
  *   construction); nothing else of the gateway (TCP, DNS, unix sockets) is on in memory.
+ * @param {{ network: { connectTcp?: Function, resolve?: Function, openUdp?: Function, listenTcp?: Function }, allow: string[], allowPrivate?: string[], udp?: boolean | object, dns?: boolean, reverse?: boolean | object, maxConnections?: number, maxBufferedBytes?: number, maxClientBufferedBytes?: number, connectTimeoutMs?: number, halfCloseIdleMs?: number, udpIdleMs?: number }} [options.gateway]
+ *   #299: the gateway (TCP, UDP, DNS, reverse tunnels) over a network YOU supply, for a host that has no sockets. Off unless given, and then
+ *   default-deny: `allow` lists the destinations (`"host"`, `"host:port"`, `"*"`) and is required. `network` is `{ connectTcp({ host, port, signal }),
+ *   resolve({ name, family, signal }), openUdp({ host, port, signal }), listenTcp({ port, bindAddr, signal, onConnection }) }`, each optional
+ *   (one is required), bytes as web streams `{ readable, writable }`; see `GatewayNetwork` in the types. The destination policy is wsh's and runs
+ *   BEFORE the network is called, on the address the network's `resolve` answered with (the address `connectTcp` then receives; the name is never passed on).
+ *   Addresses of the network's own that are not public (private ranges, loopback) are refused until you name them in `allowPrivate`
+ *   (or as an IP literal in `allow`). `udp`, `dns` and `reverse` are each off unless given, and each also needs its network method.
+ *   wsh cannot vouch for what your network reaches. Combine with `endpoints` freely. `socks`, `unix` and `tcp: false` do not apply.
  * @param {number} [options.gatewayHalfCloseIdleMs=300000] - The half-close idle bound of this host's endpoint connections (the same rule
  *   and meaning as `gateway.halfCloseIdleMs` of `createWshServer`, #271): a connection that one side has half-closed is ended after this
  *   many milliseconds with nothing moving in either direction. A non-negative integer up to 2147483647, `0` = never; anything else is
@@ -197,7 +210,7 @@ function createRegistry(sessions, log) {
  *   from `@johnhenry/wsh/host`), what is known of `who`, and a human `detail` (not stable). Not for parsing `onLog`.
  * @param {(line: string) => void} [options.onLog]
  */
-export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, gatewayHalfCloseIdleMs, loginTimeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onLog = () => {},
+export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions, rpc, rpcMaxMessageBytes = RPC_DEFAULT_MAX_MESSAGE, rpcMaxInflight = 64, sessions, endpoints, gateway, dataStreams = true, bindTimeoutMs = 3000, connectionTtlMs = 0, sealTimeoutMs = DEFAULT_SEAL_TIMEOUT_MS, gatewayHalfCloseIdleMs, loginTimeoutMs = DEFAULT_LOGIN_TIMEOUT_MS, requireChannelBinding = false, sealSession = false, onLog = () => {},
   onShare, onRefused, onSealed, targets, requireTarget, usernamePattern } = {}) {
   if (onSealed !== undefined && typeof onSealed !== 'function') throw new TypeError('createMemoryHost: onSealed must be a function');
   resolveUsernamePattern(usernamePattern, 'createMemoryHost');
@@ -235,16 +248,37 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   // Named virtual endpoints: a gateway with no TCP, DNS or unix sockets that answers only `OpenEndpoint`, built from
   // the browser-safe core (`server/gateway-core.mjs`), so a page can have it.
   let gatewayCfg = endpoints === undefined || endpoints === null ? null : normalizeEndpointGateway({ endpoints, halfCloseIdleMs });
-  // A target's own endpoints (#121) need the endpoints-only gateway too, even when the host has none of its own.
-  if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({ halfCloseIdleMs })), targetEndpoints: true };
+  // The gateway proper (#299): TCP, DNS, UDP and listening over the embedder's network. The same session the Node host runs; nothing here dials.
+  // The session (with the address guard, the UDP and reverse-tunnel policies and the stream adapter) is fetched by a dynamic import ONLY when a
+  // gateway was given, so a bundler puts it in a chunk of its own and a page host that has none does not carry it. The shape of the option is
+  // checked now (a typo throws at once); the full validation runs when the module has loaded and fails `host.ready`, every `accept()` and
+  // every connection (the in-memory client socket is closed, and `onLog` is told), never silently.
+  let createSession = createEndpointGatewaySession;
+  let gatewayLoaded = null;
+  if (gateway !== undefined && gateway !== null && gateway !== false) {
+    checkGatewayShape(gateway, 'createMemoryHost');
+    if (gateway.endpoints !== undefined) throw new TypeError('createMemoryHost: give the named endpoints as the `endpoints` option, not gateway.endpoints');
+    for (const k of ['socks', 'unix', 'tcp']) if (gateway[k] !== undefined) throw new TypeError(`createMemoryHost: gateway.${k} does not apply to a host with no sockets`);
+    gatewayLoaded = import('./server/gateway-session.mjs').then((m) => {
+      gatewayCfg = m.normalizeGateway({ ...gateway, endpoints, halfCloseIdleMs: gateway.halfCloseIdleMs ?? halfCloseIdleMs });
+      createSession = m.createGatewaySession;
+    });
+    gatewayLoaded.catch(() => {});
+  }
 
-  const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady]).then(([authorize, hostKeyResolved]) => createConnectionFactory({
-    authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, loginTimeoutMs, log: onLog,
-    methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused, onSealed,
-    targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
-    gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createEndpointGatewaySession : undefined, sessions: registry, relay: null,
-  }));
+  const ready = Promise.all([buildAuthorizer(auth, { log: onLog }), hostKeyReady, gatewayLoaded]).then(([authorize, hostKeyResolved]) => {
+    // A target's own endpoints (#121) need the endpoints-only gateway too, even when the host has none of its own.
+    if (targetTable && [...targetTable.values()].some((t) => t.endpoints)) gatewayCfg = { ...(gatewayCfg ?? normalizeEndpointGateway({ halfCloseIdleMs })), targetEndpoints: true };
+    return createConnectionFactory({
+      authorize, execRunner, execOptions, pty: ptyBackend, files, bindTimeoutMs, connectionTtlMs, requireChannelBinding, sealSession, sealTimeoutMs, loginTimeoutMs, log: onLog,
+      methods, hostKey: hostKeyResolved, rateLimit, extensions, mcp: mcpHost, rpc: rpcHost, onShare, onRefused, onSealed,
+      targets: targetTable, requireTarget: mustHaveTarget, usernamePattern,
+      gateway: gatewayCfg, createGatewaySession: gatewayCfg ? createSession : undefined, sessions: registry, relay: null,
+    });
+  });
   ready.catch(() => {});
+  const hostReady = ready.then(() => undefined);
+  hostReady.catch(() => {});
 
   const accepted = new Set();
   let closed = false;
@@ -261,7 +295,8 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
     constructor() {
       super();
       const [client, server] = createSocketPair();
-      void accept(server, { remote: { address: 'memory' } }).catch(onLog);
+      // A host that could not be set up (an invalid `gateway`, a key that does not resolve) says so, and the client's connect fails now instead of waiting out its timeout.
+      void accept(server, { remote: { address: 'memory' } }).catch((e) => { onLog(`createMemoryHost: ${e?.message ?? e}`); try { client.close(1011, String(e?.message ?? e).slice(0, 100)); } catch { /* closed */ } });
       return client;
     }
   }
@@ -269,6 +304,8 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
   const host = {
     /** Pass to `client.connect()`. */
     url: MEMORY_URL,
+    /** Resolves once the host is set up (backends resolved, and the gateway module loaded when a `gateway` was given); REJECTS with the reason when it could not be (an invalid `gateway`). */
+    ready: hostReady,
     WebSocket: HostWebSocket,
     accept,
     socketPair: createSocketPair,

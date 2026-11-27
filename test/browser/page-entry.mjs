@@ -10,8 +10,10 @@ import * as identity from '../../src/identity.mjs';
 import * as doubles from '../../src/testing-doubles.mjs';
 import * as objects from '../../src/objects-core.mjs';
 import { newRendezvousId, pipeUrl } from '../../src/pipe-relay.mjs';
+import * as gatewayEntry from '../../src/gateway.mjs';
+import { createVirtualNetwork, echoService } from '../helpers/virtual-network.mjs';
 
-const wsh = { ...client, ...memory, ...host, ...reverse, ...pageHost, ...capabilities, ...identity, ...doubles, newRendezvousId, pipeUrl,createDuplexPeer: objects.createDuplexPeer, createObjectsServer: objects.createObjectsServer, createObjectsClient: objects.createObjectsClient };
+const wsh = { ...client, ...memory, ...host, ...reverse, ...pageHost, ...capabilities, ...identity, ...doubles, newRendezvousId, pipeUrl, gatewayEntry,createDuplexPeer: objects.createDuplexPeer, createObjectsServer: objects.createObjectsServer, createObjectsClient: objects.createObjectsClient };
 window.wsh = wsh;
 
 const dec = new TextDecoder();
@@ -184,6 +186,38 @@ window.h.hostInfo = async (id) => {
   };
 };
 window.h.stopHost = (id) => hosts.get(id).host.close();
+
+// ── A host in the page whose gateway dials a network the page supplies (#299) ──────────────────────────────────────────
+// The network is a virtual one (`test/helpers/virtual-network.mjs`): an echo service at 93.184.216.7:7, a name that resolves to it, a private address
+// that is the network's own, and a UDP echo. What it was asked is recorded so a spec can say what wsh did NOT call.
+window.h.startNetworkHost = async ({ authorizedKeys, gateway = {} }) => {
+  const udpEcho = async ({ readable, writable }) => { try { await readable.pipeTo(writable); } catch { /* the caller went away */ } };
+  const vnet = createVirtualNetwork({
+    services: { '93.184.216.7:7': echoService, '10.0.0.5:7': echoService },
+    names: { 'svc.test': ['93.184.216.7'], 'inner.test': ['10.0.0.5'] },
+    udp: { '93.184.216.7:53': udpEcho },
+  });
+  const h = wsh.createMemoryHost({
+    auth: { authorizedKeys: authorizedKeys.map((a) => (typeof a === 'string' ? a : new Uint8Array(a))) },
+    gateway: { network: vnet.network, allow: ['svc.test', 'inner.test', '93.184.216.7'], ...gateway },
+  });
+  const id = `h${++counter}`;
+  hosts.set(id, { host: h, vnet });
+  return id;
+};
+window.h.networkCalls = (id) => {
+  const { vnet } = hosts.get(id);
+  return {
+    connect: vnet.calls.connect.map((c) => [c.host, c.port]),
+    resolve: vnet.calls.resolve.map((c) => c.name),
+    udp: vnet.calls.udp.map((c) => [c.host, c.port]),
+    signalsAborted: vnet.conns.map((r) => r.signalAborted),
+  };
+};
+/** What the gateway entry point exports in the page (it bundled for the browser, so it ran here). */
+/** `normalizeGateway` of the gateway entry with no network, in a page: refused up front, in words (there are no sockets to fall back to). */
+window.h.gatewayNoNetwork = () => { try { wsh.gatewayEntry.normalizeGateway({ allow: ['*'] }); return 'no error'; } catch (e) { return e.message; } };
+window.h.gatewayEntryInfo =() => ({ exports: Object.keys(wsh.gatewayEntry).sort(), policyDenied: wsh.gatewayEntry.GATEWAY_FAIL.POLICY_DENIED, bufferType: typeof Buffer });
 /** The names of the shares the operator's CLI offered this in-page host (#159). */
 window.h.shareNames = (id) => [...hosts.get(id).record.shares.keys()];
 /** Run one operation of a share's `fs` and return something `page.evaluate` can carry back (bytes as text + length + a digest). */

@@ -32,6 +32,18 @@ describe('browser entry points (#115, #128)', () => {
     });
   }
 
+  it('#299: the gateway session is a chunk of its own behind a dynamic import: a host entry that is given no gateway does not ship it, and the explicit entry does', async () => {
+    for (const name of ['./memory', './reverse', './testing', './page']) {
+      const { code, chunkFiles, lazy, inputs } = await bundle(ENTRY_POINTS.find((p) => p.name === name));
+      assert.ok(lazy.chunks >= 1 && chunkFiles.some((f) => /^(gateway-session|reverse-gateway)-/.test(f)), `${name}: the gateway session is split into a chunk (${chunkFiles.join(', ')})`);
+      assert.ok(!code.includes('this network cannot open TCP connections'), `${name}: the entry chunk has no gateway session in it`);
+      assert.ok(inputs.includes('src/server/gateway-session.mjs'), `${name}: and it is still bundled (the lazy chunk)`);
+    }
+    const gateway = await bundle(ENTRY_POINTS.find((p) => p.name === './gateway'));
+    assert.ok(gateway.code.includes('this network cannot open TCP connections'), './gateway is the session itself, in its entry');
+    assert.equal(gateway.lazy.chunks, 0);
+  });
+
   it('the check fails on a Node built-in: ./server does not bundle for the browser', async () => {
     await assert.rejects(
       bundle({ name: './server', entry: 'src/server/index.mjs' }),

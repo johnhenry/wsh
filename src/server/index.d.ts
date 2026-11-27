@@ -182,6 +182,14 @@ export interface WshServerGatewayOptions {
   maxClientBufferedBytes?: number;
   socks?: string | { host: string; port: number };
   /**
+   * #299: dial this network instead of the machine's: `{ connectTcp, resolve, openUdp, listenTcp }` (see `WshGatewayNetwork` in `@johnhenry/wsh/gateway`). The destination
+   * policy is applied before the network is called, to the address its `resolve` answered with; its non-public addresses need `allowPrivate`. `udp`, `dns` and `reverse`
+   * are then each off unless given. Cannot be combined with `socks`, `unix` or `tcp: false`; `allow` is required. wsh cannot vouch for what such a network reaches.
+   */
+  network?: import('../gateway.js').WshGatewayNetwork;
+  /** `ResolveDns`. With `network`: answered only when this is `true` (and the network has `resolve`). On the machine's gateway: answered unless this is `false` (a `false` was ignored before; it now turns name resolution off). */
+  dns?: boolean;
+  /**
    * Unix-domain sockets a client may reach (`OpenUnix`, feature `gateway-unix`) or ask the host to create
    * (`ListenUnix`). Off unless given; each entry is an absolute path (exact), a directory prefix with a trailing `/`,
    * or `@name` / `@prefix/` for the Linux abstract namespace. Checked after `realpath` of the parent directory; the

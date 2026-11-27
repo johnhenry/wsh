@@ -35,6 +35,7 @@ export const ENTRY_POINTS = [
   { name: './identity', entry: 'src/identity.mjs' },
   { name: './duplex', entry: 'src/duplex.mjs' },
   { name: './address-guard', entry: 'src/address-guard.mjs' },
+  { name: './gateway', entry: 'src/gateway.mjs' },
   { name: './testing (encodeRecord only)', contents: "import { encodeRecord } from './src/testing.mjs'; globalThis.x = encodeRecord;" },
   { name: '. (generateKeyPair only)', contents: "import { generateKeyPair } from './src/index.mjs'; globalThis.x = generateKeyPair;" },
   { name: '. (WshClient only)', contents: "import { WshClient } from './src/index.mjs'; globalThis.x = WshClient;" },
@@ -47,7 +48,7 @@ const BUFFER_MARKER = '__WSH_NODE_BUFFER__';
 
 /**
  * Bundle one entry for the browser. Rejects (with esbuild's message naming the import) when anything reachable imports
- * a Node built-in; resolves with `{ code, raw, gzip, inputs }`. `code` is the bundle; `problems` lists a reference to the
+ * a Node built-in; resolves with `{ code, raw, gzip, lazy, chunkFiles, inputs }` (`code`, `raw`, `gzip`: the entry chunk; `lazy`: the chunks behind a dynamic import). `code` is the bundle; `problems` lists a reference to the
  * Node `Buffer` global or a `require(`.
  */
 export async function bundle(point, { minify = true } = {}) {
@@ -55,6 +56,10 @@ export async function bundle(point, { minify = true } = {}) {
     ...(point.entry ? { entryPoints: [path.join(ROOT, point.entry)] } : { stdin: { contents: point.contents, resolveDir: ROOT, loader: 'js' } }),
     bundle: true,
     write: false,
+    // Code behind a dynamic `import()` (the gateway session of a host that was given a `gateway`, #299) is a chunk of its own, as it is in an
+    // embedder's bundler: the entry's size is what a page that never uses it ships, and the chunks are reported apart as `lazy`.
+    splitting: true,
+    outdir: path.join(ROOT, '.bundle-out'),
     platform: 'browser',
     format: 'esm',
     target: 'es2022',
@@ -65,13 +70,32 @@ export async function bundle(point, { minify = true } = {}) {
     metafile: true,
     logLevel: 'silent',
   });
-  const code = result.outputFiles[0].text;
+  // What a page loads at once is the entry chunk and every chunk it reaches by a STATIC import (code shared between the entry and a lazy chunk is split
+  // into a `chunk-*.js` the entry imports); what only a dynamic `import()` reaches is `lazy`. Every chunk is checked for Node built-ins, only the eager
+  // ones are the entry's size.
+  const files = result.outputFiles;
+  const key = (f) => path.relative(ROOT, f.path).split(path.sep).join('/');
+  const byKey = new Map(files.map((f) => [key(f), f]));
+  const entryKey = Object.keys(result.metafile.outputs).find((k) => result.metafile.outputs[k].entryPoint) ?? key(files[0]);
+  const eagerKeys = new Set();
+  const visit = (k) => {
+    if (eagerKeys.has(k) || !byKey.has(k)) return;
+    eagerKeys.add(k);
+    for (const i of result.metafile.outputs[k]?.imports ?? []) if (i.kind === 'import-statement') visit(i.path);
+  };
+  visit(entryKey);
+  const eagerFiles = files.filter((f) => eagerKeys.has(key(f)));
+  const lazyFiles = files.filter((f) => !eagerKeys.has(key(f)));
+  const code = eagerFiles.map((f) => f.text).join('\n');
   const bytes = Buffer.from(code);
+  const lazyBytes = Buffer.concat(lazyFiles.map((f) => Buffer.from(f.text)));
+  const lazy = { chunks: lazyFiles.length, raw: lazyBytes.length, gzip: lazyFiles.length ? gzipSync(lazyBytes, { level: 9 }).length : 0 };
   const problems = [];
-  if (code.includes(BUFFER_MARKER)) problems.push('references the Node `Buffer` global');
-  if (/\brequire\(/.test(code)) problems.push('calls require()');
+  const all = files.map((f) => f.text).join('\n');
+  if (all.includes(BUFFER_MARKER)) problems.push('references the Node `Buffer` global');
+  if (/\brequire\(/.test(all)) problems.push('calls require()');
   // The source files that contribute bytes to the bundle (what tree-shaking left), not every file that was parsed.
   const inputs = Object.values(result.metafile.outputs).flatMap((o) => Object.entries(o.inputs))
     .filter(([f, i]) => i.bytesInOutput > 0 && !f.startsWith('node_modules/')).map(([f]) => f);
-  return { code, raw: bytes.length, gzip: gzipSync(bytes, { level: 9 }).length, inputs, problems };
+  return { code, raw: bytes.length, gzip: gzipSync(bytes, { level: 9 }).length, lazy, chunkFiles: files.map((f) => path.basename(f.path)), inputs, problems };
 }

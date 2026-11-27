@@ -68,9 +68,17 @@ export interface WshMemoryHostOptions {
    * Named virtual endpoints: a host with no file system exposes these instead of unix sockets; a client reaches one with
    * `client.openEndpoint(name)`. The handler gets web streams with backpressure and `who` (the authenticated
    * `{ username, fingerprint }`) and refuses by throwing; `{ open, authorize(who) }` authorises per call. Only the
-   * names listed exist. Nothing else of the gateway (TCP, DNS, unix sockets) is available in memory.
+   * names listed exist. TCP, DNS, UDP and listening are served only over a network you supply (`gateway`, below); unix sockets are not available in memory.
    */
   endpoints?: Record<string, WshMemoryEndpointHandler | { open: WshMemoryEndpointHandler; authorize?: (who: { username: string | null; fingerprint: string | null }) => boolean | Promise<boolean>; halfCloseIdleMs?: number }>;
+  /**
+   * #299: the gateway (TCP, DNS, UDP, reverse tunnels) over a network YOU supply, for a host that has no sockets. Off unless given, then default-deny: `allow` is required.
+   * `network` is `{ connectTcp, resolve, openUdp, listenTcp }` (each optional, one required; bytes as web streams). The destination policy is wsh's, applied BEFORE the
+   * network is called and to the address the network's `resolve` answered with (the one `connectTcp` then receives; the name is never passed on); the network's own
+   * non-public addresses are refused until `allowPrivate` names them. `udp`, `dns` and `reverse` are each off unless given and also need their network method. Same
+   * session, credit flow control, half-close rules and bounds as `createWshServer`. wsh cannot vouch for what your network reaches. Works with `endpoints`.
+   */
+  gateway?: import('./gateway.js').WshNetworkGatewayOptions;
   /**
    * The half-close idle bound (#271) of this host's endpoint connections, the same rule as `gateway.halfCloseIdleMs` of
    * `createWshServer`: a connection one side has half-closed is ended after this many milliseconds with nothing moving in
@@ -139,6 +147,12 @@ export interface WshMemoryConnectOptions {
 export interface WshMemoryHost {
   /** The URL to give `client.connect()`; the host ignores it. */
   readonly url: string;
+  /**
+   * Resolves once the host is set up: its backends resolved and, when a `gateway` was given (#299), the gateway module loaded (it is fetched by a dynamic
+   * import only then, so a bundler puts it in a chunk of its own) and the option fully validated. REJECTS with the reason when it could not be (a bad
+   * value in `gateway`): every `accept()` and every connection then fails the same way, and `onLog` is told. A typo in the shape of `gateway` throws from `createMemoryHost` itself.
+   */
+  readonly ready: Promise<void>;
   /** A `WebSocket` constructor that dials this host. */
   readonly WebSocket: new (url?: string) => any;
   /** Serve any pre-upgraded socket (see `createSocketPair()`). */
