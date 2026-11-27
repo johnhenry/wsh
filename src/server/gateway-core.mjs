@@ -127,6 +127,9 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
       /** Tear the connection down now. */
       destroy: (reason) => channel.destroy(reason),
       closed: channel.closedPromise,
+      /** Bytes received from the client and not yet read from `readable`, and the most that was ever held at once: what the credit window bounds. */
+      get queuedBytes() { return channel.queuedBytes; },
+      get peakQueuedBytes() { return channel.peakQueuedBytes; },
     };
     try {
       const out = ep.open(duplex, who);

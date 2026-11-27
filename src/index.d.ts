@@ -2351,6 +2351,10 @@ export interface WshGatewayDuplex {
   lossless?: boolean;
   /** The answering socket of this connection went away after finishing its side (a reverse forward's local service): end it with `released`, which loses nothing the peer has received. A discard where `lossless` is false. */
   release?(): void;
+  /** Bytes received from the peer and not yet read from `readable`: what this end is holding for you. With credit it never exceeds the credit window (256 KiB). */
+  readonly queuedBytes?: number;
+  /** The most bytes this connection has ever held, received and not yet read, at once (a byte count kept by the connection, not a heap measurement). */
+  readonly peakQueuedBytes?: number;
 }
 
 /** A UDP flow (`client.openUdp()`): one chunk = one datagram, and a datagram may be dropped without notice. */

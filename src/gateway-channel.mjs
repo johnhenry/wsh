@@ -111,6 +111,7 @@ export class GatewayChannel {
   #unacked = 0;
   #queue = [];
   #queued = 0;
+  #peakQueued = 0;
   #waiter = null;
   #creditWaiters = [];
   #sentClose = false;
@@ -143,6 +144,8 @@ export class GatewayChannel {
   get closedPromise() { return this.#closedPromise; }
   /** Bytes received and not yet consumed. */
   get queuedBytes() { return this.#queued; }
+  /** The most bytes this connection has ever held received and not yet consumed (what the credit window bounds). */
+  get peakQueuedBytes() { return this.#peakQueued; }
 
   // ── wire side ──────────────────────────────────────────────────────
 
@@ -158,6 +161,7 @@ export class GatewayChannel {
     const budget = this.#o.budget;
     if (this.#queued + n > this.#o.maxQueued || (budget && budget.used + n > budget.max)) return this.#violate('buffer limit exceeded');
     this.#queued += n;
+    if (this.#queued > this.#peakQueued) this.#peakQueued = this.#queued;
     if (budget) budget.used += n;
     this.#lastActive = Date.now();
     if (this.#o.onData) { this.#o.onData(bytes); return; }

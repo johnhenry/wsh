@@ -475,13 +475,20 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     // what it has already received and then ends), so an origin that finished sending and vanished is noticed too, and a server that sent its whole
     // answer, half-closed and closed completely (HTTP/1.0, `Connection: close`) loses no byte of it. `halfCloseProbeAnswers: false` turns this off.
     let originGone = false;
-    if (!watchPeer && !sock.isStreamSocket && channel.lossless && cfg.halfCloseProbeAnswers !== false) {
+    let answering = false;
+    if (!watchPeer && !sock.isStreamSocket && channel.lossless && cfg.halfCloseProbeAnswers !== false && (cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS) > 0) {
+      answering = true;
       const probe = cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS;
       watchHalfClosed(sock, probe, (e) => { originGone = true; log(`gateway ${id}: ${e.message}`); }, answeringKeepAliveMs(sock, probe, cfg.halfCloseProbeRemoteMs));
     }
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
-    sock.on('close', () => { void tail.finally(() => (originGone ? channel.release() : channel.destroy())); });
+    // The probe is not the only way the end of a watched answering origin is seen: a write that fails (the client's request body, still uploading, into an
+    // origin that has been reset: an 'error', then 'close'). The probe is skipped while a write is queued, so either may be first, and the verdict must not
+    // depend on which: an origin that sent its WHOLE answer (its end of file was read) is released, not discarded, because a second close of "discarded" makes
+    // the client drop what it has received and not yet read. A failure BEFORE the end of file (a reset included) is not a complete answer, and `released`
+    // would make a cut answer look like a finished one to the caller: it stays a discard, an error end.
+    sock.on('close', () => { void tail.finally(() => (originGone || (answering && sock.readableEnded) ? channel.release() : channel.destroy())); });
     return channel;
   }
 

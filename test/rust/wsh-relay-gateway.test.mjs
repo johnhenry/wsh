@@ -451,7 +451,8 @@ describe('the Rust CLI reverse host behind a relay that does not carry the gatew
       procs.push(r);
       let err = '';
       r.stderr.on('data', (d) => { err += d; });
-      const code = await new Promise((res) => r.once('exit', res));
+      // 'close', not 'exit': 'exit' can fire before the last of stderr has been read.
+      const code = await new Promise((res) => r.once('close', res));
       assert.notEqual(code, 0);
       assert.match(err, pattern);
     });

@@ -233,6 +233,8 @@ struct Chan {
     remote_closed: AtomicBool,
     /// The origin's write side has been shut (the client's GatewayClose, passed on).
     write_shut: AtomicBool,
+    /// The origin's end of file has been read: it sent its whole answer.
+    origin_eof: AtomicBool,
     /// A UDP flow: it has no half-close, the client's GatewayClose ends it.
     is_udp: AtomicBool,
     /// The half-closed idle watcher is running.
@@ -805,6 +807,7 @@ impl Inner {
             sent_close: AtomicBool::new(false),
             remote_closed: AtomicBool::new(false),
             write_shut: AtomicBool::new(false),
+            origin_eof: AtomicBool::new(false),
             is_udp: AtomicBool::new(false),
             idle_armed: AtomicBool::new(false),
             born: std::time::Instant::now(),
@@ -844,7 +847,7 @@ impl Inner {
         let writer = {
             let inner = self.clone();
             let chan = chan.clone();
-            tokio::spawn(async move { inner.write_loop(chan, wr, write_rx).await })
+            tokio::spawn(async move { inner.write_loop(chan, wr, write_rx, answering).await })
         };
         let mut tasks = vec![reader.abort_handle(), writer.abort_handle()];
         if let (Some(watch), Some(every)) = (watch, self.half_close_probe) {
@@ -926,6 +929,7 @@ impl Inner {
             let n = match rd.read(&mut buf).await {
                 Ok(0) => {
                     eof = true;
+                    chan.origin_eof.store(true, Ordering::Release);
                     break;
                 }
                 Err(_) => break,
@@ -947,7 +951,8 @@ impl Inner {
             }
         }
         if !eof || chan.finished.load(Ordering::Acquire) {
-            // The origin failed (or the client is gone): the connection is over.
+            // The origin failed before its end of file (a reset included), or the client is gone: the connection is over, as an error. The answer
+            // is not known to be complete, so it is not released (that would make a cut answer look like a finished one to the caller).
             self.destroy(&chan, None);
             return;
         }
@@ -998,13 +1003,26 @@ impl Inner {
         chan: Arc<Chan>,
         mut wr: tokio::io::WriteHalf<BoxStream>,
         mut rx: mpsc::UnboundedReceiver<WriteCmd>,
+        answering: bool,
     ) {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 WriteCmd::Data(data) => {
                     let n = data.len();
                     if wr.write_all(&data).await.is_err() {
-                        self.destroy(&chan, Some("write failed"));
+                        // The watch is not the only way the end of an answering origin is seen: a write that fails (the client's bytes, still
+                        // arriving, into an origin that has finished and gone) ends it too, and which is first is not up to us. An origin whose
+                        // end of file was read sent its WHOLE answer, so it is released either way: a second close of `discarded` would make the
+                        // client drop what it has received and not yet read. A failure before the end of file (a reset included) is not a complete
+                        // answer, and `released` would make a cut answer look like a finished one: it stays a discard.
+                        if answering
+                            && self.answering_watch()
+                            && chan.origin_eof.load(Ordering::Acquire)
+                        {
+                            self.release(&chan);
+                        } else {
+                            self.destroy(&chan, Some("write failed"));
+                        }
                         return;
                     }
                     self.consumed(&chan, n).await;

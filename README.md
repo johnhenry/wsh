@@ -498,6 +498,7 @@ everything that was handed to it: a caller that half-closed first and reads a lo
 when the service or origin sent it and closed completely at once (a reverse forward's local service, a TCP or unix origin).
 A socket whose peer takes nothing for `gateway.halfCloseIdleMs` is cut then (`0` = never); every other end of a connection
 (an error, a discard, the idle bound, the session ending) still destroys the socket at once and drops what was queued.
+A service that answers and closes without reading its caller's request can lose its own answer to a reset in the kernel (the request reaches a closed socket, and a reset throws away what the reader has not read yet), with or without wsh.
 
 **Choosing `0` (never) for `halfCloseIdleMs`.** With `0` a half-closed connection is held for as long as the session lives
 unless something ends it, so know what does and what does not:

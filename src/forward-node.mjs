@@ -66,7 +66,11 @@ export function pipe(sock, duplex, { probeMs, onGone, answering = false, remoteM
   // closes completely (or is reset, as one is when the caller's request reaches a service that has already closed) right after its
   // last bytes would otherwise cost the caller the tail of the answer.
   let tail = Promise.resolve();
-  const destroyAfterTail = () => { void tail.finally(() => (released && typeof duplex.release === 'function' ? duplex.release() : duplex.destroy())); };
+  // The probe is not the only way the end of an answering socket is seen: a write that fails (the caller's bytes, still arriving, into a service that has been
+  // reset) closes it too, and the probe is skipped while a write is queued, so either may be first. A service that sent its WHOLE answer (its end of file was
+  // read) is released whichever it is: a second close of "discarded" would make the host drop what its caller has not read yet. A failure BEFORE the end of
+  // file (a reset included) is not a complete answer, and `released` would make a cut answer look like a finished one: it stays a discard, an error end.
+  const destroyAfterTail = () => { void tail.finally(() => ((released || (answering && sock.readableEnded)) && typeof duplex.release === 'function' ? duplex.release() : duplex.destroy())); };
   sock.on('data', (d) => {
     sock.pause();
     tail = writer.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => {

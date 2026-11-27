@@ -20,6 +20,9 @@ import { WshClient, generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
 import { GatewayChannel, GATEWAY_RELEASED, GATEWAY_DISCARDED, GATEWAY_LOSSLESS_FEATURE } from '../src/gateway-channel.mjs';
 import { halfCloseWatchCount, watchHalfClosed, answeringKeepAliveMs } from '../src/half-close-watch.mjs';
 import { until, listen } from './gateway-fixture.mjs';
+import { MSG } from '@johnhenry/wsh';
+import { createGatewaySession } from '../src/server/gateway.mjs';
+import { pipe } from '../src/forward-node.mjs';
 
 const CHILD = fileURLToPath(new URL('./half-close-probe-child.mjs', import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -317,6 +320,33 @@ describe('the answering side is watched, and nothing is lost (#286)', () => {
     assert.equal(await stateAfter(d.closed, BOUND), GATEWAY_RELEASED);
   });
 
+  // The probe is held off (an interval of an hour), so the only thing that can conclude the connection is the failure of the write of the client's next
+  // bytes into the reset origin: what the client holds unread must survive it, byte for byte (the order of the two paths is the order of the race).
+  it('a TCP origin that sent its whole answer and half-closed, then is reset while the client has read none of it: the whole answer is read, byte for byte, then `released`', async () => {
+    const answer = Buffer.from(Array.from({ length: 100_000 }, (_, i) => (i * 31 + 7) & 0xff));
+    const socks = [];
+    const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.end(answer); });
+    const port = await listen(origin); nets.push(origin);
+    const other = net.createServer((s) => { s.on('error', () => {}); s.resume(); });
+    const otherPort = await listen(other); nets.push(other);
+    const { client } = await setup({ allow: [`127.0.0.1:${port}`, `127.0.0.1:${otherPort}`], halfCloseProbeMs: 3_600_000, maxConnections: 1 });
+    const before = halfCloseWatchCount();
+    const d = await client.openTcp('127.0.0.1', port);
+    await until(() => halfCloseWatchCount() > before, 'the origin\'s end of file to have been seen by the host');
+    socks[0].resetAndDestroy();
+    const w = d.writable.getWriter();
+    // The host's one slot is free again once it has concluded, and its close reached the client (one ordered connection) before the answer to that. A write made
+    // before the reset has reached this machine's kernel succeeds, so bytes are offered until one fails: each is a request body, none is a wait.
+    const slotFree = async () => { try { (await client.openTcp('127.0.0.1', otherPort)).destroy(); return true; } catch (e) { if (/too many/.test(e.message)) return false; throw e; } };
+    await until(async () => { await w.write(new Uint8Array(1)).catch(() => {}); return slotFree(); }, 'the host to have concluded the connection', BOUND);
+    const reader = d.readable.getReader();
+    const chunks = [];
+    for (;;) { const { value, done } = await reader.read(); if (done) break; chunks.push(Buffer.from(value)); }
+    const got = Buffer.concat(chunks);
+    assert.ok(got.equals(answer), `the whole answer arrived (${got.length} of ${answer.length} bytes)`);
+    assert.equal(await stateAfter(d.closed, BOUND), GATEWAY_RELEASED);
+  });
+
   for (const [what, gateway, connectOptions] of [
     ['a client that did not state the feature', {}, { gatewayLosslessClose: false }],
     ['a host that did not state the feature', { losslessClose: false }, {}],
@@ -436,4 +466,130 @@ describe('the answering side is watched, and nothing is lost (#286)', () => {
       }
     });
   });
+});
+
+// ── the order in which an answering socket's end and its error are seen ────────────────────────────────────────────────────────────────
+//
+// An answering socket that has sent its whole answer and its end of file can conclude the connection by two paths: the half-close probe (a zero-length write
+// that fails once the peer is gone: `released`) and the failure of a write the socket was handed (a request body still uploading into a peer that has been
+// reset: an 'error', then 'close'). The probe is skipped while a write is queued, so the second can come first, and it used to be a plain discard: the
+// close that follows an end of file is a SECOND close, and a second close of "discarded" makes the receiver drop what it has received and not yet read.
+// These tests hold the probe off (an interval of an hour), so the failed write is the only path that can conclude the connection, and make that write fail
+// by sending after the reset; the verdict and the tail are then the same in whatever order the two would have come.
+describe('an answering socket that finished its answer and is then reset: the end of the connection is `released` by whichever path sees it first', () => {
+  const nets = []; const sessions = [];
+  afterEach(async () => {
+    for (const s of sessions.splice(0)) s.close();
+    for (const n of nets.splice(0)) n.close();
+  });
+  const ANSWER = Buffer.from(Array.from({ length: 100_000 }, (_, i) => (i * 13 + 5) & 0xff));
+  const HOUR = 3_600_000;
+
+  it('host: the origin sent its whole answer and half-closed; a write that then fails (the origin was reset) ends the connection with `released`, after every byte went out', async () => {
+    const socks = [];
+    const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.end(ANSWER); });
+    const port = await listen(origin); nets.push(origin);
+    const out = [];
+    const cfg = normalizeGateway({ allow: ['127.0.0.1'], allowPrivate: ['127.0.0.0/8'], halfCloseProbeMs: HOUR, halfCloseIdleMs: 0 });
+    const s = createGatewaySession(cfg, (m) => { out.push(m); }, () => {}); sessions.push(s);
+    s.setPeerFeatures(['gateway-credit', GATEWAY_LOSSLESS_FEATURE]);
+    await s.handle({ type: MSG.OPEN_TCP, gateway_id: 1, host: '127.0.0.1', port });
+    assert.ok(out.find((m) => m.type === MSG.GATEWAY_OK));
+    const closes = () => out.filter((m) => m.type === MSG.GATEWAY_CLOSE);
+    // the origin's end of file has been passed on as the host's half-close: everything it sent is out
+    await until(() => closes().length === 1, 'the origin\'s end of file to reach the client as a half-close');
+    assert.equal(closes()[0].reason, undefined, 'a half-close, not a discard');
+    const sent = Buffer.concat(out.filter((m) => m.type === MSG.GATEWAY_DATA).map((m) => Buffer.from(m.data)));
+    assert.ok(sent.equals(ANSWER), 'the whole answer went out, byte for byte');
+    // the origin is reset; the client's next bytes (a request body still uploading) fail to be written to it, and that failure is the only thing that can conclude the connection
+    // (a write made before the reset has reached this machine's kernel succeeds, so bytes are offered until one fails: each is a request body, none is a wait)
+    socks[0].resetAndDestroy();
+    await until(async () => { if (closes().length < 2) await s.handle({ type: MSG.GATEWAY_DATA, gateway_id: 1, data: new Uint8Array(1) }); return closes().length === 2; }, 'the connection to be concluded');
+    assert.equal(closes()[1].reason, GATEWAY_RELEASED,'released (what it sent is delivered), not discarded (what the client has not read is dropped)');
+    assert.equal(s.size, 0);
+  });
+
+  it('host: the same against a client that did not state the feature is a discard, as it always was', async () => {
+    const socks = [];
+    const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.end(ANSWER); });
+    const port = await listen(origin); nets.push(origin);
+    const out = [];
+    const cfg = normalizeGateway({ allow: ['127.0.0.1'], allowPrivate: ['127.0.0.0/8'], halfCloseProbeMs: HOUR, halfCloseIdleMs: 0 });
+    const s = createGatewaySession(cfg, (m) => { out.push(m); }, () => {}); sessions.push(s);
+    s.setPeerFeatures(['gateway-credit']);
+    await s.handle({ type: MSG.OPEN_TCP, gateway_id: 1, host: '127.0.0.1', port });
+    const closes = () => out.filter((m) => m.type === MSG.GATEWAY_CLOSE);
+    await until(() => closes().length === 1, 'the half-close');
+    socks[0].resetAndDestroy();
+    await until(async () => { if (closes().length < 2) await s.handle({ type: MSG.GATEWAY_DATA, gateway_id: 1, data: new Uint8Array(1) }); return closes().length === 2; }, 'the connection to be concluded');
+    assert.equal(closes()[1].reason, GATEWAY_DISCARDED);
+  });
+
+  // `released` tells the caller "deliver what you have, then finish": for an origin reset in the MIDDLE of its answer (its end of file never read) that would
+  // make a truncated answer look like a complete one (a close-delimited response cut by an origin crash would read as a clean end). So a reset before the end
+  // of file is an error end whatever was negotiated: the close reason is `discarded`, and the caller (the client's stream) can tell.
+  for (const [what, features, extra, want] of [
+    ['both ends state the feature', ['gateway-credit', GATEWAY_LOSSLESS_FEATURE], {}, GATEWAY_DISCARDED],
+    ['the client did not state the feature', ['gateway-credit'], {}, GATEWAY_DISCARDED],
+    ['halfCloseProbeAnswers: false', ['gateway-credit', GATEWAY_LOSSLESS_FEATURE], { halfCloseProbeAnswers: false }, GATEWAY_DISCARDED],
+  ]) {
+    it(`host: a reset before the end of file is NOT a clean end for the caller (${what}): the close is ${want}, never released`, async () => {
+      const socks = [];
+      const origin = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.write(Buffer.alloc(10)); });
+      const port = await listen(origin); nets.push(origin);
+      const out = [];
+      const cfg = normalizeGateway({ allow: ['127.0.0.1'], allowPrivate: ['127.0.0.0/8'], halfCloseProbeMs: HOUR, halfCloseIdleMs: 0, ...extra });
+      const s = createGatewaySession(cfg, (m) => { out.push(m); }, () => {}); sessions.push(s);
+      s.setPeerFeatures(features);
+      await s.handle({ type: MSG.OPEN_TCP, gateway_id: 1, host: '127.0.0.1', port });
+      await until(() => out.some((m) => m.type === MSG.GATEWAY_DATA), 'the first bytes');
+      socks[0].resetAndDestroy();
+      await until(async () => { if (!out.some((m) => m.type === MSG.GATEWAY_CLOSE)) await s.handle({ type: MSG.GATEWAY_DATA, gateway_id: 1, data: new Uint8Array(1) }); return out.some((m) => m.type === MSG.GATEWAY_CLOSE); }, 'the connection to be concluded');
+      assert.equal(out.find((m) => m.type === MSG.GATEWAY_CLOSE).reason, want);
+    });
+  }
+
+  it('client (the local service of a reverse forward): a write to the service that fails after its end of file releases the connection, it does not discard it', async () => {
+    const socks = [];
+    const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); s.end('the whole answer'); });
+    const port = await listen(service); nets.push(service);
+    const calls = [];
+    let push;
+    const duplex = {
+      readable: new ReadableStream({ start(c) { push = c; } }), writable: new WritableStream({ write() {} }), closed: new Promise(() => {}),
+      lossless: true, peerReleased: false, release: () => calls.push('release'), destroy: () => calls.push('destroy'),
+    };
+    const sock = net.connect({ host: '127.0.0.1', port, allowHalfOpen: true });
+    await new Promise((r) => sock.once('connect', r));
+    pipe(sock, duplex, { probeMs: HOUR, answering: true });
+    await until(() => sock.readableEnded, 'the service\'s end of file');
+    socks[0].resetAndDestroy();
+    await until(() => { if (!calls.length) push.enqueue(new Uint8Array(1)); return calls.length > 0; }, 'the connection to be concluded'); // the caller's bytes, until a write to the reset service fails
+    assert.equal(calls[0], 'release');
+    sock.destroy();
+  });
+
+  // The same on the client: a service reset in the MIDDLE of its answer (its end of file never read) must not end the connection with `release`, which would
+  // make a truncated answer look like a complete one to the host's caller; it is a destroy (a discard), watched or not.
+  for (const [what, options, want] of [['a watched service', { probeMs: HOUR, answering: true }, 'destroy'], ['an unwatched one', undefined, 'destroy']]) {
+    it(`client: a reset before the end of file is NOT a clean end for the caller (${what}): the connection is destroyed, never released`, async () => {
+      const socks = [];
+      const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); socks.push(s); s.pause(); });
+      const port = await listen(service); nets.push(service);
+      const calls = [];
+      let push;
+      const duplex = {
+        readable: new ReadableStream({ start(c) { push = c; } }), writable: new WritableStream({ write() {} }), closed: new Promise(() => {}),
+        lossless: true, peerReleased: false, release: () => calls.push('release'), destroy: () => calls.push('destroy'),
+      };
+      const sock = net.connect({ host: '127.0.0.1', port, allowHalfOpen: true });
+      await new Promise((r) => sock.once('connect', r));
+      await until(() => socks.length === 1, 'the service to have accepted');
+      pipe(sock, duplex, options);
+      socks[0].resetAndDestroy();
+      await until(() => { if (!calls.length) push.enqueue(new Uint8Array(1)); return calls.length > 0; }, 'the connection to be concluded');
+      assert.equal(calls[0], want);
+      sock.destroy();
+    });
+  }
 });

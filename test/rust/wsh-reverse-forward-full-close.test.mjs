@@ -173,7 +173,10 @@ for (const [label, makeHost] of [['a Node host', nodeHost], ['the Rust wsh-serve
       const h = makeHome();
       const dir = scratchDir('rffc');
       const host = await makeHost(h, dir);
-      const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 7), () => s.destroy()); });
+      // The service reads the caller's whole request (up to its end of file) before it answers, as a service does. One that answers and closes without
+      // reading it is reset by the kernel when the request reaches it, and a reset throws away what the reader has not yet read (so many bytes of the
+      // 3 MiB depending on timing: a plain Node client and server lose them too, and no gateway can bring them back). This was the flake of this test.
+      const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); s.once('end', () => s.end(Buffer.alloc(SIZE, 7), () => s.destroy())); s.resume(); });
       await new Promise((r) => service.listen(0, '127.0.0.1', r));
       closers.push(async () => service.close());
       const remote = path.join(dir, 'r.sock');

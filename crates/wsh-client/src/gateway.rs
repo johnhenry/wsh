@@ -555,6 +555,12 @@ impl GatewayStream {
             let last = last.clone();
             move || last.store(started.elapsed().as_millis() as u64, Ordering::Release)
         };
+        // The watch is not the only way the end of a watched ANSWERING service is seen: a write to it that fails (the host's bytes, still arriving, into a
+        // service that has finished and gone) ends the exchange too, and the watch can be the later of the two. A service whose end of file was read sent its
+        // WHOLE answer, so the connection is RELEASED either way: a second close of `discarded` would make the host drop what its caller has not read yet.
+        // A failure BEFORE the end of file (a reset included) is not a complete answer, and `released` would make a cut answer look like a finished one: it
+        // is a discard. An unwatched service (no feature, no probe) is as it was.
+        let answering_watched = answering && watch.is_some();
         let up = {
             let me = self.clone();
             let touch = touch.clone();
@@ -584,6 +590,7 @@ impl GatewayStream {
                             touch();
                         }
                         Err(e) => {
+                            // Before the service's end of file (a reset included): not a complete answer, so not released.
                             me.destroy();
                             break Err(e);
                         }
@@ -602,6 +609,7 @@ impl GatewayStream {
             let half = half.clone();
             let down_bytes = down_bytes.clone();
             let local_shut = local_shut.clone();
+            let local_eof = local_eof.clone();
             async move {
                 let mut buf = vec![0u8; GATEWAY_MAX_FRAME];
                 let result = loop {
@@ -609,7 +617,11 @@ impl GatewayStream {
                         Ok(0) => break Ok(()),
                         Ok(n) => {
                             if lw.write_all(&buf[..n]).await.is_err() {
-                                me.destroy();
+                                if answering_watched && local_eof.load(Ordering::Acquire) {
+                                    me.release();
+                                } else {
+                                    me.destroy();
+                                }
                                 half.send_replace(true);
                                 return Ok::<(), std::io::Error>(());
                             }
