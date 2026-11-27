@@ -286,19 +286,17 @@ pub fn verify_proof(msg: &ReverseProofPayload, issued: &IssuedChallenge) -> Opti
         return None;
     }
     // v1 (no statement signed), then v2 with the signable statement (wsh #318).
-    let signed: &[&str] = [&[][..], SIGNABLE]
-        .into_iter()
-        .find(|features| {
-            let data = proof_transcript_with(
-                &issued.peer_public_key,
-                &public_key,
-                &msg.username,
-                &issued.nonce,
-                &issued.session_id,
-                features,
-            );
-            verify_with(&public_key, &msg.signature, &data)
-        })?;
+    let signed: &[&str] = [&[][..], SIGNABLE].into_iter().find(|features| {
+        let data = proof_transcript_with(
+            &issued.peer_public_key,
+            &public_key,
+            &msg.username,
+            &issued.nonce,
+            &issued.session_id,
+            features,
+        );
+        verify_with(&public_key, &msg.signature, &data)
+    })?;
     Some(ProvenOperator {
         public_key,
         fingerprint: fingerprint(&public_key),
@@ -374,9 +372,19 @@ mod tests {
         assert!(v1.signed_features.is_empty());
         let v2proof = create_proof_with(&op, &verified, "alice", &["gateway-lossless-close"]);
         let v2 = verify_proof(&v2proof, &issued).unwrap();
-        assert_eq!(v2.signed_features, vec!["gateway-lossless-close".to_string()]);
-        assert!(proof_transcript_with(&[1u8; 32], &[3u8; 32], "a", &[2u8; 32], "s", &["gateway-lossless-close"])
-            .starts_with(b"wsh-operator-proof-v2\0"));
+        assert_eq!(
+            v2.signed_features,
+            vec!["gateway-lossless-close".to_string()]
+        );
+        assert!(proof_transcript_with(
+            &[1u8; 32],
+            &[3u8; 32],
+            "a",
+            &[2u8; 32],
+            "s",
+            &["gateway-lossless-close"]
+        )
+        .starts_with(b"wsh-operator-proof-v2\0"));
     }
 
     #[test]
@@ -384,7 +392,14 @@ mod tests {
         // printed by src/operator-proof.mjs proofTranscript({ ..., features: ['gateway-lossless-close'] }) for the same inputs as the v1 vector
         const PROOF_V2: &str = "7773682d6f70657261746f722d70726f6f662d76320000000020010101010101010101010101010101010101010101010101010101010101010100000020030303030303030303030303030303030303030303030303030303030303030300000005616c6963650000002002020202020202020202020202020202020202020202020202020202020202020000000373696400000016676174657761792d6c6f73736c6573732d636c6f7365";
         assert_eq!(
-            hex::encode(proof_transcript_with(&[1u8; 32], &[3u8; 32], "alice", &[2u8; 32], "sid", &["gateway-lossless-close"])),
+            hex::encode(proof_transcript_with(
+                &[1u8; 32],
+                &[3u8; 32],
+                "alice",
+                &[2u8; 32],
+                "sid",
+                &["gateway-lossless-close"]
+            )),
             PROOF_V2
         );
     }
