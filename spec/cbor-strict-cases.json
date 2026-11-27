@@ -1,0 +1,707 @@
+{
+ "note": "Shared table for the strict CBOR decoder (#317). Read by test/cbor-strict.test.mjs and by wsh-core codec::tests. `error` is the rule code a decoder must report, null if the bytes are accepted. `legacy: false` runs the case with legacyIndefiniteMap off.",
+ "cases": [
+  {
+   "hex": "7a00000010",
+   "error": "length-exceeds-buffer",
+   "why": "text string declaring 16 bytes with none left (#317: the session-id length byte)"
+  },
+  {
+   "hex": "616100",
+   "error": "trailing-bytes",
+   "why": "sanity: a valid text then a stray byte"
+  },
+  {
+   "hex": "61",
+   "error": "length-exceeds-buffer",
+   "why": "text string declaring 1 byte, buffer ends"
+  },
+  {
+   "hex": "6261",
+   "error": "length-exceeds-buffer",
+   "why": "text string declaring 2 bytes with 1 left"
+  },
+  {
+   "hex": "4201",
+   "error": "length-exceeds-buffer",
+   "why": "byte string declaring 2 bytes with 1 left"
+  },
+  {
+   "hex": "5bffffffffffffffff",
+   "error": "length-exceeds-buffer",
+   "why": "byte string declaring 2^64-1 bytes"
+  },
+  {
+   "hex": "5b0000000100000000",
+   "error": "length-exceeds-buffer",
+   "why": "byte string declaring 2^32 bytes"
+  },
+  {
+   "hex": "7b0000000100000000",
+   "error": "length-exceeds-buffer",
+   "why": "text string declaring 2^32 bytes"
+  },
+  {
+   "hex": "9a0000010000",
+   "error": "length-exceeds-buffer",
+   "why": "array declaring 256 elements with 1 byte left"
+  },
+  {
+   "hex": "9b000000010000000000",
+   "error": "length-exceeds-buffer",
+   "why": "array declaring 2^32 elements: refused before any allocation or loop"
+  },
+  {
+   "hex": "bb000000010000000000",
+   "error": "length-exceeds-buffer",
+   "why": "map declaring 2^32 pairs: refused before any allocation or loop"
+  },
+  {
+   "hex": "9bffffffffffffffff00",
+   "error": "length-exceeds-buffer",
+   "why": "array declaring 2^64-1 elements"
+  },
+  {
+   "hex": "8201",
+   "error": "length-exceeds-buffer",
+   "why": "array declaring 2 elements with 1 byte left"
+  },
+  {
+   "hex": "a1ff",
+   "error": "length-exceeds-buffer",
+   "why": "map declaring 1 pair with 1 byte left (a pair needs two)"
+  },
+  {
+   "hex": "a16161",
+   "error": "truncated",
+   "why": "map whose only value is missing"
+  },
+  {
+   "hex": "",
+   "error": "truncated",
+   "why": "empty input"
+  },
+  {
+   "hex": "18",
+   "error": "truncated",
+   "why": "one-byte argument missing"
+  },
+  {
+   "hex": "1901",
+   "error": "truncated",
+   "why": "two-byte argument cut"
+  },
+  {
+   "hex": "1a000001",
+   "error": "truncated",
+   "why": "four-byte argument cut"
+  },
+  {
+   "hex": "1b00000000000001",
+   "error": "truncated",
+   "why": "eight-byte argument cut"
+  },
+  {
+   "hex": "f93c",
+   "error": "truncated",
+   "why": "half float cut"
+  },
+  {
+   "hex": "fa3fc000",
+   "error": "truncated",
+   "why": "single float cut"
+  },
+  {
+   "hex": "fb3ff00000",
+   "error": "truncated",
+   "why": "double float cut"
+  },
+  {
+   "hex": "8301",
+   "error": "length-exceeds-buffer",
+   "why": "array of three with one element"
+  },
+  {
+   "hex": "83010280",
+   "error": null,
+   "why": "array of three whose third element is the empty array"
+  },
+  {
+   "hex": "0000",
+   "error": "trailing-bytes",
+   "why": "two integers"
+  },
+  {
+   "hex": "f600",
+   "error": "trailing-bytes",
+   "why": "null then a byte"
+  },
+  {
+   "hex": "a000",
+   "error": "trailing-bytes",
+   "why": "empty map then a byte"
+  },
+  {
+   "hex": "a161610100",
+   "error": "trailing-bytes",
+   "why": "map then a byte"
+  },
+  {
+   "hex": "80f6",
+   "error": "trailing-bytes",
+   "why": "empty array then null"
+  },
+  {
+   "hex": "1800",
+   "error": "non-shortest",
+   "why": "uint 0 in one argument byte"
+  },
+  {
+   "hex": "1817",
+   "error": "non-shortest",
+   "why": "uint 23 in one argument byte"
+  },
+  {
+   "hex": "1818",
+   "error": null,
+   "why": "uint 24 is the first value of the one-byte form"
+  },
+  {
+   "hex": "18ff",
+   "error": null,
+   "why": "uint 255"
+  },
+  {
+   "hex": "190000",
+   "error": "non-shortest",
+   "why": "uint 0 in two bytes"
+  },
+  {
+   "hex": "1900ff",
+   "error": "non-shortest",
+   "why": "uint 255 in two bytes"
+  },
+  {
+   "hex": "190100",
+   "error": null,
+   "why": "uint 256"
+  },
+  {
+   "hex": "19ffff",
+   "error": null,
+   "why": "uint 65535"
+  },
+  {
+   "hex": "1a0000ffff",
+   "error": "non-shortest",
+   "why": "uint 65535 in four bytes"
+  },
+  {
+   "hex": "1a00010000",
+   "error": null,
+   "why": "uint 65536"
+  },
+  {
+   "hex": "1b00000000ffffffff",
+   "error": "non-shortest",
+   "why": "uint 2^32-1 in eight bytes"
+  },
+  {
+   "hex": "1b0000000100000000",
+   "error": null,
+   "why": "uint 2^32"
+  },
+  {
+   "hex": "1bffffffffffffffff",
+   "error": null,
+   "why": "uint 2^64-1"
+  },
+  {
+   "hex": "3800",
+   "error": "non-shortest",
+   "why": "negative -1 in one argument byte"
+  },
+  {
+   "hex": "3818",
+   "error": null,
+   "why": "negative -25"
+  },
+  {
+   "hex": "37",
+   "error": null,
+   "why": "negative -24"
+  },
+  {
+   "hex": "3bffffffffffffffff",
+   "error": null,
+   "why": "negative -2^64"
+  },
+  {
+   "hex": "5800",
+   "error": "non-shortest",
+   "why": "empty byte string with a one-byte length"
+  },
+  {
+   "hex": "7800",
+   "error": "non-shortest",
+   "why": "empty text string with a one-byte length"
+  },
+  {
+   "hex": "9800",
+   "error": "non-shortest",
+   "why": "empty array with a one-byte length"
+  },
+  {
+   "hex": "b800",
+   "error": "non-shortest",
+   "why": "empty map with a one-byte length"
+  },
+  {
+   "hex": "780161",
+   "error": "non-shortest",
+   "why": "one-character text with a one-byte length"
+  },
+  {
+   "hex": "79000161",
+   "error": "non-shortest",
+   "why": "one-character text with a two-byte length"
+  },
+  {
+   "hex": "a178016100",
+   "error": "non-shortest",
+   "why": "a map key whose own length is non-shortest"
+  },
+  {
+   "hex": "5818000000000000000000000000000000000000000000000000",
+   "error": null,
+   "why": "byte string of 24 bytes uses the one-byte length"
+  },
+  {
+   "hex": "590018000000000000000000000000000000000000000000000000",
+   "error": "non-shortest",
+   "why": "byte string of 24 bytes with a two-byte length"
+  },
+  {
+   "hex": "5fff",
+   "error": "indefinite-length",
+   "why": "indefinite byte string"
+  },
+  {
+   "hex": "7fff",
+   "error": "indefinite-length",
+   "why": "indefinite text string"
+  },
+  {
+   "hex": "9fff",
+   "error": "indefinite-length",
+   "why": "indefinite array"
+  },
+  {
+   "hex": "9f01ff",
+   "error": "indefinite-length",
+   "why": "indefinite array with an element"
+  },
+  {
+   "hex": "5f4101ff",
+   "error": "indefinite-length",
+   "why": "indefinite byte string with a chunk"
+  },
+  {
+   "hex": "81bfff",
+   "error": "indefinite-length",
+   "why": "an indefinite map that is not the top-level item"
+  },
+  {
+   "hex": "a16161bfff",
+   "error": "indefinite-length",
+   "why": "an indefinite map as a map value"
+  },
+  {
+   "hex": "bf6161bfffff",
+   "error": "indefinite-length",
+   "why": "an indefinite map inside the legacy top-level indefinite map"
+  },
+  {
+   "hex": "bf61619f01ffff",
+   "error": "indefinite-length",
+   "why": "an indefinite array inside the legacy top-level indefinite map"
+  },
+  {
+   "hex": "bfff",
+   "error": null,
+   "why": "the legacy exception: an empty indefinite map as the top-level item (what every released wsh Rust encoder writes for an Envelope)"
+  },
+  {
+   "hex": "bf616101ff",
+   "error": null,
+   "why": "the legacy exception with one pair"
+  },
+  {
+   "hex": "bf6161820102ff",
+   "error": null,
+   "why": "the legacy exception with an array value (definite inside)"
+  },
+  {
+   "hex": "bfff",
+   "error": "indefinite-length",
+   "why": "the legacy exception switched off (legacyIndefiniteMap: false)",
+   "legacy": false
+  },
+  {
+   "hex": "bf616101ff",
+   "error": "indefinite-length",
+   "why": "the legacy exception switched off, one pair",
+   "legacy": false
+  },
+  {
+   "hex": "bf616101",
+   "error": "truncated",
+   "why": "the legacy map never closed"
+  },
+  {
+   "hex": "bf6161ff",
+   "error": "unexpected-break",
+   "why": "a break where the value of a pair was due"
+  },
+  {
+   "hex": "bf01ff",
+   "error": "non-text-key",
+   "why": "a non-text key in the legacy map"
+  },
+  {
+   "hex": "ff",
+   "error": "unexpected-break",
+   "why": "a break outside any indefinite item"
+  },
+  {
+   "hex": "82ffff",
+   "error": "unexpected-break",
+   "why": "a break as an array element"
+  },
+  {
+   "hex": "1f",
+   "error": "reserved-additional-info",
+   "why": "unsigned integer with additional info 31"
+  },
+  {
+   "hex": "3f",
+   "error": "reserved-additional-info",
+   "why": "negative integer with additional info 31"
+  },
+  {
+   "hex": "df00",
+   "error": "reserved-additional-info",
+   "why": "tag with additional info 31"
+  },
+  {
+   "hex": "1c",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0x1c"
+  },
+  {
+   "hex": "1d",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0x1d"
+  },
+  {
+   "hex": "1e",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0x1e"
+  },
+  {
+   "hex": "3c",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0x3c"
+  },
+  {
+   "hex": "5c",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0x5c"
+  },
+  {
+   "hex": "7d",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0x7d"
+  },
+  {
+   "hex": "9e",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0x9e"
+  },
+  {
+   "hex": "be",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0xbe"
+  },
+  {
+   "hex": "dc",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0xdc"
+  },
+  {
+   "hex": "fc",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0xfc"
+  },
+  {
+   "hex": "fd",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0xfd"
+  },
+  {
+   "hex": "fe",
+   "error": "reserved-additional-info",
+   "why": "reserved additional info in the head byte 0xfe"
+  },
+  {
+   "hex": "a2616101616102",
+   "error": "duplicate-key",
+   "why": "the same key twice"
+  },
+  {
+   "hex": "a3616101616202616102",
+   "error": "duplicate-key",
+   "why": "the same key twice, not adjacent"
+  },
+  {
+   "hex": "a16161a2616201616202",
+   "error": "duplicate-key",
+   "why": "duplicate key in a nested map"
+  },
+  {
+   "hex": "bf616101616102ff",
+   "error": "duplicate-key",
+   "why": "the same key twice in the legacy indefinite map"
+  },
+  {
+   "hex": "a2616101616202",
+   "error": null,
+   "why": "two different keys"
+  },
+  {
+   "hex": "a2616201616102",
+   "error": null,
+   "why": "keys in any order: wsh has no canonical key order (the JS encoder writes insertion order, Rust writes field order)"
+  },
+  {
+   "hex": "a2616101a1616101",
+   "error": null,
+   "why": "the same key in different maps is fine"
+  },
+  {
+   "hex": "a10102",
+   "error": "non-text-key",
+   "why": "integer key"
+  },
+  {
+   "hex": "a1410101",
+   "error": "non-text-key",
+   "why": "byte string key"
+  },
+  {
+   "hex": "a1f601",
+   "error": "non-text-key",
+   "why": "null key"
+  },
+  {
+   "hex": "a1810101",
+   "error": "non-text-key",
+   "why": "array key"
+  },
+  {
+   "hex": "a1a001",
+   "error": "non-text-key",
+   "why": "map key"
+  },
+  {
+   "hex": "c000",
+   "error": "tag",
+   "why": "tag 0"
+  },
+  {
+   "hex": "c11a514b67b0",
+   "error": "tag",
+   "why": "tag 1 (epoch time)"
+  },
+  {
+   "hex": "d8184100",
+   "error": "tag",
+   "why": "tag 24 (encoded CBOR)"
+  },
+  {
+   "hex": "d9d9f700",
+   "error": "tag",
+   "why": "self-described CBOR tag 55799"
+  },
+  {
+   "hex": "c24101",
+   "error": "tag",
+   "why": "bignum tag 2"
+  },
+  {
+   "hex": "82c000",
+   "error": "tag",
+   "why": "a tag nested in an array"
+  },
+  {
+   "hex": "f4",
+   "error": null,
+   "why": "false"
+  },
+  {
+   "hex": "f5",
+   "error": null,
+   "why": "true"
+  },
+  {
+   "hex": "f6",
+   "error": null,
+   "why": "null"
+  },
+  {
+   "hex": "f7",
+   "error": "simple-value",
+   "why": "undefined"
+  },
+  {
+   "hex": "e0",
+   "error": "simple-value",
+   "why": "simple value 0"
+  },
+  {
+   "hex": "f3",
+   "error": "simple-value",
+   "why": "simple value 19"
+  },
+  {
+   "hex": "f820",
+   "error": "simple-value",
+   "why": "simple value 32 (one-byte form)"
+  },
+  {
+   "hex": "f8",
+   "error": "truncated",
+   "why": "simple value head with its byte missing"
+  },
+  {
+   "hex": "f818",
+   "error": "simple-value",
+   "why": "simple value 24 in the one-byte form"
+  },
+  {
+   "hex": "f81f",
+   "error": "simple-value",
+   "why": "simple value 31 in the one-byte form (below 32 is reserved)"
+  },
+  {
+   "hex": "f93c00",
+   "error": null,
+   "why": "half float 1.0"
+  },
+  {
+   "hex": "f97e00",
+   "error": null,
+   "why": "half float NaN"
+  },
+  {
+   "hex": "f97c00",
+   "error": null,
+   "why": "half float +Infinity"
+  },
+  {
+   "hex": "fa3fc00000",
+   "error": null,
+   "why": "single float 1.5"
+  },
+  {
+   "hex": "fb3ff8000000000000",
+   "error": null,
+   "why": "double float 1.5"
+  },
+  {
+   "hex": "fb7ff8000000000000",
+   "error": null,
+   "why": "double float NaN"
+  },
+  {
+   "hex": "fb8000000000000000",
+   "error": null,
+   "why": "double float -0"
+  },
+  {
+   "hex": "fb3ff0000000000000",
+   "error": null,
+   "why": "double float 1.0 (a float64 that fits a half is not rewritten)"
+  },
+  {
+   "hex": "61ff",
+   "error": "invalid-utf8",
+   "why": "lone 0xff in a text string"
+  },
+  {
+   "hex": "62c328",
+   "error": "invalid-utf8",
+   "why": "broken two-byte sequence"
+  },
+  {
+   "hex": "63e28228",
+   "error": "invalid-utf8",
+   "why": "broken three-byte sequence"
+  },
+  {
+   "hex": "62c080",
+   "error": "invalid-utf8",
+   "why": "overlong NUL"
+  },
+  {
+   "hex": "63eda080",
+   "error": "invalid-utf8",
+   "why": "an encoded surrogate"
+  },
+  {
+   "hex": "64f4908080",
+   "error": "invalid-utf8",
+   "why": "beyond U+10FFFF"
+  },
+  {
+   "hex": "a161ff00",
+   "error": "invalid-utf8",
+   "why": "invalid UTF-8 in a map key"
+  },
+  {
+   "hex": "62c3a9",
+   "error": null,
+   "why": "e with acute"
+  },
+  {
+   "hex": "64f09f9880",
+   "error": null,
+   "why": "an emoji"
+  },
+  {
+   "hex": "41ff",
+   "error": null,
+   "why": "byte string may hold anything"
+  },
+  {
+   "hex": "81818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818100",
+   "error": "too-deep",
+   "why": "129 nested arrays"
+  },
+  {
+   "hex": "818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818100",
+   "error": null,
+   "why": "128 nested arrays"
+  },
+  {
+   "hex": "a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a16161a1616100",
+   "error": "too-deep",
+   "why": "129 nested maps"
+  },
+  {
+   "hex": "a1646e616d656161",
+   "error": null,
+   "why": "a map with one text pair (name: \"a\")"
+  }
+ ]
+}
