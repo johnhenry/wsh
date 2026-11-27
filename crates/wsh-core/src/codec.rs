@@ -423,6 +423,27 @@ mod tests {
     }
 
     #[test]
+    fn feed_drops_the_bad_frame_so_the_next_call_resumes_after_it() {
+        // [good][bad][good] in one call: the call returns the error (the good message before it is not returned: the production
+        // paths use feed_raw + decode_envelope per frame, so a bad frame there costs only itself); the bad frame is consumed, not
+        // left in front of the stream forever, so the following frame is read by the next call.
+        let good = |n: i64| frame_encode(&TestMsg { name: "m".into(), value: n }).unwrap();
+        let mut bad = good(0);
+        bad.push(0x00);
+        let len = (bad.len() - 4) as u32;
+        bad[..4].copy_from_slice(&len.to_be_bytes());
+        let mut chunk = good(1);
+        chunk.extend(&bad);
+        chunk.extend(good(2));
+        let mut decoder = FrameDecoder::new();
+        assert!(decoder.feed::<TestMsg>(&chunk).is_err());
+        let rest: Vec<TestMsg> = decoder.feed(&[]).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].value, 2);
+        assert_eq!(decoder.pending(), 0);
+    }
+
+    #[test]
     fn an_encoded_envelope_is_a_definite_length_map_not_serdes_indefinite_flatten_map() {
         let v = vectors();
         let mut n = 0;
