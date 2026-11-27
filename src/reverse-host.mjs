@@ -19,6 +19,7 @@ import { exportPublicKeyRaw, fingerprint } from './auth.mjs';
 import { MSG, reverseAccept, reverseReject, reverseChallenge } from './messages.gen.mjs';
 import { MULTI_OPERATOR_FEATURE } from './server/relay.mjs';
 import { RELAY_GATEWAY_FEATURE } from './features.mjs';
+import { GATEWAY_LOSSLESS_FEATURE, GATEWAY_LOSSLESS_ACK_FEATURE } from './gateway-channel.mjs';
 import { grantPermissions } from './key-options.mjs';
 import { E2E_SIGN_FEATURE, E2EResponder } from './e2e-exchange.mjs';
 import { OPERATOR_PROOF_FEATURE, E2E_SEALED_FEATURE, createReverseChallenge, verifyOperatorProof } from './operator-proof.mjs';
@@ -248,13 +249,14 @@ export function createReverseHostWith({
         if (!ok) { await refuse('not accepted', 'unauthorized'); return; }
         if (bridges.size >= operatorLimit()) { await refuse('not accepted'); return; }
         c.trustRelayPeer(from);
-        const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge, grant);
+        const bridge = makeBridge(c, from, String(req.username ?? 'operator'), proven, challenge, grant, Array.isArray(req.features) ? req.features : []);
         bridges.set(from, bridge);
         onLog(`[reverse] bridged to ${from.slice(0, 12)}${proven ? ' (operator proven)' : ''}${requireOperatorProof ? ', sealed' : ''}`);
         await answer(reverseAccept({
           targetFingerprint: myFingerprint, username, capabilities, peerType, shellBackend,
           supportsAttach: false, supportsReplay: false, supportsEcho: false, supportsTermSync: false,
-          features: reportFeatures ? [...bridgeFeatures(c, e2eFor(c), manyOperators()), ...(proven && e2e !== false ? [E2E_SEALED_FEATURE] : [])] : undefined,
+          // `gateway-lossless-close-ack` (#286): only when the operator's own statement reached this host (the relay may drop it)
+          features: reportFeatures ? [...bridgeFeatures(c, e2eFor(c), manyOperators()), ...(proven && e2e !== false ? [E2E_SEALED_FEATURE] : []), ...(gatewayOn(c) && backends.gateway.cfg?.losslessClose !== false && Array.isArray(req.features) && req.features.includes(GATEWAY_LOSSLESS_FEATURE) ? [GATEWAY_LOSSLESS_ACK_FEATURE] : [])] : undefined,
         }));
       } finally { reserved.delete(from); }
     };
@@ -288,7 +290,7 @@ export function createReverseHostWith({
      * The connection for one bridged operator. A proven operator may seal the bridge (a signed `KeyExchange` for the
      * challenge's session id); with `requireOperatorProof` it must, and until it has the host hears nothing else.
      */
-    function makeBridge(conn, from, operatorName, proven, challenge, grant = null) {
+    function makeBridge(conn, from, operatorName, proven, challenge, grant = null, operatorFeatures = []) {
       const to = () => (manyOperators() ? { to: from } : undefined);
       let sealed = null;
       const mustSeal = requireOperatorProof;
@@ -299,7 +301,8 @@ export function createReverseHostWith({
           if (mustSeal) return undefined; // nothing may leave a bridge that is not sealed yet
           return conn.sendRelayControl(m, to());
         },
-        authenticated: { username: operatorName, fingerprint: from, grant },
+        // `features`: what the operator stated in ReverseConnect (gateway-lossless-close, #286), as the relay passed it on.
+        authenticated: { username: operatorName, fingerprint: from, grant, features: operatorFeatures },
         dataStreams: false,
         e2e: e2eFor(conn),
       });

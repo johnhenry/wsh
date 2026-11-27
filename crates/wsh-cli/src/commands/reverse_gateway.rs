@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use wsh_core::gateway::policy::{GatewayPolicy, GatewayPolicyEnforcer};
 use wsh_core::gateway::GatewaySession;
-use wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE;
+use wsh_core::gateway_credit::{GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE};
 use wsh_core::messages::*;
 
 /// `GatewayFail.code` of a request the policy refuses.
@@ -91,6 +91,8 @@ impl RelayGateway {
             allowed_destinations: self.allow.clone(),
             max_connections: self.max_connections,
             enable_reverse_tunnels: self.listen,
+            // `--no-half-close-probe-answers` turns the answering-side watch off (wsh #286); the feature is still stated.
+            half_close_probe_answers: !crate::commands::common::identity_policy().no_probe_answers,
             ..GatewayPolicy::default()
         }
     }
@@ -156,7 +158,11 @@ impl Drop for OperatorGateway {
 impl OperatorGateway {
     /// A session for one bridged operator; what it says goes to `link`. Every connection is metered (`relay-gateway` implies
     /// `gateway-credit`), whatever the operator listed.
-    pub fn new<L: GatewayLink>(gateway: &RelayGateway, link: L) -> Self {
+    ///
+    /// `operator_lossless`: the operator stated `gateway-lossless-close` in its `ReverseConnect` (wsh #286). The host states it in its
+    /// `ReverseAccept` whenever it has a gateway, so both ends have then: the origins this operator's connections dial are watched
+    /// once half-closed, and one that vanished releases its connection instead of waiting for the idle bound.
+    pub fn new<L: GatewayLink>(gateway: &RelayGateway, link: L, operator_lossless: bool) -> Self {
         let policy = Arc::new(GatewayPolicyEnforcer::new(gateway.policy()));
         // Bounded: a relay link that does not take what the gateway has to say slows the connections down, not the memory up.
         let (tx, mut rx) = mpsc::channel::<Envelope>(64);
@@ -173,7 +179,9 @@ impl OperatorGateway {
                 policy,
                 tx.clone(),
                 true,
-                &[GATEWAY_CREDIT_FEATURE.to_string()],
+                &std::iter::once(GATEWAY_CREDIT_FEATURE.to_string())
+                    .chain(operator_lossless.then(|| GATEWAY_LOSSLESS_FEATURE.to_string()))
+                    .collect::<Vec<_>>(),
             ),
             udp: gateway.udp,
             dns: gateway.dns,
@@ -334,7 +342,7 @@ mod tests {
             grant("bbbbbbbb", &["b.invalid:9"]),
         ];
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let a = OperatorGateway::new(&g.for_operator(OP_A).unwrap(), Sink(tx));
+        let a = OperatorGateway::new(&g.for_operator(OP_A).unwrap(), Sink(tx), false);
         // B's destination is not on A's list: refused by the policy, nothing dialled
         a.handle(open_tcp(1, "b.invalid")).await;
         let f = fail_of(&mut rx).await;
@@ -424,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn udp_and_name_resolution_are_refused_unless_turned_on() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx));
+        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx), false);
         g.handle(open_udp(1)).await;
         let f = fail_of(&mut rx).await;
         assert_eq!((f.gateway_id, f.code), (1, FAIL_POLICY));
@@ -462,6 +470,7 @@ mod tests {
                 gate: gate.clone(),
                 out,
             },
+            false,
         );
         // three answers (refusals) pile up behind a link that is not taking anything
         for id in 1..=3 {
@@ -484,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn a_destination_no_rule_names_is_refused_by_the_policy() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let g = OperatorGateway::new(&gateway(&["db.example.com:5432"]), Sink(tx));
+        let g = OperatorGateway::new(&gateway(&["db.example.com:5432"]), Sink(tx), false);
         g.handle(open_tcp(7, "other.example.com")).await;
         let f = fail_of(&mut rx).await;
         assert_eq!((f.gateway_id, f.code), (7, FAIL_POLICY));
@@ -494,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn a_loopback_address_is_refused_even_under_the_wildcard() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx));
+        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx), false);
         g.handle(open_tcp(8, "127.0.0.1")).await;
         let f = fail_of(&mut rx).await;
         assert_eq!((f.gateway_id, f.code), (8, FAIL_POLICY));

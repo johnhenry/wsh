@@ -30,6 +30,7 @@ import { fingerprint as fingerprintOf, importPublicKeyRaw, verifyPeerRecord } fr
 import { MSG, isRelayForwardable, isRelayGatewayForwardable, relayForward, reversePeers, reverseReject, reverseClose } from '../messages.gen.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { RELAY_GATEWAY_FEATURE } from '../features.mjs';
+import { GATEWAY_LOSSLESS_FEATURE } from '../gateway-channel.mjs';
 
 export const DEFAULT_MAX_PEERS = 1024;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 8000;
@@ -290,7 +291,13 @@ export class RelayHub {
     // the field outright (its generated types deny unknown fields), which the operator would see as a timeout. Stripped,
     // that peer answers as it always did, without a challenge; an operator that insists on proof then fails at once.
     const peerCanProve = (target.meta.capabilities ?? []).includes(OPERATOR_PROOF_FEATURE);
-    if (peerCanProve && Array.isArray(msg.features) && msg.features.length <= MAX_OPERATOR_FEATURES && msg.features.every((f) => isStr(f, MAX_FEATURE_LENGTH))) forwarded.features = [...msg.features];
+    // #286: a peer whose record lists `gateway` (a host that serves the gateway behind this relay, which can decode the field) is also sent the operator's
+    // `gateway-lossless-close` and nothing else of it (it cannot answer a proof it did not list); a peer that lists neither is sent none of it.
+    const peerHasGateway = (target.meta.capabilities ?? []).includes('gateway');
+    if ((peerCanProve || peerHasGateway) && Array.isArray(msg.features) && msg.features.length <= MAX_OPERATOR_FEATURES && msg.features.every((f) => isStr(f, MAX_FEATURE_LENGTH))) {
+      const sent = peerCanProve ? [...msg.features] : msg.features.filter((f) => f === GATEWAY_LOSSLESS_FEATURE);
+      if (sent.length) forwarded.features = sent;
+    }
     target.handle.send(forwarded);
     this.log(`relay: ${operator.fingerprint.slice(0, 12)} -> ${target.meta.fingerprint.slice(0, 12)} requested`);
   }

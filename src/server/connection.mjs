@@ -34,7 +34,7 @@ import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
 import { gatewayFeatures, gatewayDatagrams } from './gateway-features.mjs';
 import { GATEWAY_FAIL } from '../gateway-errors.mjs';
-import { GATEWAY_CREDIT_FEATURE } from '../gateway-channel.mjs';
+import { GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE } from '../gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
@@ -386,7 +386,8 @@ export function createConnectionFactory(cfg) {
       : null;
     // A reverse host's gateway (#289): connections opened through a relay bridge are always metered (`relay-gateway` implies `gateway-credit`),
     // whatever the operator listed: there is no Hello on a bridge to read it from.
-    if (gateway && cfg.gatewayCredit && authenticated) gateway.setPeerFeatures([GATEWAY_CREDIT_FEATURE]);
+    // The operator's `gateway-lossless-close` (#286) is what it stated in ReverseConnect.features (`authenticated.features`); the host states its own in ReverseAccept.
+    if (gateway && cfg.gatewayCredit && authenticated) gateway.setPeerFeatures([GATEWAY_CREDIT_FEATURE, ...(authenticated.features ?? []).filter((f) => f === GATEWAY_LOSSLESS_FEATURE)]);
 
     // Operator-side shared folders (#159): created with the connection, used only after the client's ShareOffer.
     const shares = cfg.onShare

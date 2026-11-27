@@ -169,7 +169,7 @@ describe('the Rust wsh -L: a local program that half-closed and was killed is no
 
 // ── the Rust wsh-server's origins ────────────────────────────────────
 
-async function startServer(config) {
+async function startServer(config, connectOptions = {}) {
   const kp = await generateKeyPair(true);
   const home = mkdtempSync(path.join(tmpdir(), 'wsh-hcps-'));
   scratch.push(home);
@@ -188,7 +188,7 @@ async function startServer(config) {
     setTimeout(() => reject(new Error(`wsh-server not ready: ${logs}`)), 10_000);
   });
   const client = new WshClient();
-  await client.connect(`wss://127.0.0.1:${port}`, { username: 'tester', keyPair: kp });
+  await client.connect(`wss://127.0.0.1:${port}`, { username: 'tester', keyPair: kp, ...connectOptions });
   closers.push(() => client.disconnect());
   return { client };
 }
@@ -243,25 +243,93 @@ describe('the Rust wsh-server: a caller that finished sending and was killed is 
     assert.equal(await stateAfter(seen[0].closed, 2000), 'open');
   });
 
-  // An ORIGIN the server dialled is not watched: one that sent its whole answer and closed completely is the normal end of a response,
-  // and the client may still be reading it (the discard a watch would send drops what it has received and not yet read).
-  it('a unix origin that sent everything and closed completely is not discarded: a slow client still gets all of it', async () => {
+  // An ORIGIN the server dialled used to be unwatched: one that sent its whole answer and closed completely is the normal end of a response,
+  // and the client may still be reading it (the discard a watch would send drops what it has received and not yet read). Since #286 it is
+  // watched where both ends state `gateway-lossless-close`, and the close is `released`, which drops nothing.
+  const SIZE = 3 * 1024 * 1024;
+  const slowRead = async (d) => { const r = d.readable.getReader(); let n = 0; for (;;) { const { value, done } = await r.read(); if (done) return n; n += value.length; await sleep(10); } };
+  const unixOrigin = async (name) => {
     const dir = scratchDir('hcs');
-    const sock = path.join(dir, 'o.sock');
-    const SIZE = 3 * 1024 * 1024;
+    const sock = path.join(dir, name);
     const origin = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 5), () => s.destroy()); });
     await new Promise((r) => origin.listen(sock, r));
     closers.push(async () => origin.close());
-    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = []\nunix_connect = ["${sock}"]\nhalf_close_idle_secs = 0\n`);
+    return sock;
+  };
+  const originConfig = (sock, extra = '') => `[gateway]\nenabled = true\nallowed_destinations = []\nunix_connect = ["${sock}"]\nhalf_close_idle_secs = 0\n${extra}`;
+
+  it('a unix origin that sent everything and closed completely is watched, and a slow client still gets all of it; the connection is released by itself (#286)', async () => {
+    const sock = await unixOrigin('o.sock');
+    const { client } = await startServer(originConfig(sock));
+    assert.ok(client.hasFeature('gateway-lossless-close'), 'the server states it');
     const d = await client.openUnix(sock);
     await sleep(1000); // the origin is long gone; what it sent is mostly unread
     assert.equal(await stateAfter(d.closed, 0), 'open', 'held for the reader');
-    const r = d.readable.getReader();
-    let n = 0;
-    for (;;) { const { value, done } = await r.read(); if (done) break; n += value.length; await sleep(10); } // a slow reader
-    assert.equal(n, SIZE);
-    await d.writable.getWriter().close();
-    assert.notEqual(await d.closed, 'discarded');
+    assert.equal(await slowRead(d), SIZE);
+    assert.equal(await stateAfter(d.closed, BOUND_MS), 'released', 'noticed by the server, which ended the connection once the client had everything');
+  });
+
+  it('a unix origin that half-closed and then vanished is noticed by the server within the probe bound and the connection released (#286)', async (t) => {
+    const dir = scratchDir('hcv');
+    const sock = path.join(dir, 'v.sock');
+    const { child, lines } = await startChild(['server', 'unix', sock], 'listening');
+    const { client } = await startServer(originConfig(sock));
+    const d = await client.openUnix(sock);
+    await until(() => lines.includes('accepted'), 'the origin to have taken the connection and half-closed');
+    assert.equal(await stateAfter(d.closed, 1500), 'open', 'a half-closed origin that is alive is held');
+    const t0 = Date.now();
+    await kill(child);
+    const state = await stateAfter(d.closed, BOUND_MS);
+    t.diagnostic(`wsh-server unix origin: ended as ${JSON.stringify(state)} ${Date.now() - t0} ms after the kill`);
+    assert.equal(state, 'released');
+  });
+
+  it('a TCP origin killed with data unread (reset at once) is noticed within the probe bound (#286)', async () => {
+    const { child, lines } = await startChild(['server', 'tcp', 'paused'], 'listening');
+    const port = lines.find((l) => l.startsWith('listening')).split(' ')[1];
+    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1:${port}"]\nhalf_close_idle_secs = 0\n`);
+    const d = await client.openTcp('127.0.0.1', Number(port));
+    await until(() => lines.includes('accepted'), 'the origin to have taken the connection and half-closed');
+    await handUnread(d);
+    await kill(child);
+    assert.equal(await stateAfter(d.closed, BOUND_MS), 'released');
+  });
+
+  // A TCP origin that sends 3 MiB and CLOSES CLEANLY is not provable in bounded time: the server's kernel reports nothing about it for about a minute (the
+  // keep-alive probe after that is what reports it), so such a connection is held for the client, and every byte arrives. What IS provable at once is a
+  // reset, so the same connection proves both halves: the whole answer arrives byte-exact, and when the origin then resets, the server releases it.
+  it('a TCP origin that sent 3 MiB: every byte arrives (a slow reader), and when the origin then vanishes with a reset the server releases the connection by itself', async () => {
+    const socks = [];
+    const origin = net.createServer((s) => { s.on('error', () => {}); socks.push(s); s.end(Buffer.alloc(SIZE, 6)); });
+    await new Promise((r) => origin.listen(0, '127.0.0.1', r));
+    closers.push(async () => origin.close());
+    const port = origin.address().port;
+    const { client } = await startServer(`[gateway]\nenabled = true\nallowed_destinations = ["127.0.0.1:${port}"]\nhalf_close_idle_secs = 0\n`);
+    const d = await client.openTcp('127.0.0.1', port);
+    await sleep(500);
+    assert.equal(await slowRead(d), SIZE);
+    assert.equal(await stateAfter(d.closed, 400), 'open', 'a half-closed origin that is alive is held');
+    socks[0].resetAndDestroy(); // after the client has everything: a reset that reaches the server's kernel earlier would purge what it had not read
+    assert.equal(await stateAfter(d.closed, BOUND_MS), 'released');
+  });
+
+  it('with a client that did not state the feature, with lossless_close = false, with half_close_probe_answers = false or half_close_probe_secs = 0: not watched, as before', async () => {
+    for (const [extra, connectOptions] of [
+      ['', { gatewayLosslessClose: false }],
+      ['lossless_close = false\n', {}],
+      ['half_close_probe_answers = false\n', {}],
+      ['half_close_probe_secs = 0\n', {}],
+    ]) {
+      const sock = await unixOrigin(`p${Math.random().toString(36).slice(2, 6)}.sock`);
+      const { client } = await startServer(originConfig(sock, extra), connectOptions);
+      assert.equal(client.hasFeature('gateway-lossless-close'), !/lossless_close = false/.test(extra));
+      const d = await client.openUnix(sock);
+      await sleep(500);
+      assert.equal(await slowRead(d), SIZE, `every byte (${extra || JSON.stringify(connectOptions)})`);
+      assert.equal(await stateAfter(d.closed, 1500), 'open', 'held for the client, as before');
+      await d.writable.getWriter().close();
+      assert.notEqual(await d.closed, 'discarded');
+    }
   });
 });
 

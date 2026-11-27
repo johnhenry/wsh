@@ -78,6 +78,9 @@ pub struct ConnectConfig {
     pub ping_interval_secs: u64,
     /// Connection timeout in seconds.
     pub timeout_secs: u64,
+    /// State `gateway-lossless-close` in `Hello` (wsh #286): this client understands the reason `released` on a `GatewayClose`, and, with a
+    /// host that states it too, uses it. `false` does not state it: connections behave as they did before the feature. Default `true`.
+    pub lossless_close: bool,
 }
 
 impl Default for ConnectConfig {
@@ -99,6 +102,7 @@ impl Default for ConnectConfig {
             insecure_skip_cert_verification: false,
             ping_interval_secs: 30,
             timeout_secs: 10,
+            lossless_close: true,
         }
     }
 }
@@ -2014,7 +2018,15 @@ impl WshClient {
                     "file-transfer".to_string(),
                     // GatewayCredit flow control for connections opened through the host.
                     wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE.to_string(),
-                ],
+                ]
+                .into_iter()
+                // The reason `released` on a GatewayClose (wsh #286); `lossless_close: false` does not say so.
+                .chain(
+                    config
+                        .lossless_close
+                        .then(|| wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE.to_string()),
+                )
+                .collect(),
                 auth_method: Some(auth_method.clone()),
             }),
         };
@@ -2035,6 +2047,13 @@ impl WshClient {
                 _ => return Err(WshError::InvalidMessage("expected SERVER_HELLO".into())),
             };
         gateway_credit_on(&self.gateway, &advertised_features);
+        // Both ends must state `gateway-lossless-close` (wsh #286).
+        self.gateway.set_lossless(
+            config.lossless_close
+                && advertised_features
+                    .iter()
+                    .any(|f| f == wsh_core::gateway_credit::GATEWAY_LOSSLESS_FEATURE),
+        );
         *self.server_features.lock().await = advertised_features.clone();
 
         // Host key (wsh #59, #145): trust only a key the host PROVED it holds, over this

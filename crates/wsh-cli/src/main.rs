@@ -210,6 +210,17 @@ struct Cli {
     #[arg(long = "relay-gateway-max-connections", global = true, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1024))]
     relay_gateway_max_connections: u64,
 
+    /// Do not watch the ANSWERING socket of a gateway connection for a vanished peer (wsh #286): a reverse host's origin, a `-R`'s local
+    /// service. With `gateway-lossless-close` negotiated they are watched once half-closed (a vanished one releases the connection, one that
+    /// sent its whole answer and closed loses nothing); this keeps them unwatched, as before the feature.
+    #[arg(long = "no-half-close-probe-answers", global = true)]
+    no_half_close_probe_answers: bool,
+
+    /// Reverse host: do not state `gateway-lossless-close` (wsh #286), nor acknowledge an operator's; its operators' gateway connections
+    /// then behave as they did before the feature.
+    #[arg(long = "no-lossless-close", global = true)]
+    no_lossless_close: bool,
+
     /// `wsh reverse-connect`: always offer to prove this operator's identity to the peer (needed
     /// for a peer that does not advertise `operator-proof`, such as a JS host).
     #[arg(long = "operator-proof", global = true)]
@@ -662,6 +673,8 @@ async fn main() {
         relay_gateway_listen_for: cli.relay_gateway_listen_for.clone(),
         relay_gateway_trust_relay: cli.relay_gateway_trust_relay,
         relay_gateway_max_connections: cli.relay_gateway_max_connections as usize,
+        no_probe_answers: cli.no_half_close_probe_answers,
+        no_lossless_close: cli.no_lossless_close,
         operator_proof: if cli.operator_proof {
             commands::common::OperatorProofMode::Always
         } else if cli.no_operator_proof {

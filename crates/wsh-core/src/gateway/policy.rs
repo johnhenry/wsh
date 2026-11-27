@@ -80,10 +80,22 @@ pub struct GatewayPolicy {
     /// after this long, then one per this long). `None` = no watch. Origins the host dialled are
     /// never watched.
     pub half_close_probe: Option<std::time::Duration>,
+    /// State `gateway-lossless-close` (wsh #286): understand the reason `released`, and, with the client's own statement, release a connection
+    /// instead of discarding it. `false` = not stated; connections behave as before the feature.
+    pub lossless_close: bool,
+    /// With `gateway-lossless-close` negotiated, also watch the ANSWERING socket (an origin the host dialled) once it has half-closed, with the
+    /// same schedule (`half_close_probe`); a vanished one releases the connection (wsh #286). `false` keeps origins unwatched.
+    pub half_close_probe_answers: bool,
+    /// The TCP keep-alive schedule of a half-closed ANSWERING socket on ANOTHER machine (wsh #286): a live origin behind a short network partition is
+    /// not released where TCP retransmission would have ridden it out. Loopback and unix origins keep `half_close_probe`. Zero = the same as
+    /// `half_close_probe`. Default 30 s.
+    pub half_close_probe_remote: std::time::Duration,
 }
 
 /// Default for [`GatewayPolicy::half_close_idle`], in seconds (the same as the Node host: five minutes).
 pub const DEFAULT_HALF_CLOSE_IDLE_SECS: u64 = 300;
+/// Default for [`GatewayPolicy::half_close_probe_remote`], in seconds.
+pub const DEFAULT_HALF_CLOSE_PROBE_REMOTE_SECS: u64 = 30;
 /// Default for [`GatewayPolicy::max_buffered_bytes`] (the same as the Node host).
 pub const DEFAULT_MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 /// Default for [`GatewayPolicy::max_client_buffered_bytes`] (the same as the Node host).
@@ -108,6 +120,11 @@ impl Default for GatewayPolicy {
             max_client_buffered_bytes: DEFAULT_MAX_CLIENT_BUFFERED_BYTES,
             half_close_idle: Some(std::time::Duration::from_secs(DEFAULT_HALF_CLOSE_IDLE_SECS)),
             half_close_probe: Some(wsh_core::peer_watch::DEFAULT_HALF_CLOSE_PROBE),
+            lossless_close: true,
+            half_close_probe_answers: true,
+            half_close_probe_remote: std::time::Duration::from_secs(
+                DEFAULT_HALF_CLOSE_PROBE_REMOTE_SECS,
+            ),
         }
     }
 }
@@ -432,6 +449,21 @@ impl GatewayPolicyEnforcer {
     /// The schedule of the watch on a half-closed origin socket (`None` = no watch).
     pub fn half_close_probe(&self) -> Option<std::time::Duration> {
         self.policy.half_close_probe
+    }
+
+    /// Whether this gateway states `gateway-lossless-close` (wsh #286).
+    pub fn lossless_close(&self) -> bool {
+        self.policy.lossless_close
+    }
+
+    /// The longer keep-alive schedule of an answering socket on another machine (wsh #286).
+    pub fn half_close_probe_remote(&self) -> std::time::Duration {
+        self.policy.half_close_probe_remote
+    }
+
+    /// Whether the answering socket of a connection is watched too, where the feature is negotiated (wsh #286).
+    pub fn half_close_probe_answers(&self) -> bool {
+        self.policy.half_close_probe_answers
     }
 
     /// Count a connection if the limit allows it: the check and the count are one step, so

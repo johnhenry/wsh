@@ -6,7 +6,7 @@
 import net from 'node:net';
 import fsp from 'node:fs/promises';
 import { listenUnixSocket, removeIfIdentity } from './unix-listen.mjs';
-import { watchHalfClosed } from './half-close-watch.mjs';
+import { watchHalfClosed, answeringKeepAliveMs } from './half-close-watch.mjs';
 import { assertHalfCloseProbeMs } from './gateway-channel.mjs';
 
 /** A named endpoint: the CLI's rule (`valid_endpoint_name`): letters, digits, ".", "_", "-", starting with a letter or digit, at most 64. */
@@ -54,19 +54,27 @@ function drained(sock) {
  * still sends. Never for a service that answers (a reverse forward's local end): its complete close after its last byte is the
  * normal end of a response, and the discard would drop what the caller has not read yet.
  */
-export function pipe(sock, duplex, { probeMs, onGone } = {}) {
+export function pipe(sock, duplex, { probeMs, onGone, answering = false, remoteMs } = {}) {
   const writer = duplex.writable.getWriter();
   const reader = duplex.readable.getReader();
-  watchHalfClosed(sock, probeMs, onGone);
+  // An ANSWERING socket (a reverse forward's local service; only when `gateway-lossless-close` is negotiated, #286) that went away is not a failure
+  // and not a discard: the connection is RELEASED, which makes the host deliver to its caller what the service sent and then end.
+  let released = false;
+  watchHalfClosed(sock, probeMs, answering ? () => { released = true; } : onGone, answering ? answeringKeepAliveMs(sock, probeMs, remoteMs) : probeMs);
   // The write of the chunk last read from the socket. The connection is destroyed only after it has settled: a chunk the socket
   // already handed over is part of what it said, and destroying the connection drops it while it waits for credit. A socket that
   // closes completely (or is reset, as one is when the caller's request reaches a service that has already closed) right after its
   // last bytes would otherwise cost the caller the tail of the answer.
   let tail = Promise.resolve();
-  const destroyAfterTail = () => { void tail.finally(() => duplex.destroy()); };
+  const destroyAfterTail = () => { void tail.finally(() => (released && typeof duplex.release === 'function' ? duplex.release() : duplex.destroy())); };
   sock.on('data', (d) => {
     sock.pause();
-    tail = writer.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => sock.destroy());
+    tail = writer.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => {
+      // The peer RELEASED the connection (#286): it reads nothing more, so what the socket sends now (a request body still uploading after the
+      // answer was complete) has nowhere to go and is dropped, with the socket left paused; what the peer sent is still being written to the
+      // socket, and destroying it now would drop that. (Any other failed write is the end of the connection.)
+      if (!duplex.peerReleased) sock.destroy();
+    });
   });
   sock.on('end', () => { void writer.close().catch(() => {}); });
   sock.on('error', () => {});
@@ -80,8 +88,11 @@ export function pipe(sock, duplex, { probeMs, onGone } = {}) {
         if (!sock.write(value)) await drained(sock);
         if (sock.destroyed) break;
       }
-      if (!sock.destroyed) sock.end();
-      else destroyAfterTail();
+      if (!sock.destroyed) {
+        sock.end();
+        // A released connection is over once its tail is out: the socket is not left half-open for a peer that may never read or close.
+        if (duplex.peerReleased) sock.once('finish', () => sock.destroy());
+      } else destroyAfterTail();
     } catch { sock.destroy(); }
   })();
   duplex.closed.then(() => { if (!sock.destroyed) sock.end(); });
@@ -128,7 +139,11 @@ export async function forwardEndpoint(client, opts = {}) {
  * @param {import('./client.mjs').WshClient} client
  * @param {{ local: string, remote: string, reverse?: boolean, replace?: boolean, maxConnections?: number, halfCloseProbeMs?: number, onError?: (err: Error) => void }} opts
  */
-export async function forward(client, { local, remote, reverse = false, replace = false, maxConnections, halfCloseProbeMs, onError = () => {} } = {}) {
+export async function forward(client, { local, remote, reverse = false, replace = false, maxConnections, halfCloseProbeMs, halfCloseProbeAnswers = true, halfCloseProbeRemoteMs, onError = () => {} } = {}) {
+  if (typeof halfCloseProbeAnswers !== 'boolean') throw new TypeError('forwardUnix: halfCloseProbeAnswers must be a boolean');
+  // #286: the keep-alive of a half-closed local service on another machine (default 30 s), as the host's `halfCloseProbeRemoteMs`
+  const probeRemoteMs = halfCloseProbeRemoteMs === undefined ? 30_000 : assertHalfCloseProbeMs(halfCloseProbeRemoteMs, 'forwardUnix: halfCloseProbeRemoteMs');
+  const probeAnswers = halfCloseProbeAnswers;
   const l = parseEndpoint(local);
   const r = parseEndpoint(remote);
   const probeMs = assertHalfCloseProbeMs(halfCloseProbeMs, 'forwardUnix: halfCloseProbeMs');
@@ -151,8 +166,11 @@ export async function forward(client, { local, remote, reverse = false, replace 
         sock.once('close', () => { rconns.delete(sock); });
         sock.pause();
         // The local end of a REVERSE forward is a service (it answers): one that finished and closed completely is the ordinary end
-        // of a response, and the caller may still be reading it, so it is not watched (see `halfCloseProbeMs`).
-        sock.once('connect', () => { pipe(sock, duplex); sock.resume(); });
+        // of a response, and the caller may still be reading it. A `discarded` close would drop what the caller has not read, so it is
+        // watched only when the host and this client both stated `gateway-lossless-close` (#286): the close is then `released`, which loses
+        // nothing. `halfCloseProbeAnswers: false` (or `halfCloseProbeMs: 0`) keeps it unwatched.
+        const watchService = probeMs > 0 && probeAnswers && duplex.lossless === true;
+        sock.once('connect', () => { pipe(sock, duplex, watchService ? { probeMs, answering: true, remoteMs: probeRemoteMs } : undefined); sock.resume(); });
         // Only a failure to reach the local service is reported; a socket that ends later (EPIPE, a reset) is just the end of that connection.
         const failed = (e) => { sock.off('connect', failed); duplex.destroy(); report(e); };
         sock.once('error', failed);

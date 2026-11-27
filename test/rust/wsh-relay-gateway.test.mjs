@@ -220,6 +220,35 @@ describe('the JS reverse host behind the Rust relay', () => {
     for (const r of results) { assert.equal(r.n, SIZE); assert.ok(r.ok, 'bytes in order'); }
   });
 
+  // ONE connection proves both halves (a TCP origin that merely exits cleanly is reported by the kernel only after about a minute, so a reset is what is
+  // provable in bounded time; it follows the operator's last byte read).
+  it('gateway-lossless-close crosses the Rust relay to the JS host (#286): a 3 MiB answer arrives byte-exact and the connection is released by itself when the origin vanishes', async () => {
+    const SIZE = 3 * 1024 * 1024;
+    const gone = [];
+    const origin = net.createServer((s) => { s.on('error', () => {}); gone.push(s); const b = Buffer.alloc(SIZE); for (let i = 0; i < SIZE; i += 4096) b.writeUInt32LE(i, i); s.end(b); });
+    const port = await listen(origin);
+    closers.push(async () => { origin.close(); for (const s of gone) s.destroy(); });
+    const { op, keys } = await start(rustRelay, {}, { gateway: { allow: ['127.0.0.1'], halfCloseIdleMs: 0, halfCloseProbeMs: 50 } });
+    const res = await op.reverseConnect(keys.hostFp);
+    assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
+    assert.ok(res.features.includes('gateway-lossless-close') && res.features.includes('gateway-lossless-close-ack'), `${res.features}`);
+    const v = await op.openTcp('127.0.0.1', port);
+    assert.equal(v.lossless, true);
+    const reader = v.readable.getReader();
+    let n = 0; let ok = true; let chunks = 0;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      for (let i = 0; i < value.length; i += 4096) { if ((n + i) % 4096 === 0 && Buffer.from(value.buffer, value.byteOffset, value.length).readUInt32LE(i) !== (n + i)) ok = false; }
+      n += value.length;
+      if (++chunks % 8 === 0) await sleep(1);
+    }
+    assert.equal(n, SIZE);
+    assert.ok(ok, 'in order, byte-exact');
+    gone[0].resetAndDestroy();
+    assert.equal(await Promise.race([v.closed, sleep(20_000).then(() => 'open')]), 'released');
+  });
+
   it('with the bridge sealed, through the Rust relay', async () => {
     const origin = await echoOrigin();
     const { op, keys } = await start(rustRelay, {}, { gateway: { allow: ['127.0.0.1'] }, requireOperatorProof: true });

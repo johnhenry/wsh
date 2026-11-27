@@ -7,7 +7,7 @@
  */
 
 import { MSG, gatewayOk, gatewayFail, gatewayClose, gatewayData, gatewayCredit, listenFail } from '../messages.gen.mjs';
-import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, DEFAULT_HALF_CLOSE_IDLE_MS, assertHalfCloseIdleMs, assertHalfCloseProbeMs } from '../gateway-channel.mjs';
+import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE, GATEWAY_CREDIT_WINDOW, DEFAULT_HALF_CLOSE_IDLE_MS, assertHalfCloseIdleMs, assertHalfCloseProbeMs } from '../gateway-channel.mjs';
 
 import { GATEWAY_FAIL } from '../gateway-errors.mjs';
 
@@ -33,7 +33,14 @@ export function normalizeGatewayLimits(opts) {
   // How often a socket of this host (an origin, a listener's accepted connection) whose peer half-closed is checked for a peer
   // that went away (#282). Only sockets use it; a host with none (the memory host) validates and ignores it.
   const halfCloseProbeMs = assertHalfCloseProbeMs(opts.halfCloseProbeMs, 'gateway.halfCloseProbeMs');
-  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs };
+  // #286: `losslessClose: false` does not state `gateway-lossless-close` (the connection then behaves as it did before the feature);
+  // `halfCloseProbeAnswers: false` keeps the answering side of a connection (an origin the host dialled) unwatched even where the feature is negotiated.
+  const flag = (v, what) => { if (v !== undefined && typeof v !== 'boolean') throw new TypeError(`${what} must be a boolean`); return v !== false; };
+  const losslessClose = flag(opts.losslessClose, 'gateway.losslessClose');
+  const halfCloseProbeAnswers = flag(opts.halfCloseProbeAnswers, 'gateway.halfCloseProbeAnswers');
+  // #286: the keep-alive schedule of a half-closed answering socket on ANOTHER machine (default 30 s; 0 = the short one of halfCloseProbeMs)
+  const halfCloseProbeRemoteMs = opts.halfCloseProbeRemoteMs === undefined ? 30_000 : assertHalfCloseProbeMs(opts.halfCloseProbeRemoteMs, 'gateway.halfCloseProbeRemoteMs');
+  return { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs, losslessClose, halfCloseProbeAnswers, halfCloseProbeRemoteMs };
 }
 
 export { normalizeEndpoints } from './gateway-features.mjs';
@@ -62,6 +69,8 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
   /** gateway_ids whose connect is still in flight (they count against the cap). */
   const pending = new Set();
   let credit = false;
+  /** Both ends stated `gateway-lossless-close` (#286): this host's connections may be released, and a `released` close is understood. */
+  let lossless = false;
   let closed = false;
   const budget = { used: 0, max: cfg.maxClientBufferedBytes };
 
@@ -73,7 +82,7 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
   /** A channel wired to the wire; `extra` adds the sink (a socket's writer) and the close hooks. */
   function makeChannel(id, extra) {
     return new GatewayChannel({
-      id, credit, maxQueued: cfg.maxBufferedBytes, budget, halfCloseIdleMs: cfg.halfCloseIdleMs ?? DEFAULT_HALF_CLOSE_IDLE_MS,
+      id, credit, lossless, maxQueued: cfg.maxBufferedBytes, budget, halfCloseIdleMs: cfg.halfCloseIdleMs ?? DEFAULT_HALF_CLOSE_IDLE_MS,
       sendData: (data) => reply(gatewayData({ gatewayId: id, data })),
       sendCredit: (n) => reply(gatewayCredit({ gatewayId: id, bytes: n })),
       sendClose: (reason) => reply(gatewayClose({ gatewayId: id, reason })),
@@ -135,7 +144,12 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
     conns, pending, budget, reply, fail, active, idInUse, makeChannel,
     get closed() { return closed; },
     /** Credit is used on this connection only when the client listed "gateway-credit" in its Hello. */
-    setPeerFeatures(features) { credit = Array.isArray(features) && features.includes(GATEWAY_CREDIT_FEATURE); },
+    setPeerFeatures(features) {
+      credit = Array.isArray(features) && features.includes(GATEWAY_CREDIT_FEATURE);
+      lossless = cfg.losslessClose !== false && Array.isArray(features) && features.includes(GATEWAY_LOSSLESS_FEATURE);
+    },
+    /** Both ends stated `gateway-lossless-close` (#286). */
+    get lossless() { return lossless; },
     /** @returns {Promise<boolean>} true when the message was a gateway message this session consumed */
     async handle(m) {
       if (closed) return true;

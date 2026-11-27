@@ -1960,6 +1960,13 @@ export interface WshConnectOptions extends WshHostKeyOptions {
    * this many milliseconds with nothing moving in either. Default 300000 (five minutes); `0` never.
    */
   gatewayHalfCloseIdleMs?: number;
+  /**
+   * State `gateway-lossless-close` (#286, default `true`): this client understands the `GatewayClose` reason `released` and, with a host
+   * that states it too (directly, or behind a relay that carries the gateway), the host watches the ANSWERING socket of a connection
+   * (an origin it dialled) and releases the connection when it vanished, losing nothing the client has received. `false` does not
+   * state it: connections behave as they did before the feature (and a pairing with an older host is simulated this way in tests).
+   */
+  gatewayLosslessClose?: boolean;
 }
 
 /** Options for WshClient.openSession(). */
@@ -2256,6 +2263,10 @@ export interface WshForwardEndpointOptions {
   /** How often a local connection whose program has half-closed (sent its end of file) is checked for the program having gone away; see {@link WshForwardOptions.halfCloseProbeMs}. */
   halfCloseProbeMs?: number;
   /**
+   * `halfCloseProbeAnswers` (#286): see {@link WshForwardOptions.halfCloseProbeAnswers}. (A named endpoint's forward connects, so this only matters for a reverse forward.)
+   */
+  halfCloseProbeAnswers?: boolean;
+  /**
    * Called for a connection that could not be served (no such endpoint, refused, over the bound), with the reason. The listener stays up.
    * Also called, with `error.code === 'WSH_LOCAL_PEER_GONE'`, when a local program half-closed and then went away (killed, crashed)
    * and the connection was ended because of it: informational, not a failure of the forward.
@@ -2272,7 +2283,7 @@ export interface WshForwardOptions {
   maxConnections?: number;
   /**
    * (Not for `reverse: true`: the local end of a reverse forward is a service that answers, and one that finished and closed
-   * completely is the normal end of a response, so it is not watched.)
+   * completely is the normal end of a response; it is watched only with `gateway-lossless-close`, see `halfCloseProbeAnswers`.)
    * A local program that connected, half-closed (sent its end of file, still reading) and was then killed gives Node no event; the
    * kernel reports it to a writer only. While (and only while) a local connection is half-closed the forward writes ZERO bytes to
    * it every this many milliseconds: a live program is not touched (no byte, no wake-up), a dead one fails the write, and the
@@ -2283,6 +2294,15 @@ export interface WshForwardOptions {
    * 2147483647, else a `TypeError`.
    */
   halfCloseProbeMs?: number;
+  /**
+   * For `reverse: true` (#286): the local service of a reverse forward is watched (once it has half-closed, at `halfCloseProbeMs`) when the
+   * host and this client both stated `gateway-lossless-close`. A service that went away releases the connection (the host delivers what
+   * it has received to its caller, then ends it, with no `onError`); one that sent its whole answer and closed completely loses nothing.
+   * `false` keeps the local service unwatched, as before the feature. Default `true`; a non-boolean is a `TypeError`.
+   */
+  halfCloseProbeAnswers?: boolean;
+  /** For `reverse: true` (#286): the keep-alive schedule of a half-closed local service on another machine, in milliseconds (default 30000; loopback and unix keep `halfCloseProbeMs`; `0` = the same). */
+  halfCloseProbeRemoteMs?: number;
   onError?: (err: Error) => void;
 }
 
@@ -2321,8 +2341,16 @@ export interface WshGatewayDuplex {
   close(reason?: string): void;
   /** Tear the connection down now. */
   destroy(reason?: string): void;
-  /** Settles once the connection is over. */
+  /** Settles once the connection is over. Resolves with `'released'` when the peer released it (see {@link WshGatewayDuplex.lossless}). */
   closed: Promise<string | undefined>;
+  /**
+   * Both ends stated `gateway-lossless-close` (#286): this connection may be RELEASED, and a close with the reason `released` ("I will read
+   * nothing more and send nothing more; deliver what you already sent, in order, then finish") is understood. What a peer released is still
+   * delivered to `readable` before it ends; writes fail from then on.
+   */
+  lossless?: boolean;
+  /** The answering socket of this connection went away after finishing its side (a reverse forward's local service): end it with `released`, which loses nothing the peer has received. A discard where `lossless` is false. */
+  release?(): void;
 }
 
 /** A UDP flow (`client.openUdp()`): one chunk = one datagram, and a datagram may be dropped without notice. */
@@ -2361,6 +2389,12 @@ export function gatewayFailName(code: number): string | null;
 
 /** The feature a client lists in `Hello.features` and a host in `ServerHello.features` to meter gateway data with `GatewayCredit`. */
 export const GATEWAY_CREDIT_FEATURE: 'gateway-credit';
+/** The feature a side states when it understands the `GatewayClose` reason `released` (#286). */
+export const GATEWAY_LOSSLESS_FEATURE: 'gateway-lossless-close';
+/** What a reverse host lists in `ReverseAccept.features` when the operator's `gateway-lossless-close` really reached it (a relay can drop the statement); an operator relies on the feature behind a relay only with this (#286). */
+export const GATEWAY_LOSSLESS_ACK_FEATURE: 'gateway-lossless-close-ack';
+/** The `GatewayClose` reason of a connection one side releases: it reads and sends nothing more, and what it already sent is still delivered (#286). */
+export const GATEWAY_RELEASED: 'released';
 /** Credit, in bytes, each direction of a gateway connection starts with. */
 export const GATEWAY_CREDIT_WINDOW: 262144;
 

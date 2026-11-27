@@ -1371,6 +1371,42 @@ messages:
         something is written to it, and a peer that vanishes without its
         transport noticing is bounded by the transport's own liveness.
 
+        The reason "released" (wsh #286) is the lossless counterpart of
+        "discarded".  It means "I will read nothing more and send nothing
+        more; deliver what you already sent, in order, then finish", and
+        it is used ONLY between two sides that both listed the feature
+        "gateway-lossless-close" (a client in Hello.features, a host in
+        ServerHello.features; behind a relay, the operator in
+        ReverseConnect.features and the host in ReverseAccept.features).
+        Behind a relay the operator's statement can be dropped or added by
+        the relay, so the host answers it: it lists
+        "gateway-lossless-close-ack" in ReverseAccept.features only when
+        it actually received the operator's statement, and the operator
+        treats the feature as negotiated for that bridge only when it
+        stated it AND received the acknowledgement (the host: only when it
+        received the statement).  A relay that drops the statement thus
+        leaves both sides on the earlier behaviour; one that adds a
+        statement the operator never made makes the host believe in it,
+        and the operator, which did not state it, treats "released" as an
+        ordinary reason (nothing is lost).
+        It is sent by the side that holds an ANSWERING socket (an origin
+        a host dialled, the local service of a reverse forward) when that
+        socket has half-closed and then vanished (the watch of #282,
+        extended to the answering side only when the feature is
+        negotiated): as the second close of a connection whose first
+        close was already sent, or as the first close.  The receiver
+        keeps what it has already received and delivers it to its
+        application in order, fails its own writes, sends nothing back,
+        and finishes once the application has taken the last of it (the
+        half-closed idle bound applies to an application that never
+        reads).  Unlike "discarded" it drops nothing the receiver has, so
+        a server that sent its whole answer, half-closed and closed
+        completely (HTTP/1.0, "Connection: close") loses no byte of it.
+        Nothing is sent to a peer that did not list the feature; to a
+        peer that predates it "released" is an ordinary reason text (a
+        half-close as a first close, ignored as a second).  No field is
+        added.
+
         A host ends the gateway connections of a grant that has run out
         (wsh #297): a key's `expires`, or the `expires` of what an
         authorize or accept callback granted, passes while connections it

@@ -22,6 +22,7 @@ import {
   WshClient, generateKeyPair, exportPublicKeySSH, exportPublicKeyRaw, fingerprint, MSG, resolveDns,
 } from '@johnhenry/wsh';
 import { GatewayError } from '../src/gateway-client.mjs';
+import { halfCloseWatchCount } from '../src/half-close-watch.mjs';
 import { createVirtualNetwork, echoService, readAll, concatBytes } from './helpers/virtual-network.mjs';
 
 const enc = new TextEncoder();
@@ -133,6 +134,27 @@ describe('the gateway over a network the embedder supplies (#299)', () => {
       const w = d.writable.getWriter(); await w.write(enc.encode('late reply')); await w.close();
       await until(() => late !== undefined, 'the origin to hear the late bytes');
       assert.equal(late, 'late reply');
+    });
+
+    it('a connection of an injected network is never probed, even where gateway-lossless-close is negotiated: it ends when the network closes the stream (#286)', async () => {
+      const heldOpen = [];
+      const vnet = createVirtualNetwork({ services: {
+        // finishes sending and keeps its end open: a socket would be watched for a vanished peer, a network's stream has no kernel to ask
+        '93.184.216.7:9002': async ({ readable, writable }) => {
+          const w = writable.getWriter(); await w.write(enc.encode('answer')); await w.close();
+          heldOpen.push(readable);
+        },
+      } });
+      const { client } = await setup(vnet);
+      assert.ok(client.hasFeature('gateway-lossless-close'), 'negotiated');
+      const d = await client.openTcp('93.184.216.7', 9002);
+      assert.equal(dec.decode(await readAll(d.readable)), 'answer');
+      await until(() => heldOpen.length === 1, 'the service to have finished');
+      await sleep(400); // longer than the default probe interval of a socket would need to show itself
+      assert.equal(halfCloseWatchCount(), 0, 'no probe, no timer');
+      assert.equal(await Promise.race([d.closed, sleep(100).then(() => 'open')]), 'open', 'held until the caller (or the network) closes it');
+      await d.writable.getWriter().close();
+      assert.notEqual(await d.closed, 'discarded');
     });
 
     it('moves 12 MiB each way intact (credit-metered)', async () => {

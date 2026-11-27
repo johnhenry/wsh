@@ -49,7 +49,15 @@ impl WatchablePeer for tokio::net::UnixStream {
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+
+    /// A descriptor that is somebody else's: registered with the reactor for the wait and never closed by it (the watch's own `OwnedFd` outlives the wait).
+    struct Borrowed(RawFd);
+    impl AsRawFd for Borrowed {
+        fn as_raw_fd(&self) -> RawFd {
+            self.0
+        }
+    }
     use tokio::io::unix::AsyncFd;
     use tokio::io::{Interest, Ready};
 
@@ -61,24 +69,53 @@ mod imp {
     pub struct PeerWatch {
         fd: OwnedFd,
         tcp: bool,
+        /// A TCP peer on another machine (not loopback): its keep-alive schedule may be a longer one (wsh #286).
+        remote: bool,
     }
 
     impl PeerWatch {
         /// Watch a TCP stream. Must be called inside a tokio runtime.
         pub fn tcp(s: &tokio::net::TcpStream) -> io::Result<Self> {
-            Self::of(s.as_fd(), true)
+            let remote = s.peer_addr().is_ok_and(|a| !a.ip().is_loopback());
+            Self::of(s.as_fd(), true, remote)
         }
 
         /// Watch a unix stream. Must be called inside a tokio runtime.
         pub fn unix(s: &tokio::net::UnixStream) -> io::Result<Self> {
-            Self::of(s.as_fd(), false)
+            Self::of(s.as_fd(), false, false)
         }
 
-        fn of(fd: std::os::fd::BorrowedFd<'_>, tcp: bool) -> io::Result<Self> {
+        fn of(fd: std::os::fd::BorrowedFd<'_>, tcp: bool, remote: bool) -> io::Result<Self> {
             Ok(Self {
                 fd: fd.try_clone_to_owned()?,
                 tcp,
+                remote,
             })
+        }
+
+        /// Is the peer on another machine?
+        pub fn is_remote(&self) -> bool {
+            self.remote
+        }
+
+        /// The schedule for a socket whose peer is (`remote`) or is not on another machine: `long` for a remote one when it is set (not zero), else `short`.
+        pub fn schedule(remote: bool, short: Duration, long: Duration) -> Duration {
+            if remote && !long.is_zero() {
+                long
+            } else {
+                short
+            }
+        }
+
+        /// The schedule this socket gets: see [`PeerWatch::schedule`].
+        pub fn keepalive_for(&self, short: Duration, long: Duration) -> Duration {
+            Self::schedule(self.remote, short, long)
+        }
+
+        /// [`PeerWatch::arm`] for the ANSWERING socket of a connection (wsh #286): a peer on another machine gets the longer schedule, so that a live
+        /// origin behind a short network partition is not released where TCP retransmission would have ridden it out.
+        pub fn arm_answering(&self, short: Duration, long: Duration) {
+            self.arm(self.keepalive_for(short, long));
         }
 
         /// The socket has become half-closed: a TCP socket gets keep-alive on a short schedule
@@ -109,10 +146,8 @@ mod imp {
         /// write side). Never resolves for a peer that is alive, however long it stays quiet.
         /// Must be awaited inside a tokio runtime.
         pub async fn gone(&self) {
-            let Ok(fd) = self
-                .fd
-                .try_clone()
-                .and_then(|fd| AsyncFd::with_interest(fd, Interest::WRITABLE))
+            // Registered by reference: no second descriptor while waiting (the one the watch holds is the only one it costs).
+            let Ok(fd) = AsyncFd::with_interest(Borrowed(self.fd.as_raw_fd()), Interest::WRITABLE)
             else {
                 return std::future::pending().await;
             };
@@ -145,6 +180,16 @@ mod imp {
             ))
         }
         pub fn arm(&self, _: Duration) {}
+        pub fn is_remote(&self) -> bool {
+            false
+        }
+        pub fn schedule(_remote: bool, short: Duration, _long: Duration) -> Duration {
+            short
+        }
+        pub fn keepalive_for(&self, short: Duration, _long: Duration) -> Duration {
+            short
+        }
+        pub fn arm_answering(&self, _: Duration, _: Duration) {}
         pub async fn gone(&self) {
             std::future::pending().await
         }
@@ -152,6 +197,13 @@ mod imp {
 }
 
 pub use imp::PeerWatch;
+
+/// A watch could not be made for a connection (the extra descriptor each one costs was refused: a descriptor limit): true only the first time, so a
+/// caller logs it once and not for every connection. The connection is served as before, unwatched.
+pub fn note_watch_failed() -> bool {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -236,6 +288,36 @@ mod tests {
         let sock = socket2::SockRef::from(&a);
         assert!(sock.keepalive().unwrap());
         assert!(a.nodelay().is_ok());
+    }
+
+    /// An answering socket on ANOTHER machine gets the longer keep-alive schedule (wsh #286); loopback and unix keep the short one.
+    #[tokio::test]
+    async fn the_keep_alive_of_an_answering_socket_depends_on_where_it_is() {
+        let short = Duration::from_secs(2);
+        let long = Duration::from_secs(30);
+        let (a, _b) = tcp_pair().await; // loopback
+        let w = a.peer_watch().unwrap();
+        assert!(!w.is_remote());
+        assert_eq!(w.keepalive_for(short, long), short);
+        assert_eq!(w.keepalive_for(short, Duration::ZERO), short);
+        w.arm_answering(short, long);
+        assert!(socket2::SockRef::from(&a).keepalive().unwrap());
+        // a socket to another machine: the decision is the same function with the flag set
+        assert_eq!(PeerWatch::schedule(true, short, long), long);
+        assert_eq!(PeerWatch::schedule(true, short, Duration::ZERO), short);
+        assert_eq!(PeerWatch::schedule(false, short, long), short);
+        let (u, _v) = UnixStream::pair().unwrap();
+        assert!(!u.peer_watch().unwrap().is_remote());
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_could_not_be_made_is_noted_once() {
+        assert!(
+            note_watch_failed(),
+            "the first failure is the one that is logged"
+        );
+        assert!(!note_watch_failed());
+        assert!(!note_watch_failed());
     }
 
     #[tokio::test]

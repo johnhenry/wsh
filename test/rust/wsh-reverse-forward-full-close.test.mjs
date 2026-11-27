@@ -190,5 +190,57 @@ for (const [label, makeHost] of [['a Node host', nodeHost], ['the Rust wsh-serve
       assert.equal(verdict, 'ended', `the caller's stream did not end; it had ${n} of ${SIZE} bytes`);
       assert.equal(n, SIZE);
     });
+
+    // #286: with `gateway-lossless-close` stated by both ends (a Rust client states it, both hosts state it) the local service of a `-R` is
+    // watched once half-closed. A UNIX service's complete close is a hang-up at once, so the release really happens here, and
+    // the caller still gets every byte; a service that half-closed and was killed is noticed, which frees the host's connection.
+    it('a unix service that answers at length and closes completely is watched (#286): every byte arrives at a slow caller', async () => {
+      const h = makeHome();
+      const dir = scratchDir('rffc');
+      const host = await makeHost(h, dir);
+      const svc = path.join(dir, 'svc.sock');
+      const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 7), () => s.destroy()); });
+      await new Promise((r) => service.listen(svc, r));
+      closers.push(async () => service.close());
+      const remote = path.join(dir, 'ru.sock');
+      await startWsh([...host.args, '-N', '-R', `${remote}:${svc}`, host.target], { home: h.home, env: host.env });
+      // The caller does NOT half-close. Its `end` comes on the service's FIRST close, with or without any watch, and proves only that the bytes
+      // arrived. What proves the service was watched and released is that the host then closes the connection COMPLETELY by itself, with the
+      // caller still open: a write from the caller then fails (a mere half-close at the host would leave it succeeding), and the tail the caller
+      // had not read when the service vanished is still all there (a discard would have dropped it).
+      const caller = net.connect({ path: remote, allowHalfOpen: true });
+      caller.on('error', () => {});
+      let n = 0;
+      const ended = new Promise((r) => caller.once('end', r));
+      caller.on('data', (b) => { n += b.length; caller.pause(); setTimeout(() => caller.resume(), 5); });
+      caller.write('request');
+      const verdict = await Promise.race([ended.then(() => 'ended'), sleep(30_000).then(() => 'still open')]);
+      assert.equal(verdict, 'ended', `the caller's stream did not end; it had ${n} of ${SIZE} bytes`);
+      assert.equal(n, SIZE);
+      await until(() => { if (!caller.destroyed) caller.write('x', () => {}); return caller.destroyed; }, 'the host to close the connection completely');
+      caller.destroy();
+    });
+
+    it('with --no-half-close-probe-answers the service of a -R is not watched, as before (#286): the same exchange loses nothing either', async () => {
+      const h = makeHome();
+      const dir = scratchDir('rffc');
+      const host = await makeHost(h, dir);
+      const svc = path.join(dir, 'svcn.sock');
+      const service = net.createServer({ allowHalfOpen: true }, (s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 7), () => s.destroy()); });
+      await new Promise((r) => service.listen(svc, r));
+      closers.push(async () => service.close());
+      const remote = path.join(dir, 'rn.sock');
+      await startWsh(['--no-half-close-probe-answers', ...host.args, '-N', '-R', `${remote}:${svc}`, host.target], { home: h.home, env: host.env });
+      const caller = net.connect({ path: remote, allowHalfOpen: true });
+      caller.on('error', () => {});
+      let n = 0;
+      const ended = new Promise((r) => caller.once('close', r));
+      caller.on('data', (b) => { n += b.length; caller.pause(); setTimeout(() => caller.resume(), 5); });
+      caller.end('request');
+      const verdict = await Promise.race([ended.then(() => 'ended'), sleep(30_000).then(() => 'still open')]);
+      caller.destroy();
+      assert.equal(verdict, 'ended');
+      assert.equal(n, SIZE);
+    });
   });
 }

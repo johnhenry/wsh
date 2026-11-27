@@ -170,13 +170,16 @@ describe('a half-closed local peer that is killed is noticed with the far side s
   });
 
   // The two places where the DEAD party would be a data producer that finished (an origin the host dialled, the local service of a
-  // reverse forward) are deliberately not watched: a server that sends its whole answer and then closes completely is the normal end
-  // of a response, and the discard a watch would send drops what the reader has received and not yet read.
+  // reverse forward) used to be deliberately not watched: a server that sends its whole answer and then closes completely is the normal
+  // end of a response, and the `discarded` close a watch would send drops what the reader has received and not yet read. Since #286 they
+  // ARE watched when both ends state `gateway-lossless-close`: the close is then `released`, which delivers what was sent first, so the
+  // two tests below changed from "not watched" to "watched, and every byte arrives" (the old behaviour, against a side that did not state
+  // the feature, is pinned in test/gateway-lossless-close.test.mjs).
   const SIZE = 3 * 1024 * 1024;
   // A slow reader: a pause after every chunk, so that when the end of the answer reaches it a good part of what is left is still queued.
   const readAll = async (d) => { const r = d.readable.getReader(); let n = 0; for (;;) { const { value, done } = await r.read(); if (done) return n; n += value.length; await sleep(10); } };
 
-  it('a unix ORIGIN of the host that sent everything and closed completely is not discarded: a slow client still gets all of it', async () => {
+  it('a unix ORIGIN of the host that sent everything and closed completely is watched, and a slow client still gets all of it (#286)', async () => {
     const sock = path.join(tmp(), 'o.sock');
     const origin = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 5), () => s.destroy()); });
     await new Promise((r) => origin.listen(sock, r)); fx.nets.push(origin);
@@ -184,17 +187,19 @@ describe('a half-closed local peer that is killed is noticed with the far side s
     const d = await client.openUnix(sock);
     await sleep(1000); // the origin is long gone; what it sent is mostly unread
     assert.equal(await stateAfter(d.closed, 0), 'open', 'held for the reader');
-    assert.equal(await readAll(d), SIZE);
-    await d.writable.getWriter().close();
-    assert.notEqual(await d.closed, 'discarded');
+    const reading = readAll(d);
+    await until(() => halfCloseWatchCount() >= 1, 'the origin to be watched (the watch starts when the host has read its end of file)');
+    assert.equal(await reading, SIZE);
+    assert.equal(await stateAfter(d.closed, BOUND_MS), 'released', 'and the host, which noticed the origin was gone, ended the connection by itself');
   });
 
-  it('the local service of a reverse forward that sent everything and closed completely is not discarded: a slow caller still gets all of it', async () => {
+  it('the local service of a reverse forward that sent everything and closed completely is watched, and a slow caller still gets all of it (#286)', async () => {
     const hostSock = path.join(tmp(), 'r2.sock');
+    const svcSock = path.join(tmp(), 's2.sock'); // a unix service: its complete close is seen at once, so the release really happens
     const service = net.createServer((s) => { s.on('error', () => {}); s.end(Buffer.alloc(SIZE, 6), () => s.destroy()); });
-    const servicePort = await listen(service); fx.nets.push(service);
+    await new Promise((r) => service.listen(svcSock, r)); fx.nets.push(service);
     const { client } = await fx.setup({ allow: [], unix: { listen: [hostSock] }, halfCloseIdleMs: 0, halfCloseProbeMs: 50 });
-    forwards.push(await client.forwardUnix({ local: `127.0.0.1:${servicePort}`, remote: hostSock, reverse: true, halfCloseProbeMs: 50 }));
+    forwards.push(await client.forwardUnix({ local: svcSock, remote: hostSock, reverse: true, halfCloseProbeMs: 50 }));
     const caller = net.connect({ path: hostSock, allowHalfOpen: true });
     caller.on('error', () => {});
     caller.pause();
@@ -206,6 +211,9 @@ describe('a half-closed local peer that is killed is noticed with the far side s
     caller.resume();
     await ended;
     assert.equal(n, SIZE);
+    // The caller's `end` also comes on the service's FIRST close, watched or not. What the release adds is that the host then ends the
+    // connection by itself: it closes its socket completely (a mere half-close would leave a write from the caller succeeding for ever).
+    await until(() => { if (!caller.destroyed) caller.write('x', () => {}); return caller.destroyed; }, 'the host to close the connection completely', BOUND_MS);
     caller.destroy();
   });
 
