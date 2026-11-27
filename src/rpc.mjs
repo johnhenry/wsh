@@ -233,7 +233,7 @@ export class CborSequenceDecoder {
         if (end - off > this.#max) throw tooLarge('message', end - off, this.#max);
         let item;
         try {
-          item = cborDecode(this.#buf.subarray(off, end));
+          item = cborDecode(this.#buf.subarray(off, end), { legacyIndefiniteMap: false }); // strict (#317); the legacy exception is for the control Envelope
         } catch (e) {
           throw new RpcError(RPC_ERROR.PARSE, `malformed cbor: ${e.message}`);
         }

@@ -7,6 +7,7 @@
 // names this crate as `wsh_core::...`; that path works inside the crate too.
 extern crate self as wsh_core;
 
+pub mod cbor_strict;
 pub mod channel_binding;
 pub mod codec;
 pub mod e2e_exchange;

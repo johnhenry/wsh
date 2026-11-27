@@ -272,7 +272,8 @@ describe('relay / reverse mode', () => {
       await bob.sendControl(openMsg({ kind: 'exec', command: 'echo plain' }));
       await until(() => received.some((m) => m.type === MSG.OPEN), 'the plain Open');
       assert.ok(!received.some((m) => m.type === MSG.PING));
-      assert.ok(logs.filter((l) => /dropped a RelayForward wrapping a non-forwardable type/.test(l)).length >= 2, 'the relay dropped the Ping and the garbage');
+      assert.ok(logs.filter((l) => /dropped a RelayForward (wrapping a non-forwardable type|with an undecodable inner)/.test(l)).length >= 2, 'the relay dropped the Ping and the garbage');
+      assert.ok(logs.some((l) => /undecodable inner/.test(l)), 'the garbage inner (a bare break) is an undecodable item since #317, not a message of no type');
     });
 
     it('traffic from a connection that is not bridged is never forwarded', async () => {

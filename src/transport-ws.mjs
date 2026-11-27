@@ -303,19 +303,16 @@ export class WebSocketTransport extends WshTransport {
    * @param {Uint8Array} payload
    */
   async #handleControlBytes(payload) {
-    let messages;
-    try {
-      messages = this.#decoder.feed(payload);
-    } catch (err) {
-      this._emitError(err);
-      if (err instanceof FrameSizeError) {
-        // Oversized claimed frame length — treat as a hostile or badly
-        // broken peer and tear down the connection rather than continue.
-        this.close().catch(() => {});
-      }
-      return;
-    }
+    // A frame that does not decode is reported and dropped; the frames around it are delivered (COMPATIBILITY.md rule 7).
+    const { messages, errors, fatal } = this.#decoder.feedAll(payload);
     await dispatchSerially(messages, (msg) => this._emitControl(msg));
+    for (const err of errors) this._emitError(err);
+    if (fatal) {
+      this._emitError(fatal);
+      // Oversized claimed frame length — treat as a hostile or badly
+      // broken peer and tear down the connection rather than continue.
+      this.close().catch(() => {});
+    }
   }
 
   /**

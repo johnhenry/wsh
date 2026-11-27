@@ -220,6 +220,17 @@ impl CborSequenceDecoder {
                 if end - off > self.max {
                     return Err(too_large(end - off, self.max));
                 }
+                // each item is held to the strict rules (#317) before it is read: the scan above only finds where it ends
+                crate::cbor_strict::validate_with(
+                    &self.buf[off..end],
+                    &crate::cbor_strict::Options {
+                        legacy_indefinite_map: false,
+                    },
+                )
+                .map_err(|e| RpcCodecError {
+                    code: PARSE,
+                    message: format!("malformed cbor: {e}"),
+                })?;
                 let item: Cbor =
                     ciborium::from_reader(&self.buf[off..end]).map_err(|e| RpcCodecError {
                         code: PARSE,
@@ -400,14 +411,36 @@ mod tests {
     }
 
     #[test]
-    fn indefinite_strings_and_maps_decode() {
+    fn indefinite_lengths_are_refused_the_decoder_is_strict_since_317() {
+        // an indefinite string, and an indefinite map (the control envelope's legacy exception does not apply to rpc items)
+        for bytes in [
+            &[0x7f, 0x61, b'a', 0x61, b'b', 0xff][..],
+            &[0xbf, 0x61, b'k', 0x01, 0xff][..],
+            &[0x9f, 0x01, 0xff][..],
+        ] {
+            let mut d = CborSequenceDecoder::new(64);
+            let e = d.feed(bytes).unwrap_err();
+            assert_eq!(e.code, PARSE, "{bytes:02x?}");
+            assert!(e.message.contains("indefinite-length"), "{}", e.message);
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_or_duplicate_item_is_refused() {
+        for bytes in [
+            &[0x18, 0x01][..],
+            &[0xa2, 0x61, b'a', 0x01, 0x61, b'a', 0x02][..],
+            &[0xc0, 0x00][..],
+        ] {
+            let mut d = CborSequenceDecoder::new(64);
+            assert_eq!(d.feed(bytes).unwrap_err().code, PARSE, "{bytes:02x?}");
+        }
         let mut d = CborSequenceDecoder::new(64);
-        let items = d
-            .feed(&[
-                0x7f, 0x61, b'a', 0x61, b'b', 0xff, 0xbf, 0x61, b'k', 0x01, 0xff,
-            ])
-            .unwrap();
-        assert_eq!(items, vec![json!("ab"), json!({"k": 1})]);
+        assert_eq!(
+            d.feed(&[0x01, 0x02]).unwrap(),
+            vec![json!(1), json!(2)],
+            "a sequence of canonical items is still read"
+        );
     }
 
     #[test]

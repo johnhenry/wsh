@@ -102,6 +102,45 @@ last release is breaking in the sense of rule "versions" above even when no depl
 - If you change `spec/wsh-v1.yaml`: `npm run codegen`, then the matrix with `npm run matrix`; `npm run codegen:check` and
   `npm run matrix:check` are both CI gates.
 
+### 7. CBOR is read strictly, and the two decoders are one rule set (#317)
+
+A message is accepted only if it is exactly one well-formed CBOR item with no non-canonical *head* (integers, lengths) and none of the constructs listed below. That is strict, but it is **not** "exactly one canonical encoding": the residual list is under the table. `cborDecode` (`src/cbor.mjs`) and `cbor_decode` /
+`cbor_strict::validate` (`crates/wsh-core/src/cbor_strict.rs`) refuse, with the same rule code (`CborError.code`, `StrictCode::as_str()`), the
+same inputs (`spec/cbor-strict-cases.json` is the shared table; `test/rust/cbor-differential.test.mjs` compares the two on 20000 mutations):
+
+| Rule | Code |
+|---|---|
+| a declared string, byte-string, array or map length past the end of the buffer (an array needs a byte per element, a map two per pair; checked before anything is allocated) | `length-exceeds-buffer` |
+| a head or item cut off | `truncated` |
+| a byte after the top-level item (`cborDecodePrefix` / `item_end` read one item out of a longer buffer) | `trailing-bytes` |
+| an integer or length that is not in the shortest form of its head | `non-shortest` |
+| an indefinite-length string, array or map (except the legacy exception below); a break outside one | `indefinite-length`, `unexpected-break` |
+| reserved additional info (28 to 30; 31 on integers and tags) | `reserved-additional-info` |
+| a map key twice in one map; a map key that is not text | `duplicate-key`, `non-text-key` |
+| any tag; any simple value but `false`, `true`, `null` | `tag`, `simple-value` |
+| a text string that is not UTF-8; nesting deeper than 128 | `invalid-utf8`, `too-deep` |
+
+What is **not** required, so more than one byte string decodes to the same value (tracked in #325): **the order of map keys** (the JS encoder
+writes insertion order, the Rust encoder field order; neither is the RFC 8949 length-first order), and **the width of a float** (the JS encoder
+writes every float as float64, ciborium the shortest exact width; all three widths are read), **NaN payloads and -0** (any NaN bit pattern is read; -0 is a float and stays one), **JS integers above 2^53** (the JS decoder returns a double, so two integers that round to the same double decode alike), and **JS integer/float conflation** (an integral float reads as the same JS number as the integer). The Rust and JS decoders agree on accept/reject for all of these; they differ only in the value a JS caller sees. The legacy top-level map (next paragraph) is the last residual.
+
+**The one legacy exception.** Every released `wsh-core` encoder wrote a message envelope as an **indefinite-length map** (`0xbf ... 0xff`):
+`Envelope` has a `#[serde(flatten)]` payload, which makes serde ask for an unsized map and ciborium write the indefinite form. All 110
+message types did this (`spec/cbor-vectors.json`, `rust_released`), so refusing it would refuse every message a released `wsh`,
+`wsh-server` or `wsh-client` sends. Decoders therefore accept an indefinite-length map as the **top-level item** (`legacyIndefiniteMap`,
+default true), and nowhere else; what is inside it is held to every rule above. The Rust encoder in this tree writes a definite-length
+map (`Envelope` serializes by hand, generated from `spec/codegen.mjs`), so the exception is only for peers that predate it, and can be
+removed when `rust-v0.26.x` leaves the supported window (rule "versions": the latest release and the one before it), tracked in #326. The rpc channel (a CBOR sequence of JSON-RPC messages) never had the exception: no released encoder wrote
+an indefinite-length rpc item, and its decoders refuse one.
+
+**What happens on a decode error** (the frame is delimited by its length prefix, so the stream stays in step): the Rust server and client close the session (they read frames with `feed_raw` and `decode_envelope` and end on the first error); the JS WebSocket server logs the error and drops the frame, and handles the good frames around it; the JS WebSocket client emits the error (`onError`) and continues; the JS WebTransport client does the same since this change (before it left its read loop and the connection half-open), and so does the JS WebTransport server. An oversized claimed length ends the connection everywhere. On a sealed session a dropped frame is a gap in the strict counter, so the next frame ends the session. `FrameDecoder.feedAll` is the helper the JS transports share: it returns every good message and every error of a chunk. `FrameDecoder.feed` throws at the first bad frame, with the messages before it in `error.decoded`.
+
+**An older peer.** What the released encoders write is recorded and checked: `test/cbor-vectors.test.mjs` (JS encoder, current Rust
+encoder and the released Rust encoder, every message type), `scripts/cbor-interop-old.mjs` (the encoder of an older `@johnhenry/wsh` install
+against this decoder: 0.47.0 to 0.62.2 are byte-identical to this encoder over 291 values; 0.0.0 to 0.45.0 differ only for the value 2^64,
+which they wrote as the non-canonical zero `1b 00..00`, for -2^63 (one too low) and for -0 (as 0): bugs fixed in 0.47.0, in values no wsh message carries). A peer written by someone else that emits indefinite lengths, non-shortest integers, tags
+or duplicate keys is refused: that is the change, and it is listed as breaking in the CHANGELOG.
+
 ## Worked case: the gateway through a relay (`relay-gateway`, #289)
 
 `OpenTcp`, `OpenUdp`, `ResolveDns`, `ListenRequest` and their answers (`DnsResult`, `ListenOk`, `ListenFail`, `ListenClose`, `InboundOpen`,

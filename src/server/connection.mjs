@@ -499,8 +499,10 @@ export function createConnectionFactory(cfg) {
       if (s.id !== 0) { bindDataStream(s); return; }
       control = s;
       s.onData = (d) => {
-        let msgs;
-        try { msgs = decoder.feed(d); } catch (e) { log(`frame decode error: ${e.message}`); return; }
+        // a frame that does not decode is logged and dropped; the good frames around it are handled (COMPATIBILITY.md rule 7)
+        const { messages: msgs, errors, fatal } = decoder.feedAll(d);
+        for (const e of errors) log(`frame decode error: ${e.message}`);
+        if (fatal) log(`frame decode error: ${fatal.message}`);
         for (const m of msgs) chain = chain.then(() => handle(m)).catch((e) => log(`handler error: ${e.message}`));
       };
       s.onEnd = () => shutdownAfterQueue('control stream FIN');

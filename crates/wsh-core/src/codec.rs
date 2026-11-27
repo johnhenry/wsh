@@ -19,7 +19,17 @@ pub fn frame_encode<T: serde::Serialize>(value: &T) -> WshResult<Vec<u8>> {
 }
 
 /// Decode a CBOR payload (without length prefix) into a typed value.
+///
+/// Strict (#317, [`crate::cbor_strict`]): `data` must be exactly one well-formed, canonical item. A declared length past the end of the buffer, a
+/// byte after the item, a non-shortest integer or length, an indefinite-length string or array, a duplicate or non-text map key, a tag and invalid UTF-8
+/// are errors. The one legacy exception is an indefinite-length map as the top-level item, which every wsh Rust encoder before this one wrote.
 pub fn cbor_decode<T: serde::de::DeserializeOwned>(data: &[u8]) -> WshResult<T> {
+    crate::cbor_strict::validate(data).map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
+    decode_checked(data)
+}
+
+/// Deserialize bytes that [`crate::cbor_strict::validate`] has already accepted.
+fn decode_checked<T: serde::de::DeserializeOwned>(data: &[u8]) -> WshResult<T> {
     let cursor = Cursor::new(data);
     let value: T = ciborium::from_reader(cursor)?;
     Ok(value)
@@ -40,8 +50,9 @@ pub fn decode_envelope(data: &[u8]) -> WshResult<Envelope> {
         msg_type: MsgType,
     }
 
-    let header: EnvelopeTypeOnly = cbor_decode(data)?;
-    let value: ciborium::value::Value = cbor_decode(data)?;
+    crate::cbor_strict::validate(data).map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
+    let header: EnvelopeTypeOnly = decode_checked(data)?;
+    let value: ciborium::value::Value = decode_checked(data)?;
     let payload_value = match value {
         ciborium::value::Value::Map(entries) => ciborium::value::Value::Map(
             entries
@@ -80,6 +91,11 @@ impl FrameDecoder {
     }
 
     /// Feed bytes into the decoder and return all complete CBOR-decoded messages.
+    ///
+    /// A malformed frame fails the call and is dropped from the buffer (the frames after it are read by the next call); the good messages
+    /// of the same call before it are not returned. That is deliberate: the production paths (`wsh-server`, the clients) read frames with
+    /// `feed_raw` and `decode_envelope` one by one and close the session on the first error, so this typed form is for tests and
+    /// single-message callers.
     pub fn feed<T: serde::de::DeserializeOwned>(&mut self, data: &[u8]) -> WshResult<Vec<T>> {
         self.buffer.extend_from_slice(data);
         let mut messages = Vec::new();
@@ -99,11 +115,10 @@ impl FrameDecoder {
                 break;
             }
 
-            let payload = &self.buffer[4..4 + len];
-            let msg: T = cbor_decode(payload)?;
-            messages.push(msg);
-
+            let decoded = cbor_decode::<T>(&self.buffer[4..4 + len]);
+            // the bad frame is consumed either way: the length prefix keeps the stream in step, and leaving it in front would fail every later call
             self.buffer.drain(..4 + len);
+            messages.push(decoded?);
         }
 
         Ok(messages)
@@ -372,6 +387,149 @@ mod tests {
         match decode_envelope(&framed[4..]).unwrap().payload {
             Payload::KeyExchange(p) => assert_eq!(p.signature, Some(vec![9; 64])),
             other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    // ── strict decoding (#317) ──────────────────────────────────────────
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../../spec/cbor-vectors.json")).unwrap()
+    }
+
+    #[test]
+    fn cbor_decode_is_strict_a_stray_byte_a_bad_length_and_a_long_head_are_errors() {
+        use ciborium::value::Value;
+        assert!(cbor_decode::<Value>(&[0x00]).is_ok());
+        for bad in [
+            &[0x00u8, 0x00][..],
+            &[0x61][..],
+            &[0x18, 0x01][..],
+            &[0x7a, 0, 0, 0, 0x10][..],
+            &[0xf7][..],
+            &[0xc0, 0x00][..],
+        ] {
+            assert!(cbor_decode::<Value>(bad).is_err(), "{bad:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_frame_with_a_stray_byte_after_the_value_is_an_error_not_a_message() {
+        let mut frame = frame_encode(&TestMsg {
+            name: "x".into(),
+            value: 1,
+        })
+        .unwrap();
+        frame.push(0x00);
+        let len = (frame.len() - 4) as u32;
+        frame[..4].copy_from_slice(&len.to_be_bytes());
+        let mut decoder = FrameDecoder::new();
+        assert!(decoder.feed::<TestMsg>(&frame).is_err());
+    }
+
+    #[test]
+    fn feed_drops_the_bad_frame_so_the_next_call_resumes_after_it() {
+        // [good][bad][good] in one call: the call returns the error (the good message before it is not returned: the production
+        // paths use feed_raw + decode_envelope per frame, so a bad frame there costs only itself); the bad frame is consumed, not
+        // left in front of the stream forever, so the following frame is read by the next call.
+        let good = |n: i64| {
+            frame_encode(&TestMsg {
+                name: "m".into(),
+                value: n,
+            })
+            .unwrap()
+        };
+        let mut bad = good(0);
+        bad.push(0x00);
+        let len = (bad.len() - 4) as u32;
+        bad[..4].copy_from_slice(&len.to_be_bytes());
+        let mut chunk = good(1);
+        chunk.extend(&bad);
+        chunk.extend(good(2));
+        let mut decoder = FrameDecoder::new();
+        assert!(decoder.feed::<TestMsg>(&chunk).is_err());
+        let rest: Vec<TestMsg> = decoder.feed(&[]).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].value, 2);
+        assert_eq!(decoder.pending(), 0);
+    }
+
+    #[test]
+    fn an_encoded_envelope_is_a_definite_length_map_not_serdes_indefinite_flatten_map() {
+        let v = vectors();
+        let mut n = 0;
+        for vec in v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["layer"] == "control")
+        {
+            let js = hex::decode(vec["js"].as_str().unwrap()).unwrap();
+            let env = decode_envelope(&js).unwrap();
+            let out = cbor_encode(&env).unwrap();
+            assert_ne!(out[0], 0xbf, "{}: indefinite-length map", vec["name"]);
+            assert_eq!(out[0] >> 5, 5, "{}: a map", vec["name"]);
+            crate::cbor_strict::validate_with(
+                &out,
+                &crate::cbor_strict::Options {
+                    legacy_indefinite_map: false,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
+            // and what it says is unchanged
+            let back = decode_envelope(&out).unwrap();
+            assert_eq!(back.msg_type, env.msg_type);
+            n += 1;
+        }
+        assert!(n >= 200, "{n}");
+    }
+
+    #[test]
+    fn decode_envelope_is_strict_a_stray_byte_a_long_head_and_a_cut_frame_are_errors() {
+        let v = vectors();
+        let ping = v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "Ping" && x["kind"] == "min")
+            .unwrap();
+        let good = ping["js"].as_str().unwrap().to_string();
+        assert!(
+            decode_envelope(&hex::decode(&good).unwrap()).is_ok(),
+            "{good}"
+        );
+        // a byte after the envelope
+        assert!(decode_envelope(&hex::decode(format!("{good}00")).unwrap()).is_err());
+        // the type (0x21) in the four-byte form instead of the shortest one
+        let longer = good.replacen("1821", "1a00000021", 1);
+        assert_ne!(longer, good, "the vector holds type 0x21 as 18 21");
+        assert!(decode_envelope(&hex::decode(longer).unwrap()).is_err());
+        // cut one byte short
+        assert!(decode_envelope(&hex::decode(&good[..good.len() - 2]).unwrap()).is_err());
+        // the same malformed bytes in an indefinite-length envelope (the legacy shape)
+        let legacy = format!("bf{}ff", &good[2..]);
+        assert!(
+            decode_envelope(&hex::decode(&legacy).unwrap()).is_ok(),
+            "the legacy shape of the same message"
+        );
+        assert!(
+            decode_envelope(&hex::decode(legacy.replacen("1821", "1a00000021", 1)).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_released_rust_peers_indefinite_map_envelope_is_still_read() {
+        let v = vectors();
+        for vec in v["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["layer"] == "control")
+        {
+            let old = hex::decode(vec["rust_released"].as_str().unwrap()).unwrap();
+            assert_eq!(old[0], 0xbf);
+            let env = decode_envelope(&old).unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
+            assert_eq!(env.msg_type as u8 as u64, vec["code"].as_u64().unwrap());
         }
     }
 }

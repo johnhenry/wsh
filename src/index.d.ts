@@ -17,9 +17,32 @@
 export function cborEncode(value: unknown): Uint8Array;
 
 /**
- * Decode CBOR bytes into a JS value.
+ * Decode CBOR bytes into a JS value. Strict (#317): the whole buffer must be exactly one canonical item, every declared length must fit the
+ * buffer, and there are no tags, no indefinite lengths (but see `legacyIndefiniteMap`), no duplicate or non-text map keys, no invalid UTF-8.
+ * Throws a {@link CborError}.
+ *
+ * `legacyIndefiniteMap` (default true): accept an indefinite-length map as the TOP-LEVEL item, which every released wsh Rust encoder wrote.
  */
-export function cborDecode(data: Uint8Array): unknown;
+export function cborDecode(data: Uint8Array, options?: { legacyIndefiniteMap?: boolean }): unknown;
+
+/**
+ * Decode ONE item starting at `offset` and return where it ended; whatever follows is left to the caller. As strict as `cborDecode` about the item.
+ */
+export function cborDecodePrefix(data: Uint8Array, options?: { offset?: number; legacyIndefiniteMap?: boolean }): { value: unknown; end: number };
+
+/** A malformed CBOR input. `code` is the rule that was broken. */
+export class CborError extends Error {
+  constructor(code: CborErrorCode, message: string, offset?: number);
+  readonly code: CborErrorCode;
+  readonly offset?: number;
+}
+
+export type CborErrorCode =
+  | 'truncated' | 'length-exceeds-buffer' | 'trailing-bytes' | 'non-shortest' | 'indefinite-length' | 'unexpected-break'
+  | 'reserved-additional-info' | 'duplicate-key' | 'non-text-key' | 'tag' | 'simple-value' | 'invalid-utf8' | 'too-deep';
+
+/** The deepest nesting a decoded item may have. */
+export const CBOR_MAX_DEPTH: number;
 
 /**
  * Frame a CBOR-encoded message with a 4-byte big-endian length prefix.

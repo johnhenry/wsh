@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### CBOR decoding is strict, in JS and in Rust: a length past the buffer, a stray byte, a non-canonical encoding are decode errors (#317; npm and Rust)
+
+- **What was wrong.** The JS decoder (`src/cbor.mjs`) read a text string of its declared length without checking it against the buffer, so on a
+  sealed session flipping the session-id LENGTH byte of an `EncryptedFrame` left the frame accepted and the command inside it ran (the payload
+  is authenticated, so this was a decoder-strictness defect, not a break of confidentiality or integrity). The same decoder also ignored bytes after
+  the value, read non-shortest integers and lengths, tags, duplicate map keys and invalid UTF-8, and the Rust decoder (ciborium) did all of
+  that too. Before the change, a bit flip at every offset of a sealed frame ran the command at the session-id length byte (3 of 3 bit positions);
+  now no offset runs anything (`test/cbor-sealed-sweep.test.mjs`).
+- **Now** (`cborDecode` / `cbor_decode`; the rules, with their codes, are in COMPATIBILITY.md rule 7). A declared length past the end of the buffer,
+  checked before anything is allocated (an array that declares 2^32 elements fails at once); bytes after the top-level item; an integer or length not
+  in its shortest form; an indefinite-length string, array or nested map; a break; reserved additional info; a tag; a simple value other than
+  false/true/null; a duplicate or non-text map key; text that is not UTF-8; nesting past 128. They throw `CborError` (`.code`) in JS and
+  `StrictError` (`StrictCode`) in Rust. New: `cborDecodePrefix(data, { offset })` / `cbor_strict::item_end` read ONE item out of a longer buffer; the
+  default stays whole-buffer. The framing layer hands the decoder exactly one item per frame, so nothing in wsh needs the prefix form today.
+- **Not required**: the order of map keys, and the width of a float (the two encoders write different, both valid, forms).
+- **The one exception, and the Rust encoder fix.** Every released Rust encoder wrote the message envelope as an indefinite-length map
+  (`serde(flatten)` makes ciborium emit `0xbf ... 0xff`; 110 of 110 message types in `spec/cbor-vectors.json`). Refusing that would refuse every
+  message a released `wsh`, `wsh-server` or `wsh-client` sends, so both decoders still accept an indefinite-length map as the **top-level** item
+  (`legacyIndefiniteMap: false` / `Options { legacy_indefinite_map: false }` turns it off); everything inside it is strict. The Rust `Envelope` now
+  serializes as a definite-length map (generated from `spec/codegen.mjs`; the same keys in the same order, with a counted head), so the exception is only for
+  old peers. The rpc channel never had the exception (no released encoder wrote an indefinite-length rpc item): its decoders refuse one.
+- **Breaking, for a peer that is neither the JS package nor `wsh-core`.** A third-party encoder that writes indefinite lengths (other than the
+  top-level map), non-shortest integers, tags, duplicate keys or invalid UTF-8, or that appends bytes to a frame, is now refused. No released wsh
+  encoder does any of those (the audit: `spec/cbor-vectors.json` holds every message type from the JS encoder, the current and the released Rust
+  encoder; `scripts/cbor-interop-old.mjs` runs older `@johnhenry/wsh` encoders against the decoder). The previous `cborDecode` also accepted a
+  tag and returned its inner value, any simple value (as its number) and a stray break (as `undefined`); those are errors now.
+- **A released peer.** A released JS or Rust peer reading what this release sends: unchanged (the JS encoder is untouched; the Rust encoder writes a
+  definite map, which every released decoder reads). This release reading a released peer: everything the released encoders wrote is accepted
+  (`test/cbor-vectors.test.mjs`, and the `test/rust` suite against the released `rust-v0.9.0` and `rust-v0.26.2` binaries; see the PR). The one thing
+  a released JS encoder (0.0.0 to 0.45.0) wrote that is refused is integral doubles at or above 2^64, for example 2^64 and 1e300 (both encoded as `1b00..00` by 0.0.0 to 0.45.0 encoders: a zero in the wrong form, an encoder bug fixed in 0.47.0); no message carries one.
+- **Malformed frames on a control stream.** A frame that does not decode is reported as an error and dropped; the length prefix keeps the stream in
+  step, and the good frames before and after it are delivered (`FrameDecoder.feed` used to lose the messages decoded earlier in the same chunk; it now throws with them in `error.decoded`, and `feedAll` returns everything). The JS WebTransport client used to leave its read loop, and the connection half-open, on such an error; it now reports it and keeps reading, as the WebSocket transports do (COMPATIBILITY.md rule 7 lists what each implementation does). `cborDecodePrefix` throws a `RangeError` for an offset that is not an integer within `0..length`, and accepts the legacy indefinite map at any offset (the item it reads is its own top level). On a sealed session the next frame then fails the strict counter and ends the session (unchanged; #314 makes a frame that is not this
+  session's end it at once). A transport that wants a malformed frame to end the connection can do it from the `CborError`.
+- Tests: `test/cbor-strict.test.mjs` and `codec::tests`/`cbor_strict::tests` (one shared table, `spec/cbor-strict-cases.json`, plus per-rule
+  tests), `test/cbor-vectors.test.mjs` (every encoder's output for every message type is accepted), `test/cbor-fuzz.test.mjs` and the Rust fuzz
+  (fixed seed: no crash but `CborError`, no hang, bounded allocation, accepted means canonical), `test/rust/cbor-differential.test.mjs` (JS and Rust agree
+  on accept/reject and the rule, 20000 mutations), `test/cbor-sealed-sweep.test.mjs` (every byte offset of a sealed `EncryptedFrame`, three bit positions).
+  Two existing tests that pinned the lenient decoder (`test/cbor.test.mjs` indefinite strings, `rpc_codec::tests::indefinite_strings_and_maps_decode`) now
+  pin the refusal.
+
 ### The page's tool server answers MCP 2026-07-28 itself: `server/discover`, per-request `_meta`, `subscriptions/listen`; `tools/list` is in order of name (#302; npm only)
 
 - **What changes.** `webmcpTools(...)` (so `serveMcpOverDuplex(handler, ...)`, the wsh `mcp` rpc channel, `createPageHost` and `exposeObjects`) speaks MCP 2026-07-28 beside the legacy `initialize` session, chosen per request: a request whose `params._meta` has `io.modelcontextprotocol/protocolVersion` is served statelessly; any other is what it was. Tools only: resources, prompts, sampling, roots, elicitation, tasks, skills, events and uploads are not offered, whatever a client declares (`-32601`). Minor: new methods and one new limit, no breaking change to the `initialize` session apart from the ordering below.
