@@ -1716,6 +1716,196 @@ mod unix {
     }
 }
 
+// ── a grant that runs out (#297) ──────────────────────────────────
+
+mod expiry {
+    use super::*;
+
+    /// A service that echoes and says, on `gone`, each time a connection of it ended.
+    async fn echo_noting_ends() -> (u16, mpsc::UnboundedReceiver<()>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(());
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    fn closes_of(msgs: &[Envelope], id: u32) -> Vec<Option<String>> {
+        msgs.iter()
+            .filter_map(|m| match &m.payload {
+                Payload::GatewayClose(c) if c.gateway_id == id => Some(c.reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn open_two(r: &mut Rig, port: u16) {
+        for id in [1u32, 2] {
+            r.open_tcp(id, port);
+            r.expect_ok(id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn end_all_ends_every_connection_with_the_reason_and_then_discarded() {
+        let (port, mut gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        open_two(&mut r, port).await;
+        r.session.end_all("key expired");
+        let msgs = r.drain(500).await;
+        for id in [1, 2] {
+            assert_eq!(
+                closes_of(&msgs, id),
+                vec![
+                    Some("key expired".to_string()),
+                    Some(GATEWAY_DISCARDED.to_string())
+                ],
+                "connection {id}: the reason first, then the second close that frees a peer which knows it"
+            );
+        }
+        wait_for_no_connections(&r).await;
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), gone.recv())
+                .await
+                .expect("the origin saw its connection end")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_client_had_already_closed_gets_the_reason_only() {
+        let (port, _held) = mute_service().await; // it neither answers nor ends, so the connection stays half-closed
+        let mut r = rig(CREDIT);
+        r.open_tcp(1, port);
+        r.expect_ok(1).await;
+        r.close(1);
+        assert!(
+            r.drain(200).await.is_empty(),
+            "the host has nothing to say yet"
+        );
+        r.session.end_all("key expired");
+        let msgs = r.drain(300).await;
+        assert!(
+            got_close(&msgs).is_some(),
+            "the half-closed connection is ended too: {msgs:?}"
+        );
+        assert_eq!(
+            closes_of(&msgs, 1),
+            vec![Some("key expired".to_string())],
+            "the client had closed: nothing more than the reason"
+        );
+        wait_for_no_connections(&r).await;
+    }
+
+    #[tokio::test]
+    async fn end_after_ends_what_is_open_when_the_time_comes_and_not_before() {
+        let (port, _gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        open_two(&mut r, port).await;
+        r.session
+            .end_after(Duration::from_millis(400), "key expired");
+        // Not before: a quiet 150 ms with both connections still there.
+        assert!(r.drain(150).await.is_empty());
+        assert_eq!(conns(&r).await, 2);
+        // Then: both are ended with the reason.
+        let msgs = r.drain(1500).await;
+        for id in [1, 2] {
+            assert_eq!(
+                closes_of(&msgs, id).first().cloned(),
+                Some(Some("key expired".to_string()))
+            );
+        }
+        wait_for_no_connections(&r).await;
+    }
+
+    #[tokio::test]
+    async fn end_after_arms_one_timer_however_often_it_is_asked() {
+        let (port, _gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        r.open_tcp(1, port);
+        r.expect_ok(1).await;
+        // The first call decides; asking again (once per request that opens something) arms no second timer.
+        r.session
+            .end_after(Duration::from_secs(3600), "key expired");
+        for _ in 0..20 {
+            r.session
+                .end_after(Duration::from_millis(100), "key expired");
+        }
+        let msgs = r.drain(1000).await;
+        assert!(
+            msgs.is_empty() && conns(&r).await == 1,
+            "no later call armed another timer: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listener_stops_and_what_it_had_accepted_is_ended() {
+        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut r = rig_with(reverse_policy(lo), true, CREDIT);
+        let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+            Payload::ListenOk(ok) => ok.actual_port,
+            other => panic!("{other:?}"),
+        };
+        let _caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        assert!(r.drain(150).await.is_empty());
+        r.session.end_all("key expired");
+        let msgs = r.drain(500).await;
+        assert_eq!(
+            closes_of(&msgs, 9).first().cloned(),
+            Some(Some("key expired".to_string()))
+        );
+        // The listener is gone: nothing accepts any more.
+        let t0 = std::time::Instant::now();
+        while TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "still listening");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_that_finishes_behind_the_expiry_is_ended_too() {
+        // The connect is in flight when the grant runs out: it must not outlive it.
+        let (port, _gone) = echo_noting_ends().await;
+        let mut r = rig(CREDIT);
+        r.session.end_all("key expired"); // nothing open yet: marks the session as expired
+        r.open_tcp(1, port);
+        let msgs = r.drain(800).await;
+        assert!(
+            got_close(&msgs).is_some()
+                || matches!(
+                    msgs.first().map(|m| &m.payload),
+                    Some(Payload::GatewayFail(_))
+                ),
+            "a request after the expiry opens nothing that lasts: {msgs:?}"
+        );
+        wait_for_no_connections(&r).await;
+    }
+}
+
 // ── reverse TCP listeners ─────────────────────────────────────────
 
 async fn listen_tcp(r: &mut Rig, id: u32, requested_bind: &str) -> Envelope {
@@ -1826,6 +2016,540 @@ async fn a_tcp_listener_hands_inbound_connections_to_the_client_and_relays_them(
 // hang-up of the socket and tells the client the connection is discarded. An ORIGIN the host dialled that
 // finished and then closed is NOT discarded (the client may still be reading what it sent).
 
+/// `gateway-lossless-close` (wsh #286): with both ends having stated it the ANSWERING socket (an origin the host dialled) is watched once it has
+/// half-closed, a vanished one releases the connection (`GatewayClose` reason `released`, which drops nothing the client has), and one that sent
+/// everything and closed completely loses no byte. Without the feature, or with the answering watch off, nothing changes.
+#[cfg(unix)]
+mod lossless {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    const BOTH: &[&str] = &[GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE];
+    const SEEN: Duration = Duration::from_secs(20);
+    const QUIET_MS: u64 = 600;
+    const SIZE: usize = 600_000;
+
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn new() -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "wll-{}-{}",
+                std::process::id(),
+                rand::random::<u16>()
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(std::fs::canonicalize(d).unwrap())
+        }
+        fn sock(&self, name: &str) -> String {
+            self.0.join(name).to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rig_unix(path: &str, features: &[&str], tweak: impl FnOnce(&mut GatewayPolicy)) -> Rig {
+        let mut policy = GatewayPolicy {
+            unix: UnixPolicy::new(vec![path.to_string()], vec![], false, 4).unwrap(),
+            half_close_probe: Some(Duration::from_millis(50)),
+            ..GatewayPolicy::default()
+        };
+        tweak(&mut policy);
+        rig_with(policy, true, features)
+    }
+
+    fn open_unix(r: &Rig, id: u32, path: &str) {
+        r.send(
+            MsgType::OpenUnix,
+            Payload::OpenUnix(OpenUnixPayload {
+                gateway_id: id,
+                path: path.to_string(),
+            }),
+        );
+    }
+
+    /// An origin that sends `SIZE` bytes, half-closes and closes completely.
+    fn finished_origin(path: &str) {
+        let l = UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let _ = s.write_all(&vec![7u8; SIZE]).await;
+                    let _ = s.shutdown().await;
+                    drop(s);
+                });
+            }
+        });
+    }
+
+    /// Read what the host sends until `want` bytes and the close messages have arrived (a slow reader: credit is given back as it reads).
+    async fn read_everything(r: &mut Rig, id: u32, want: usize) -> (usize, Vec<Option<String>>) {
+        let mut got = 0;
+        let mut closes = Vec::new();
+        let t0 = std::time::Instant::now();
+        while (got < want || closes.is_empty()) && t0.elapsed() < SEEN {
+            let Ok(m) = tokio::time::timeout(Duration::from_millis(500), r.rx.recv()).await else {
+                continue;
+            };
+            match m.expect("session open").payload {
+                Payload::GatewayData(d) => {
+                    got += d.data.len();
+                    r.credit(id, d.data.len() as u32);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Payload::GatewayClose(c) => closes.push(c.reason),
+                other => panic!("{other:?}"),
+            }
+        }
+        // a second close may follow the first
+        while let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(300), r.rx.recv()).await
+        {
+            if let Payload::GatewayClose(c) = m.payload {
+                closes.push(c.reason);
+            }
+        }
+        (got, closes)
+    }
+
+    #[tokio::test]
+    async fn an_origin_that_sent_everything_and_closed_completely_loses_nothing_and_the_connection_is_released(
+    ) {
+        let d = Dir::new();
+        let path = d.sock("o.sock");
+        finished_origin(&path);
+        let mut r = rig_unix(&path, BOTH, |_| {});
+        open_unix(&r, 1, &path);
+        r.expect_ok(1).await;
+        // a slow reader: it takes what the host sent only after the origin is long gone
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let (got, closes) = read_everything(&mut r, 1, SIZE).await;
+        assert_eq!(got, SIZE, "every byte, though the origin was gone");
+        assert_eq!(
+            closes,
+            vec![None, Some(GATEWAY_RELEASED.to_string())],
+            "the origin's end of file, then the release (never `discarded`, which would drop the tail)"
+        );
+        wait_for_no_connections(&r).await;
+    }
+
+    #[tokio::test]
+    async fn without_the_feature_the_origin_is_not_watched_and_the_connection_is_held() {
+        for features in [CREDIT, &[][..]] {
+            let d = Dir::new();
+            let path = d.sock("o.sock");
+            finished_origin(&path);
+            let mut r = rig_unix(&path, features, |_| {});
+            open_unix(&r, 1, &path);
+            r.expect_ok(1).await;
+            let (got, closes) = read_everything(&mut r, 1, SIZE).await;
+            assert_eq!(got, SIZE);
+            assert_eq!(closes, vec![None], "a half-close and nothing more");
+            assert!(r.drain(QUIET_MS).await.is_empty());
+            assert_eq!(conns(&r).await, 1, "held for the client, as before");
+            r.close(1);
+            wait_for_no_connections(&r).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_answering_watch_can_be_turned_off_and_so_can_the_statement_of_the_feature() {
+        for tweak in [
+            (|p: &mut GatewayPolicy| p.half_close_probe_answers = false) as fn(&mut GatewayPolicy),
+            |p| p.lossless_close = false,
+            |p| p.half_close_probe = None,
+        ] {
+            let d = Dir::new();
+            let path = d.sock("o.sock");
+            finished_origin(&path);
+            let mut r = rig_unix(&path, BOTH, tweak);
+            open_unix(&r, 1, &path);
+            r.expect_ok(1).await;
+            let (got, closes) = read_everything(&mut r, 1, SIZE).await;
+            assert_eq!((got, closes), (SIZE, vec![None]));
+            assert!(r.drain(QUIET_MS).await.is_empty());
+            assert_eq!(conns(&r).await, 1);
+            r.close(1);
+            wait_for_no_connections(&r).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_origin_that_half_closed_and_is_alive_is_never_released_and_still_hears_the_client()
+    {
+        let d = Dir::new();
+        let path = d.sock("a.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let _ = s.shutdown().await; // finished sending, still reading
+                    let mut buf = vec![0u8; 1024];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = seen_tx.send(buf[..n].to_vec());
+                    }
+                });
+            }
+        });
+        let mut r = rig_unix(&path, BOTH, |_| {});
+        open_unix(&r, 1, &path);
+        r.expect_ok(1).await;
+        assert_eq!(got_close(&[r.next().await]), Some(None));
+        assert!(
+            r.drain(QUIET_MS).await.is_empty(),
+            "thirty probe intervals and nothing"
+        );
+        r.data(1, b"after".to_vec());
+        assert_eq!(seen_rx.recv().await.unwrap(), b"after");
+        assert_eq!(conns(&r).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_origin_that_half_closed_and_vanished_releases_the_connection_within_the_probe_bound(
+    ) {
+        let d = Dir::new();
+        let path = d.sock("v.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let _ = s.write_all(b"bye").await;
+            let _ = s.shutdown().await;
+            let _ = go_rx.await;
+            drop(s); // gone
+        });
+        let mut r = rig_unix(&path, BOTH, |_| {});
+        open_unix(&r, 1, &path);
+        r.expect_ok(1).await;
+        let (got, closes) = {
+            let mut got = 0;
+            let mut closes = Vec::new();
+            for _ in 0..2 {
+                match r.next().await.payload {
+                    Payload::GatewayData(d) => got += d.data.len(),
+                    Payload::GatewayClose(c) => closes.push(c.reason),
+                    other => panic!("{other:?}"),
+                }
+            }
+            (got, closes)
+        };
+        assert_eq!((got, closes), (3, vec![None]));
+        assert!(r.drain(QUIET_MS).await.is_empty(), "alive: held");
+        let _ = go_tx.send(());
+        assert_eq!(
+            tokio::time::timeout(SEEN, async {
+                match r.next().await.payload {
+                    Payload::GatewayClose(c) => c.reason,
+                    other => panic!("{other:?}"),
+                }
+            })
+            .await
+            .expect("released"),
+            Some(GATEWAY_RELEASED.to_string())
+        );
+        wait_for_no_connections(&r).await;
+    }
+
+    /// An origin made of two held halves, so that the order of its end of file and of a failed write is the test's, not the kernel's: what the test sends
+    /// through `peer` is what the host reads (and `peer`'s `shutdown` is the origin's end of file); a write fails once `fail_writes` is set, a read once
+    /// `fail_reads` is (send a byte through `peer` to wake a read that is waiting). 0 = no failure, 1 = the peer is gone (a broken pipe, a reset),
+    /// 2 = any other failure.
+    struct HeldOrigin {
+        read: tokio::io::DuplexStream,
+        fail_writes: Arc<std::sync::atomic::AtomicU8>,
+        fail_reads: Arc<std::sync::atomic::AtomicU8>,
+    }
+    fn failure(code: u8, gone: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::from(if code == 1 {
+            gone
+        } else {
+            std::io::ErrorKind::PermissionDenied
+        })
+    }
+    impl tokio::io::AsyncRead for HeldOrigin {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let f = self.fail_reads.load(Ordering::Acquire);
+            if f != 0 {
+                return std::task::Poll::Ready(Err(failure(
+                    f,
+                    std::io::ErrorKind::ConnectionReset,
+                )));
+            }
+            std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
+        }
+    }
+    impl tokio::io::AsyncWrite for HeldOrigin {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let f = self.fail_writes.load(Ordering::Acquire);
+            if f != 0 {
+                return std::task::Poll::Ready(Err(failure(f, std::io::ErrorKind::BrokenPipe)));
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A host session with an answering origin attached as connection 1, no kernel and no watch: only the origin's end of file and a failed write
+    /// can end it. Returns what the test needs to hold the origin.
+    fn held_origin(
+        features: &[&str],
+    ) -> (
+        Rig,
+        tokio::io::DuplexStream,
+        Arc<std::sync::atomic::AtomicU8>,
+        Arc<std::sync::atomic::AtomicU8>,
+    ) {
+        let r = rig_with(GatewayPolicy::default(), true, features);
+        let (host_side, peer) = tokio::io::duplex(1 << 20);
+        let fail_writes = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let fail_reads = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let origin = HeldOrigin {
+            read: host_side,
+            fail_writes: fail_writes.clone(),
+            fail_reads: fail_reads.clone(),
+        };
+        let inner = r.session.inner.clone();
+        let guard = inner.policy.acquire();
+        let ready = inner.attach_stream(1, Box::new(origin), guard, None, true);
+        ready.notify_one();
+        (r, peer, fail_writes, fail_reads)
+    }
+
+    /// Everything the host sends until `want` bytes and `closes` closes have arrived: (bytes, the close reasons).
+    async fn take(r: &mut Rig, want: usize, closes: usize) -> (Vec<u8>, Vec<Option<String>>) {
+        let (mut bytes, mut said) = (Vec::new(), Vec::new());
+        while bytes.len() < want || said.len() < closes {
+            match r.next().await.payload {
+                Payload::GatewayData(d) => {
+                    r.credit(1, d.data.len() as u32);
+                    bytes.extend(d.data);
+                }
+                Payload::GatewayClose(c) => said.push(c.reason),
+                other => panic!("{other:?}"),
+            }
+        }
+        (bytes, said)
+    }
+
+    /// The probe is skipped while a write is queued, so a failed write to an origin that has finished its answer can conclude the connection before
+    /// anything else does. The origin's end of file has gone out as the host's half-close; a second close of `discarded` would make the client drop what it has
+    /// received and not yet read, so it is `released` whichever sees the end first.
+    #[tokio::test]
+    async fn a_failed_write_after_the_origins_end_of_file_releases_the_connection_it_does_not_discard_it(
+    ) {
+        for code in [1u8, 2] {
+            // a broken pipe, and a failure of any other kind: after the end of file both are the end of a finished answer
+            let (mut r, mut peer, fail_writes, _) = held_origin(BOTH);
+            let answer: Vec<u8> = (0..100_000u32).map(|i| (i * 13 + 5) as u8).collect();
+            peer.write_all(&answer).await.unwrap();
+            peer.shutdown().await.unwrap(); // the origin's end of file
+            let (got, closes) = take(&mut r, answer.len(), 1).await;
+            assert_eq!(got, answer, "every byte, in order");
+            assert_eq!(closes, vec![None], "the half-close");
+            fail_writes.store(code, Ordering::Release);
+            r.data(1, vec![1]); // the caller's next bytes: the write to the finished origin fails
+            let (_, closes) = take(&mut r, 0, 1).await;
+            assert_eq!(closes, vec![Some(GATEWAY_RELEASED.to_string())], "{code}");
+            wait_for_no_connections(&r).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_failed_write_is_a_discard_where_the_feature_was_not_negotiated_or_the_answering_watch_is_off(
+    ) {
+        for (features, tweak) in [
+            (CREDIT, None),
+            (&[][..], None),
+            (
+                BOTH,
+                Some(
+                    (|p: &mut GatewayPolicy| p.half_close_probe_answers = false)
+                        as fn(&mut GatewayPolicy),
+                ),
+            ),
+        ] {
+            let mut policy = GatewayPolicy::default();
+            if let Some(t) = tweak {
+                t(&mut policy);
+            }
+            let mut r = rig_with(policy, true, features);
+            let (host_side, mut peer) = tokio::io::duplex(1 << 20);
+            let fail_writes = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let origin = HeldOrigin {
+                read: host_side,
+                fail_writes: fail_writes.clone(),
+                fail_reads: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            };
+            let inner = r.session.inner.clone();
+            let ready =
+                inner.attach_stream(1, Box::new(origin), inner.policy.acquire(), None, true);
+            ready.notify_one();
+            peer.write_all(&[5u8; 1000]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let (_, closes) = take(&mut r, 1000, 1).await;
+            assert_eq!(closes, vec![None]);
+            fail_writes.store(1, Ordering::Release);
+            r.data(1, vec![1]);
+            let (_, closes) = take(&mut r, 0, 1).await;
+            assert_eq!(closes, vec![Some(GATEWAY_DISCARDED.to_string())]);
+        }
+    }
+
+    /// `released` tells the caller "deliver what you have, then finish": for an origin reset in the MIDDLE of its answer (its end of file never read) that
+    /// would make a truncated answer look like a complete one (a close-delimited response cut by an origin crash would read as a clean end). So a failure
+    /// before the end of file, a reset included, is an error end (`discarded`, or the reason of the failed write), never a clean one. Reads and writes alike.
+    #[tokio::test]
+    async fn a_reset_before_the_end_of_file_is_not_a_clean_end_for_the_caller_it_is_a_discard() {
+        for (code, released) in [(1u8, false), (2, false)] {
+            for on_write in [true, false] {
+                let (mut r, mut peer, fail_writes, fail_reads) = held_origin(BOTH);
+                peer.write_all(&[5u8; 1000]).await.unwrap(); // no end of file: the origin is still answering
+                let (got, closes) = take(&mut r, 1000, 0).await;
+                assert_eq!(got.len(), 1000);
+                assert!(closes.is_empty());
+                if on_write {
+                    fail_writes.store(code, Ordering::Release);
+                    r.data(1, vec![1]);
+                } else {
+                    fail_reads.store(code, Ordering::Release);
+                    peer.write_all(&[1]).await.unwrap(); // wakes the read that is waiting
+                }
+                let (_, closes) = take(&mut r, 0, 1).await;
+                let want = if released {
+                    GATEWAY_RELEASED.to_string()
+                } else if on_write {
+                    "write failed".to_string()
+                } else {
+                    GATEWAY_DISCARDED.to_string()
+                };
+                assert_eq!(closes, vec![Some(want)], "code {code}, write {on_write}");
+                wait_for_no_connections(&r).await;
+            }
+        }
+    }
+
+    /// The receiving side: a client that RELEASES a connection (its answering socket vanished) has what it sent delivered, in order, to the
+    /// caller of a reverse listener, which is then ended; nothing goes back. Without the feature the same close is an ordinary one.
+    #[tokio::test]
+    async fn a_close_with_released_from_the_client_delivers_what_it_sent_and_ends_the_connection() {
+        for second in [false, true] {
+            let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            let mut r = rig_with(reverse_policy(lo), true, BOTH);
+            let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+                Payload::ListenOk(ok) => ok.actual_port,
+                other => panic!("{other:?}"),
+            };
+            let mut caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let channel_id = match r.next().await.payload {
+                Payload::InboundOpen(o) => o.channel_id,
+                other => panic!("{other:?}"),
+            };
+            r.send(
+                MsgType::InboundAccept,
+                Payload::InboundAccept(InboundAcceptPayload {
+                    channel_id,
+                    gateway_id: Some(9),
+                }),
+            );
+            r.credit(9, 1);
+            let sent: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+            for chunk in sent.chunks(60_000) {
+                r.data(9, chunk.to_vec());
+            }
+            if second {
+                r.close(9); // its first close: the service's end of file
+            }
+            r.send(
+                MsgType::GatewayClose,
+                Payload::GatewayClose(GatewayClosePayload {
+                    gateway_id: 9,
+                    reason: Some(GATEWAY_RELEASED.into()),
+                }),
+            );
+            let mut got = Vec::new();
+            tokio::time::timeout(SEEN, caller.read_to_end(&mut got))
+                .await
+                .expect("the caller sees the end")
+                .unwrap();
+            assert_eq!(
+                got, sent,
+                "everything the client sent, in order (second={second})"
+            );
+            wait_for_no_connections(&r).await;
+            let rest = r.drain(200).await;
+            assert!(
+                got_close(&rest).is_none(),
+                "nothing goes back after a release: {rest:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn without_the_feature_a_close_with_that_reason_is_an_ordinary_half_close() {
+        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut r = rig_with(reverse_policy(lo), true, CREDIT);
+        let port = match listen_tcp(&mut r, 5, "0.0.0.0").await.payload {
+            Payload::ListenOk(ok) => ok.actual_port,
+            other => panic!("{other:?}"),
+        };
+        let mut caller = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let channel_id = match r.next().await.payload {
+            Payload::InboundOpen(o) => o.channel_id,
+            other => panic!("{other:?}"),
+        };
+        r.send(
+            MsgType::InboundAccept,
+            Payload::InboundAccept(InboundAcceptPayload {
+                channel_id,
+                gateway_id: Some(9),
+            }),
+        );
+        r.send(
+            MsgType::GatewayClose,
+            Payload::GatewayClose(GatewayClosePayload {
+                gateway_id: 9,
+                reason: Some(GATEWAY_RELEASED.into()),
+            }),
+        );
+        // a half-close: the caller sees the end of file, and the host still holds the connection for what the caller sends
+        let mut buf = [0u8; 8];
+        assert_eq!(caller.read(&mut buf).await.unwrap(), 0);
+        caller.write_all(b"still").await.unwrap();
+        let msgs = r.drain(400).await;
+        assert_eq!(
+            data_len(&msgs),
+            5,
+            "what the caller sends still reaches the client"
+        );
+        assert_eq!(conns(&r).await, 1);
+    }
+}
+
 mod half_closed_origin {
     use super::*;
 
@@ -1854,8 +2578,10 @@ mod half_closed_origin {
 
     /// An ORIGIN that sent everything, half-closed and then closed completely is the ordinary end of
     /// a response (an HTTP/1.0 server, `Connection: close`). The client may still be reading what it
-    /// sent: a second close saying "discarded" would drop that. So the host says nothing more than the
-    /// half-close it already sent, and holds the connection until the client closes (or the idle bound).
+    /// sent: a second close saying "discarded" would drop that. So, with a client that did not state
+    /// `gateway-lossless-close` (this rig lists only credit; with the feature the origin IS watched and
+    /// released, see `lossless`), the host says nothing more than the half-close it already sent, and
+    /// holds the connection until the client closes (or the idle bound).
     #[cfg(unix)]
     #[tokio::test]
     async fn an_origin_that_sent_everything_and_closed_completely_is_not_discarded() {

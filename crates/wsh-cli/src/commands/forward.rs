@@ -578,6 +578,12 @@ where
         .await
 }
 
+/// The probe schedule for the local service of a `-R` (wsh #286): the default, unless `--no-half-close-probe-answers` turned it off.
+fn answering_probe() -> Option<std::time::Duration> {
+    (!crate::commands::common::identity_policy().no_probe_answers)
+        .then_some(DEFAULT_HALF_CLOSE_PROBE)
+}
+
 /// Open the remote end for an accepted local connection and join the two.
 fn spawn_forward<S>(
     handle: &GatewayHandle,
@@ -651,18 +657,33 @@ async fn start_remote(
             tokio::spawn(async move {
                 let _permit = permit;
                 match connect_local(&target).await {
-                    // The local end of a `-R` is a service that answers: it is not watched (a service that
-                    // finished and closed completely is the ordinary end of a response, and the caller may
-                    // still be reading it; see `pump_local`).
+                    // The local end of a `-R` is a service that answers: one that finished and closed completely is
+                    // the ordinary end of a response, and the caller may still be reading it, so a `discarded` close
+                    // would cost the caller the tail. It is watched only where the host and this client both stated
+                    // `gateway-lossless-close` (wsh #286): a vanished service then RELEASES the connection (the host
+                    // delivers what it has, then ends it), and one that sent its whole answer and closed loses nothing.
+                    // `--no-half-close-probe-answers`, or no feature: not watched, as before.
                     Ok(Local_::Tcp(sock)) => {
                         if let Ok(stream) = pending.accept().await {
-                            let _ = stream.pump(sock).await;
+                            let _ = stream
+                                .pump_answering(
+                                    sock,
+                                    Some(DEFAULT_HALF_CLOSE_IDLE),
+                                    answering_probe(),
+                                )
+                                .await;
                         }
                     }
                     #[cfg(unix)]
                     Ok(Local_::Unix(sock)) => {
                         if let Ok(stream) = pending.accept().await {
-                            let _ = stream.pump(sock).await;
+                            let _ = stream
+                                .pump_answering(
+                                    sock,
+                                    Some(DEFAULT_HALF_CLOSE_IDLE),
+                                    answering_probe(),
+                                )
+                                .await;
                         }
                     }
                     Err(e) => {

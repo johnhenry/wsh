@@ -167,7 +167,9 @@ struct Cli {
     max_operators: u64,
 
     /// Reverse host (`wsh reverse`, `wsh agent run`): let an operator behind the relay use THIS machine's network, to the
-    /// destinations this rule names (`host`, `host:port`, `10.0.0.0/8:5432`, `*`). Repeatable. OFF without it, and then the host does not
+    /// destinations this rule names (`host`, `host:port`, `10.0.0.0/8:5432`, `*`). Repeatable. A rule written `FINGERPRINT=RULE` (at least
+    /// 8 hex digits of the operator's fingerprint, one of those `--allow-operator` lets in) is that operator's only; a rule without it is
+    /// every allowed operator's. An operator no rule reaches gets no gateway. OFF without it, and then the host does not
     /// say `relay-gateway`. Needs `--capability gateway`. Nothing is reachable that no rule names, and no loopback, private or
     /// otherwise non-public address unless a rule names it. Only on a relay that carries it (`relay-gateway`).
     #[arg(long = "relay-gateway-allow", global = true, value_name = "RULE", action = clap::ArgAction::Append)]
@@ -186,6 +188,18 @@ struct Cli {
     #[arg(long = "relay-gateway-listen", global = true)]
     relay_gateway_listen: bool,
 
+    /// Reverse host: `--relay-gateway-udp` for this operator only (at least 8 hex digits of its fingerprint; repeatable).
+    #[arg(long = "relay-gateway-udp-for", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
+    relay_gateway_udp_for: Vec<String>,
+
+    /// Reverse host: `--relay-gateway-dns` for this operator only (repeatable).
+    #[arg(long = "relay-gateway-dns-for", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
+    relay_gateway_dns_for: Vec<String>,
+
+    /// Reverse host: `--relay-gateway-listen` for this operator only (repeatable).
+    #[arg(long = "relay-gateway-listen-for", global = true, value_name = "FINGERPRINT", action = clap::ArgAction::Append)]
+    relay_gateway_listen_for: Vec<String>,
+
     /// Reverse host: with `--relay-gateway-allow` and without `--require-operator-proof`, say that you trust the relay's word about who
     /// is asking (it can stamp an accepted operator's identity on a request, and then open what that operator could). Several operators
     /// at once (`--max-operators` above 1) cannot seal their bridges, so they always need this.
@@ -195,6 +209,17 @@ struct Cli {
     /// Reverse host: connections (TCP, UDP flows, listeners) one operator may hold open at once (default 32, at most 1024).
     #[arg(long = "relay-gateway-max-connections", global = true, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1024))]
     relay_gateway_max_connections: u64,
+
+    /// Do not watch the ANSWERING socket of a gateway connection for a vanished peer (wsh #286): a reverse host's origin, a `-R`'s local
+    /// service. With `gateway-lossless-close` negotiated they are watched once half-closed (a vanished one releases the connection, one that
+    /// sent its whole answer and closed loses nothing); this keeps them unwatched, as before the feature.
+    #[arg(long = "no-half-close-probe-answers", global = true)]
+    no_half_close_probe_answers: bool,
+
+    /// Reverse host: do not state `gateway-lossless-close` (wsh #286), nor acknowledge an operator's; its operators' gateway connections
+    /// then behave as they did before the feature.
+    #[arg(long = "no-lossless-close", global = true)]
+    no_lossless_close: bool,
 
     /// `wsh reverse-connect`: always offer to prove this operator's identity to the peer (needed
     /// for a peer that does not advertise `operator-proof`, such as a JS host).
@@ -643,8 +668,13 @@ async fn main() {
         relay_gateway_udp: cli.relay_gateway_udp,
         relay_gateway_dns: cli.relay_gateway_dns,
         relay_gateway_listen: cli.relay_gateway_listen,
+        relay_gateway_udp_for: cli.relay_gateway_udp_for.clone(),
+        relay_gateway_dns_for: cli.relay_gateway_dns_for.clone(),
+        relay_gateway_listen_for: cli.relay_gateway_listen_for.clone(),
         relay_gateway_trust_relay: cli.relay_gateway_trust_relay,
         relay_gateway_max_connections: cli.relay_gateway_max_connections as usize,
+        no_probe_answers: cli.no_half_close_probe_answers,
+        no_lossless_close: cli.no_lossless_close,
         operator_proof: if cli.operator_proof {
             commands::common::OperatorProofMode::Always
         } else if cli.no_operator_proof {

@@ -60,7 +60,7 @@ import {
   GATEWAY_FAIL, gatewayFeatures, createGatewayCore, normalizeGatewayLimits, normalizeEndpoints,
 } from './gateway-core.mjs';
 import { DEFAULT_HALF_CLOSE_PROBE_MS } from '../gateway-channel.mjs';
-import { watchHalfClosed } from '../half-close-watch.mjs';
+import { watchHalfClosed, answeringKeepAliveMs } from '../half-close-watch.mjs';
 import { parseCidr, parseIp } from './address-guard.mjs';
 import { checkAddress, resolveChecked, dialChecked, dialUdpChecked, AddressGuardError } from '../address-guard.mjs';
 import { normalizeReverse, reversePortAllowed, reversePortRefusal, reverseBindAddress } from './reverse-policy.mjs';
@@ -276,7 +276,7 @@ export function normalizeGateway(opts) {
     if (!c) throw new TypeError(`gateway.allowPrivate: ${JSON.stringify(r)} is not an address or CIDR block`);
     return c;
   });
-  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs } = normalizeGatewayLimits(opts);
+  const { maxConnections, maxBufferedBytes, maxClientBufferedBytes, halfCloseIdleMs, halfCloseProbeMs, losslessClose, halfCloseProbeAnswers, halfCloseProbeRemoteMs } = normalizeGatewayLimits(opts);
   let unix = null;
   if (opts.unix !== undefined && opts.unix !== null && opts.unix !== false) {
     if (opts.unix === true || typeof opts.unix !== 'object') throw new TypeError('gateway.unix needs explicit paths (default deny): { connect: [...], listen: [...] }');
@@ -292,6 +292,9 @@ export function normalizeGateway(opts) {
     maxClientBufferedBytes,
     halfCloseIdleMs,
     halfCloseProbeMs,
+    losslessClose,
+    halfCloseProbeAnswers,
+    halfCloseProbeRemoteMs,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     udpIdleMs: opts.udpIdleMs ?? DEFAULT_UDP_IDLE_MS,
     // `udp: false` turns UDP OFF (on the Node path too: it used to throw "must be an options object"); `true` or the bounds turn it on with them.
@@ -450,7 +453,9 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     // credit and for the transport), so a client that stops reading stops the origin instead of filling memory here.
     sock.on('data', (d) => {
       sock.pause();
-      tail = channel.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => { sock.destroy(); });
+      // A write that fails after the peer RELEASED the connection (#286) drops what the socket sends now (it reads nothing more) and leaves the
+      // socket paused: destroying it would drop the tail the peer sent, which is still being written. Any other failed write ends it.
+      tail = channel.write(new Uint8Array(d.buffer, d.byteOffset, d.length)).then(() => { if (!sock.destroyed) sock.resume(); }, () => { if (!channel.peerReleased) sock.destroy(); });
     });
     sock.on('error', (e) => log(`gateway ${id}: ${e.message}`));
     // The origin finished sending (its FIN): half-close towards the client once everything it sent has gone out, and keep
@@ -466,9 +471,24 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     // yet read, so it would cut the tail of the answer off.
     // (A socket of an injected network has no kernel to ask: its owner closes the stream when its peer is gone.)
     if (watchPeer && !sock.isStreamSocket) watchHalfClosed(sock, cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS, (e) => log(`gateway ${id}: ${e.message}`));
+    // ... unless BOTH ends stated `gateway-lossless-close` (#286): then the close that follows is `released`, which loses nothing (the client delivers
+    // what it has already received and then ends), so an origin that finished sending and vanished is noticed too, and a server that sent its whole
+    // answer, half-closed and closed completely (HTTP/1.0, `Connection: close`) loses no byte of it. `halfCloseProbeAnswers: false` turns this off.
+    let originGone = false;
+    let answering = false;
+    if (!watchPeer && !sock.isStreamSocket && channel.lossless && cfg.halfCloseProbeAnswers !== false && (cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS) > 0) {
+      answering = true;
+      const probe = cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS;
+      watchHalfClosed(sock, probe, (e) => { originGone = true; log(`gateway ${id}: ${e.message}`); }, answeringKeepAliveMs(sock, probe, cfg.halfCloseProbeRemoteMs));
+    }
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
-    sock.on('close', () => { void tail.finally(() => channel.destroy()); });
+    // The probe is not the only way the end of a watched answering origin is seen: a write that fails (the client's request body, still uploading, into an
+    // origin that has been reset: an 'error', then 'close'). The probe is skipped while a write is queued, so either may be first, and the verdict must not
+    // depend on which: an origin that sent its WHOLE answer (its end of file was read) is released, not discarded, because a second close of "discarded" makes
+    // the client drop what it has received and not yet read. A failure BEFORE the end of file (a reset included) is not a complete answer, and `released`
+    // would make a cut answer look like a finished one to the caller: it stays a discard, an error end.
+    sock.on('close', () => { void tail.finally(() => (originGone || (answering && sock.readableEnded) ? channel.release() : channel.destroy())); });
     return channel;
   }
 
@@ -981,6 +1001,20 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       closed = true;
       core.close();
       for (const ac of aborts) ac.abort(); // a connect or lookup still in flight on an injected network
+      aborts.clear();
+      for (const { sock, timer } of inbound.values()) { clearTimeout(timer); sock.destroy(); }
+      inbound.clear();
+      for (const id of [...listeners.keys()]) void closeListener(id).catch(() => {});
+    },
+    /**
+     * #297: the grant behind this connection expired. Every open connection of every kind (TCP, unix, UDP, endpoint, an accepted
+     * inbound one) is ended with `reason`, the listeners stop (nothing more is accepted for a grant that is over), and a connect or lookup still in
+     * flight on an injected network is told to stop.
+     */
+    endAll(reason) {
+      if (closed) return;
+      core.endAll(reason);
+      for (const ac of aborts) ac.abort();
       aborts.clear();
       for (const { sock, timer } of inbound.values()) { clearTimeout(timer); sock.destroy(); }
       inbound.clear();

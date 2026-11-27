@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use wsh_core::gateway::policy::{GatewayPolicy, GatewayPolicyEnforcer};
 use wsh_core::gateway::GatewaySession;
-use wsh_core::gateway_credit::GATEWAY_CREDIT_FEATURE;
+use wsh_core::gateway_credit::{GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE};
 use wsh_core::messages::*;
 
 /// `GatewayFail.code` of a request the policy refuses.
@@ -36,6 +36,52 @@ pub struct RelayGateway {
     pub listen: bool,
     /// Connections (TCP, UDP flows, listeners) one operator may hold open at once.
     pub max_connections: usize,
+    /// Rules and switches scoped to an operator (wsh #296): `--relay-gateway-allow FINGERPRINT=RULE`, `--relay-gateway-udp-for`,
+    /// `-dns-for`, `-listen-for`. They ADD to what is unscoped (`allow`, `udp`, `dns`, `listen`, which are every operator's). Empty = one
+    /// list for every operator, as before.
+    pub operators: Vec<OperatorGrant>,
+}
+
+/// What is granted to the operators whose fingerprint starts with `operator` (wsh #296).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorGrant {
+    /// At least 8 lowercase hex digits of the fingerprint, as `--allow-operator` takes them.
+    pub operator: String,
+    /// Destination rules for these operators only.
+    pub allow: Vec<String>,
+    /// These operators may also open UDP flows / look names up / listen.
+    pub udp: bool,
+    pub dns: bool,
+    pub listen: bool,
+}
+
+/// At least 8 hex digits, as `--allow-operator` takes an operator.
+pub fn is_operator_scope(s: &str) -> bool {
+    s.len() >= 8 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+impl RelayGateway {
+    /// What the operator whose fingerprint is `fingerprint` gets, or `None` when nothing is granted to it: the unscoped rules and
+    /// switches plus those of every grant whose scope is a prefix of the fingerprint. An operator with no rule at all (none scoped to it,
+    /// none unscoped) has no gateway: its requests are refused. The result has no `operators` of its own.
+    pub fn for_operator(&self, fingerprint: &str) -> Option<RelayGateway> {
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        let mut own = RelayGateway {
+            operators: Vec::new(),
+            ..self.clone()
+        };
+        for g in self
+            .operators
+            .iter()
+            .filter(|g| fingerprint.starts_with(g.operator.as_str()))
+        {
+            own.allow.extend(g.allow.iter().cloned());
+            own.udp |= g.udp;
+            own.dns |= g.dns;
+            own.listen |= g.listen;
+        }
+        (!own.allow.is_empty()).then_some(own)
+    }
 }
 
 impl RelayGateway {
@@ -45,24 +91,38 @@ impl RelayGateway {
             allowed_destinations: self.allow.clone(),
             max_connections: self.max_connections,
             enable_reverse_tunnels: self.listen,
+            // `--no-half-close-probe-answers` turns the answering-side watch off (wsh #286); the feature is still stated.
+            half_close_probe_answers: !crate::commands::common::identity_policy().no_probe_answers,
             ..GatewayPolicy::default()
         }
     }
 
     /// Check what the command line gave: at least one rule, each of which parses, and a sane bound.
     pub fn validate(&self) -> Result<(), String> {
-        if self.allow.is_empty() {
+        if self.allow.is_empty() && self.operators.iter().all(|g| g.allow.is_empty()) {
             return Err(
                 "the relay gateway needs at least one --relay-gateway-allow rule (default deny)"
                     .into(),
             );
+        }
+        for g in &self.operators {
+            if !is_operator_scope(&g.operator) {
+                return Err(format!(
+                    "--relay-gateway-allow takes FINGERPRINT=RULE with at least 8 hex digits of the fingerprint, got `{}`",
+                    g.operator
+                ));
+            }
         }
         if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS_LIMIT {
             return Err(format!(
                 "--relay-gateway-max-connections must be between 1 and {MAX_CONNECTIONS_LIMIT}"
             ));
         }
-        for rule in &self.allow {
+        for rule in self
+            .allow
+            .iter()
+            .chain(self.operators.iter().flat_map(|g| g.allow.iter()))
+        {
             // The enforcer ignores a rule it cannot parse (which only narrows the policy); a typo should not do so silently.
             if wsh_core::gateway::policy::parse_rule_check(rule).is_err() {
                 return Err(format!(
@@ -98,7 +158,11 @@ impl Drop for OperatorGateway {
 impl OperatorGateway {
     /// A session for one bridged operator; what it says goes to `link`. Every connection is metered (`relay-gateway` implies
     /// `gateway-credit`), whatever the operator listed.
-    pub fn new<L: GatewayLink>(gateway: &RelayGateway, link: L) -> Self {
+    ///
+    /// `operator_lossless`: the operator stated `gateway-lossless-close` in its `ReverseConnect` (wsh #286). The host states it in its
+    /// `ReverseAccept` whenever it has a gateway, so both ends have then: the origins this operator's connections dial are watched
+    /// once half-closed, and one that vanished releases its connection instead of waiting for the idle bound.
+    pub fn new<L: GatewayLink>(gateway: &RelayGateway, link: L, operator_lossless: bool) -> Self {
         let policy = Arc::new(GatewayPolicyEnforcer::new(gateway.policy()));
         // Bounded: a relay link that does not take what the gateway has to say slows the connections down, not the memory up.
         let (tx, mut rx) = mpsc::channel::<Envelope>(64);
@@ -115,7 +179,9 @@ impl OperatorGateway {
                 policy,
                 tx.clone(),
                 true,
-                &[GATEWAY_CREDIT_FEATURE.to_string()],
+                &std::iter::once(GATEWAY_CREDIT_FEATURE.to_string())
+                    .chain(operator_lossless.then(|| GATEWAY_LOSSLESS_FEATURE.to_string()))
+                    .collect::<Vec<_>>(),
             ),
             udp: gateway.udp,
             dns: gateway.dns,
@@ -161,7 +227,127 @@ mod tests {
             dns: false,
             listen: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            operators: Vec::new(),
         }
+    }
+
+    const OP_A: &str = "aaaaaaaa11112222";
+    const OP_B: &str = "bbbbbbbb33334444";
+    const OP_C: &str = "cccccccc55556666";
+
+    fn grant(operator: &str, rules: &[&str]) -> OperatorGrant {
+        OperatorGrant {
+            operator: operator.into(),
+            allow: rules.iter().map(|r| r.to_string()).collect(),
+            udp: false,
+            dns: false,
+            listen: false,
+        }
+    }
+
+    /// Per operator (wsh #296): the rules scoped to an operator are its own, an unscoped rule is every operator's, and an operator with
+    /// neither gets no gateway at all.
+    #[test]
+    fn an_operator_gets_the_unscoped_rules_and_its_own_and_not_another_operators() {
+        let mut g = gateway(&["shared.example.com"]);
+        g.operators = vec![
+            grant("aaaaaaaa", &["a.example.com:1"]),
+            grant("bbbbbbbb", &["b.example.com:2"]),
+        ];
+        assert_eq!(
+            g.for_operator(OP_A).unwrap().allow,
+            ["shared.example.com", "a.example.com:1"]
+        );
+        assert_eq!(
+            g.for_operator(OP_B).unwrap().allow,
+            ["shared.example.com", "b.example.com:2"]
+        );
+        assert_eq!(
+            g.for_operator(OP_C).unwrap().allow,
+            ["shared.example.com"],
+            "an operator no rule is scoped to gets what is unscoped (every operator's)"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_only_host_is_unchanged_for_every_operator() {
+        let g = gateway(&["db.example.com:5432"]);
+        for op in [OP_A, OP_B, OP_C] {
+            assert_eq!(g.for_operator(op), Some(g.clone()));
+        }
+    }
+
+    #[test]
+    fn an_operator_with_no_rule_and_no_unscoped_rule_gets_nothing() {
+        let mut g = gateway(&[]);
+        g.operators = vec![grant("aaaaaaaa", &["a.example.com:1"])];
+        assert!(g.for_operator(OP_A).is_some());
+        assert!(g.for_operator(OP_B).is_none());
+        assert!(g.for_operator("").is_none());
+    }
+
+    #[test]
+    fn a_switch_scoped_to_an_operator_is_that_operators_only() {
+        let mut g = gateway(&["*"]);
+        let mut a = grant("aaaaaaaa", &[]);
+        a.udp = true;
+        a.dns = true;
+        a.listen = true;
+        g.operators = vec![a];
+        let for_a = g.for_operator(OP_A).unwrap();
+        assert!(for_a.udp && for_a.dns && for_a.listen);
+        let for_b = g.for_operator(OP_B).unwrap();
+        assert!(!for_b.udp && !for_b.dns && !for_b.listen);
+        // and an unscoped switch is everyone's
+        g.udp = true;
+        assert!(g.for_operator(OP_B).unwrap().udp);
+    }
+
+    #[test]
+    fn a_scope_is_a_prefix_of_the_fingerprint_and_a_longer_one_adds_to_a_shorter() {
+        let mut g = gateway(&[]);
+        g.operators = vec![
+            grant("aaaaaaaa", &["short.example.com"]),
+            grant("aaaaaaaa1111", &["long.example.com"]),
+            grant("aaaaaaaa9999", &["other.example.com"]),
+        ];
+        assert_eq!(
+            g.for_operator(OP_A).unwrap().allow,
+            ["short.example.com", "long.example.com"]
+        );
+    }
+
+    #[test]
+    fn a_scoped_rule_must_parse_and_a_scope_must_be_a_fingerprint() {
+        let mut g = gateway(&["*"]);
+        g.operators = vec![grant("aaaaaaaa", &["10.0.0.0/33"])];
+        assert!(g.validate().is_err());
+        g.operators = vec![grant("aaaa", &["x.example.com"])];
+        assert!(g.validate().is_err(), "fewer than 8 digits");
+        g.operators = vec![grant("aaaaaaaz", &["x.example.com"])];
+        assert!(g.validate().is_err(), "not hex");
+        g.operators = vec![grant("aaaaaaaa", &["x.example.com"])];
+        assert!(g.validate().is_ok());
+        // only scoped rules is a gateway too
+        let mut only = gateway(&[]);
+        only.operators = vec![grant("aaaaaaaa", &["x.example.com"])];
+        assert!(only.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn operator_a_reaches_what_its_rules_name_and_not_what_bs_name() {
+        let mut g = gateway(&[]);
+        g.operators = vec![
+            grant("aaaaaaaa", &["a.invalid:9"]),
+            grant("bbbbbbbb", &["b.invalid:9"]),
+        ];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let a = OperatorGateway::new(&g.for_operator(OP_A).unwrap(), Sink(tx), false);
+        // B's destination is not on A's list: refused by the policy, nothing dialled
+        a.handle(open_tcp(1, "b.invalid")).await;
+        let f = fail_of(&mut rx).await;
+        assert_eq!((f.gateway_id, f.code), (1, FAIL_POLICY));
+        assert_eq!(a.open_connections(), 0);
     }
 
     #[test]
@@ -246,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn udp_and_name_resolution_are_refused_unless_turned_on() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx));
+        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx), false);
         g.handle(open_udp(1)).await;
         let f = fail_of(&mut rx).await;
         assert_eq!((f.gateway_id, f.code), (1, FAIL_POLICY));
@@ -284,6 +470,7 @@ mod tests {
                 gate: gate.clone(),
                 out,
             },
+            false,
         );
         // three answers (refusals) pile up behind a link that is not taking anything
         for id in 1..=3 {
@@ -306,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn a_destination_no_rule_names_is_refused_by_the_policy() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let g = OperatorGateway::new(&gateway(&["db.example.com:5432"]), Sink(tx));
+        let g = OperatorGateway::new(&gateway(&["db.example.com:5432"]), Sink(tx), false);
         g.handle(open_tcp(7, "other.example.com")).await;
         let f = fail_of(&mut rx).await;
         assert_eq!((f.gateway_id, f.code), (7, FAIL_POLICY));
@@ -316,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn a_loopback_address_is_refused_even_under_the_wildcard() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx));
+        let g = OperatorGateway::new(&gateway(&["*"]), Sink(tx), false);
         g.handle(open_tcp(8, "127.0.0.1")).await;
         let f = fail_of(&mut rx).await;
         assert_eq!((f.gateway_id, f.code), (8, FAIL_POLICY));

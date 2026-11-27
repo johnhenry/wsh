@@ -50,7 +50,8 @@ use wsh_core::peer_watch::PeerWatch;
 
 use wsh_core::gateway_credit::SendCredit;
 pub use wsh_core::gateway_credit::{
-    GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED,
+    GATEWAY_CREDIT_FEATURE, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED, GATEWAY_EXPIRED,
+    GATEWAY_LOSSLESS_FEATURE, GATEWAY_RELEASED,
 };
 use wsh_core::gateway_datagram::{
     decode_datagram, encode_datagram, DATAGRAM_HEADER_BYTES, GATEWAY_DATAGRAM_FEATURE,
@@ -194,6 +195,20 @@ fn close_msg(gateway_id: u32, reason: Option<&str>) -> Envelope {
     }
 }
 
+/// The watch of an answering socket, or none: each costs one extra descriptor (the connection's socket is split between the read and write halves, so
+/// the watch holds a duplicate); one that cannot be had (a descriptor limit) is logged once, and the connection is served unwatched as before.
+fn answering_peer_watch(made: std::io::Result<PeerWatch>) -> Option<PeerWatch> {
+    match made {
+        Ok(w) => Some(w),
+        Err(e) => {
+            if wsh_core::peer_watch::note_watch_failed() {
+                warn!(error = %e, "could not watch an answering socket for a vanished peer (a descriptor limit?); such connections are served unwatched");
+            }
+            None
+        }
+    }
+}
+
 enum WriteCmd {
     Data(Vec<u8>),
     Shutdown,
@@ -218,6 +233,8 @@ struct Chan {
     remote_closed: AtomicBool,
     /// The origin's write side has been shut (the client's GatewayClose, passed on).
     write_shut: AtomicBool,
+    /// The origin's end of file has been read: it sent its whole answer.
+    origin_eof: AtomicBool,
     /// A UDP flow: it has no half-close, the client's GatewayClose ends it.
     is_udp: AtomicBool,
     /// The half-closed idle watcher is running.
@@ -296,6 +313,12 @@ struct Inner {
     /// While a reverse listener's caller is half-closed, wait for the kernel's hang-up of it and
     /// give a TCP socket keep-alive on this schedule (`None` = no watch). See [`PeerWatch`].
     half_close_probe: Option<Duration>,
+    /// The keep-alive schedule of a half-closed ANSWERING TCP socket on another machine (wsh #286; zero = the same as `half_close_probe`).
+    half_close_probe_remote: Duration,
+    /// Both ends stated `gateway-lossless-close` (wsh #286): a connection may be released, and a close with the reason `released` is understood.
+    lossless: bool,
+    /// Also watch the ANSWERING socket (an origin the host dialled) once it is half-closed, when `lossless` (`[gateway] half_close_probe_answers`).
+    probe_answers: bool,
     /// Bytes received from this client for its origins and not yet taken.
     budget: AtomicUsize,
     conns: Mutex<HashMap<u32, Arc<Chan>>>,
@@ -317,6 +340,11 @@ struct Inner {
     /// The flows that take datagrams from the client, by gateway_id.
     udp_datagram_flows: Mutex<HashMap<u32, UdpFlowHandle>>,
     closed: AtomicBool,
+    /// The grant behind this connection ran out (wsh #297): the reason connections and listeners were ended with. What a connect
+    /// still in flight at that moment opens is ended as soon as it is there.
+    expired: Mutex<Option<String>>,
+    /// The one timer of the grant (see [`GatewaySession::end_after`]).
+    expiry_timer: Mutex<Option<AbortHandle>>,
 }
 
 /// The gateway of one client connection. Dropping it closes everything it opened.
@@ -356,6 +384,13 @@ impl GatewaySession {
         let (max_conn_bytes, max_client_bytes) = policy.buffer_limits();
         let policy_idle = policy.half_close_idle();
         let policy_probe = policy.half_close_probe();
+        let policy_probe_remote = policy.half_close_probe_remote();
+        let lossless = enabled
+            && policy.lossless_close()
+            && client_features
+                .iter()
+                .any(|f| f == GATEWAY_LOSSLESS_FEATURE);
+        let probe_answers = policy.half_close_probe_answers();
         let credit = enabled && client_features.iter().any(|f| f == GATEWAY_CREDIT_FEATURE);
         let peer_datagrams = client_features
             .iter()
@@ -379,6 +414,9 @@ impl GatewaySession {
                 max_client_bytes,
                 half_close_idle: policy_idle,
                 half_close_probe: policy_probe,
+                half_close_probe_remote: policy_probe_remote,
+                lossless,
+                probe_answers,
                 budget: AtomicUsize::new(0),
                 conns: Mutex::new(HashMap::new()),
                 reserved: Mutex::new(HashSet::new()),
@@ -387,6 +425,8 @@ impl GatewaySession {
                 listeners: Mutex::new(HashMap::new()),
                 pending_listeners: Mutex::new(HashSet::new()),
                 closed: AtomicBool::new(false),
+                expired: Mutex::new(None),
+                expiry_timer: Mutex::new(None),
             }),
         }
     }
@@ -442,6 +482,34 @@ impl GatewaySession {
     /// Bytes received from the client and not yet taken by an origin.
     pub fn buffered_bytes(&self) -> usize {
         self.inner.budget.load(Ordering::Acquire)
+    }
+
+    /// The grant behind this connection has run out (wsh #297): end every open connection (TCP, unix socket, UDP flow, one a
+    /// reverse listener accepted) with `reason`, stop the listeners, and end whatever a connect still in flight opens. Each
+    /// connection's peer is told `GatewayClose` with `reason` and then, as a side that has lost its reader does, once more with
+    /// "discarded": a peer that knows that frees the connection at once, and one that predates it sees the first as an ordinary
+    /// half-close and ignores the second. What is queued for the peer is not waited for; an expiry is a cut.
+    pub fn end_all(&self, reason: &str) {
+        self.inner.end_all(reason);
+    }
+
+    /// Arm the ONE timer of this connection's grant: after `after`, [`GatewaySession::end_all`] runs with `reason`. The first call
+    /// decides; asking again (the caller asks once per request that opens something) does nothing, so a connection holds one timer
+    /// however many connections it opens, and none per connection. Dropping the session cancels it.
+    pub fn end_after(&self, after: Duration, reason: &str) {
+        let mut timer = self.inner.expiry_timer.lock().expect("expiry timer");
+        if timer.is_some() || self.inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let reason = reason.to_string();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            if let Some(inner) = weak.upgrade() {
+                inner.end_all(&reason);
+            }
+        });
+        *timer = Some(handle.abort_handle());
     }
 
     /// Handle one gateway message. Answers go out through the connection's outbound queue, never
@@ -582,7 +650,13 @@ impl Inner {
             let result = open(inner.clone(), id, guard).await;
             inner.reserved.lock().expect("reserved").remove(&id);
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    // A connect that finished behind the expiry of the grant does not outlive it.
+                    let expired = inner.expired.lock().expect("expired").clone();
+                    if let Some(reason) = expired {
+                        inner.end_all(&reason);
+                    }
+                }
                 Err((code, message)) => inner.send(fail(id, code, &message)).await,
             }
         });
@@ -613,10 +687,15 @@ impl Inner {
         info!(gateway_id = id, addr = %format!("{host}:{port}"), "TCP connection established");
         // Register the connection BEFORE the client hears GatewayOk, and send nothing from the
         // origin before the Ok is queued.
-        // An origin is not watched for a peer that went away after its end of file (wsh #282): an origin that
-        // finished and then closed completely is the ordinary end of a response, and the client may still be
-        // reading what it sent; the discard would drop that. Only the callers of a reverse listener are watched.
-        let ready = self.attach_stream(id, Box::new(stream), guard, None);
+        // An origin is watched for a peer that went away after its end of file only where both ends stated
+        // `gateway-lossless-close` (wsh #286): an origin that finished and then closed completely is the ordinary end of a response, and
+        // the client may still be reading what it sent. The close is then `released`, which drops nothing the client has received; a
+        // `discarded` close would. Without the feature (wsh #282) only the callers of a reverse listener are watched.
+        let watch = self
+            .answering_watch()
+            .then(|| answering_peer_watch(PeerWatch::tcp(&stream)))
+            .flatten();
+        let ready = self.attach_stream(id, Box::new(stream), guard, watch, true);
         self.send(ok(id, Some(resolved))).await;
         ready.notify_one();
         Ok(())
@@ -653,13 +732,15 @@ impl Inner {
                     Ok(Some(_)) => {}
                     Err(e) => return Err((FAIL_UNREACHABLE, e.to_string())),
                 }
-                connect_unix_path(path).await?
+                connect_unix_path(path, self.answering_watch()).await?
             }
-            UnixTarget::Abstract(name) => connect_unix_abstract(name).await?,
+            UnixTarget::Abstract(name) => {
+                connect_unix_abstract(name, self.answering_watch()).await?
+            }
         };
         info!(gateway_id = id, path = %requested.chars().take(200).collect::<String>(), "unix connection established");
         let (stream, watch) = stream;
-        let ready = self.attach_stream(id, stream, guard, watch);
+        let ready = self.attach_stream(id, stream, guard, watch, true);
         self.send(ok(id, None)).await;
         ready.notify_one();
         Ok(())
@@ -726,6 +807,7 @@ impl Inner {
             sent_close: AtomicBool::new(false),
             remote_closed: AtomicBool::new(false),
             write_shut: AtomicBool::new(false),
+            origin_eof: AtomicBool::new(false),
             is_udp: AtomicBool::new(false),
             idle_armed: AtomicBool::new(false),
             born: std::time::Instant::now(),
@@ -746,6 +828,7 @@ impl Inner {
         stream: BoxStream,
         guard: ConnectionGuard,
         watch: Option<PeerWatch>,
+        answering: bool,
     ) -> Arc<Notify> {
         let (chan, write_rx) = self.new_chan(id, guard);
         let (rd, wr) = tokio::io::split(stream);
@@ -764,16 +847,17 @@ impl Inner {
         let writer = {
             let inner = self.clone();
             let chan = chan.clone();
-            tokio::spawn(async move { inner.write_loop(chan, wr, write_rx).await })
+            tokio::spawn(async move { inner.write_loop(chan, wr, write_rx, answering).await })
         };
         let mut tasks = vec![reader.abort_handle(), writer.abort_handle()];
         if let (Some(watch), Some(every)) = (watch, self.half_close_probe) {
             let inner = self.clone();
             let chan = chan.clone();
-            let watcher =
-                tokio::spawn(
-                    async move { inner.watch_half_closed(chan, watch, every, eof_rx).await },
-                );
+            let watcher = tokio::spawn(async move {
+                inner
+                    .watch_half_closed(chan, watch, every, eof_rx, answering)
+                    .await
+            });
             tasks.push(watcher.abort_handle());
         }
         chan.tasks.lock().expect("tasks").extend(tasks);
@@ -787,9 +871,11 @@ impl Inner {
     /// socket; for TCP once a short keep-alive schedule, applied only now, has the peer's kernel
     /// answer with a reset) and end the connection as a destroyed one: the client is told
     /// `GatewayClose` "discarded" (the caller reads nothing more, so what the client's service
-    /// still sends is wanted by nobody). Nothing is ever written to the caller. Only callers are
-    /// watched, never an origin the host dialled: an origin that finished and then closed
-    /// completely is the ordinary end of a response, and the client may still be reading it.
+    /// still sends is wanted by nobody). Nothing is ever written to the caller. An origin the host
+    /// dialled (`answering`) is watched only where both ends stated `gateway-lossless-close` (wsh
+    /// #286): one that finished and then closed completely is the ordinary end of a response, and
+    /// the client may still be reading it, so its connection is RELEASED (the client keeps and
+    /// delivers what it has received) and not discarded.
     /// The task is one of the connection's tasks: ended with it.
     async fn watch_half_closed(
         self: Arc<Self>,
@@ -797,17 +883,37 @@ impl Inner {
         watch: PeerWatch,
         every: Duration,
         eof: oneshot::Receiver<()>,
+        answering: bool,
     ) {
         if eof.await.is_err() {
             return; // the origin never half-closed (the read loop ended another way)
         }
-        watch.arm(every);
+        if answering {
+            // An origin on another machine gets the longer keep-alive schedule (wsh #286): a live one behind a short partition is not released.
+            watch.arm_answering(every, self.half_close_probe_remote);
+        } else {
+            watch.arm(every);
+        }
         watch.gone().await;
-        debug!(
-            gateway_id = chan.id,
-            "a caller that had half-closed went away"
-        );
-        self.destroy(&chan, None);
+        if answering {
+            debug!(
+                gateway_id = chan.id,
+                "an origin that had half-closed went away: releasing the connection"
+            );
+            self.release(&chan);
+        } else {
+            debug!(
+                gateway_id = chan.id,
+                "a caller that had half-closed went away"
+            );
+            self.destroy(&chan, None);
+        }
+    }
+
+    /// Watch an answering socket (an origin the host dialled) for a vanished peer? Only with `gateway-lossless-close` negotiated and the
+    /// probe on (wsh #286).
+    fn answering_watch(&self) -> bool {
+        self.lossless && self.probe_answers && self.half_close_probe.is_some()
     }
 
     /// Origin -> client, one chunk at a time: the origin is read only while credit is held.
@@ -823,6 +929,7 @@ impl Inner {
             let n = match rd.read(&mut buf).await {
                 Ok(0) => {
                     eof = true;
+                    chan.origin_eof.store(true, Ordering::Release);
                     break;
                 }
                 Err(_) => break,
@@ -844,7 +951,8 @@ impl Inner {
             }
         }
         if !eof || chan.finished.load(Ordering::Acquire) {
-            // The origin failed (or the client is gone): the connection is over.
+            // The origin failed before its end of file (a reset included), or the client is gone: the connection is over, as an error. The answer
+            // is not known to be complete, so it is not released (that would make a cut answer look like a finished one to the caller).
             self.destroy(&chan, None);
             return;
         }
@@ -895,13 +1003,26 @@ impl Inner {
         chan: Arc<Chan>,
         mut wr: tokio::io::WriteHalf<BoxStream>,
         mut rx: mpsc::UnboundedReceiver<WriteCmd>,
+        answering: bool,
     ) {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 WriteCmd::Data(data) => {
                     let n = data.len();
                     if wr.write_all(&data).await.is_err() {
-                        self.destroy(&chan, Some("write failed"));
+                        // The watch is not the only way the end of an answering origin is seen: a write that fails (the client's bytes, still
+                        // arriving, into an origin that has finished and gone) ends it too, and which is first is not up to us. An origin whose
+                        // end of file was read sent its WHOLE answer, so it is released either way: a second close of `discarded` would make the
+                        // client drop what it has received and not yet read. A failure before the end of file (a reset included) is not a complete
+                        // answer, and `released` would make a cut answer look like a finished one: it stays a discard.
+                        if answering
+                            && self.answering_watch()
+                            && chan.origin_eof.load(Ordering::Acquire)
+                        {
+                            self.release(&chan);
+                        } else {
+                            self.destroy(&chan, Some("write failed"));
+                        }
                         return;
                     }
                     self.consumed(&chan, n).await;
@@ -1111,6 +1232,17 @@ impl Inner {
 
     /// Tear a connection down: tell the client (once), stop the tasks, give the slot back.
     fn destroy(self: &Arc<Self>, chan: &Arc<Chan>, reason: Option<&str>) {
+        self.end_conn(chan, reason, false);
+    }
+
+    /// The answering socket of a connection (an origin the host dialled) half-closed and went away (wsh #286): end the connection with
+    /// `GatewayClose` reason `released`, which makes the client deliver what it has already received and then finish, instead of
+    /// `discarded`, which makes it drop it. Only called where both ends stated `gateway-lossless-close`.
+    fn release(self: &Arc<Self>, chan: &Arc<Chan>) {
+        self.end_conn(chan, None, true);
+    }
+
+    fn end_conn(self: &Arc<Self>, chan: &Arc<Chan>, reason: Option<&str>, release: bool) {
         if chan.finished.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1122,7 +1254,9 @@ impl Inner {
         if !self.closed.load(Ordering::Acquire)
             && (!already || !chan.remote_closed.load(Ordering::Acquire))
         {
-            let said = if already {
+            let said = if release {
+                GATEWAY_RELEASED
+            } else if already {
                 GATEWAY_DISCARDED
             } else {
                 reason.unwrap_or(GATEWAY_DISCARDED)
@@ -1199,6 +1333,16 @@ impl Inner {
             if reason == Some(GATEWAY_DISCARDED) && !chan.sent_close.swap(true, Ordering::AcqRel) {
                 self.destroy(&chan, None);
             }
+            // A SECOND close saying "released" (wsh #286, both ends stated `gateway-lossless-close`): it reads nothing more and sends
+            // nothing more, but what it had sent is still delivered: nothing goes back, and the connection ends once what was queued
+            // for the origin is written (the writer ends it after the shutdown it already has, or here if that is done).
+            if reason == Some(GATEWAY_RELEASED)
+                && self.lossless
+                && !chan.sent_close.swap(true, Ordering::SeqCst)
+                && chan.write_shut.load(Ordering::SeqCst)
+            {
+                self.destroy(&chan, None);
+            }
             return;
         }
         if chan.is_udp.load(Ordering::Acquire) {
@@ -1207,8 +1351,9 @@ impl Inner {
             return;
         }
         chan.touch();
-        if reason == Some(GATEWAY_DISCARDED) {
-            // The client dropped the connection and reads nothing more: our side is over too, once
+        if reason == Some(GATEWAY_DISCARDED) || (reason == Some(GATEWAY_RELEASED) && self.lossless)
+        {
+            // The client dropped (or released) the connection and reads nothing more: our side is over too, once
             // what it had sent is written (the writer ends it after the shutdown); no close goes back.
             chan.sent_close.store(true, Ordering::SeqCst);
             let _ = chan.write_tx.send(WriteCmd::Shutdown);
@@ -1613,7 +1758,7 @@ impl Inner {
             return;
         };
         info!(channel_id, gateway_id, "inbound connection relay started");
-        let ready = self.attach_stream(gateway_id, pending.stream, guard, pending.watch);
+        let ready = self.attach_stream(gateway_id, pending.stream, guard, pending.watch, false);
         ready.notify_one();
     }
 
@@ -1636,10 +1781,77 @@ impl Inner {
         }
     }
 
+    /// The grant ran out (wsh #297; see [`GatewaySession::end_all`]).
+    fn end_all(self: &Arc<Self>, reason: &str) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        *self.expired.lock().expect("expired") = Some(reason.to_string());
+        let chans: Vec<Arc<Chan>> = self
+            .conns
+            .lock()
+            .expect("conns")
+            .values()
+            .cloned()
+            .collect();
+        for chan in chans {
+            if chan.finished.load(Ordering::Acquire) {
+                continue;
+            }
+            // The two closes go out in this order from one task (separate tasks could overtake each other); `destroy` then has
+            // nothing of its own to say, which it does not once the client's close is marked as received.
+            let mut said = Vec::new();
+            if !chan.sent_close.swap(true, Ordering::AcqRel) {
+                said.push(close_msg(chan.id, Some(reason)));
+            }
+            if !chan.remote_closed.load(Ordering::Acquire) {
+                said.push(close_msg(chan.id, Some(GATEWAY_DISCARDED)));
+            }
+            chan.remote_closed.store(true, Ordering::Release);
+            self.destroy(&chan, None);
+            if !said.is_empty() {
+                let inner = self.clone();
+                tokio::spawn(async move {
+                    for m in said {
+                        inner.send(m).await;
+                    }
+                });
+            }
+        }
+        self.drop_pending_and_listeners();
+    }
+
+    /// Unanswered inbound connections are dropped and the listeners stopped.
+    fn drop_pending_and_listeners(&self) {
+        let ids: Vec<u32> = self
+            .inbound
+            .lock()
+            .expect("inbound")
+            .keys()
+            .copied()
+            .collect();
+        for id in ids {
+            self.drop_pending(id);
+        }
+        let listeners: Vec<Listener> = self
+            .listeners
+            .lock()
+            .expect("listeners")
+            .drain()
+            .map(|(_, l)| l)
+            .collect();
+        for l in listeners {
+            self.stop_listener(l);
+        }
+    }
+
     /// The connection is gone: close everything silently.
     fn close_all(self: &Arc<Self>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if let Some(timer) = self.expiry_timer.lock().expect("expiry timer").take() {
+            timer.abort();
         }
         let chans: Vec<Arc<Chan>> = self
             .conns
@@ -1678,10 +1890,15 @@ impl Inner {
 // ── unix socket helpers ───────────────────────────────────────────────
 
 #[cfg(unix)]
-async fn connect_unix_path(path: &std::path::Path) -> Result<Origin, (u32, String)> {
+async fn connect_unix_path(path: &std::path::Path, watch: bool) -> Result<Origin, (u32, String)> {
     match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(path)).await {
-        // Not watched: see `open_tcp` (an origin that finished and closed completely is a normal end).
-        Ok(Ok(s)) => Ok((Box::new(s), None)),
+        // Watched only where the close that follows loses nothing: see `open_tcp`.
+        Ok(Ok(s)) => {
+            let watch = watch
+                .then(|| answering_peer_watch(PeerWatch::unix(&s)))
+                .flatten();
+            Ok((Box::new(s), watch))
+        }
         Ok(Err(e)) => Err((
             if e.kind() == std::io::ErrorKind::ConnectionRefused {
                 FAIL_REFUSED
@@ -1695,7 +1912,7 @@ async fn connect_unix_path(path: &std::path::Path) -> Result<Origin, (u32, Strin
 }
 
 #[cfg(not(unix))]
-async fn connect_unix_path(_path: &std::path::Path) -> Result<Origin, (u32, String)> {
+async fn connect_unix_path(_path: &std::path::Path, _watch: bool) -> Result<Origin, (u32, String)> {
     Err((
         FAIL_POLICY,
         "unix sockets are not available on this platform".into(),
@@ -1703,7 +1920,7 @@ async fn connect_unix_path(_path: &std::path::Path) -> Result<Origin, (u32, Stri
 }
 
 #[cfg(target_os = "linux")]
-async fn connect_unix_abstract(name: &str) -> Result<Origin, (u32, String)> {
+async fn connect_unix_abstract(name: &str, watch: bool) -> Result<Origin, (u32, String)> {
     use std::os::linux::net::SocketAddrExt;
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
         .map_err(|e| (FAIL_POLICY, e.to_string()))?;
@@ -1722,11 +1939,14 @@ async fn connect_unix_abstract(name: &str) -> Result<Origin, (u32, String)> {
         .map_err(|e| (FAIL_UNREACHABLE, e.to_string()))?;
     let s = tokio::net::UnixStream::from_std(std_stream)
         .map_err(|e| (FAIL_UNREACHABLE, e.to_string()))?;
-    Ok((Box::new(s), None))
+    let watch = watch
+        .then(|| answering_peer_watch(PeerWatch::unix(&s)))
+        .flatten();
+    Ok((Box::new(s), watch))
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn connect_unix_abstract(_name: &str) -> Result<Origin, (u32, String)> {
+async fn connect_unix_abstract(_name: &str, _watch: bool) -> Result<Origin, (u32, String)> {
     Err((
         FAIL_POLICY,
         "abstract unix sockets exist only on Linux".into(),

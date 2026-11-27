@@ -34,7 +34,7 @@ import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
 import { gatewayFeatures, gatewayDatagrams } from './gateway-features.mjs';
 import { GATEWAY_FAIL } from '../gateway-errors.mjs';
-import { GATEWAY_CREDIT_FEATURE } from '../gateway-channel.mjs';
+import { GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE } from '../gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { OPERATOR_PROOF_FEATURE } from '../operator-proof.mjs';
 import { clientEnvFilter } from './client-env.mjs';
@@ -92,6 +92,9 @@ export function hostFeatures(cfg, { dataStreams = true } = {}) {
  * host waits for that message to be written at all: a peer that granted no credit, or does not read, cannot hold the close back past 2 x this.
  */
 const FINAL_MESSAGE_DRAIN_MS = 50;
+/** The GatewayClose reason a grant that ran out is ended with (#297), and the requests that open a gateway connection or listener. */
+export const GATEWAY_EXPIRED = 'key expired';
+const GATEWAY_OPENERS = new Set([MSG.OPEN_TCP, MSG.OPEN_UDP, MSG.OPEN_UNIX, MSG.OPEN_ENDPOINT, MSG.LISTEN_REQUEST, MSG.LISTEN_UNIX]);
 /**
  * How long a connection that logged in under `sealSession: 'require'` may stay unsealed (#244): 30 s. The JS client's default for
  * each login step and for its own key exchange is 10 s, so a client on defaults gives up long before this and one on a slow link
@@ -296,6 +299,39 @@ export function createConnectionFactory(cfg) {
       if (!refusal) return null;
       return listener ? listenFail({ listenerId: m.listener_id, reason: refusal.reason }) : gatewayFail({ gatewayId: m.gateway_id, code: GATEWAY_FAIL.POLICY_DENIED, message: refusal.reason });
     }
+    // ── The gateway connections of a grant that runs out (#297) ──────
+    // `expires` (of the key's options, of what authorize() returned, of what a reverse host's accept() returned) is checked at each request, so a
+    // connection opened a moment before it passes would otherwise outlive it. This connection holds one timer for it, armed when it opens its first
+    // gateway connection (not one per connection): at the instant the earliest expiry passes, every gateway connection and listener it holds is ended
+    // (`gateway.endAll`), GatewayClose "key expired" then "discarded". The connection itself stays; whatever it asks for next is refused as expired.
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    let gatewayExpiryTimer = null;
+    /** Epoch ms at which the earliest `expires` of this connection's key options and grant passes (`null`: none). */
+    const expiryAt = () => {
+      let at = null;
+      for (const p of permissionSets()) if (typeof p.expires === 'number') at = at === null ? p.expires * 1000 : Math.min(at, p.expires * 1000);
+      return at;
+    };
+    function armGatewayExpiry(at) {
+      // setTimeout cannot count past 2^31 ms: a far expiry re-arms when the timer fires early.
+      gatewayExpiryTimer = setTimeout(() => {
+        gatewayExpiryTimer = null;
+        if (state.closed) return;
+        const next = expiryAt(); // the key list may have been reloaded since: what it says now decides
+        if (next === null) return;
+        if (Date.now() >= next) { log(`gateway: ${state.username ?? '?'}'s key expired; ending its gateway connections`); gateway?.endAll?.(GATEWAY_EXPIRED); return; }
+        armGatewayExpiry(next);
+      }, Math.min(Math.max(at - Date.now(), 1), 2 ** 31 - 1));
+      gatewayExpiryTimer.unref?.();
+    }
+    /** Called after a request that opens something: arms the timer, or ends at once what opened behind an expiry that has just passed. */
+    function watchGatewayExpiry() {
+      if (state.closed) return;
+      const at = expiryAt();
+      if (at === null) return;
+      if (Date.now() >= at) { gateway?.endAll?.(GATEWAY_EXPIRED); return; }
+      if (!gatewayExpiryTimer) armGatewayExpiry(at);
+    }
     /** FileOp `write`/`rename`s awaiting their FileChunk frames, by client-chosen channel id. */
     const fileWrites = new Map();
     /** AbortControllers of in-flight MCP calls: aborted on disconnect, counted for the cap. */
@@ -350,7 +386,8 @@ export function createConnectionFactory(cfg) {
       : null;
     // A reverse host's gateway (#289): connections opened through a relay bridge are always metered (`relay-gateway` implies `gateway-credit`),
     // whatever the operator listed: there is no Hello on a bridge to read it from.
-    if (gateway && cfg.gatewayCredit && authenticated) gateway.setPeerFeatures([GATEWAY_CREDIT_FEATURE]);
+    // The operator's `gateway-lossless-close` (#286) is what it stated in ReverseConnect.features (`authenticated.features`); the host states its own in ReverseAccept.
+    if (gateway && cfg.gatewayCredit && authenticated) gateway.setPeerFeatures([GATEWAY_CREDIT_FEATURE, ...(authenticated.features ?? []).filter((f) => f === GATEWAY_LOSSLESS_FEATURE)]);
 
     // Operator-side shared folders (#159): created with the connection, used only after the client's ShareOffer.
     const shares = cfg.onShare
@@ -427,6 +464,7 @@ export function createConnectionFactory(cfg) {
       clearTimeout(ttlTimer);
       clearTimeout(sealTimer);
       clearTimeout(loginTimer);
+      clearTimeout(gatewayExpiryTimer);
       // A hosted session survives its connection (it is detached, then expires or is resumed);
       // everything else dies with it.
       for (const ch of [...channels.values()]) (ch.detach ?? ch.kill)?.call(ch);
@@ -499,7 +537,7 @@ export function createConnectionFactory(cfg) {
         // What the key's capabilities allow of the gateway (#122), before the gateway's own policy is asked.
         const refusal = gatewayRefusal(m);
         if (refusal) return send(refusal);
-        if (await gateway.handle(m)) return;
+        if (await gateway.handle(m)) { if (GATEWAY_OPENERS.has(m.type)) watchGatewayExpiry(); return; }
       }
       if (shares && shares.handle(m)) return;
       switch (m.type) {

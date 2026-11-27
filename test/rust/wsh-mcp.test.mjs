@@ -334,7 +334,7 @@ describe('wsh mcp: an MCP client reaches an MCP server behind a wsh host (#127, 
   it('--target is refused: rpc channels are not per target', async () => {
     const t = spawn(WSH_BIN, ['--target', 'web', 'mcp', 'ws://127.0.0.1:1'], { env: env(), stdio: ['ignore', 'pipe', 'pipe'] });
     let err = ''; t.stderr.on('data', (d) => { err += d; });
-    const { code } = await new Promise((resolve) => t.once('exit', (c) => resolve({ code: c })));
+    const { code } = await new Promise((resolve) => t.once('close', (c) => resolve({ code: c })));
     assert.equal(code, 2);
     assert.match(err, /--target applies to/);
   });

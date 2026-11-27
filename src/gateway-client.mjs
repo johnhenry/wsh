@@ -13,7 +13,7 @@ import {
   listenClose as listenCloseMsg, inboundAccept as inboundAcceptMsg, inboundReject as inboundRejectMsg,
   gatewayData as gatewayDataMsg, gatewayCredit as gatewayCreditMsg, gatewayClose as gatewayCloseMsg,
 } from './messages.mjs';
-import { GatewayChannel, GATEWAY_CREDIT_FEATURE, assertHalfCloseIdleMs } from './gateway-channel.mjs';
+import { GatewayChannel, GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE, assertHalfCloseIdleMs } from './gateway-channel.mjs';
 import { UdpFlow, decodeDatagram } from './gateway-datagram.mjs';
 import { GATEWAY_FAIL_FIVE_NOTE } from './gateway-errors.mjs';
 
@@ -59,7 +59,8 @@ export class GatewayConnections {
    * @param {(msg: object) => Promise<void>} o.send
    * @param {(feature: string) => boolean} o.hasFeature
    */
-  constructor({ send, hasFeature, datagrams = () => null, halfCloseIdleMs }) {
+  constructor({ send, hasFeature, datagrams = () => null, halfCloseIdleMs, statesLossless = () => true }) {
+    this.#statesLossless = statesLossless;
     this.#halfCloseIdleMs = assertHalfCloseIdleMs(halfCloseIdleMs);
     this.#send = send;
     this.#hasFeature = hasFeature;
@@ -67,6 +68,7 @@ export class GatewayConnections {
   }
 
   #datagrams;
+  #statesLossless;
   #halfCloseIdleMs;
   /** @type {Map<number, UdpFlow>} */
   #udp = new Map();
@@ -91,6 +93,8 @@ export class GatewayConnections {
     const channel = new GatewayChannel({
       id,
       credit: this.#hasFeature(GATEWAY_CREDIT_FEATURE),
+      // #286: a close with the reason `released` means something only when both ends stated `gateway-lossless-close`.
+      lossless: this.#statesLossless() && this.#hasFeature(GATEWAY_LOSSLESS_FEATURE),
       // A GatewayClose from the host is a half-close: the application may keep writing, and may take as long as it likes
       // to finish, while anything moves in either direction. A half-closed connection with nothing moving for
       // `halfCloseIdleMs` is ended, so one nobody closes does not stay in the table forever.
@@ -113,7 +117,18 @@ export class GatewayConnections {
     const flow = this.#udp.get(channel.id);
     if (flow) return flow;
     const { readable, writable } = channel.streams();
-    return { readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise };
+    return {
+      readable, writable, close: (r) => channel.end(r), destroy: (r) => channel.destroy(r), closed: channel.closedPromise,
+      /** #286: both ends stated `gateway-lossless-close`, so this connection may be released (see `release()`). */
+      lossless: channel.lossless,
+      /** #286: the peer released this connection: it reads nothing more; a write now fails and what it sent is still delivered. */
+      get peerReleased() { return channel.peerReleased; },
+      /** Bytes received from the host and not yet read from `readable`, and the most that was ever held at once: what the credit window bounds. */
+      get queuedBytes() { return channel.queuedBytes; },
+      get peakQueuedBytes() { return channel.peakQueuedBytes; },
+      /** #286: the answering socket of this connection went away after finishing its side: end it without making the peer drop what it was sent. */
+      release: () => channel.release(),
+    };
   }
 
   async #open(build, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, halfCloseIdleMs } = {}, kind) {
@@ -129,6 +144,10 @@ export class GatewayConnections {
       timer.unref?.();
       this.#opening.set(id, { channel, resolve, reject, timer });
     });
+    // Nothing awaits `done` until the request is sent. A transport that closes, a signal that fires or a timeout that runs while the send is
+    // still in flight rejects it first; the caller still gets that rejection from the `await done` below, and this handler only keeps
+    // it from being reported as one nobody saw (when the send itself fails, the caller gets that error instead).
+    done.catch(() => {});
     const onAbort = () => {
       const o = this.#opening.get(id);
       if (!o) return;
@@ -207,6 +226,7 @@ export class GatewayConnections {
       entry.timer = setTimeout(() => { this.#listeners.delete(id); reject(new GatewayError('the host did not answer the listen request in time', 5)); }, timeoutMs);
       entry.timer.unref?.();
     });
+    answered.catch(() => {}); // as `done` in #open: the caller gets the rejection from the `await answered` below, or the send's own error
     this.#listeners.set(id, entry);
     try {
       await this.#send(listenRequestMsg({ listenerId: id, port, ...(bindAddr === undefined ? {} : { bindAddr }) }));
@@ -240,6 +260,7 @@ export class GatewayConnections {
       entry.timer = setTimeout(() => { this.#listeners.delete(id); reject(new GatewayError('the host did not answer the listen request in time', 5)); }, timeoutMs);
       entry.timer.unref?.();
     });
+    answered.catch(() => {}); // as `done` in #open: the caller gets the rejection from the `await answered` below, or the send's own error
     this.#listeners.set(id, entry);
     try {
       await this.#send(listenUnixMsg({ listenerId: id, path, replace: replace === true ? true : undefined }));

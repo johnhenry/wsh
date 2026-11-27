@@ -561,6 +561,371 @@ async fn a_second_discarded_close_from_the_host_ends_the_connection_and_nothing_
     );
 }
 
+// ── gateway-lossless-close (wsh #286): the reason `released` ──────
+
+fn host_lossless(lossless: bool) -> Host {
+    let h = host(true);
+    h.hub.set_lossless(lossless);
+    h
+}
+
+#[tokio::test]
+async fn a_host_that_released_the_connection_still_has_what_it_sent_delivered_in_order_and_nothing_goes_back(
+) {
+    for second in [false, true] {
+        let mut h = host_lossless(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        h.data(id, &[1u8; 10]).await;
+        h.data(id, &[2u8; 20]).await;
+        if second {
+            host_close(&h, id, None).await; // its end of file
+        }
+        host_close(&h, id, Some(GATEWAY_RELEASED)).await;
+        assert!(s.write_all(b"x").await.is_err(), "it reads nothing more");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 7];
+        loop {
+            let n = s.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        let want: Vec<u8> = [vec![1u8; 10], vec![2u8; 20]].concat();
+        assert_eq!(got, want, "everything, in order (second={second})");
+        drop(s);
+        assert!(
+            h.sent_within(100).await.is_none(),
+            "a release is not answered"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_released_close_ends_a_pump_whose_local_side_is_still_open() {
+    for second in [true, false] {
+        let mut h = host_lossless(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut app) = duplex(1 << 16);
+        // no idle bound: only the release can end it, and the application keeps its end open and silent
+        let pump = tokio::spawn(s.pump_with_idle(local, None));
+        h.data(id, b"tail").await;
+        if second {
+            host_close(&h, id, None).await;
+        }
+        host_close(&h, id, Some(GATEWAY_RELEASED)).await;
+        let mut got = [0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut app, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, b"tail");
+        let r = tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the release ends the exchange even though the local side is still open")
+            .unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        drop(app);
+    }
+}
+
+#[tokio::test]
+async fn without_the_feature_released_is_an_ordinary_close() {
+    let mut h = host_lossless(false);
+    let s = open(&mut h).await;
+    let id = s.id();
+    host_close(&h, id, Some(GATEWAY_RELEASED)).await; // a half-close
+    s.write_all(b"still").await.unwrap();
+    let _ = h.sent().await;
+    host_close(&h, id, Some(GATEWAY_RELEASED)).await; // a repeated close with another reason: ignored
+    assert!(!s.is_closed());
+    s.write_all(b"again").await.unwrap();
+}
+
+#[tokio::test]
+async fn releasing_sends_the_reason_as_the_second_close_or_the_first_and_only_once() {
+    let mut h = host_lossless(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    s.shutdown().await;
+    expect_close(&mut h, id, None).await;
+    s.release();
+    expect_close(&mut h, id, Some(GATEWAY_RELEASED)).await;
+    s.release();
+    drop(s);
+    assert!(h.sent_within(100).await.is_none(), "only once");
+    let t = open(&mut h).await;
+    let tid = t.id();
+    t.release();
+    expect_close(&mut h, tid, Some(GATEWAY_RELEASED)).await;
+}
+
+#[tokio::test]
+async fn releasing_against_a_host_that_did_not_state_the_feature_is_a_discard() {
+    let mut h = host_lossless(false);
+    let s = open(&mut h).await;
+    let id = s.id();
+    s.shutdown().await;
+    expect_close(&mut h, id, None).await;
+    s.release();
+    expect_close(&mut h, id, Some(GATEWAY_DISCARDED)).await;
+}
+
+/// The local service of a `-R` that half-closed and went away: noticed, and the connection released (never discarded).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_local_service_that_half_closed_and_vanished_releases_the_connection() {
+    let mut h = host_lossless(true);
+    let s = open(&mut h).await;
+    let id = s.id();
+    let (local, mut service) = tokio::net::UnixStream::pair().unwrap();
+    let pump = tokio::spawn(s.pump_answering(local, None, Some(Duration::from_millis(50))));
+    service.write_all(b"answer").await.unwrap();
+    service.shutdown().await.unwrap(); // its end of file
+    match h.sent().await.payload {
+        Payload::GatewayData(d) => assert_eq!(d.data, b"answer"),
+        other => panic!("{other:?}"),
+    }
+    expect_close(&mut h, id, None).await;
+    assert!(
+        h.sent_within(300).await.is_none(),
+        "a half-closed service that is alive is held"
+    );
+    drop(service); // gone
+    expect_close(&mut h, id, Some(GATEWAY_RELEASED)).await;
+    assert!(pump.await.unwrap().is_err());
+}
+
+/// A local service whose end of file and whose failed write are the test's: what the test sends through its `service` end is what the pump reads
+/// (`shutdown` is the end of file), and a write fails once `fail_writes` is set. Its watch is on a socket pair the test keeps alive, so no hang-up
+/// can end the exchange before the failed write does.
+#[cfg(unix)]
+struct HeldLocal {
+    read: tokio::io::DuplexStream,
+    /// 0 = no failure, 1 = the service is gone (a broken pipe, a reset), 2 = any other failure; a read waiting is woken by a byte from the test.
+    fail_writes: Arc<std::sync::atomic::AtomicU8>,
+    fail_reads: Arc<std::sync::atomic::AtomicU8>,
+    _far: tokio::net::UnixStream,
+    near: tokio::net::UnixStream,
+}
+#[cfg(unix)]
+fn local_failure(code: u8, gone: std::io::ErrorKind) -> std::io::Error {
+    std::io::Error::from(if code == 1 {
+        gone
+    } else {
+        std::io::ErrorKind::PermissionDenied
+    })
+}
+#[cfg(unix)]
+impl AsyncRead for HeldLocal {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let f = self.fail_reads.load(Ordering::Acquire);
+        if f != 0 {
+            return std::task::Poll::Ready(Err(local_failure(
+                f,
+                std::io::ErrorKind::ConnectionReset,
+            )));
+        }
+        std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
+    }
+}
+#[cfg(unix)]
+impl AsyncWrite for HeldLocal {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let f = self.fail_writes.load(Ordering::Acquire);
+        if f != 0 {
+            return std::task::Poll::Ready(Err(local_failure(f, std::io::ErrorKind::BrokenPipe)));
+        }
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+#[cfg(unix)]
+impl WatchablePeer for HeldLocal {
+    fn peer_watch(&self) -> Option<PeerWatch> {
+        PeerWatch::unix(&self.near).ok()
+    }
+}
+#[cfg(unix)]
+fn held_local() -> (
+    HeldLocal,
+    tokio::io::DuplexStream,
+    Arc<std::sync::atomic::AtomicU8>,
+    Arc<std::sync::atomic::AtomicU8>,
+) {
+    let (host_side, service) = duplex(1 << 16);
+    let fail_writes = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let fail_reads = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let (near, far) = tokio::net::UnixStream::pair().unwrap();
+    (
+        HeldLocal {
+            read: host_side,
+            fail_writes: fail_writes.clone(),
+            fail_reads: fail_reads.clone(),
+            _far: far,
+            near,
+        },
+        service,
+        fail_writes,
+        fail_reads,
+    )
+}
+
+/// The watch is not the only way the end of the local service is seen: a write to it that fails (the host's bytes, still arriving, into a service
+/// that has finished and gone) ends the exchange too, and the watch can be the later of the two. A service whose end of file was read sent its
+/// WHOLE answer: the connection is released, as the watch would have done, never discarded (the host would drop what its caller has not read).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_write_to_the_local_service_after_its_end_of_file_releases_the_connection() {
+    for code in [1u8, 2] {
+        let mut h = host_lossless(true);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut service, fail_writes, _) = held_local();
+        let pump = tokio::spawn(s.pump_answering(local, None, Some(Duration::from_secs(3600))));
+        service.write_all(b"answer").await.unwrap();
+        service.shutdown().await.unwrap(); // its end of file
+        match h.sent().await.payload {
+            Payload::GatewayData(d) => assert_eq!(d.data, b"answer"),
+            other => panic!("{other:?}"),
+        }
+        expect_close(&mut h, id, None).await;
+        fail_writes.store(code, Ordering::Release);
+        h.data(id, b"the caller's next bytes").await;
+        expect_close(&mut h, id, Some(GATEWAY_RELEASED)).await;
+        assert!(pump.await.unwrap().is_ok());
+    }
+}
+
+/// Negative cases: no feature and no probe for answering services are discards, as they were. And `released` tells the host "deliver what you have, then
+/// finish": for a service reset in the MIDDLE of its answer (its end of file never read) that would make a truncated answer look like a complete one to the
+/// caller, so a failure before the end of file, a reset included, on a write or on a read, is a discard, never a clean end.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_reset_before_the_end_of_file_is_not_a_clean_end_for_the_caller_and_the_same_failures_are_discards_without_the_feature_or_the_probe(
+) {
+    // (lossless, probe, end of file first, failure code, on a write, expected close)
+    let cases = [
+        (
+            false,
+            Some(Duration::from_secs(3600)),
+            true,
+            1u8,
+            true,
+            GATEWAY_DISCARDED,
+        ),
+        (true, None, true, 1, true, GATEWAY_DISCARDED),
+        (
+            true,
+            Some(Duration::from_secs(3600)),
+            false,
+            2,
+            true,
+            GATEWAY_DISCARDED,
+        ),
+        (
+            true,
+            Some(Duration::from_secs(3600)),
+            false,
+            2,
+            false,
+            GATEWAY_DISCARDED,
+        ),
+        (
+            true,
+            Some(Duration::from_secs(3600)),
+            false,
+            1,
+            true,
+            GATEWAY_DISCARDED,
+        ),
+        (
+            true,
+            Some(Duration::from_secs(3600)),
+            false,
+            1,
+            false,
+            GATEWAY_DISCARDED,
+        ),
+        (
+            false,
+            Some(Duration::from_secs(3600)),
+            false,
+            1,
+            false,
+            GATEWAY_DISCARDED,
+        ),
+    ];
+    for (lossless, probe, eof, code, on_write, want) in cases {
+        let mut h = host_lossless(lossless);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut service, fail_writes, fail_reads) = held_local();
+        let pump = tokio::spawn(s.pump_answering(local, None, probe));
+        service.write_all(b"answer").await.unwrap();
+        if eof {
+            service.shutdown().await.unwrap();
+        }
+        match h.sent().await.payload {
+            Payload::GatewayData(d) => assert_eq!(d.data, b"answer"),
+            other => panic!("{other:?}"),
+        }
+        if eof {
+            expect_close(&mut h, id, None).await;
+        }
+        if on_write {
+            fail_writes.store(code, Ordering::Release);
+            h.data(id, b"the caller's next bytes").await;
+        } else {
+            fail_reads.store(code, Ordering::Release);
+            service.write_all(b"x").await.unwrap(); // wakes the read that is waiting
+        }
+        expect_close(&mut h, id, Some(want)).await;
+        let _ = pump.await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn without_the_feature_or_without_a_probe_the_service_is_not_watched() {
+    for (lossless, probe) in [(false, Some(Duration::from_millis(50))), (true, None)] {
+        let mut h = host_lossless(lossless);
+        let s = open(&mut h).await;
+        let id = s.id();
+        let (local, mut service) = tokio::net::UnixStream::pair().unwrap();
+        let pump = tokio::spawn(s.pump_answering(local, None, probe));
+        service.shutdown().await.unwrap();
+        expect_close(&mut h, id, None).await;
+        drop(service);
+        assert!(
+            h.sent_within(500).await.is_none(),
+            "not noticed: held, as before"
+        );
+        assert!(!pump.is_finished());
+        pump.abort();
+    }
+}
+
 #[tokio::test]
 async fn a_repeated_close_without_the_reason_changes_nothing() {
     let mut h = host(true);

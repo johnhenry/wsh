@@ -60,6 +60,28 @@ export function assertHalfCloseProbeMs(v, what = 'halfCloseProbeMs') {
  */
 export const GATEWAY_DISCARDED = 'discarded';
 
+/** The feature (#286) a side states in `Hello.features` / `ServerHello.features` (behind a relay: `ReverseConnect.features` / `ReverseAccept.features`) when it understands the reason `released`. */
+export const GATEWAY_LOSSLESS_FEATURE = 'gateway-lossless-close';
+
+/**
+ * Behind a relay the statement of an operator travels in `ReverseConnect.features`, which a relay can drop or add. So a host answers it: it lists this in
+ * `ReverseAccept.features` ONLY when it actually received the operator's `gateway-lossless-close`, and an operator treats the feature as negotiated for a
+ * bridge only when it stated it AND got this back (the host: only when it received the statement). A relay that strips the statement therefore leaves
+ * both sides on the earlier behaviour. (A relay that ADDS one an operator never made makes the host believe in it; the operator, which did not state it,
+ * treats `released` as an ordinary reason. Nothing is lost either way; see COMPATIBILITY.md.)
+ */
+export const GATEWAY_LOSSLESS_ACK_FEATURE = 'gateway-lossless-close-ack';
+
+/**
+ * The reason on a GatewayClose that RELEASES the connection (#286, only to a peer that stated `gateway-lossless-close`): "I will read nothing more and
+ * send nothing more; deliver what you already sent, in order, then finish." Where `discarded` makes the receiver drop what it has received and not yet
+ * read (the sender is gone and nobody will read it), `released` loses nothing: it is what the side that holds an ANSWERING socket (an origin the host
+ * dialled, the local service of a reverse forward) sends when that socket has half-closed and vanished, since a server that sent its whole answer and
+ * closed completely looks exactly like that. Sent as the second close of a connection whose first close was already sent, or as the first close.
+ * A peer that did not state the feature never receives it.
+ */
+export const GATEWAY_RELEASED = 'released';
+
 /** Largest GatewayData payload this implementation sends. */
 export const GATEWAY_MAX_FRAME = 65536;
 
@@ -89,12 +111,15 @@ export class GatewayChannel {
   #unacked = 0;
   #queue = [];
   #queued = 0;
+  #peakQueued = 0;
   #waiter = null;
   #creditWaiters = [];
   #sentClose = false;
   #gotClose = false;
   /** The peer's FIRST close was a discard: it reads nothing more, so nothing queued for it is worth delivering. */
   #discarded = false;
+  /** The peer released the connection (#286): it reads nothing more, but what it already sent is still delivered. */
+  #released = false;
   #finished = false;
   #idleTimer = null;
   #lastActive = 0;
@@ -104,7 +129,7 @@ export class GatewayChannel {
 
   /** @param {GatewayChannelOptions} o */
   constructor(o) {
-    this.#o = { window: GATEWAY_CREDIT_WINDOW, maxQueued: 4 * 1024 * 1024, credit: false, writeAfterRemoteClose: false, halfCloseIdleMs: 0, ...o };
+    this.#o = { window: GATEWAY_CREDIT_WINDOW, maxQueued: 4 * 1024 * 1024, credit: false, writeAfterRemoteClose: false, halfCloseIdleMs: 0, lossless: false, ...o };
     this.#sendCredit = this.#o.credit ? this.#o.window : Infinity;
     this.#peerWindow = this.#o.credit ? this.#o.window : Infinity;
     this.#closedPromise = new Promise((r) => { this.#resolveClosed = r; });
@@ -119,6 +144,8 @@ export class GatewayChannel {
   get closedPromise() { return this.#closedPromise; }
   /** Bytes received and not yet consumed. */
   get queuedBytes() { return this.#queued; }
+  /** The most bytes this connection has ever held received and not yet consumed (what the credit window bounds). */
+  get peakQueuedBytes() { return this.#peakQueued; }
 
   // ── wire side ──────────────────────────────────────────────────────
 
@@ -134,6 +161,7 @@ export class GatewayChannel {
     const budget = this.#o.budget;
     if (this.#queued + n > this.#o.maxQueued || (budget && budget.used + n > budget.max)) return this.#violate('buffer limit exceeded');
     this.#queued += n;
+    if (this.#queued > this.#peakQueued) this.#peakQueued = this.#queued;
     if (budget) budget.used += n;
     this.#lastActive = Date.now();
     if (this.#o.onData) { this.#o.onData(bytes); return; }
@@ -152,6 +180,13 @@ export class GatewayChannel {
   /** A GatewayClose arrived: no more data comes (queued data can still be read). */
   remoteClosed(reason) {
     if (this.#finished) return;
+    // `released` means something only between two sides that both stated `gateway-lossless-close`; to any other it is an ordinary reason text.
+    const released = reason === GATEWAY_RELEASED && this.#o.lossless;
+    if (this.#gotClose && released) {
+      // (a connection the peer already DISCARDED stays a discard)
+      if (!this.#released && !this.#discarded) this.#peerReleased();
+      return;
+    }
     if (this.#gotClose) {
       // A SECOND GatewayClose with "discarded": the peer had half-closed and has now lost its reader. It reads nothing
       // more, so the connection is over at once, as after a reset: what it sent and nothing here has read is dropped (an
@@ -166,8 +201,43 @@ export class GatewayChannel {
     this.#waiter?.();
     try { this.#o.onRemoteClose?.(reason); } catch { /* the application's problem */ }
     if (!this.#o.writeAfterRemoteClose) this.#wakeWriters();
+    if (released) { this.#peerReleased(); return; }
     if (this.#sentClose) { if (this.#queue.length === 0) this.#finish(reason, !this.#discarded); return; }
     this.#watchIdle();
+  }
+
+  /**
+   * The peer released the connection (#286): it reads nothing more and sends nothing more. Everything it sent before is already here (one ordered
+   * stream), so it is delivered, in order; our writes fail and no close goes back; the connection ends once the application has taken the last of it
+   * (at once if nothing is waiting). An application that never reads is bounded by the idle rule, as any half-closed connection is.
+   */
+  #peerReleased() {
+    this.#released = true;
+    this.#sentClose = true;
+    this.#wakeWriters();
+    this.#waiter?.();
+    if (this.#queue.length === 0) this.#finish(GATEWAY_RELEASED, true);
+    else this.#watchIdle();
+  }
+
+  /** The peer released the connection (#286): it reads nothing more, and what it sent is still being delivered. */
+  get peerReleased() { return this.#released; }
+
+  /** Does this connection use the lossless close (both ends stated `gateway-lossless-close`)? Only then may it be released. */
+  get lossless() { return this.#o.lossless; }
+
+  /**
+   * The answering socket of this connection (an origin, a reverse forward's local service) has half-closed and vanished (#286): say so with `released`
+   * and end the connection here. Against a peer that did not state the feature this is a discard, as it always was (a caller never releases).
+   */
+  release() {
+    if (this.#finished) return;
+    if (!this.#o.lossless) { this.destroy(); return; }
+    if (!this.#sentClose || !this.#gotClose) {
+      this.#sentClose = true;
+      try { void this.#o.sendClose(GATEWAY_RELEASED); } catch { /* gone */ }
+    }
+    this.#finish(GATEWAY_RELEASED);
   }
 
   /**
@@ -286,7 +356,7 @@ export class GatewayChannel {
           return;
         }
         controller.close();
-        if (self.#sentClose) self.#finish(undefined, !self.#discarded);
+        if (self.#sentClose) self.#finish(self.#released ? GATEWAY_RELEASED : undefined, !self.#discarded);
       },
       cancel(reason) { self.destroy(typeof reason === 'string' ? reason : undefined); },
     }, { highWaterMark: 0 });

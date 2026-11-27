@@ -54,17 +54,17 @@ describe('a reverse forward whose service answers at length and closes completel
   // The service closes at once, with everything written: its FIN follows the data, then the socket goes.
   const sendAndClose = (s) => { s.end(Buffer.alloc(SIZE, 7), () => s.destroy()); };
 
+  // The service reads the caller's whole request (up to its end of file) before it answers, as a service does. One that answers and closes without reading it
+  // is reset by the kernel when the request reaches it, and a reset throws away what the reader has not yet read (a plain Node client and server lose bytes
+  // the same way, with no wsh code involved), so how many of the 3 MiB arrive then depends on timing, whatever the gateway does.
+  const answerAfterRequest = (s) => { s.once('end', () => sendAndClose(s)); s.resume(); };
+
   it('every byte arrives (the probe on)', async () => {
-    assert.equal(await run({ serve: sendAndClose, probe: 200 }), SIZE);
+    assert.equal(await run({ serve: answerAfterRequest, probe: 200 }), SIZE);
   });
 
   it('every byte arrives (the probe off)', async () => {
-    assert.equal(await run({ serve: sendAndClose, probe: 0 }), SIZE);
-  });
-
-  it('every byte arrives when the service waits for the request first', async () => {
-    const serve = (s) => { s.once('end', () => sendAndClose(s)); s.resume(); };
-    assert.equal(await run({ serve, probe: 0 }), SIZE);
+    assert.equal(await run({ serve: answerAfterRequest, probe: 0 }), SIZE);
   });
 
   it('a service that is reset in the middle of its answer ends the connection and the caller does not hang', async () => {

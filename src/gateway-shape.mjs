@@ -10,7 +10,7 @@ const METHODS = ['connectTcp', 'resolve', 'openUdp', 'listenTcp'];
 /** Every key of a `gateway` option that names an injected network. A key outside it is a typo, not an option that silently does nothing. */
 const KNOWN_KEYS = new Set([
   'allow', 'allowPrivate', 'maxConnections', 'maxBufferedBytes', 'maxClientBufferedBytes', 'connectTimeoutMs', 'halfCloseIdleMs', 'halfCloseProbeMs',
-  'udpIdleMs', 'udp', 'dns', 'reverse', 'network', 'log', 'socks', 'unix', 'tcp', 'endpoints',
+  'losslessClose', 'halfCloseProbeAnswers', 'halfCloseProbeRemoteMs', 'udpIdleMs', 'udp', 'dns', 'reverse', 'network', 'log', 'socks', 'unix', 'tcp', 'endpoints',
 ]);
 
 /**

@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use wsh_core::gateway_credit::{
-    SendCredit, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED, GATEWAY_MAX_FRAME,
+    SendCredit, GATEWAY_CREDIT_WINDOW, GATEWAY_DISCARDED, GATEWAY_MAX_FRAME, GATEWAY_RELEASED,
 };
 use wsh_core::messages::*;
 use wsh_core::peer_watch::PeerWatch;
@@ -76,14 +76,17 @@ struct ConnShared {
     finished: AtomicBool,
     error: Mutex<Option<String>>,
     closed_tx: watch::Sender<bool>,
+    /// Both ends stated `gateway-lossless-close` (wsh #286): this connection may be released, and a `released` close is understood.
+    lossless: bool,
 }
 
 impl ConnShared {
-    fn new(id: u32, credit: bool, hub: Weak<GatewayHub>) -> Arc<Self> {
+    fn new(id: u32, credit: bool, lossless: bool, hub: Weak<GatewayHub>) -> Arc<Self> {
         Arc::new(Self {
             id,
             hub,
             credit,
+            lossless,
             send: SendCredit::new(credit),
             peer_window: AtomicI64::new(if credit {
                 GATEWAY_CREDIT_WINDOW as i64
@@ -139,7 +142,10 @@ impl ConnShared {
     /// The host sent GatewayClose: no more data comes (what is queued can still be read).
     /// `discarded`: the host has dropped the connection and reads nothing more, so our direction is
     /// over too (writes fail; nothing is sent back).
-    fn remote_closed(&self, discarded: bool) {
+    fn remote_closed(&self, reason: Option<&str>) {
+        let discarded = reason == Some(GATEWAY_DISCARDED);
+        // `released` (wsh #286) means something only where both ends stated `gateway-lossless-close`; to any other it is a plain reason text.
+        let released = reason == Some(GATEWAY_RELEASED) && self.lossless;
         if self.remote_closed.swap(true, Ordering::AcqRel) {
             // A SECOND close saying "discarded": the host had half-closed and has now lost its
             // reader. It reads nothing more, so the connection is over at once, as after a reset
@@ -148,10 +154,22 @@ impl ConnShared {
             if discarded && !self.sent_close.swap(true, Ordering::AcqRel) {
                 self.destroy(None);
             }
+            // A SECOND close saying "released": it reads nothing more and sends nothing more, but what it sent is still
+            // here and is delivered: our writes fail, nothing goes back, the connection ends once it has been read.
+            if released && !self.sent_close.swap(true, Ordering::AcqRel) {
+                self.data_ready.notify_one();
+                self.send.wake();
+                // Nothing more can be sent: whoever feeds this connection is told (the inbox is kept; what the host sent is still read).
+                self.closed_tx.send_replace(true);
+                self.retire();
+            }
             return;
         }
-        if discarded {
+        if discarded || released {
             self.sent_close.store(true, Ordering::Release);
+        }
+        if released {
+            self.closed_tx.send_replace(true);
         }
         self.data_ready.notify_one();
         self.send.wake();
@@ -169,6 +187,17 @@ impl ConnShared {
 
     /// Close at once: GatewayClose goes out (if it had not), everything waiting is woken with an error.
     fn destroy(&self, reason: Option<&str>) {
+        self.end(reason, false);
+    }
+
+    /// The answering socket of this connection (the local service of a reverse forward) half-closed and went away (wsh #286): end the
+    /// connection with `GatewayClose` reason `released`, which makes the host deliver what it has received and then finish, instead
+    /// of `discarded`, which makes it drop it. Only where both ends stated `gateway-lossless-close`; otherwise a discard, as always.
+    fn release(&self) {
+        self.end(None, self.lossless);
+    }
+
+    fn end(&self, reason: Option<&str>, release: bool) {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -182,7 +211,9 @@ impl ConnShared {
             // host had closed too the connection is over and nothing more is sent.
             let already = self.sent_close.swap(true, Ordering::AcqRel);
             if !already || !self.remote_closed.load(Ordering::Acquire) {
-                let said = if already {
+                let said = if release {
+                    GATEWAY_RELEASED
+                } else if already {
                     GATEWAY_DISCARDED
                 } else {
                     reason.unwrap_or(GATEWAY_DISCARDED)
@@ -438,7 +469,7 @@ impl GatewayStream {
     where
         L: AsyncRead + AsyncWrite + Send + 'static,
     {
-        self.pump_inner(local, idle, None).await
+        self.pump_inner(local, idle, None, false).await
     }
 
     /// [`GatewayStream::pump_with_idle`] for a local socket (TCP, or a unix stream) whose peer is
@@ -463,7 +494,39 @@ impl GatewayStream {
         L: AsyncRead + AsyncWrite + Send + 'static + WatchablePeer,
     {
         let watch = probe.and_then(|p| local.peer_watch().map(|w| (w, p)));
-        self.pump_inner(local, idle, watch).await
+        self.pump_inner(local, idle, watch, false).await
+    }
+
+    /// [`GatewayStream::pump_watched`] for the local ANSWERING socket of a connection: the service a reverse forward (`-R`) dials. Where both
+    /// ends stated `gateway-lossless-close` (wsh #286, [`GatewayStream::lossless`]) a service that half-closed and then went away is noticed
+    /// and the connection RELEASED (`GatewayClose` reason `released`: the host delivers what it has received to its caller, then ends it)
+    /// instead of held until the idle bound; a service that sent its whole answer and closed completely loses nothing. Without the
+    /// feature, or with `probe` of `None`, this is [`GatewayStream::pump_with_idle`]: the service is not watched, as before.
+    pub async fn pump_answering<L>(
+        self,
+        local: L,
+        idle: Option<Duration>,
+        probe: Option<Duration>,
+    ) -> std::io::Result<(u64, u64)>
+    where
+        L: AsyncRead + AsyncWrite + Send + 'static + WatchablePeer,
+    {
+        if !self.lossless() {
+            return self.pump_inner(local, idle, None, false).await;
+        }
+        let watch = probe.and_then(|p| local.peer_watch().map(|w| (w, p)));
+        self.pump_inner(local, idle, watch, true).await
+    }
+
+    /// Both ends stated `gateway-lossless-close` (wsh #286): this connection may be released.
+    pub fn lossless(&self) -> bool {
+        self.shared.lossless
+    }
+
+    /// The local service of this connection went away after finishing its side: end the connection with the reason `released`
+    /// (see [`GatewayStream::pump_answering`]). A discard where the feature was not negotiated.
+    pub fn release(&self) {
+        self.shared.release();
     }
 
     async fn pump_inner<L>(
@@ -471,6 +534,7 @@ impl GatewayStream {
         local: L,
         idle: Option<Duration>,
         watch: Option<(PeerWatch, Duration)>,
+        answering: bool,
     ) -> std::io::Result<(u64, u64)>
     where
         L: AsyncRead + AsyncWrite + Send + 'static,
@@ -491,6 +555,12 @@ impl GatewayStream {
             let last = last.clone();
             move || last.store(started.elapsed().as_millis() as u64, Ordering::Release)
         };
+        // The watch is not the only way the end of a watched ANSWERING service is seen: a write to it that fails (the host's bytes, still arriving, into a
+        // service that has finished and gone) ends the exchange too, and the watch can be the later of the two. A service whose end of file was read sent its
+        // WHOLE answer, so the connection is RELEASED either way: a second close of `discarded` would make the host drop what its caller has not read yet.
+        // A failure BEFORE the end of file (a reset included) is not a complete answer, and `released` would make a cut answer look like a finished one: it
+        // is a discard. An unwatched service (no feature, no probe) is as it was.
+        let answering_watched = answering && watch.is_some();
         let up = {
             let me = self.clone();
             let touch = touch.clone();
@@ -520,6 +590,7 @@ impl GatewayStream {
                             touch();
                         }
                         Err(e) => {
+                            // Before the service's end of file (a reset included): not a complete answer, so not released.
                             me.destroy();
                             break Err(e);
                         }
@@ -538,6 +609,7 @@ impl GatewayStream {
             let half = half.clone();
             let down_bytes = down_bytes.clone();
             let local_shut = local_shut.clone();
+            let local_eof = local_eof.clone();
             async move {
                 let mut buf = vec![0u8; GATEWAY_MAX_FRAME];
                 let result = loop {
@@ -545,7 +617,11 @@ impl GatewayStream {
                         Ok(0) => break Ok(()),
                         Ok(n) => {
                             if lw.write_all(&buf[..n]).await.is_err() {
-                                me.destroy();
+                                if answering_watched && local_eof.load(Ordering::Acquire) {
+                                    me.release();
+                                } else {
+                                    me.destroy();
+                                }
                                 half.send_replace(true);
                                 return Ok::<(), std::io::Error>(());
                             }
@@ -603,7 +679,17 @@ impl GatewayStream {
                 if !local_eof.load(Ordering::Acquire) {
                     return std::future::pending::<()>().await;
                 }
-                watch.arm(every);
+                if answering {
+                    // A local service on another machine gets the longer keep-alive schedule (wsh #286)
+                    watch.arm_answering(
+                        every,
+                        Duration::from_secs(
+                            wsh_core::gateway::policy::DEFAULT_HALF_CLOSE_PROBE_REMOTE_SECS,
+                        ),
+                    );
+                } else {
+                    watch.arm(every);
+                }
                 watch.gone().await;
                 if local_shut.load(Ordering::Acquire) {
                     // The hang-up is our own shutdown of the write side: the exchange is ending,
@@ -636,8 +722,13 @@ impl GatewayStream {
             ));
         }
         if gone {
-            // As a local socket that was destroyed: the host is told (a second close, "discarded").
-            self.destroy();
+            // As a local socket that was destroyed: the host is told (a second close, "discarded"); for an answering
+            // service that is released instead (wsh #286): the host keeps what it received and delivers it.
+            if answering {
+                self.release();
+            } else {
+                self.destroy();
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "the local peer went away after finishing its side",
@@ -670,6 +761,7 @@ impl PendingInbound {
         let shared = ConnShared::new(
             id,
             self.hub.credit.load(Ordering::Acquire),
+            self.hub.lossless.load(Ordering::Acquire),
             Arc::downgrade(&self.hub),
         );
         // Registered BEFORE the host is told, so data that follows cannot beat it.
@@ -784,6 +876,8 @@ struct HubState {
 pub(crate) struct GatewayHub {
     out: mpsc::Sender<Vec<u8>>,
     credit: AtomicBool,
+    /// Both ends stated `gateway-lossless-close` (wsh #286).
+    lossless: AtomicBool,
     next_id: AtomicU32,
     budget: AtomicUsize,
     state: Mutex<HubState>,
@@ -803,6 +897,7 @@ impl GatewayHub {
     pub(crate) fn new(out: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
             credit: AtomicBool::new(false),
+            lossless: AtomicBool::new(false),
             next_id: AtomicU32::new(1),
             budget: AtomicUsize::new(0),
             state: Mutex::new(HubState::default()),
@@ -814,6 +909,11 @@ impl GatewayHub {
     /// Credit is on when the host advertised `gateway-credit` (we always list it in `Hello`).
     pub(crate) fn set_credit(&self, on: bool) {
         self.credit.store(on, Ordering::Release);
+    }
+
+    /// The reason `released` is used when the host advertised `gateway-lossless-close` AND this client listed it (wsh #286).
+    pub(crate) fn set_lossless(&self, on: bool) {
+        self.lossless.store(on, Ordering::Release);
     }
 
     async fn send(&self, envelope: Envelope) {
@@ -869,6 +969,7 @@ impl GatewayHub {
         let shared = ConnShared::new(
             id,
             self.credit.load(Ordering::Acquire),
+            self.lossless.load(Ordering::Acquire),
             Arc::downgrade(self),
         );
         let (tx, rx) = oneshot::channel();
@@ -1049,7 +1150,7 @@ impl GatewayHub {
                     .cloned();
                 match conn {
                     Some(conn) => {
-                        conn.remote_closed(c.reason.as_deref() == Some(GATEWAY_DISCARDED));
+                        conn.remote_closed(c.reason.as_deref());
                         true
                     }
                     None => false,

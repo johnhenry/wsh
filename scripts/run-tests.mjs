@@ -33,7 +33,7 @@ function runFile(file) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     process.stderr.write(`[gate] start ${file}\n`);
-    const child = spawn(process.execPath, ['--test', `--test-timeout=${TEST_TIMEOUT_MS}`, file], {
+    const child = spawn(process.execPath, ['--test', '--unhandled-rejections=strict', `--test-timeout=${TEST_TIMEOUT_MS}`, file], {
       cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: process.env,
     });
     let out = '';

@@ -160,6 +160,67 @@ carries the same `GatewayFail` code 4 (policy) with a sentence that says which s
 (direct, through a pipe relay, a Node server, a reverse host behind a relay) and `test/browser/gateway-network.spec.mjs` (Chromium).
 Not tested against a release binary of the Rust CLI: stated from the wire, which this adds nothing to.
 
+## Worked case: the lossless close, `gateway-lossless-close` (#286)
+
+**One feature string, one reason text, no message and no field.** A side that understands the `GatewayClose` reason `released` ("I will read
+nothing more and send nothing more; deliver what you already sent, in order, then finish") states `gateway-lossless-close`: a client in
+`Hello.features` (the Rust client always, the JS client unless `gatewayLosslessClose: false`), a host in `ServerHello.features` (a gateway on
+`wsh-server` and the Node servers, unless `lossless_close = false` / `losslessClose: false`); behind a relay, the host in `ReverseAccept.features`
+and the operator in `ReverseConnect.features`. A side sends `released` **only to a peer that stated it** (and only when it holds an answering
+socket that half-closed and vanished, see the README), so a Rust decoder with `deny_unknown_fields` is never given anything new: the feature is a
+string in a list that already exists and the reason is the existing optional text of `GatewayClose`.
+
+| Host | Client / operator | What happens |
+| --- | --- | --- |
+| new | new | The feature is stated at both ends. The answering side (an origin the host dialled, a reverse forward's local service) is watched once half-closed; one that vanished releases its connection (`GatewayClose` `released`), one that closed completely after its whole answer loses nothing. |
+| new | released (0.61.0 JS, `rust-v0.25.0`) | The client does not state the feature, so the host does not send `released` and does not watch origins: exactly the behaviour before this change (an origin that vanished after its end of file is held until the client closes or the idle bound; one that closed completely loses nothing). Tested with `gatewayLosslessClose: false`, which is what a released client's `Hello` looks like. |
+| released | new | The host does not state the feature, so the client never sends `released` and does not watch a reverse forward's local service: as before. Tested with `losslessClose: false` / `lossless_close = false`. |
+| new | new, through the JS relay | The operator states the feature in `ReverseConnect.features` only when the relay lists `relay-gateway` and the host's registered record lists `gateway` (a host that can decode the field: a released peer of rust-v0.6 to v0.8 drops a connection on a field it does not know). The relay passes it on to a host that lists `gateway` (only that string) or `operator-proof` (the operator's features whole). A released JS relay (0.60.0, 0.61.0) strips it unless the host lists `operator-proof`: then nothing is negotiated and nothing changes. |
+| new | new, through the Rust relay | The Rust relay already carries `ReverseConnect.features` (bounded) unchanged: the released one too (`rust-v0.25.0`), so it carries this. |
+| new host | operator that did not state it, through a relay | The host sees no `gateway-lossless-close` in the request: it does not acknowledge, and its origins behind this bridge are not watched. |
+| new | new, through a relay that DROPS the operator's statement (a released JS relay, 0.60 / 0.61, for a host without `operator-proof`; or a hostile one) | The host never sees it, so it does not list `gateway-lossless-close-ack`; the operator, which relies on the feature behind a relay only with that answer, does not either. Both sides are on the earlier behaviour (tested). |
+| new host | operator that did not state it, through a relay that ADDS a statement | The host believes it, acknowledges and watches, and sends `released`; the operator did not state the feature, so it treats `released` as an ordinary reason (a half-close as a first close, ignored as a second): nothing is lost, its connection waits for its own close or the idle bound (tested). There is no signed or sealed carrier for the statement (it precedes the key exchange of a sealed bridge), so this cannot be closed without a new message. |
+| any | the Rust `wsh reverse-connect` operator | It does not state the feature, so behind a relay it never gets the lossless close. A Rust reverse host can decline to state or acknowledge it with `--no-lossless-close`. |
+
+**Behind a relay the negotiation is two-sided, with one more string:** `gateway-lossless-close-ack`, listed by a host in `ReverseAccept.features` only
+when it actually received the operator's `gateway-lossless-close`; a peer that does not know it ignores it (an unknown entry of a list of strings: the
+JS and Rust clients and relays read `features` as plain strings, verified by the tests that pass it through both relays and both hosts).
+| a connection of an injected network (#299) | any | Never probed (there is no kernel to ask): unchanged, it ends when the network closes the stream; the feature is still stated, and a `released` close from the peer is understood. |
+
+What is tested: both ends new and each end declining (both implementations: `test/gateway-lossless-close.test.mjs`,
+`test/half-close-probe.test.mjs`, the `lossless` and `gateway` tests of `wsh-core` / `wsh-client`, `test/rust/wsh-half-close-probe.test.mjs`,
+`test/rust/wsh-reverse-forward-full-close.test.mjs` for the Rust `wsh -R`), through the JS relay and the Rust relay to a JS host and to the Rust CLI
+host (`test/relay-gateway.test.mjs`, `test/rust/wsh-relay-gateway.test.mjs`, `test/rust/wsh-reverse-host-half-close.test.mjs`), a TCP and a unix
+origin, 3 MiB through each, a slow reader, and an origin that vanished. Not tested against a released binary of either implementation: the old
+side is simulated by not stating the feature.
+
+## Worked case: a per-operator gateway grant on the Rust CLI reverse host (#296)
+
+**Nothing is added to the wire.** The scoping is command-line flags of the host; what an operator sees is what it saw: `relay-gateway`,
+`gateway` and `gateway-credit` in `ReverseAccept.features` (stated for every operator of a host that has a gateway, since the relay keeps the
+statement per peer connection), and, for an operator no rule reaches, the existing `GatewayFail` (code 4) for each request with the sentence
+"this reverse host has no gateway rule for this operator". A released JS client or Rust peer decodes it as any policy refusal; a released
+relay carries it as before. A host older than this one has one list (it would read `FINGERPRINT=RULE` as a destination rule and, by its own start-up check, refuse one that does not parse; not tested against a released binary).
+
+## Worked case: a grant that runs out ends its gateway connections, and a peer that leaves ends its operators (#297)
+
+**Nothing is added to the wire**: no message, field or feature string. When the `expires` of a key (or of what `authorize()` / a reverse
+host's `accept()` granted) passes, the host sends each open gateway connection of that holder a `GatewayClose` with the reason
+`key expired` and then a second one with the reason `discarded`, and stops its reverse listeners (no message exists for that). On the Rust relay, a
+peer that stated `relay-gateway` and leaves has each of its operators sent the existing `Shutdown` message (reason: the bridge is over), after
+which the relay closes the operator's connection (the JS relay always closed it, without a message).
+
+| Peer | What happens |
+| --- | --- |
+| released JS client (0.45.0 and later) | The first close is an ordinary half-close from the host (the application sees the end of its stream); the second is the documented "discarded" and frees the connection at once on a client that has that wording (0.58.1 and later); an older client ignores it and its own half-close bounds free the connection. A `Shutdown` from the Rust relay makes it disconnect (it did so for any `Shutdown`). |
+| released Rust peer (`rust-v0.16.0`, `deny_unknown_fields`) | Nothing new is sent: `GatewayClose.reason` is a field every release decodes, and `Shutdown` is a message every release decodes (the Rust client logs it; a Rust CLI operator stays up until its own bridge handling ends it). A peer that ignores a second `GatewayClose` for a connection it already saw close does so as it always did. |
+| released relay | Unchanged: the JS relay already closed the operators of a peer that left; a Rust relay of an older release leaves them connected. |
+| released host (no expiry cut) | Keeps the connections open past the expiry, exactly as before. |
+
+Not covered: a Rust relay and a peer that did not state `relay-gateway` (the operator stays connected, as since #93); the Rust CLI reverse host
+(it has no grant with an expiry). Tested: `test/gateway-expiry.test.mjs`, the `expiry` tests of `crates/wsh-core/src/gateway/session/tests.rs`,
+`test/rust/wsh-gateway-expiry.test.mjs`, `test/rust/wsh-relay-peer-left.test.mjs` and the `bridges` unit tests.
+
 ## What this policy does not promise
 
 - No peer older than the previous release of its implementation is tested. The CHANGELOG says what an older one does where it was known.

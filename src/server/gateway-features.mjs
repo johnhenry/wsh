@@ -4,7 +4,7 @@
  * loaded only when a host is given a gateway (#299). Browser-safe.
  */
 
-import { GATEWAY_CREDIT_FEATURE, assertHalfCloseIdleMs } from '../gateway-channel.mjs';
+import { GATEWAY_CREDIT_FEATURE, GATEWAY_LOSSLESS_FEATURE, assertHalfCloseIdleMs } from '../gateway-channel.mjs';
 
 export const ENDPOINT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
@@ -51,6 +51,8 @@ export function gatewayFeatures(cfg) {
   // "gateway" also covers reverse tunnels (the Rust server lists nothing more specific for ListenRequest).
   if (gatewayServes(cfg)) f.push('gateway');
   f.push(GATEWAY_CREDIT_FEATURE);
+  // #286: understands the reason `released` (a lossless close); `losslessClose: false` does not say so.
+  if (cfg.losslessClose !== false) f.push(GATEWAY_LOSSLESS_FEATURE);
   if (cfg.unix) f.push('gateway-unix');
   if (cfg.endpoints || cfg.targetEndpoints) f.push('gateway-endpoints');
   return f;
