@@ -123,6 +123,9 @@ export class GatewayConnections {
       lossless: channel.lossless,
       /** #286: the peer released this connection: it reads nothing more; a write now fails and what it sent is still delivered. */
       get peerReleased() { return channel.peerReleased; },
+      /** Bytes received from the host and not yet read from `readable`, and the most that was ever held at once: what the credit window bounds. */
+      get queuedBytes() { return channel.queuedBytes; },
+      get peakQueuedBytes() { return channel.peakQueuedBytes; },
       /** #286: the answering socket of this connection went away after finishing its side: end it without making the peer drop what it was sent. */
       release: () => channel.release(),
     };

@@ -211,7 +211,9 @@ describe('end to end: the peer of a half-closed side that is destroyed learns of
       const { client } = await fx.setup({ allow: [`127.0.0.1:${port}`], halfCloseIdleMs: 0 });
       const d = await client.openTcp('127.0.0.1', port);
       await goneP;
-      assert.equal(await pokeUntilClosed(d), 'discarded');
+      // Both ends state `gateway-lossless-close` here, so the failed write after the origin's end of file ends the connection with `released` (#311), which
+      // loses nothing the client has received; it used to be a `discarded` second close (the lossy one) whichever of the write and the probe saw the end first.
+      assert.equal(await pokeUntilClosed(d), 'released');
     } finally { await fx.teardown(); }
   });
 });

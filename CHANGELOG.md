@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### An answering socket that finished its answer and then fails releases its connection, it does not discard it (#311; npm)
+
+- **What was wrong.** Where both ends stated `gateway-lossless-close`, an answering socket (an origin the host dialled, the local service of a reverse forward) that had sent its whole answer and its end of file was released by the half-close probe when its peer vanished. A failed write to the same socket (the request body still uploading into an origin that had been reset) closes it too, and the probe is skipped while a write is queued, so that could come first; it ended the connection as a discard. After an end of file that is a second close of `discarded`, which makes the receiver drop what it has received and not yet read: all of a 100 kB answer in the reproduction.
+- **Now.** An answering socket whose end of file was read ends its connection with `released` however it ends (the probe, a failed write, a reset), on the host and in the client's reverse forward. A socket that failed before its end of file cut its answer short and is still a discard; so is every connection where the feature was not negotiated. The Rust implementation has the same shape (a failed write after the origin's end of file ends the connection with a second `discarded`); it is not changed here.
+- **Also.** A gateway duplex has read-only `queuedBytes` and `peakQueuedBytes`: the bytes received from the peer and not yet read, and the most held at once, which the credit window bounds. `test/gateway-sealed-backpressure.test.mjs` asserts the bound on that count instead of on live heap after a forced collection (which depended on the collector and failed now and then).
+- No wire, spec or default change. New tests: the order of the probe and a failed write, on the host and in `pipe` (`test/gateway-lossless-close.test.mjs`).
+
 ## 0.62.1 / Rust `rust-v0.26.1`
 
 ### A connection closed while a gateway call is being sent no longer leaves an unhandled rejection (#308; npm)

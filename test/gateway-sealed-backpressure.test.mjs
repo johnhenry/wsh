@@ -5,8 +5,6 @@
 // awaiting `writer.ready` defeats this; the README says how to use it.)
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import v8 from 'node:v8';
-import vm from 'node:vm';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { generateKeyPair, exportPublicKeySSH } from '@johnhenry/wsh';
 import { GATEWAY_CREDIT_WINDOW } from '../src/gateway-channel.mjs';
@@ -15,10 +13,9 @@ const MiB = 1024 * 1024;
 const TOTAL = 32 * MiB;
 const CHUNK = 256 * 1024;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// Live (not merely not-yet-collected) ArrayBuffer memory: the sealing and framing of 32 MiB makes a lot of short-lived garbage.
-v8.setFlagsFromString('--expose_gc');
-const gc = vm.runInNewContext('gc');
-const liveBuffers = () => { gc(); return process.memoryUsage().arrayBuffers; };
+// "Memory is bounded" is asserted on what the connection itself counts: the bytes it holds received and not yet read (`duplex.peakQueuedBytes`, kept by the
+// gateway channel, which is what the credit window bounds). Heap or ArrayBuffer totals are not used: how much sealing garbage is still alive at a sample depends
+// on when the collector last ran (18.1 MiB, 6 MiB and 38.3 MiB were seen for the same transfer), so no fixed number is right.
 /** The pattern the producer sends: byte at global offset o is BASE[o % CHUNK] (one buffer, reused, so the test itself allocates nothing). */
 const BASE = new Uint8Array(CHUNK).map((_, i) => (i * 7 + 3) & 0xff);
 
@@ -60,13 +57,12 @@ describe('a sealed session: an endpoint stream applies backpressure end to end',
     const client = await host.connect({ username: 'u', keyPair });
     try {
       assert.equal(client.sessionSealed, true, 'the session under test is sealed');
-      let rd;
-      const hostGot = new Promise((resolve) => { serve = (d) => { rd = slowReader(d.readable); resolve(rd); }; });
+      let rd; let hostDuplex;
+      const hostGot = new Promise((resolve) => { serve = (d) => { hostDuplex = d; rd = slowReader(d.readable); resolve(rd); }; });
       const d = await client.openEndpoint('bulk');
       const reader = await hostGot;
       const w = d.writable.getWriter();
       let accepted = 0; let maxAhead = 0; let askedWhileFull = 0;
-      const heapBefore = liveBuffers(); let heapPeak = 0;
       while (accepted < TOTAL) {
         await w.ready;
         // `ready` resolved: the stream is asking for more. If the reader is far behind it must not be.
@@ -74,7 +70,6 @@ describe('a sealed session: an endpoint stream applies backpressure end to end',
         await w.write(BASE);
         accepted += CHUNK;
         maxAhead = Math.max(maxAhead, accepted - reader.state.read);
-        if (accepted % (4 * MiB) === 0) heapPeak = Math.max(heapPeak, liveBuffers() - heapBefore);
       }
       await w.close();
       await reader.finished;
@@ -83,19 +78,17 @@ describe('a sealed session: an endpoint stream applies backpressure end to end',
       // What the writer has handed over and the reader has not yet taken is the credit window plus the chunk in flight, never the 32 MiB.
       assert.ok(maxAhead <= GATEWAY_CREDIT_WINDOW + 2 * CHUNK, `writer ran ${maxAhead} bytes ahead of the reader (window ${GATEWAY_CREDIT_WINDOW})`);
       assert.equal(askedWhileFull, 0, '`writer.ready` did not resolve while the reader was far behind');
-      // The guarantee is the assertion above: what was handed over and not yet taken never exceeds the credit window. Live-buffer growth is printed, not asserted
-      // against a fixed number: how much sealing garbage is still alive at a sample depends on when the collector last ran (18.1 MiB was seen on one runner, 6 MiB on others).
-      assert.ok(heapPeak < TOTAL, `memory on the writer's side stayed below the whole transfer: peak ${(heapPeak / MiB).toFixed(1)} MiB for 32 MiB sent`);
-      console.log(`# client->host 32 MiB: max ahead of the reader ${maxAhead} bytes, peak arrayBuffers growth ${(heapPeak / MiB).toFixed(1)} MiB`);
+      // The memory the receiving end held, as that end counted it: never more than the credit window, for a transfer of 32 MiB (and it did hold some: the reader was slower).
+      assert.ok(hostDuplex.peakQueuedBytes > 0, 'the receiving end counted what it held');
+      assert.ok(hostDuplex.peakQueuedBytes <= GATEWAY_CREDIT_WINDOW, `the host held ${hostDuplex.peakQueuedBytes} bytes at once (window ${GATEWAY_CREDIT_WINDOW})`);
     } finally { await client.disconnect().catch(() => {}); }
   });
 
   it('host to client: 32 MiB from a fast producer that awaits writer.ready, at a slow reader: the same', async () => {
     const client = await host.connect({ username: 'u', keyPair });
     try {
-      const stats = { accepted: 0, maxAhead: 0, askedWhileFull: 0, heapPeak: 0 };
+      const stats = { accepted: 0, maxAhead: 0, askedWhileFull: 0 };
       let rd; let producing;
-      const heapBefore = liveBuffers();
       serve = (d) => {
         producing = (async () => {
           const w = d.writable.getWriter();
@@ -105,7 +98,6 @@ describe('a sealed session: an endpoint stream applies backpressure end to end',
             await w.write(BASE);
             stats.accepted += CHUNK;
             stats.maxAhead = Math.max(stats.maxAhead, stats.accepted - (rd?.state.read ?? 0));
-            if (stats.accepted % (4 * MiB) === 0) stats.heapPeak = Math.max(stats.heapPeak, liveBuffers() - heapBefore);
           }
           await w.close();
         })();
@@ -117,10 +109,9 @@ describe('a sealed session: an endpoint stream applies backpressure end to end',
       assert.equal(rd.state.bad, -1);
       assert.ok(stats.maxAhead <= GATEWAY_CREDIT_WINDOW + 2 * CHUNK, `the producer ran ${stats.maxAhead} bytes ahead of the reader`);
       assert.equal(stats.askedWhileFull, 0);
-      // The guarantee is the assertion above: what was handed over and not yet taken never exceeds the credit window. Live-buffer growth is printed, not asserted
-      // against a fixed number: how much sealing garbage is still alive at a sample depends on when the collector last ran (18.1 MiB was seen on one runner, 6 MiB on others).
-      assert.ok(stats.heapPeak < TOTAL, `peak ${(stats.heapPeak / MiB).toFixed(1)} MiB`);
-      console.log(`# host->client 32 MiB: max ahead of the reader ${stats.maxAhead} bytes, peak arrayBuffers growth ${(stats.heapPeak / MiB).toFixed(1)} MiB`);
+      // The memory the receiving end (the client) held, as it counted it: never more than the credit window, for a transfer of 32 MiB.
+      assert.ok(d.peakQueuedBytes > 0, 'the receiving end counted what it held');
+      assert.ok(d.peakQueuedBytes <= GATEWAY_CREDIT_WINDOW, `the client held ${d.peakQueuedBytes} bytes at once (window ${GATEWAY_CREDIT_WINDOW})`);
     } finally { await client.disconnect().catch(() => {}); }
   });
 
@@ -143,6 +134,7 @@ describe('a sealed session: an endpoint stream applies backpressure end to end',
       await writing; await rd.finished;
       assert.equal(rd.state.read, 5 * MiB, 'nothing lost');
       assert.equal(rd.state.bad, -1);
+      assert.ok(d.peakQueuedBytes <= GATEWAY_CREDIT_WINDOW, `the receiving end held ${d.peakQueuedBytes} bytes at once of the 5 MiB written (window ${GATEWAY_CREDIT_WINDOW})`);
     } finally { await client.disconnect().catch(() => {}); }
   });
 
@@ -169,6 +161,7 @@ describe('a sealed session: an endpoint stream applies backpressure end to end',
       await rd.finished;
       assert.equal(rd.state.read, 64 * CHUNK);
       assert.equal(rd.state.bad, -1);
+      assert.ok(d.peakQueuedBytes <= GATEWAY_CREDIT_WINDOW, `the receiving end held ${d.peakQueuedBytes} bytes at once of the 16 MiB queued by the producer (window ${GATEWAY_CREDIT_WINDOW})`);
     } finally { await client.disconnect().catch(() => {}); }
   });
 });

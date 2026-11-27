@@ -475,13 +475,20 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     // what it has already received and then ends), so an origin that finished sending and vanished is noticed too, and a server that sent its whole
     // answer, half-closed and closed completely (HTTP/1.0, `Connection: close`) loses no byte of it. `halfCloseProbeAnswers: false` turns this off.
     let originGone = false;
+    let answering = false;
     if (!watchPeer && !sock.isStreamSocket && channel.lossless && cfg.halfCloseProbeAnswers !== false) {
+      answering = true;
       const probe = cfg.halfCloseProbeMs ?? DEFAULT_HALF_CLOSE_PROBE_MS;
       watchHalfClosed(sock, probe, (e) => { originGone = true; log(`gateway ${id}: ${e.message}`); }, answeringKeepAliveMs(sock, probe, cfg.halfCloseProbeRemoteMs));
     }
     // The origin is gone: say so once everything it sent has gone out, and forget the connection (the client's own
     // GatewayClose, if it sends one, then finds nothing and is ignored).
-    sock.on('close', () => { void tail.finally(() => (originGone ? channel.release() : channel.destroy())); });
+    // Two things can end the socket after its end of file: the probe above, and a write that fails (the client's request body, still uploading, into an
+    // origin that has been reset: an 'error', then 'close'). The probe is skipped while a write is queued, so either may be first, and the verdict must not
+    // depend on which: an origin that sent its WHOLE answer (its end of file was read, so nothing of it is left in the kernel to lose) is released either way,
+    // not discarded, because a second close of "discarded" makes the client drop what it has received and not yet read. An origin that failed before its end
+    // of file cut its answer short, and stays a discard.
+    sock.on('close', () => { void tail.finally(() => (originGone || (answering && sock.readableEnded) ? channel.release() : channel.destroy())); });
     return channel;
   }
 
