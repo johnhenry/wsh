@@ -22,7 +22,7 @@ describe('memory host hostFingerprint', () => {
     const keyPair = await generateKeyPair(true);
     const host = createMemoryHost({ auth: { authorizedKeys: [await exportPublicKeyRaw(keyPair.publicKey)] }, hostKey: true, exec: async () => 0 });
     const fp = await host.hostFingerprint;
-    assert.match(fp, /^SHA256:/);
+    assert.match(fp, /^[0-9a-f]{64}$/);
     const client = await host.connect({ username: 'alice', keyPair, expectHostKey: fp });
     assert.equal(client.hostKey.fingerprint, fp);
     await client.disconnect(); await host.close();

@@ -1338,11 +1338,16 @@ const { window: win } = await client.openObjects();            // the roots, as 
 await win.document.title;                                       // a reference is a lazy path: this one `await` sends ONE `resolve` request,
 await win.app.cart.items.length;                                // whatever the length of the chain, calls included
 await win.app.cart.add({ sku: 'A1', qty: 2 });                  // a call with plain-data arguments; `this` is the object the method was found on
+await call(win.app.cart.add, { sku: 'A1', qty: 2 });            // the same call, spelled with call(): the first argument is the METHOD's reference, not the object and a name
+                                                                // (`call(win.app.cart, 'add', x)` is a call of `cart` itself and is refused); use it for a method named `then`
 await set(win.document, 'title', 'Paid');                       // not `=`: an assignment cannot be awaited or report a refusal, so it throws a sentence naming set()
 await snapshot(win.app.state, { depth: 3, maxBytes: 256_000 }); // a bounded deep copy (subtrees past `depth` are null)
 await describe(win.app);                                        // names and types the allow-list could walk to, for a REPL or completion
 await get(win.app, 'then');                                     // a remote property really named "then" (`ref.then` is the awaiting function)
 ```
+
+A reference is `PromiseLike` (a lazy path), not a `Promise`, so a test that expects a refusal wraps it in an async function: `await assert.rejects(async () => win.app.cart.add(x), (e) => e.reason === 'not-allowed')`
+(`assert.rejects(win.app.cart.add(x))` throws a `TypeError` of its own before the call is made; `Promise.resolve(ref)` works too). The refusal's `reason` is `not-allowed` (the allow-list) or `not-permitted` (the key's capabilities).
 
 `createPageHost({ ..., expose: { window: { mode: 'values', allow: { get: ['document.title', 'app.**'], call: ['app.**'] } } } })` is the same thing on a page host (paths relative to the
 root, which is the `window` that was passed; another root needs `{ object }`), with the sealing, the indicator and Stop, the window guard and the key capability `rpc:wsh-objects`.

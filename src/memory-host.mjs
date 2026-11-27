@@ -309,6 +309,8 @@ export function createMemoryHost({ auth, exec, pty, fs, hostKey, mcp, extensions
     WebSocket: HostWebSocket,
     accept,
     socketPair: createSocketPair,
+    /** The fingerprint of this host's key (64 hex digits), or null when it has none: `expectHostKey: await host.hostFingerprint` pins it (#292). Never rejects. */
+    hostFingerprint: hostKeyReady.then((k) => k?.fingerprint ?? null, () => null),
     /** A `WshClient` whose transport is this host (`await client.connect(host.url, ...)`). */
     createClient(clientOptions = {}) {
       return new WshClient({

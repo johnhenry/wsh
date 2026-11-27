@@ -8,14 +8,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { generateKeyPair, exportPublicKeyRaw, fingerprint } from '@johnhenry/wsh';
+import { generateKeyPair, exportPublicKeyRaw } from '@johnhenry/wsh';
 import { createMemoryHost } from '@johnhenry/wsh/memory';
 import { serveWshOverDuplex, connectWshOverDuplex } from '@johnhenry/wsh/duplex';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const keyPair = await generateKeyPair(true);
-const hostPair = await generateKeyPair(true);
-const hostFingerprint = await fingerprint(await exportPublicKeyRaw(hostPair.publicKey));
 const MAX = 512;
 
 /** A host that serves one session over one MessageChannel; returns the client's end and what travelled. */
@@ -33,9 +31,11 @@ function wire() {
 const feed = (port, target) => { port.onmessage = (e) => target.receive(e.data); port.unref?.(); };
 
 const host = createMemoryHost({
-  auth: { authorizedKeys: [await exportPublicKeyRaw(keyPair.publicKey)] }, hostKey: hostPair,
+  auth: { authorizedKeys: [await exportPublicKeyRaw(keyPair.publicKey)] }, hostKey: true,                                  // the host makes its own key; `host.hostFingerprint` is what a client pins
   exec: async (command, io) => { await io.write(`${command}: ${'x'.repeat(3000)}\n`); return 0; },
 });
+
+const hostFingerprint = await host.hostFingerprint;
 
 // ── 1. The session ────────────────────────────────────────────────────
 

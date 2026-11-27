@@ -153,6 +153,8 @@ export interface WshMemoryHost {
    * value in `gateway`): every `accept()` and every connection then fails the same way, and `onLog` is told. A typo in the shape of `gateway` throws from `createMemoryHost` itself.
    */
   readonly ready: Promise<void>;
+  /** The fingerprint of this host's key (64 hex digits), or `null` when it has none; never rejects. `connect(url, { expectHostKey: await host.hostFingerprint })` pins it. */
+  readonly hostFingerprint: Promise<string | null>;
   /** A `WebSocket` constructor that dials this host. */
   readonly WebSocket: new (url?: string) => any;
   /** Serve any pre-upgraded socket (see `createSocketPair()`). */
