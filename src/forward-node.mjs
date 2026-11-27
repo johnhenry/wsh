@@ -156,7 +156,8 @@ export async function forward(client, { local, remote, reverse = false, replace 
   // A bound on concurrent connections: the CLI's 128 for a named endpoint; the other forwards stay unbounded unless asked.
   const limit = maxConnections ?? (r.kind === 'endpoint' ? DEFAULT_MAX_ENDPOINT_CONNECTIONS : Infinity);
   // An error callback must never take the forward down.
-  const report = (e) => { try { onError(e); } catch { /* the caller's callback threw */ } };
+  // (An `async` callback that rejects is the caller's too: a rejection nobody holds would end the process.)
+  const report = (e) => { try { const r = onError(e); if (typeof r?.then === 'function') r.then(undefined, () => {}); } catch { /* the caller's callback threw */ } };
 
   if (reverse) {
     if (r.kind === 'endpoint') throw new TypeError('forwardUnix: a named endpoint is something a host offers; the host cannot listen on one');
