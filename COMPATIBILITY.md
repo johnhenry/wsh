@@ -160,6 +160,14 @@ carries the same `GatewayFail` code 4 (policy) with a sentence that says which s
 (direct, through a pipe relay, a Node server, a reverse host behind a relay) and `test/browser/gateway-network.spec.mjs` (Chromium).
 Not tested against a release binary of the Rust CLI: stated from the wire, which this adds nothing to.
 
+## Worked case: a per-operator gateway grant on the Rust CLI reverse host (#296)
+
+**Nothing is added to the wire.** The scoping is command-line flags of the host; what an operator sees is what it saw: `relay-gateway`,
+`gateway` and `gateway-credit` in `ReverseAccept.features` (stated for every operator of a host that has a gateway, since the relay keeps the
+statement per peer connection), and, for an operator no rule reaches, the existing `GatewayFail` (code 4) for each request with the sentence
+"this reverse host has no gateway rule for this operator". A released JS client or Rust peer decodes it as any policy refusal; a released
+relay carries it as before. A host older than this one has one list (it would read `FINGERPRINT=RULE` as a destination rule and, by its own start-up check, refuse one that does not parse; not tested against a released binary).
+
 ## Worked case: a grant that runs out ends its gateway connections, and a peer that leaves ends its operators (#297)
 
 **Nothing is added to the wire**: no message, field or feature string. When the `expires` of a key (or of what `authorize()` / a reverse
