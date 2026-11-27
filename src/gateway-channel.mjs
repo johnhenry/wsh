@@ -181,7 +181,10 @@ export class GatewayChannel {
   remoteClosed(reason) {
     if (this.#finished) return;
     // `released` means something only between two sides that both stated `gateway-lossless-close`; to any other it is an ordinary reason text.
-    const released = reason === GATEWAY_RELEASED && this.#o.lossless;
+    // `tolerateRelease` (an operator side behind a relay, #318): a `released` it did not negotiate cannot be told from one a relay forged, and holding the
+    // connection to the idle bound for it was the symptom; it is taken as the peer's release (what was sent is delivered, then the connection ends) and is
+    // never reported as a guarantee (`guaranteed`).
+    const released = reason === GATEWAY_RELEASED && (this.#o.lossless || this.#o.tolerateRelease);
     if (this.#gotClose && released) {
       // (a connection the peer already DISCARDED stays a discard)
       if (!this.#released && !this.#discarded) this.#peerReleased();
@@ -225,6 +228,12 @@ export class GatewayChannel {
 
   /** Does this connection use the lossless close (both ends stated `gateway-lossless-close`)? Only then may it be released. */
   get lossless() { return this.#o.lossless; }
+
+  /**
+   * Is the lossless close GUARANTEED on this connection (#318)? Only where no relay can forge or strip the release (a sealed bridge whose operator signed the
+   * statement, or a direct connection); on any other bridge `released` is best-effort. Defaults to `lossless`.
+   */
+  get guaranteed() { return this.#o.guaranteed ?? this.#o.lossless; }
 
   /**
    * The answering socket of this connection (an origin, a reverse forward's local service) has half-closed and vanished (#286): say so with `released`

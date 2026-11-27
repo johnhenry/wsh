@@ -870,10 +870,14 @@ added: the reason is the existing optional text). It is used only between two si
 operator's statement travels in a field a relay can drop or add, so the host answers it with the feature `gateway-lossless-close-ack` in
 `ReverseAccept.features` ONLY when it actually received the statement, and the operator relies on the feature for that bridge only when it stated it
 AND got the answer back (the host: only when it received the statement). A relay that drops the statement (a released JS relay does, for a host without
-operator proof) leaves both sides on the earlier behaviour; one that ADDS a statement the operator never made makes the host believe in it, and the
-operator, which did not state it, treats a `released` it is sent as an ordinary reason (the connection then waits for its own close or the idle bound;
-nothing is lost). There is no signed or sealed carrier for the statement (it precedes the bridge's key exchange), so a relay is trusted not to forge
-it only as far as it is trusted for `ReverseConnect.features` at all. With it the watch above covers the answering side: an
+operator proof) leaves both sides on the earlier behaviour. **The guarantee holds on a SEALED bridge only (#318)**: there an operator that states it signs it into its proof (`wsh-operator-proof-v2`, see
+`src/operator-proof.mjs`), only for a host whose VERIFIED registered record lists `gateway-lossless-close-signed`, the host acts on the statement it finds
+SIGNED, never on the unsigned list (a relay that ADDS the statement is not believed, one that strips it changes nothing, and the unsigned `-ack` is
+ignored), and only then does the operator report `lossless === true`. **On an unsealed bridge, or with no proof** (`trustRelayIdentity` /
+`--relay-gateway-trust-relay`, an operator without a key) no carrier can stop a relay forging or stripping the plain `released`, so it is best-effort as
+in 0.62.x / rust-v0.26.x: the relay's list is taken, the host may still watch and release, the operator reports `lossless === false` and ends the
+connection promptly on a `released` it receives (what was sent is delivered first) instead of holding it to the idle bound. See
+[COMPATIBILITY.md](COMPATIBILITY.md) for every pairing. With it the watch above covers the answering side: an
 origin (or a reverse forward's local service) that half-closed and then vanished is noticed (a zero-length write probe in Node, write-closed
 readiness in Rust, TCP keep-alive while half-closed: the same detection and the same per-kind speed as for a caller) and the connection
 is freed with `released` instead of waiting for the idle bound, while a server that sent its whole answer, half-closed and closed completely
@@ -3195,7 +3199,10 @@ out explicitly below rather than left to be discovered.
   is accepted only from a peer that stated the feature, drops nothing, and cannot make a side deliver more than it was already sent;
   the receiver's own queue and credit bounds are unchanged. A relay cannot forge a release for an operator or a host: on a sealed bridge it
   is a sealed frame, and on an unsealed one a relay can already close a bridge. The feature string in `ReverseConnect.features` is the
-  operator's own claim and decides nothing at the relay.
+  operator's own claim and decides nothing at the relay. On a sealed bridge the host acts only on the statement the operator SIGNED (#318) and the operator reports a guarantee only then;
+  on an unsealed one the unsigned statement is taken as stated, a relay that adds it only makes the host watch and release (the operator ends promptly and reports none).
+  The host's `gateway-lossless-close-ack` is not signed: a relay that adds it to a
+  bridge whose host did not see the statement makes the operator send `released` to a host that reads it as an ordinary reason.
 - **A relay and a reverse host's gateway (#289): what a relay can and cannot do.** Off unless the host's owner gave the host a gateway
   (`createReverseHost({ gateway })`, `wsh --relay-gateway-allow`); then the **host** decides what is reachable (its destination rules,
   the address check after resolution, UDP, DNS and reverse tunnels each off unless turned on, connections and queued bytes bounded,

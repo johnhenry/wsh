@@ -20,6 +20,9 @@
  * is for, the peer's single-use nonce and the bridge's session id: it cannot be replayed to another peer, later, or
  * for another bridge, and a relay that swaps `public_key` cannot sign for the key it put there.
  *
+ * #318: an operator that states `gateway-lossless-close` signs it into a v2 proof (see `proofTranscript`), only for a peer that lists
+ * `gateway-lossless-close-signed`; the peer acts on the signed statement, never on the unsigned list a relay can edit.
+ *
  * What it does NOT do on its own: it proves who was at the other end when the bridge was set up. A relay can still
  * stamp that identity on a plain message afterwards; closing that is the sealed bridge (`bridge-seal.mjs`), which a
  * host that requires operator proof also requires.
@@ -32,9 +35,18 @@ export const OPERATOR_PROOF_FEATURE = 'operator-proof';
 /** `ReverseAccept.features` of a peer that takes a signed initiator half and a sealed bridge. */
 export const E2E_SEALED_FEATURE = 'e2e-sealed';
 
+/**
+ * What a host lists in its REGISTERED capabilities when it reads a signed statement of `gateway-lossless-close` in an operator's proof (#318): an
+ * operator signs the statement (a `wsh-operator-proof-v2` proof) only for a peer that lists this, since a peer that does not would not verify it.
+ */
+export const GATEWAY_LOSSLESS_SIGNED_FEATURE = 'gateway-lossless-close-signed';
+/** The one statement a proof can carry (the string of `gateway-channel.mjs`'s `GATEWAY_LOSSLESS_FEATURE`). */
+const SIGNABLE = ['gateway-lossless-close'];
+
 const enc = new TextEncoder();
 const CHALLENGE_LABEL = enc.encode('wsh-reverse-challenge-v1\0');
 const PROOF_LABEL = enc.encode('wsh-operator-proof-v1\0');
+const PROOF_LABEL_V2 = enc.encode('wsh-operator-proof-v2\0');
 export const NONCE_LENGTH = 32;
 
 const lp = (bytes) => {
@@ -57,9 +69,15 @@ export function challengeTranscript({ peerPublicKey, operatorFingerprint, nonce,
   return concat([CHALLENGE_LABEL, lp(peerPublicKey), lp(enc.encode(operatorFingerprint)), lp(nonce), lp(enc.encode(sessionId))]);
 }
 
-/** The bytes an operator signs in a `ReverseProof`. */
-export function proofTranscript({ peerPublicKey, operatorPublicKey, username, nonce, sessionId }) {
-  return concat([PROOF_LABEL, lp(peerPublicKey), lp(operatorPublicKey), lp(enc.encode(username)), lp(nonce), lp(enc.encode(sessionId))]);
+/**
+ * The bytes an operator signs in a `ReverseProof`. With `features` (#318: the statements the operator makes about this bridge, in `SIGNABLE`)
+ * the label is `wsh-operator-proof-v2` and the statements follow the session id, each length-prefixed, in sorted order; without, the
+ * unchanged v1 bytes.
+ */
+export function proofTranscript({ peerPublicKey, operatorPublicKey, username, nonce, sessionId, features = [] }) {
+  const base = [lp(peerPublicKey), lp(operatorPublicKey), lp(enc.encode(username)), lp(nonce), lp(enc.encode(sessionId))];
+  if (!features.length) return concat([PROOF_LABEL, ...base]);
+  return concat([PROOF_LABEL_V2, ...base, ...[...features].sort().map((f) => lp(enc.encode(f)))]);
 }
 
 async function verifyWith(rawKey, signature, data) {
@@ -110,9 +128,10 @@ export async function verifyReverseChallenge(msg, { target, ownFingerprint }) {
  * @param {{ publicKeyRaw: Uint8Array, sign: (d: Uint8Array) => Promise<Uint8Array> }} signer - from `resolveSigner`
  * @returns {Promise<object>} fields for `reverseProof({ targetFingerprint, ...fields })`
  */
-export async function createOperatorProof(signer, challenge, username) {
+export async function createOperatorProof(signer, challenge, username, features = []) {
+  if (!features.every((f) => SIGNABLE.includes(f))) throw new TypeError('createOperatorProof: a proof signs only the statements it knows');
   const signature = await signer.sign(proofTranscript({
-    peerPublicKey: challenge.peerPublicKey, operatorPublicKey: signer.publicKeyRaw, username, nonce: challenge.nonce, sessionId: challenge.sessionId,
+    peerPublicKey: challenge.peerPublicKey, operatorPublicKey: signer.publicKeyRaw, username, nonce: challenge.nonce, sessionId: challenge.sessionId, features,
   }));
   return { publicKey: signer.publicKeyRaw, username, nonce: challenge.nonce, sessionId: challenge.sessionId, signature };
 }
@@ -127,9 +146,12 @@ export async function verifyOperatorProof(msg, issued) {
   if (!isKey(msg.public_key) || !str(msg.username, 64)) return null;
   const same = (a, b) => a instanceof Uint8Array && a.length === b.length && a.every((x, i) => x === b[i]);
   if (!same(msg.nonce, issued.nonce) || msg.session_id !== issued.sessionId) return null;
-  const ok = await verifyWith(msg.public_key, msg.signature, proofTranscript({
-    peerPublicKey: issued.peerPublicKey, operatorPublicKey: msg.public_key, username: msg.username, nonce: issued.nonce, sessionId: issued.sessionId,
-  }));
-  return ok ? { publicKey: msg.public_key, fingerprint: await fingerprint(msg.public_key), username: msg.username } : null;
+  // v1 (no statement signed), then v2 with each signable statement: `signedFeatures` is what the operator itself signed, whatever a relay did to
+  // `ReverseConnect.features` (#318).
+  const base = { peerPublicKey: issued.peerPublicKey, operatorPublicKey: msg.public_key, username: msg.username, nonce: issued.nonce, sessionId: issued.sessionId };
+  let signedFeatures = null;
+  if (await verifyWith(msg.public_key, msg.signature, proofTranscript(base))) signedFeatures = [];
+  else if (await verifyWith(msg.public_key, msg.signature, proofTranscript({ ...base, features: SIGNABLE }))) signedFeatures = [...SIGNABLE];
+  return signedFeatures ? { publicKey: msg.public_key, fingerprint: await fingerprint(msg.public_key), username: msg.username, signedFeatures } : null;
 }
 

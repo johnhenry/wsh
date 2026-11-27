@@ -233,7 +233,8 @@ describe('the JS reverse host behind the Rust relay', () => {
     assert.equal(res.type, MSG.REVERSE_ACCEPT, res.reason);
     assert.ok(res.features.includes('gateway-lossless-close') && res.features.includes('gateway-lossless-close-ack'), `${res.features}`);
     const v = await op.openTcp('127.0.0.1', port);
-    assert.equal(v.lossless, true);
+    assert.equal(v.lossless, false, 'unsealed bridge: best-effort, no guarantee (#318)');
+    assert.equal(v.releasable, true);
     const reader = v.readable.getReader();
     let n = 0; let ok = true; let chunks = 0;
     for (;;) {
