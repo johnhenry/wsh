@@ -20,6 +20,9 @@ pub const GATEWAY_CREDIT_FEATURE: &str = "gateway-credit";
 /// more): the peer ends its own direction too instead of waiting for the half-closed idle bound. A
 /// `GatewayClose` without it is a half-close.
 pub const GATEWAY_DISCARDED: &str = "discarded";
+/// The reason a host puts on the `GatewayClose` of a connection it ends because the grant behind it (a key's `expires`) ran out (wsh #297).
+/// It is followed by a second close saying "discarded". Nothing is negotiated: to a peer that predates it the first is an ordinary half-close.
+pub const GATEWAY_EXPIRED: &str = "key expired";
 /// Largest `GatewayData` payload this implementation sends.
 pub const GATEWAY_MAX_FRAME: usize = 65_536;
 
