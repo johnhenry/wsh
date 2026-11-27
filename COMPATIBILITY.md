@@ -135,6 +135,27 @@ that carries it for a host that did not state it, sealed bridges, and an operato
 `reverse_gateway` and `common` unit tests). Not tested against a release binary: the released-client row (stated from the code: its
 inner-type check is `isRelayForwardable`).
 
+## Worked case: the gateway over a network the embedder supplies (#299)
+
+A host in a page (`createMemoryHost({ gateway: { network } })`), a browser-safe reverse host, or a Node host given `gateway.network`
+serves the gateway opcodes over the embedder's network instead of the machine's. **Nothing is added to the wire**: no message, no field,
+no feature string. The host states what a gateway host has always stated (`gateway` when TCP, DNS, UDP or listening is on, `gateway-credit`,
+`gateway-endpoints` when it has named endpoints; `gateway-datagram` only over a transport that has datagrams, which an in-page host's does
+not), and answers with the codes and sentences a Node gateway does. So a peer cannot tell this host from a Node host with a gateway:
+
+| Peer | What happens |
+| --- | --- |
+| released JS client (0.45.0 and later) | Reads `gateway` and `gateway-credit` as it does from a Node host: `openTcp()`, `openUdp()`, `listenTcp()`, the raw `ResolveDns`, with flow control. Nothing it does not know is sent to it. |
+| released Rust peer (`rust-v0.16.0`, `deny_unknown_fields`) | Nothing new is sent: the messages are the existing gateway ones. A released CLI that forwards (`-L host:port`) over a pipe relay to an in-page host with a gateway reaches the injected network the same way it reaches a Node host's. |
+| a reverse host with `gateway.network` behind a relay | Exactly the `relay-gateway` rows above (the feature is `relay-gateway` as before; the host states it only on a relay that lists it). A released relay or operator behaves as there. |
+| a host older than this one | Has no `gateway.network`; there is nothing to negotiate: the option is the host's own, an operator sees only the features the host states. |
+
+What differs between hosts is local policy, not wire: on an injected network `udp`, `dns` and `reverse` are each off until the embedder
+turns them on and the network has the method; on the machine's network UDP and DNS are on with the gateway (unchanged). A refusal
+carries the same `GatewayFail` code 4 (policy) with a sentence that says which switch or method is missing. Tested: `test/gateway-network.test.mjs`
+(direct, through a pipe relay, a Node server, a reverse host behind a relay) and `test/browser/gateway-network.spec.mjs` (Chromium).
+Not tested against a release binary of the Rust CLI: stated from the wire, which this adds nothing to.
+
 ## What this policy does not promise
 
 - No peer older than the previous release of its implementation is tested. The CHANGELOG says what an older one does where it was known.
