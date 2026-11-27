@@ -1691,6 +1691,9 @@ impl WshServer {
 
                 // Peer push messages (e.g. forwarded ReverseConnect)
                 Some(envelope) = peer_rx.recv() => {
+                    // A `Shutdown` pushed by the relay says the bridge this connection was an end of is over (wsh #297): after it is
+                    // written the connection ends. (The server's own shutdown does not come this way.)
+                    let ends_after = matches!(envelope.msg_type, MsgType::Shutdown);
                     match frame_encode(&envelope) {
                         Ok(frame) => {
                             // A write can wait for flow-control credit, and the
@@ -1729,6 +1732,9 @@ impl WshServer {
                                         }
                                     }
                                 }
+                            }
+                            if ends_after {
+                                break 'session Ok(());
                             }
                         }
                         Err(e) => break 'session Err(e),
@@ -2434,6 +2440,10 @@ impl WshServer {
                     send.write_all(&frame)
                         .await
                         .map_err(|e| WshError::Transport(format!("WebTransport write: {e}")))?;
+                    // A `Shutdown` pushed by the relay: the bridge is over, so is this connection (wsh #297).
+                    if matches!(envelope.msg_type, MsgType::Shutdown) {
+                        break;
+                    }
                 }
 
                 frame_result = frames.next(recv) => {
@@ -2565,8 +2575,8 @@ impl WshServer {
     /// operators (wsh #93) is told with `ReverseClose` which one left; any other peer is left
     /// connected, as it always was.
     async fn clear_relay_links(&self, conn_id: u64) {
-        let departed = self.bridges.write().await.depart(conn_id);
-        if let Some((peer, operator_fingerprint)) = departed.reverse_close {
+        let mut departed = self.bridges.write().await.depart(conn_id);
+        if let Some((peer, operator_fingerprint)) = departed.reverse_close.take() {
             if let Some(tx) = self.peer_senders.read().await.get(&peer) {
                 let _ = tx.try_send(Envelope {
                     msg_type: MsgType::ReverseClose,
@@ -2574,6 +2584,27 @@ impl WshServer {
                         target_fingerprint: operator_fingerprint,
                         reason: Some("operator left".to_string()),
                     }),
+                });
+            }
+        }
+        // Operators bridged to a peer that carried a gateway are told the bridge is over (wsh #297): a `Shutdown` with the reason, after
+        // which their connection ends (the loop closes after writing it). Without it their gateway connections would wait on their own
+        // half-close bounds for a host that is gone. The send waits for room in the operator's queue (bounded) rather than skipping.
+        for operator in departed.end_operators {
+            let tx = self.peer_senders.read().await.get(&operator).cloned();
+            if let Some(tx) = tx {
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tx.send(Envelope {
+                            msg_type: MsgType::Shutdown,
+                            payload: Payload::Shutdown(ShutdownPayload {
+                                reason: BRIDGE_OVER_REASON.into(),
+                                retry_after: None,
+                            }),
+                        }),
+                    )
+                    .await;
                 });
             }
         }
@@ -4001,6 +4032,27 @@ impl WshServer {
                 if let Some(refusal) = self.gateway_key_refusal(&ctx.fingerprint, &envelope) {
                     return Ok(Some(refusal));
                 }
+                // A key with an `expires` loses the gateway connections it has open when it passes (wsh #297): one timer for the
+                // connection, armed by the first request that opens something (the session ignores the rest).
+                if matches!(
+                    envelope.msg_type,
+                    MsgType::OpenTcp
+                        | MsgType::OpenUdp
+                        | MsgType::OpenUnix
+                        | MsgType::OpenEndpoint
+                        | MsgType::ListenRequest
+                        | MsgType::ListenUnix
+                ) {
+                    if let Some(expires) = self.key_permissions(&ctx.fingerprint).expires {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs() as i64);
+                        ctx.gateway.end_after(
+                            std::time::Duration::from_secs((expires - now).max(0) as u64),
+                            wsh_core::gateway::session::GATEWAY_EXPIRED,
+                        );
+                    }
+                }
                 ctx.gateway.handle(envelope.clone());
                 Ok(None)
             }
@@ -5261,6 +5313,8 @@ impl WshServer {
 /// Read a length-prefixed frame from a WebTransport recv stream.
 /// What a peer is told when its login is not done by the deadline (wsh #248). The same words as the
 /// JS hosts' `AuthFail`; the parenthesised name is the reason a JS host reports to `onRefused`.
+/// The `Shutdown.reason` an operator is told when the peer its bridge led to has left (wsh #297).
+const BRIDGE_OVER_REASON: &str = "the peer this bridge led to has left; the bridge is over";
 const LOGIN_TIMEOUT_REASON: &str = "the login was not completed in time (login-timeout)";
 
 /// How long the host waits for the last message it sends before it drops a connection (a refusal, a deadline, a shutdown notice) to be written

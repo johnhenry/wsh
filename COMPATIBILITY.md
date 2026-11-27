@@ -168,6 +168,25 @@ statement per peer connection), and, for an operator no rule reaches, the existi
 "this reverse host has no gateway rule for this operator". A released JS client or Rust peer decodes it as any policy refusal; a released
 relay carries it as before. A host older than this one has one list (it would read `FINGERPRINT=RULE` as a destination rule and, by its own start-up check, refuse one that does not parse; not tested against a released binary).
 
+## Worked case: a grant that runs out ends its gateway connections, and a peer that leaves ends its operators (#297)
+
+**Nothing is added to the wire**: no message, field or feature string. When the `expires` of a key (or of what `authorize()` / a reverse
+host's `accept()` granted) passes, the host sends each open gateway connection of that holder a `GatewayClose` with the reason
+`key expired` and then a second one with the reason `discarded`, and stops its reverse listeners (no message exists for that). On the Rust relay, a
+peer that stated `relay-gateway` and leaves has each of its operators sent the existing `Shutdown` message (reason: the bridge is over), after
+which the relay closes the operator's connection (the JS relay always closed it, without a message).
+
+| Peer | What happens |
+| --- | --- |
+| released JS client (0.45.0 and later) | The first close is an ordinary half-close from the host (the application sees the end of its stream); the second is the documented "discarded" and frees the connection at once on a client that has that wording (0.58.1 and later); an older client ignores it and its own half-close bounds free the connection. A `Shutdown` from the Rust relay makes it disconnect (it did so for any `Shutdown`). |
+| released Rust peer (`rust-v0.16.0`, `deny_unknown_fields`) | Nothing new is sent: `GatewayClose.reason` is a field every release decodes, and `Shutdown` is a message every release decodes (the Rust client logs it; a Rust CLI operator stays up until its own bridge handling ends it). A peer that ignores a second `GatewayClose` for a connection it already saw close does so as it always did. |
+| released relay | Unchanged: the JS relay already closed the operators of a peer that left; a Rust relay of an older release leaves them connected. |
+| released host (no expiry cut) | Keeps the connections open past the expiry, exactly as before. |
+
+Not covered: a Rust relay and a peer that did not state `relay-gateway` (the operator stays connected, as since #93); the Rust CLI reverse host
+(it has no grant with an expiry). Tested: `test/gateway-expiry.test.mjs`, the `expiry` tests of `crates/wsh-core/src/gateway/session/tests.rs`,
+`test/rust/wsh-gateway-expiry.test.mjs`, `test/rust/wsh-relay-peer-left.test.mjs` and the `bridges` unit tests.
+
 ## What this policy does not promise
 
 - No peer older than the previous release of its implementation is tested. The CHANGELOG says what an older one does where it was known.
