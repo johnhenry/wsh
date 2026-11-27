@@ -91,6 +91,11 @@ impl FrameDecoder {
     }
 
     /// Feed bytes into the decoder and return all complete CBOR-decoded messages.
+    ///
+    /// A malformed frame fails the call and is dropped from the buffer (the frames after it are read by the next call); the good messages
+    /// of the same call before it are not returned. That is deliberate: the production paths (`wsh-server`, the clients) read frames with
+    /// `feed_raw` and `decode_envelope` one by one and close the session on the first error, so this typed form is for tests and
+    /// single-message callers.
     pub fn feed<T: serde::de::DeserializeOwned>(&mut self, data: &[u8]) -> WshResult<Vec<T>> {
         self.buffer.extend_from_slice(data);
         let mut messages = Vec::new();
@@ -110,11 +115,10 @@ impl FrameDecoder {
                 break;
             }
 
-            let payload = &self.buffer[4..4 + len];
-            let msg: T = cbor_decode(payload)?;
-            messages.push(msg);
-
+            let decoded = cbor_decode::<T>(&self.buffer[4..4 + len]);
+            // the bad frame is consumed either way: the length prefix keeps the stream in step, and leaving it in front would fail every later call
             self.buffer.drain(..4 + len);
+            messages.push(decoded?);
         }
 
         Ok(messages)
@@ -427,7 +431,13 @@ mod tests {
         // [good][bad][good] in one call: the call returns the error (the good message before it is not returned: the production
         // paths use feed_raw + decode_envelope per frame, so a bad frame there costs only itself); the bad frame is consumed, not
         // left in front of the stream forever, so the following frame is read by the next call.
-        let good = |n: i64| frame_encode(&TestMsg { name: "m".into(), value: n }).unwrap();
+        let good = |n: i64| {
+            frame_encode(&TestMsg {
+                name: "m".into(),
+                value: n,
+            })
+            .unwrap()
+        };
         let mut bad = good(0);
         bad.push(0x00);
         let len = (bad.len() - 4) as u32;

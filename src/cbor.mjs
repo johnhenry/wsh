@@ -209,6 +209,8 @@ export function cborDecode(data, options) {
  * @returns {{ value: *, end: number }}
  */
 export function cborDecodePrefix(data, { offset = 0, legacyIndefiniteMap = true } = {}) {
+  if (!Number.isInteger(offset) || offset < 0 || offset > data.length) throw new RangeError(`cborDecodePrefix: offset must be an integer from 0 to ${data.length}, got ${String(offset)}`);
+  // the item this call reads is its own top level, at whatever offset: the legacy indefinite map is accepted there too
   const state = { data, offset, legacy: legacyIndefiniteMap !== false, view: new DataView(data.buffer, data.byteOffset, data.byteLength) };
   const value = decodeItem(state, 0);
   return { value, end: state.offset };
@@ -436,14 +438,47 @@ export class FrameDecoder {
         // Reject before accumulating toward the (possibly huge) claimed
         // length — do not wait for the payload to arrive.
         this.#buffer = new Uint8Array(0);
-        throw new FrameSizeError(len, this.#maxFrameSize);
+        const fatal = new FrameSizeError(len, this.#maxFrameSize);
+        fatal.decoded = messages;
+        throw fatal;
       }
       if (this.#buffer.length < 4 + len) break;
       const payload = this.#buffer.slice(4, 4 + len);
       this.#buffer = this.#buffer.slice(4 + len);
-      messages.push(cborDecode(payload));
+      try {
+        messages.push(cborDecode(payload));
+      } catch (err) {
+        // The length prefix kept the stream in step: the bad frame is consumed and the frames after it stay buffered.
+        // What was decoded before it travels with the error (`err.decoded`) so a caller that catches does not lose it.
+        err.decoded = messages;
+        throw err;
+      }
     }
     return messages;
+  }
+
+  /**
+   * Like {@link feed}, but never throws and never loses a message: every good frame of the chunk in order, one error per malformed frame (each a
+   * {@link CborError}; the frames after it are still read), and `fatal` set (a {@link FrameSizeError}, after which the buffer is empty) when a frame claims
+   * more than the maximum. Callers dispatch `messages`, report `errors`, and end the connection if `fatal`.
+   * @param {Uint8Array} chunk
+   * @returns {{ messages: Array, errors: Error[], fatal: FrameSizeError | null }}
+   */
+  feedAll(chunk) {
+    const messages = []; const errors = [];
+    let next = chunk;
+    for (;;) {
+      try {
+        messages.push(...this.feed(next));
+        return { messages, errors, fatal: null };
+      } catch (err) {
+        if (err?.decoded) messages.push(...err.decoded);
+        if (err instanceof FrameSizeError) return { messages, errors, fatal: err };
+        if (!(err instanceof CborError)) throw err;
+        errors.push(err);
+        next = new Uint8Array(0);
+      }
+    }
   }
 
   /** Reset internal buffer. */

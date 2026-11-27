@@ -70,12 +70,12 @@ describe('the JS WebTransport client: a decode error is reported and reading con
     t.onControl = (m) => got.push(m);
     t.onError = (e) => errors.push(e);
     await t.connect('https://example.test/wsh');
-    for (let i = 0; i < 100 && got.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    for (let i = 0; i < 100 && (got.length < 2 || errors.length < 1); i++) await new Promise((r) => setTimeout(r, 5));
     assert.deepEqual(got, [good1, good2]);
     assert.equal(errors.length, 1);
     assert.match(errors[0].message, /trailing-bytes|after the value/);
     assert.equal(t.state, 'connected', 'a malformed frame does not end the connection');
-    await t.close();
+    t.close().catch(() => {}); // not awaited: the fake control stream never ends
   });
 });
 

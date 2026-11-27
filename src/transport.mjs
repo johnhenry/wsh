@@ -686,8 +686,12 @@ export class WebTransportTransport extends WshTransport {
         // once (e.g. SERVER_HELLO immediately followed by CHALLENGE).
         // dispatchSerially yields between each — see its doc comment for
         // why that matters.
-        const messages = this.#decoder.feed(value);
+        // A frame that does not decode is reported and dropped; the frames around it are delivered and the stream is read on (the policy of the
+        // WebSocket transports, COMPATIBILITY.md rule 7). Only an oversized claimed length ends the connection.
+        const { messages, errors, fatal } = this.#decoder.feedAll(value);
         await dispatchSerially(messages, (msg) => this._emitControl(msg));
+        for (const err of errors) this._emitError(err);
+        if (fatal) throw fatal;
       }
     } catch (err) {
       if (!this.#abort.signal.aborted) {

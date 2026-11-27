@@ -169,9 +169,11 @@ export async function startWebTransport({ options, host, attach, log }) {
               for (;;) {
                 const { done: fin, value } = await reader.read();
                 if (fin) break;
-                let msgs;
-                try { msgs = decoder.feed(value); } catch (e) { log(`webtransport frame decode error: ${e.message}`); break; }
+                // a frame that does not decode is logged and dropped; the good ones around it are handled. An oversized claimed length ends the stream.
+                const { messages: msgs, errors, fatal } = decoder.feedAll(value);
                 for (const m of msgs) conn.receiveMessage(m);
+                for (const e of errors) log(`webtransport frame decode error: ${e.message}`);
+                if (fatal) { log(`webtransport frame decode error: ${fatal.message}`); break; }
               }
             } catch { /* session went away */ }
             end();

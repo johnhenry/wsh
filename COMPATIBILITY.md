@@ -104,7 +104,7 @@ last release is breaking in the sense of rule "versions" above even when no depl
 
 ### 7. CBOR is read strictly, and the two decoders are one rule set (#317)
 
-A message is accepted only if it is exactly one well-formed, canonical CBOR item. `cborDecode` (`src/cbor.mjs`) and `cbor_decode` /
+A message is accepted only if it is exactly one well-formed CBOR item with no non-canonical *head* (integers, lengths) and none of the constructs listed below. That is strict, but it is **not** "exactly one canonical encoding": the residual list is under the table. `cborDecode` (`src/cbor.mjs`) and `cbor_decode` /
 `cbor_strict::validate` (`crates/wsh-core/src/cbor_strict.rs`) refuse, with the same rule code (`CborError.code`, `StrictCode::as_str()`), the
 same inputs (`spec/cbor-strict-cases.json` is the shared table; `test/rust/cbor-differential.test.mjs` compares the two on 20000 mutations):
 
@@ -120,9 +120,9 @@ same inputs (`spec/cbor-strict-cases.json` is the shared table; `test/rust/cbor-
 | any tag; any simple value but `false`, `true`, `null` | `tag`, `simple-value` |
 | a text string that is not UTF-8; nesting deeper than 128 | `invalid-utf8`, `too-deep` |
 
-What is **not** required, because the two encoders disagree and refusing it would break a released peer: **the order of map keys** (the JS encoder
+What is **not** required, so more than one byte string decodes to the same value (tracked in #325): **the order of map keys** (the JS encoder
 writes insertion order, the Rust encoder field order; neither is the RFC 8949 length-first order), and **the width of a float** (the JS encoder
-writes every float as float64, ciborium the shortest exact width; all three widths are read).
+writes every float as float64, ciborium the shortest exact width; all three widths are read), **NaN payloads and -0** (any NaN bit pattern is read; -0 is a float and stays one), **JS integers above 2^53** (the JS decoder returns a double, so two integers that round to the same double decode alike), and **JS integer/float conflation** (an integral float reads as the same JS number as the integer). The Rust and JS decoders agree on accept/reject for all of these; they differ only in the value a JS caller sees. The legacy top-level map (next paragraph) is the last residual.
 
 **The one legacy exception.** Every released `wsh-core` encoder wrote a message envelope as an **indefinite-length map** (`0xbf ... 0xff`):
 `Envelope` has a `#[serde(flatten)]` payload, which makes serde ask for an unsized map and ciborium write the indefinite form. All 110
@@ -130,8 +130,10 @@ message types did this (`spec/cbor-vectors.json`, `rust_released`), so refusing 
 `wsh-server` or `wsh-client` sends. Decoders therefore accept an indefinite-length map as the **top-level item** (`legacyIndefiniteMap`,
 default true), and nowhere else; what is inside it is held to every rule above. The Rust encoder in this tree writes a definite-length
 map (`Envelope` serializes by hand, generated from `spec/codegen.mjs`), so the exception is only for peers that predate it, and can be
-removed once none is supported. The rpc channel (a CBOR sequence of JSON-RPC messages) never had the exception: no released encoder wrote
+removed when `rust-v0.26.x` leaves the supported window (rule "versions": the latest release and the one before it), tracked in #326. The rpc channel (a CBOR sequence of JSON-RPC messages) never had the exception: no released encoder wrote
 an indefinite-length rpc item, and its decoders refuse one.
+
+**What happens on a decode error** (the frame is delimited by its length prefix, so the stream stays in step): the Rust server and client close the session (they read frames with `feed_raw` and `decode_envelope` and end on the first error); the JS WebSocket server logs the error and drops the frame, and handles the good frames around it; the JS WebSocket client emits the error (`onError`) and continues; the JS WebTransport client does the same since this change (before it left its read loop and the connection half-open), and so does the JS WebTransport server. An oversized claimed length ends the connection everywhere. On a sealed session a dropped frame is a gap in the strict counter, so the next frame ends the session. `FrameDecoder.feedAll` is the helper the JS transports share: it returns every good message and every error of a chunk. `FrameDecoder.feed` throws at the first bad frame, with the messages before it in `error.decoded`.
 
 **An older peer.** What the released encoders write is recorded and checked: `test/cbor-vectors.test.mjs` (JS encoder, current Rust
 encoder and the released Rust encoder, every message type), `scripts/cbor-interop-old.mjs` (the encoder of an older `@johnhenry/wsh` install

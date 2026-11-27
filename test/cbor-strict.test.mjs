@@ -119,7 +119,7 @@ describe('the prefix API and the framing layer', () => {
   it('cborDecodePrefix is as strict as cborDecode about the value itself', () => {
     assert.throws(() => cborDecodePrefix(bytes('1800ff')), (e) => e.code === 'non-shortest');
     assert.throws(() => cborDecodePrefix(bytes('7a00011170')), (e) => e.code === 'length-exceeds-buffer');
-    assert.throws(() => cborDecodePrefix(bytes('00'), { offset: 5 }), (e) => e.code === 'truncated');
+    assert.throws(() => cborDecodePrefix(bytes('00'), { offset: 1 }), (e) => e.code === 'truncated');
   });
 
   it('FrameDecoder: a frame whose payload has a stray byte, a bad length or a non-canonical head throws; the next frame is not poisoned by a good one', () => {
