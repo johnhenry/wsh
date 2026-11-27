@@ -555,6 +555,16 @@ mod tests {
         assert_eq!(peek_rpc_open(&open_msg("rpc", None)), Some(String::new()));
         assert_eq!(peek_rpc_open(&open_msg("exec", Some("ls"))), None);
         assert_eq!(peek_rpc_open(&[0xff, 0x00]), None);
+        // strict since #317: an Open with a stray byte after it, or a non-shortest head, is not an rpc Open
+        let mut stray = open_msg("rpc", Some("wsh-host"));
+        stray.push(0x00);
+        assert_eq!(peek_rpc_open(&stray), None);
+        let mut padded = open_msg("rpc", Some("wsh-host"));
+        let kind = padded.windows(4).position(|w| w == b"kind").unwrap();
+        assert_eq!(padded[kind - 1], 0x64);
+        padded[kind - 1] = 0x78; // text(4) as text with a one-byte length: the same key in a longer head
+        padded.insert(kind, 0x04);
+        assert_eq!(peek_rpc_open(&padded), None);
         // not an Open
         let close = enc(&Value::Map(vec![
             (super::super::text("type"), super::super::int(0x16)),
