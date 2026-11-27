@@ -67,6 +67,7 @@ import { normalizeReverse, reversePortAllowed, reversePortRefusal, reverseBindAd
 import { normalizeUdp, newGatewayStats } from './udp-policy.mjs';
 import { TokenBucket, encodeDatagram, decodeDatagram, MAX_UDP_PAYLOAD, GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
 import { StreamSocket, DatagramFlow } from './stream-socket.mjs';
+import { checkGatewayOptions } from '../gateway-shape.mjs';
 
 export { normalizeReverse, reversePortAllowed } from './reverse-policy.mjs';
 export { normalizeUdp } from './udp-policy.mjs';
@@ -77,15 +78,17 @@ export { normalizeUdp } from './udp-policy.mjs';
 const NET = 'node:net';
 const UNIX_POLICY = './unix-policy.mjs';
 const SOCKS = './socks.mjs';
+// A Node entry (`server/gateway.mjs`) hands the session LITERAL dynamic imports through `cfg.nodeLoaders`, so that a bundled Node server still includes them
+// (a variable specifier is invisible to a bundler); the variable ones below are the fallback of an unbundled run, and are never reached from a browser.
 let netModule = null;
 let unixModule = null;
 let socksModule = null;
-const loadNet = async () => (netModule ??= (await import(NET)).default);
-const loadUnix = async () => (unixModule ??= await import(UNIX_POLICY));
-const loadSocks = async () => (socksModule ??= await import(SOCKS));
+const loadNet = async (cfg) => (netModule ??= cfg?.nodeLoaders?.net ? await cfg.nodeLoaders.net() : (await import(NET)).default);
+const loadUnix = async (cfg) => (unixModule ??= cfg?.nodeLoaders?.unix ? await cfg.nodeLoaders.unix() : await import(UNIX_POLICY));
+const loadSocks = async (cfg) => (socksModule ??= cfg?.nodeLoaders?.socks ? await cfg.nodeLoaders.socks() : await import(SOCKS));
 
 /** The SOCKS5 client (Node only), here so that this module can be imported where there is no `node:net`. */
-export async function socksConnect(proxy, host, port, opts) { return (await loadSocks()).socksConnect(proxy, host, port, opts); }
+export async function socksConnect(proxy, host, port, opts) { return (await loadSocks(opts?.cfg)).socksConnect(proxy, host, port, opts); }
 
 export { GATEWAY_FAIL, gatewayFeatures };
 
@@ -188,19 +191,45 @@ function networkError(e) {
 /** An error with a GATEWAY_FAIL code, for what this session itself refuses. */
 const refusal = (message, code = GATEWAY_FAIL.POLICY_DENIED) => Object.assign(new Error(message), { code });
 
-/** Await `promise`, but no longer than `ms`: then `ac` is aborted (the network is told) and the result is a TIMEOUT. A result that arrives after that is released. */
-function withTimeout(promise, ms, ac, what) {
+/** Best-effort release of whatever a network handed over that is not (or no longer) wanted: cancel what can be read, abort what can be written. Never throws. */
+function releaseDuplex(d) {
+  try { const p = d?.readable?.cancel?.(); p?.catch?.(() => {}); } catch { /* not a stream, or locked */ }
+  try { const p = d?.writable?.abort?.(); p?.catch?.(() => {}); } catch { /* not a stream, or locked */ }
+}
+
+/** A listener handle the network gave too late (or that we cannot use): stop it. Never throws. */
+function releaseListener(h) {
+  try { const p = h?.close?.(); p?.catch?.(() => {}); } catch { /* the network's own */ }
+}
+
+/**
+ * Await `promise`, but no longer than `ms`, and not past the abort of `ac` (the session ended): then the result is a TIMEOUT (and `ac` is aborted, so the
+ * network is told) or CLOSED. A result that arrives after that is passed to `release` (a connection is cancelled, a listener closed), never kept.
+ */
+function withTimeout(promise, ms, ac, what, release = releaseDuplex) {
   return new Promise((resolve, reject) => {
-    let late = false;
-    const timer = setTimeout(() => { late = true; ac.abort(); reject(refusal(what, GATEWAY_FAIL.TIMEOUT)); }, ms);
+    let settled = false;
+    const finish = (fn, v) => { if (settled) return false; settled = true; clearTimeout(timer); ac.signal.removeEventListener('abort', onAbort); fn(v); return true; };
+    const timer = setTimeout(() => { if (finish(reject, refusal(what, GATEWAY_FAIL.TIMEOUT))) ac.abort(); }, Math.max(ms, 0));
     timer.unref?.();
-    Promise.resolve(promise).then((v) => {
-      clearTimeout(timer);
-      if (late) { try { v?.readable?.cancel?.().catch(() => {}); v?.writable?.abort?.().catch(() => {}); } catch { /* released */ } return; }
-      resolve(v);
-    }, (e) => { clearTimeout(timer); if (!late) reject(e); });
+    const onAbort = () => { finish(reject, refusal('aborted', GATEWAY_FAIL.CLOSED)); };
+    if (ac.signal.aborted) onAbort(); else ac.signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then((v) => { if (!finish(resolve, v)) release(v); }, (e) => { finish(reject, e); });
   });
 }
+
+/** Wait for `promise` for at most `ms` and ignore how it ends (the network's own `close()`: it must not hold the session's message loop). */
+function settleWithin(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, Math.max(ms, 0));
+    timer.unref?.();
+    Promise.resolve(promise).then(() => { clearTimeout(timer); resolve(); }, () => { clearTimeout(timer); resolve(); });
+  });
+}
+
+/** Most addresses taken from one answer of a network's `resolve` (dialled, or handed to a caller in a `DnsResult`), and most entries looked at to find them. */
+const MAX_ANSWER_ADDRESSES = 64;
+const MAX_ANSWER_SCAN = 1024;
 
 const connectError = (e) => {
   const code = e.code === 'ECONNREFUSED' ? GATEWAY_FAIL.CONNECTION_REFUSED : e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN' ? GATEWAY_FAIL.DNS_FAILED : GATEWAY_FAIL.HOST_UNREACHABLE;
@@ -235,6 +264,8 @@ export function normalizeGateway(opts) {
     if (opts.unix !== undefined && opts.unix !== null && opts.unix !== false) throw new TypeError('gateway.unix serves this machine\'s sockets and cannot be combined with gateway.network');
     if (opts.tcp === false) throw new TypeError('gateway.tcp: false cannot be combined with gateway.network (leave the method out of the network instead)');
     if (!Array.isArray(opts.allow)) throw new TypeError('gateway.allow is required with gateway.network (default deny): { allow: ["host:port", ...] }, an empty list reaches nothing');
+    // A new surface is strict: a typo (`allowPrivte`) is a mistake, not an option that silently does nothing. (The machine's gateway keeps accepting what it always did.)
+    checkGatewayOptions(opts, 'gateway');
   }
   const allow = opts.allow ?? [];
   if (!Array.isArray(allow) || allow.some((a) => typeof a !== 'string' || !a)) throw new TypeError('gateway.allow must be an array of non-empty strings');
@@ -263,6 +294,7 @@ export function normalizeGateway(opts) {
     halfCloseProbeMs,
     connectTimeoutMs: opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     udpIdleMs: opts.udpIdleMs ?? DEFAULT_UDP_IDLE_MS,
+    // `udp: false` turns UDP OFF (on the Node path too: it used to throw "must be an options object"); `true` or the bounds turn it on with them.
     udp: normalizeUdp(opts.udp === false ? undefined : opts.udp),
     reverse: normalizeReverse(opts.reverse),
     stats: newGatewayStats(),
@@ -271,10 +303,10 @@ export function normalizeGateway(opts) {
     unix,
     endpoints,
     network,
-    // On the machine's network UDP and DNS are on with the gateway (as they always were); on an injected one each is a switch the
-    // embedder turns on, and needs the network method as well.
-    udpOn: network ? (opts.udp !== undefined && opts.udp !== null && opts.udp !== false) : true,
-    dnsOn: network ? opts.dns === true : true,
+    // On the machine's network UDP and DNS are on with the gateway (as they always were) unless given as `false`; on an injected one each is a switch
+    // the embedder turns on, and needs the network method as well.
+    udpOn: network ? (opts.udp !== undefined && opts.udp !== null && opts.udp !== false) : opts.udp !== false,
+    dnsOn: network ? opts.dns === true : opts.dns !== false,
   };
 }
 
@@ -375,7 +407,14 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       let answers;
       try { answers = await network.resolve({ name: n, family: o.family, signal }); } catch (e) { throw (e instanceof AddressGuardError ? e : Object.assign(new Error(String(e?.message ?? e).slice(0, 200)), { code: e?.code })); }
       if (!Array.isArray(answers)) throw new AddressGuardError('LOOKUP_FAILED', 'the network returned no list of addresses');
-      return answers.map((a) => (typeof a === 'string' ? a : a?.address)).filter((a) => typeof a === 'string' && parseIp(a));
+      // What is an address: text that is an IP literal exactly as written (no space around it, no zone id, no trailing dot). At most 64 are taken, from
+      // at most the first 1024 entries: a network that answers with ten thousand addresses cannot make the host classify, dial or report them all.
+      const taken = [];
+      for (const a of answers.slice(0, MAX_ANSWER_SCAN)) {
+        const text = typeof a === 'string' ? a : a?.address;
+        if (typeof text === 'string' && text === text.trim() && parseIp(text)) { taken.push(text); if (taken.length >= MAX_ANSWER_ADDRESSES) break; }
+      }
+      return taken;
     };
     return resolveChecked(name, guardOptions(cfg, explicit, { family, signal, lookup }));
   }
@@ -461,7 +500,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
           e.code = GATEWAY_FAIL.POLICY_DENIED;
           throw e;
         }
-        sock = await socksConnect(cfg.socks, m.host, m.port, { timeoutMs: cfg.connectTimeoutMs });
+        sock = await socksConnect(cfg.socks, m.host, m.port, { timeoutMs: cfg.connectTimeoutMs, cfg });
       } else {
         ({ socket: sock, address: resolvedAddr } = await dialChecked(m.host, m.port, guardOptions(cfg, decision.explicit ? m.host : null)));
       }
@@ -485,13 +524,26 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
    * that connects wins. The network is never given the name.
    */
   async function dialNetwork(m, decision, ac) {
+    const { made, address } = await dialInjected(m, decision, ac, 'connectTcp', (duplex, a) => new StreamSocket(duplex, { remoteAddress: a, remotePort: m.port, onDestroy: () => ac.abort() }));
+    return { sock: made, address };
+  }
+
+  /**
+   * The injected dial shared by TCP and UDP: ONE deadline (`connectTimeoutMs`) for the lookup and every candidate together, as the machine's `dialChecked`
+   * has; at most 64 candidates; each is a permitted address from the network's own answer, tried in its order, and the first that connects wins. A
+   * duplex the network hands over that is not one is released at once.
+   */
+  async function dialInjected(m, decision, ac, method, wrap) {
+    const deadline = Date.now() + cfg.connectTimeoutMs;
     const candidates = await resolveInjected(m.host, { explicit: decision.explicit ? m.host : null, signal: ac.signal });
     let last;
     for (const c of candidates) {
       if (ac.signal.aborted) throw refusal('aborted', GATEWAY_FAIL.CLOSED);
+      const left = deadline - Date.now();
+      if (left <= 0) { ac.abort(); throw refusal('connect timed out', GATEWAY_FAIL.TIMEOUT); }
       try {
-        const duplex = await withTimeout(network.connectTcp({ host: c.address, port: m.port, signal: ac.signal }), cfg.connectTimeoutMs, ac, 'connect timed out');
-        return { sock: new StreamSocket(duplex, { remoteAddress: c.address, remotePort: m.port, onDestroy: () => ac.abort() }), address: c.address };
+        const duplex = await withTimeout(network[method]({ host: c.address, port: m.port, signal: ac.signal }), left, ac, 'connect timed out');
+        try { return { made: wrap(duplex, c.address), address: c.address }; } catch (e) { releaseDuplex(duplex); throw e; }
       } catch (e) {
         if (ac.signal.aborted) throw e;
         last = e;
@@ -573,18 +625,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     try {
       if (network) {
         // As for TCP: the network's own answers are classified, and the address that passes is what it is given.
-        const candidates = await resolveInjected(m.host, { explicit: decision.explicit ? m.host : null, signal: ac.signal });
-        let last;
-        for (const c of candidates) {
-          if (ac.signal.aborted) throw refusal('aborted', GATEWAY_FAIL.CLOSED);
-          try {
-            const flow = await withTimeout(network.openUdp({ host: c.address, port: m.port, signal: ac.signal }), cfg.connectTimeoutMs, ac, 'connect timed out');
-            sock = new DatagramFlow(flow, { onDestroy: () => ac.abort() });
-            address = c.address;
-            break;
-          } catch (e) { if (ac.signal.aborted) throw e; last = e; }
-        }
-        if (!sock) throw last ?? refusal('connect failed', GATEWAY_FAIL.HOST_UNREACHABLE);
+        ({ made: sock, address } = await dialInjected(m, decision, ac, 'openUdp', (flow) => new DatagramFlow(flow, { onDestroy: () => ac.abort(), onDrop: () => { stats.backpressureDropped++; } })));
       } else {
         ({ socket: sock, address } = await dialUdpChecked(m.host, m.port, guardOptions(cfg, decision.explicit ? m.host : null)));
       }
@@ -681,7 +722,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     pending.add(id);
     let sock;
     try {
-      const unix = await loadUnix();
+      const unix = await loadUnix(cfg);
       const chk = await unix.checkUnixPath(m.path, cfg.unix.connect);
       if (!chk.ok) {
         log(`gateway: refused unix ${JSON.stringify(m.path.slice(0, 200))} (${chk.reason})`);
@@ -694,7 +735,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
         if (!st.socket) { pending.delete(id); log(`gateway: refused unix ${chk.path} (not a socket)`); return fail(id, GATEWAY_FAIL.POLICY_DENIED, 'not a socket'); }
       }
       sock = await new Promise((resolve, reject) => {
-        loadNet().then((net) => {
+        loadNet(cfg).then((net) => {
           const s = net.connect({ path: chk.path });
           const t = setTimeout(() => { s.destroy(); const e = new Error('connect timed out'); e.code = GATEWAY_FAIL.TIMEOUT; reject(e); }, cfg.connectTimeoutMs);
           s.once('connect', () => { clearTimeout(t); s.removeAllListeners('error'); resolve(s); });
@@ -721,8 +762,8 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     pendingListeners.add(id);
     let server;
     try {
-      const unix = await loadUnix();
-      const net = await loadNet();
+      const unix = await loadUnix(cfg);
+      const net = await loadNet(cfg);
       const chk = await unix.checkUnixPath(m.path, cfg.unix.listen);
       if (!chk.ok) { log(`gateway: refused unix listen ${JSON.stringify(m.path.slice(0, 200))} (${chk.reason})`); return await failListen(id, chk.reason); }
       if (!chk.abstract) {
@@ -780,7 +821,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       const host = reverseBindAddress(rev, m.bind_addr);
       if (host !== m.bind_addr) log(`gateway: reverse listen: ignoring the client's bind address ${JSON.stringify(String(m.bind_addr).slice(0, 64))}, binding ${host}`);
       if (network) return await listenInjected(id, m, host);
-      const net = await loadNet();
+      const net = await loadNet(cfg);
       server = net.createServer({ allowHalfOpen: true }); // as above
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen({ port: m.port, host, backlog: rev.backlog }, () => { server.off('error', reject); resolve(); }); });
       if (closed) { server.close(); return undefined; }
@@ -802,25 +843,47 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
 
   /** A reverse tunnel on an injected network: the network listens (on the bind address and port the policy chose) and hands over each connection. */
   async function listenInjected(id, m, host) {
-    const ac = new AbortController();
+    // Registered with the session, so that a session that ends while the network is still binding tells it; and bounded, so a network that never answers
+    // cannot hold this client's message loop (and a listener slot) for ever: the same `connectTimeoutMs` as a connect.
+    const ac = newAbort();
     const entry = { server: null, kind: 'tcp', path: '', abstract: false, bound: null, pendingChannels: new Set(), open: 0, ready: false };
     let handle;
     try {
-      handle = await network.listenTcp({
+      handle = await withTimeout(network.listenTcp({
         port: m.port, bindAddr: host, signal: ac.signal,
         onConnection: (duplex, info) => {
-          // Not announced before the client has been told the listener exists (its InboundOpen would have nothing to belong to).
-          const sock = new StreamSocket(duplex, { remoteAddress: String(info?.peerAddr ?? ''), remotePort: Number.isInteger(info?.peerPort) ? info.peerPort : 0 });
-          if (!entry.ready || closed) { sock.destroy(); return; }
+          // Not announced before the client has been told the listener exists, nor after it was closed (its InboundOpen would have nothing to belong to):
+          // such a connection is released at once. What the network says about the peer is text on the wire: an IP literal and a port, or nothing.
+          if (!entry.ready || closed) { releaseDuplex(duplex); return; }
+          let sock;
+          try {
+            const peer = typeof info?.peerAddr === 'string' && info.peerAddr === info.peerAddr.trim() && parseIp(info.peerAddr) ? info.peerAddr : '';
+            sock = new StreamSocket(duplex, { remoteAddress: peer, remotePort: Number.isInteger(info?.peerPort) && info.peerPort >= 0 && info.peerPort <= 65535 ? info.peerPort : 0 });
+          } catch (e) { releaseDuplex(duplex); log(`gateway listener ${id}: ${String(e?.message ?? e).slice(0, 200)}`); return; }
           onInbound(id, entry, sock);
         },
-      });
+      }), cfg.connectTimeoutMs, ac, 'the network did not start listening in time', releaseListener);
     } catch (e) {
+      aborts.delete(ac);
       ac.abort();
       return failListen(id, String(e?.message ?? e).slice(0, 200));
     }
-    const port = Number.isInteger(handle?.port) && handle.port >= 0 && handle.port <= 65535 ? handle.port : m.port;
-    entry.bound = { close: async () => { ac.abort(); await Promise.resolve(handle?.close?.()).catch(() => {}); } };
+    aborts.delete(ac);
+    // The port is what the network says it listens on: a port, or the listen failed (a number that is not one is not reported as the one asked for).
+    if (!Number.isInteger(handle?.port) || handle.port < 1 || handle.port > 65535) {
+      ac.abort(); releaseListener(handle);
+      return failListen(id, 'the network did not report a port it listens on');
+    }
+    const port = handle.port;
+    entry.bound = {
+      close: async () => {
+        entry.ready = false; // a connection the network delivers from now on is released, not announced
+        ac.abort();
+        let closing;
+        try { closing = handle.close?.(); } catch { /* the network's own failure: it is closed as far as we are concerned */ }
+        await settleWithin(closing, cfg.connectTimeoutMs); // bounded: a close that never settles must not hold the message loop
+      },
+    };
     if (closed) { await entry.bound.close(); return undefined; }
     listeners.set(id, entry);
     entry.ready = true;
@@ -877,6 +940,7 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
     const l = listeners.get(id);
     if (!l) return;
     listeners.delete(id);
+    l.ready = false;
     for (const ch of l.pendingChannels) { const p = inbound.get(ch); if (p) { clearTimeout(p.timer); inbound.delete(ch); p.sock.destroy(); } }
     const closing = l.bound ? l.bound.close() : new Promise((r) => { l.server.close(() => r()); });
     // A server finishes closing only when its connections have ended, and with half-closed connections that can need
@@ -922,6 +986,8 @@ export function createGatewaySession(cfg, send, log = () => {}, ctx = {}) {
       inbound.clear();
       for (const id of [...listeners.keys()]) void closeListener(id).catch(() => {});
     },
+    /** The peer is going away but its queued messages are still to be served: tell the injected network what it is still working on (a connect, a lookup, a listen). */
+    abortPending() { for (const ac of aborts) ac.abort(); aborts.clear(); },
     get size() { return conns.size; },
     /** Bytes received from the client for its origins and not yet taken by them (what the caps bound). */
     get bufferedBytes() { return core.bufferedBytes; },

@@ -11,11 +11,12 @@ import { createReverseHostWith } from '../reverse-host.mjs';
 import { buildBackends } from './backends.mjs';
 import { createRpcHost } from './rpc.mjs';
 import { buildReverseGateway } from '../reverse-gateway.mjs';
+import { normalizeGateway } from './gateway.mjs';
 
 /** @param {Parameters<typeof import('../reverse-host.mjs').createReverseHost>[0]} [options] - see `../reverse-host.mjs` */
 export function createReverseHost(options = {}) {
   const backends = buildBackends(options);
   const rpc = options.rpc === undefined || options.rpc === null ? null
     : createRpcHost(options.rpc, { files: backends.files, maxMessageBytes: options.rpcMaxMessageBytes, maxInflight: options.rpcMaxInflight });
-  return createReverseHostWith(options, { ...backends, rpc, gateway: buildReverseGateway(options.gateway, options) });
+  return createReverseHostWith(options, { ...backends, rpc, gateway: buildReverseGateway(options.gateway, options, { normalize: normalizeGateway }) });
 }

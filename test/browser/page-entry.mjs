@@ -215,7 +215,9 @@ window.h.networkCalls = (id) => {
   };
 };
 /** What the gateway entry point exports in the page (it bundled for the browser, so it ran here). */
-window.h.gatewayEntryInfo = () => ({ exports: Object.keys(wsh.gatewayEntry).sort(), policyDenied: wsh.gatewayEntry.GATEWAY_FAIL.POLICY_DENIED, bufferType: typeof Buffer });
+/** `normalizeGateway` of the gateway entry with no network, in a page: refused up front, in words (there are no sockets to fall back to). */
+window.h.gatewayNoNetwork = () => { try { wsh.gatewayEntry.normalizeGateway({ allow: ['*'] }); return 'no error'; } catch (e) { return e.message; } };
+window.h.gatewayEntryInfo =() => ({ exports: Object.keys(wsh.gatewayEntry).sort(), policyDenied: wsh.gatewayEntry.GATEWAY_FAIL.POLICY_DENIED, bufferType: typeof Buffer });
 /** The names of the shares the operator's CLI offered this in-page host (#159). */
 window.h.shareNames = (id) => [...hosts.get(id).record.shares.keys()];
 /** Run one operation of a share's `fs` and return something `page.evaluate` can carry back (bytes as text + length + a digest). */

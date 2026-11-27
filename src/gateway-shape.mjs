@@ -7,6 +7,26 @@
 
 const METHODS = ['connectTcp', 'resolve', 'openUdp', 'listenTcp'];
 
+/** Every key of a `gateway` option that names an injected network. A key outside it is a typo, not an option that silently does nothing. */
+const KNOWN_KEYS = new Set([
+  'allow', 'allowPrivate', 'maxConnections', 'maxBufferedBytes', 'maxClientBufferedBytes', 'connectTimeoutMs', 'halfCloseIdleMs', 'halfCloseProbeMs',
+  'udpIdleMs', 'udp', 'dns', 'reverse', 'network', 'log', 'socks', 'unix', 'tcp', 'endpoints',
+]);
+
+/**
+ * Unknown keys and wrongly typed switches (`dns`, `reverse`, `udp`) of a gateway with a network, the same for every host that takes one.
+ * @param {object} gateway
+ * @param {string} who prefix of the error
+ * @param {string[]} [extraKeys] keys this host also takes (the reverse host's `trustRelayIdentity`)
+ */
+export function checkGatewayOptions(gateway, who, extraKeys = []) {
+  for (const k of Object.keys(gateway)) if (!KNOWN_KEYS.has(k) && !extraKeys.includes(k)) throw new TypeError(`${who}: unknown gateway option "${k}"`);
+  if (gateway.dns !== undefined && typeof gateway.dns !== 'boolean') throw new TypeError(`${who}: gateway.dns must be a boolean`);
+  const objectOrBool = (v) => v === undefined || v === null || typeof v === 'boolean' || (typeof v === 'object' && !Array.isArray(v));
+  if (!objectOrBool(gateway.udp)) throw new TypeError(`${who}: gateway.udp must be true, false or an options object`);
+  if (!objectOrBool(gateway.reverse)) throw new TypeError(`${who}: gateway.reverse must be true, false or an options object`);
+}
+
 /** A reverse host's gateway starts only when the owner chose how operators' identities are taken (#289): proof and a sealed bridge, or an explicit trust of the relay's word. */
 export function checkReverseTrust(gateway, hostOptions, who) {
   if (hostOptions.requireOperatorProof !== true && gateway.trustRelayIdentity !== true) {
@@ -18,7 +38,7 @@ export function checkReverseTrust(gateway, hostOptions, who) {
  * @param {unknown} gateway the option
  * @param {string} who the prefix of the error ("createMemoryHost")
  */
-export function checkGatewayShape(gateway, who) {
+export function checkGatewayShape(gateway, who, extraKeys = []) {
   if (gateway === true || typeof gateway !== 'object' || gateway === null || Array.isArray(gateway)) {
     throw new TypeError(`${who}: gateway needs a network and an explicit allow list (default deny): { network: { connectTcp, ... }, allow: ["host:port", ...] }`);
   }
@@ -29,4 +49,5 @@ export function checkGatewayShape(gateway, who) {
   for (const k of METHODS) if (n[k] !== undefined && typeof n[k] !== 'function') throw new TypeError(`${who}: gateway.network.${k} must be a function`);
   if (!METHODS.some((k) => typeof n[k] === 'function')) throw new TypeError(`${who}: gateway.network needs at least one of ${METHODS.join(', ')}`);
   if (!Array.isArray(gateway.allow)) throw new TypeError(`${who}: gateway.allow is required with gateway.network (default deny): { allow: ["host:port", ...] }, an empty list reaches nothing`);
+  checkGatewayOptions(gateway, who, extraKeys);
 }

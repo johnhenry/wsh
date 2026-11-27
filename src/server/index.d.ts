@@ -187,7 +187,7 @@ export interface WshServerGatewayOptions {
    * are then each off unless given. Cannot be combined with `socks`, `unix` or `tcp: false`; `allow` is required. wsh cannot vouch for what such a network reaches.
    */
   network?: import('../gateway.js').WshGatewayNetwork;
-  /** With `network`: `ResolveDns` is answered only when this is `true` (and the network has `resolve`). Without `network` it has no effect: the machine's gateway always answers it. */
+  /** `ResolveDns`. With `network`: answered only when this is `true` (and the network has `resolve`). On the machine's gateway: answered unless this is `false` (a `false` was ignored before; it now turns name resolution off). */
   dns?: boolean;
   /**
    * Unix-domain sockets a client may reach (`OpenUnix`, feature `gateway-unix`) or ask the host to create

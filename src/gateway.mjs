@@ -23,9 +23,24 @@
  * whose default network is the machine's.
  */
 
+import { normalizeGateway as normalizeSessionGateway } from './server/gateway-session.mjs';
+
 export {
-  normalizeGateway, normalizeNetwork, createGatewaySession, gatewayFeatures, destinationAllowed, addressPermitted, gatewayPolicy,
+  normalizeNetwork, createGatewaySession, gatewayFeatures, destinationAllowed, addressPermitted, gatewayPolicy,
   normalizeReverse, reversePortAllowed, normalizeUdp, parseSocks,
 } from './server/gateway-session.mjs';
+
+/**
+ * Validate and normalise a gateway configuration. Where there are no sockets (a page, a Worker: no `process.versions.node`) the configuration MUST name a
+ * `network`: without one the session would reach for the machine's sockets, which are not there, so it is refused up front, in words, instead of failing
+ * later at a `node:` import. In Node a configuration without a network is the machine's, as for `createWshServer` (which is what to use there).
+ */
+export function normalizeGateway(opts) {
+  const hasNode = typeof process !== 'undefined' && !!process.versions?.node;
+  if (!hasNode && opts && typeof opts === 'object' && (opts.network === undefined || opts.network === null)) {
+    throw new TypeError('normalizeGateway: this environment has no sockets to dial, so the gateway needs a network: { network: { connectTcp, resolve, openUdp, listenTcp }, allow: [...] } (see @johnhenry/wsh/gateway)');
+  }
+  return normalizeSessionGateway(opts);
+}
 export { GATEWAY_FAIL } from './server/gateway-core.mjs';
 export { GATEWAY_FAIL_TABLE, gatewayFailName } from './gateway-errors.mjs';

@@ -43,6 +43,10 @@ test.describe('the gateway of a host in the page, over the page\'s own network',
     expect(info.bufferType).toBe('undefined');
   });
 
+  test('normalizeGateway with no network is refused up front in a page, with a sentence, not at a node: import', async ({ page }) => {
+    expect(await page.evaluate(() => window.h.gatewayNoNetwork())).toMatch(/no sockets to dial, so the gateway needs a network/);
+  });
+
   test('a TCP connection reaches the network by name, byte-exact with a half-close; the network was asked once, for the address', async ({ page }) => {
     const { id, client } = await connect(page);
     try {

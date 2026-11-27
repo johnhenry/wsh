@@ -32,7 +32,7 @@ import { RpcCreditLink, rpcChannelOfCredit, rpcCreditId } from '../rpc-virtual.m
 import { sealFrame, openFrame, ROLE_TAGS } from '../e2e-frame.mjs';
 import { E2EResponder, E2E_FEATURE, E2E_SIGN_FEATURE } from '../e2e-exchange.mjs';
 import { MULTI_OPERATOR_FEATURE } from './relay.mjs';
-import { gatewayFeatures } from './gateway-features.mjs';
+import { gatewayFeatures, gatewayDatagrams } from './gateway-features.mjs';
 import { GATEWAY_FAIL } from '../gateway-errors.mjs';
 import { GATEWAY_CREDIT_FEATURE } from '../gateway-channel.mjs';
 import { GATEWAY_DATAGRAM_FEATURE } from '../gateway-datagram.mjs';
@@ -450,7 +450,9 @@ export function createConnectionFactory(cfg) {
     // A transport that closes right behind a message (a client's `disconnect()` sends Close for
     // every channel and then goes) must not make the host forget that message: it is processed
     // first, then the connection is torn down.
-    const shutdownAfterQueue = (why) => { chain = chain.then(() => shutdown(why)); };
+    // The messages already queued are still served first (the last ones of a peer that is closing are not lost), but a gateway request the network is still working
+    // on is told at once: its peer is gone, and the queue would otherwise wait for the network until its own timeout.
+    const shutdownAfterQueue = (why) => { gateway?.abortPending?.(); chain = chain.then(() => shutdown(why)); };
 
     if (qmux) {
     qmux.onError = (e) => log(`qmux error: ${e.message}`);
@@ -649,7 +651,7 @@ export function createConnectionFactory(cfg) {
         gateway?.setPeerFeatures(m.features);
         const features = hostFeatures(sealMode === cfg.sealSession ? cfg : { ...cfg, sealSession: sealMode }, { dataStreams });
         // UDP over datagrams only where this transport has them and the gateway serves (and allows) UDP.
-        if (datagrams && cfg.gateway?.tcp && cfg.gateway.udpOn !== false && cfg.gateway.udp?.datagrams) features.push(GATEWAY_DATAGRAM_FEATURE);
+        if (datagrams && gatewayDatagrams(cfg.gateway)) features.push(GATEWAY_DATAGRAM_FEATURE);
         let hostFingerprint;
         if (cfg.hostKey) {
           hostFingerprint = cfg.hostKey.fingerprint;

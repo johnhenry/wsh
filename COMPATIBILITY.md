@@ -139,9 +139,13 @@ inner-type check is `isRelayForwardable`).
 
 A host in a page (`createMemoryHost({ gateway: { network } })`), a browser-safe reverse host, or a Node host given `gateway.network`
 serves the gateway opcodes over the embedder's network instead of the machine's. **Nothing is added to the wire**: no message, no field,
-no feature string. The host states what a gateway host has always stated (`gateway` when TCP, DNS, UDP or listening is on, `gateway-credit`,
-`gateway-endpoints` when it has named endpoints; `gateway-datagram` only over a transport that has datagrams, which an in-page host's does
-not), and answers with the codes and sentences a Node gateway does. So a peer cannot tell this host from a Node host with a gateway:
+no feature string. The host states what a gateway host has always stated, and only what it can serve: `gateway` when the network can serve any of
+TCP, UDP, DNS or listening (a released client checks `gateway` for all four, and a TCP open on a network without `connectTcp` is refused with
+a sentence), `gateway-credit`, `gateway-endpoints` when it has named endpoints, and `gateway-datagram` only over a transport that has datagrams
+(WebTransport; an in-page host's has none) and when the network has `openUdp` with UDP on (so UDP rides datagrams over an injected network too, and
+the host DROPS what a sink cannot take). It answers with the codes and sentences a Node gateway does. On the machine's gateway `udp: false` now
+means off (it threw before), so a host with UDP off no longer states `gateway-datagram`; a released client then uses the reliable path or is
+refused, as for any host without UDP. So a peer cannot tell this host from a Node host with a gateway:
 
 | Peer | What happens |
 | --- | --- |

@@ -685,11 +685,16 @@ const host = createMemoryHost({
 - **Off unless given, deny by default.** No `gateway`, no gateway feature. `allow` is required (`"*"`, `"host"`, `"host:port"`), and
   the limits and defaults are those of `createWshServer({ gateway })`: `maxConnections` (32), `maxBufferedBytes`, `maxClientBufferedBytes`,
   `connectTimeoutMs`, `halfCloseIdleMs`, `udp` bounds, `reverse` policy (ports, bind address, listeners). `socks`, `unix` and `tcp: false` are
-  the machine's and are refused with a network. A key's `gateway:...` capabilities decide who may ask, as ever.
+  the machine's and are refused with a network, and an option that is not one of the gateway's (a typo such as `allowPrivte`) or a wrongly
+  typed `dns` / `udp` / `reverse` is a `TypeError` on every host that takes a network. A key's `gateway:...` capabilities decide who may ask, as ever.
+  **`allowPrivate: ["0.0.0.0/0"]` or `["::/0"]` permits every class of address** (loopback, private, link-local, metadata, multicast, ...): name
+  the ranges your network really has, not everything.
 - **What the policy sees (the address that is dialled).** wsh applies the destination policy itself, *before* the network is called:
   the name the caller sent must match `allow`; then the network's `resolve` is asked ONCE and **its answers are what is classified**
-  (answers that are not IP addresses are ignored) and what `connectTcp` / `openUdp` then receive, one permitted address at a time, in the
-  order the network gave them: the name is never passed on, so there is no second lookup to disagree with the first. A caller who sent an
+  (answers that are not plain IP literals are ignored: a zone id, a trailing dot or surrounding space makes it not an address; at most 64
+  are taken from one answer, from the first 1024 entries) and what `connectTcp` / `openUdp` then receive, one permitted address at a
+  time, in the order the network gave them, all within ONE `connectTimeoutMs` deadline for the lookup and every candidate together (as
+  the machine's `dialChecked` has): the name is never passed on, so there is no second lookup to disagree with the first. A caller who sent an
   IP literal is checked as it is and the network is not asked to resolve. **A name the network cannot resolve is refused** (no `resolve`
   method: "this network cannot resolve names"; a name it does not know: name not found). `ResolveDns` answers are filtered the same way.
 - **The network may have address space of its own, and you name it.** Private-looking addresses are normal inside a virtual network, but
@@ -700,9 +705,16 @@ const host = createMemoryHost({
 - **UDP, DNS and listening need the switch and the method.** `udp: true` (or the bounds) and `network.openUdp`; `dns: true` and
   `network.resolve`; `reverse: true` (or its policy) and `network.listenTcp`. Either missing is a refusal with a sentence that says which
   ("UDP is not enabled on this gateway", "this network cannot open UDP flows", "this network cannot listen for connections").
-- **Cleanup.** Every `signal` the network is given aborts when wsh is done with what it was given (the caller closed it or went away, the
-  host closed, the connect timed out), and wsh closes or aborts the streams: release the connection then. A network whose stream ends is a
-  half-close towards the caller, exactly as an origin's FIN is.
+- **Cleanup, and a network that never answers.** Every `signal` the network is given aborts when wsh is done with what it was given (the
+  caller closed it or went away, the host closed, the connect, lookup or listen timed out), and wsh closes or aborts the streams: release
+  the connection then. A request is bounded by `connectTimeoutMs` (a lookup, a connect, a `listenTcp`, and the handle's `close()`), so a
+  network that never settles cannot hold the client's message loop or a listener slot; what it hands over after that (a connection, a
+  listener that binds late) is released, not kept. A session that ends while the network is still working tells it at once, even with
+  messages still queued. A connection the network delivers after the listener was closed is released and never announced; what the
+  network says about a peer in an inbound connection is bounded (an IP literal and a port, else empty and 0), and a listen whose reported
+  port is not 1-65535 fails. A network whose stream ends is a half-close towards the caller, exactly as an origin's FIN is; one that errors
+  or aborts a stream is noticed even while nothing reads it. The bytes handed to your writable are a copy; the streams a malformed
+  duplex came with are cancelled or aborted as far as they go.
 - **Flow control and bounds are the Node path's, from the same code.** The credit window and per-connection and per-client byte bounds
   are the gateway channel's; wsh reads one chunk at a time and not while the caller is not reading, and hands the network's writable one
   chunk at a time only as the network takes them, so a slow reader or a slow origin stops the other side (the stream's own backpressure
@@ -710,8 +722,14 @@ const host = createMemoryHost({
   close the stream when the far end is gone.
 - **Errors.** A thrown or rejected error is reported by its `code`: a number of `GATEWAY_FAIL` (1 refused, 2 unreachable, 3 name not found,
   8 timeout) or a Node-style name (`ECONNREFUSED`, `ENOTFOUND`, `ETIMEDOUT`); anything else is "unreachable".
-- **Wire.** Nothing new: the host states the gateway features it always has (`gateway`, `gateway-credit`, `gateway-endpoints`).
-  `gateway-datagram` is not stated for such a host over a transport without datagrams (every in-page host's). A released client works with it.
+- **Wire.** Nothing new: the host states the gateway features it always has, and only what it can serve. `gateway` is stated when the
+  network can serve any of TCP (`connectTcp`), UDP (`openUdp` and `udp`), DNS (`resolve` and `dns: true`) or listening (`listenTcp` and
+  `reverse`): a released client checks `gateway` for all four, so a network with only `openUdp` still states it and a TCP open is refused
+  with "this network cannot open TCP connections"; a network that can serve none states nothing. `gateway-datagram` is stated only where
+  the transport has datagrams (WebTransport; never an in-page host's) and the network has `openUdp` with UDP on; then UDP rides
+  datagrams over an injected network as over the machine's, and a sink that does not keep up DROPS datagrams (the `highWaterMark` of
+  your writable is the queue: give it room for a burst, e.g. `new WritableStream(sink, { highWaterMark: 32 })`), counted in
+  `server.gatewayStats().udp.backpressureDropped`, never queued without bound. A released client works with it.
 - **A reverse host in a page.** `createReverseHost({ ..., gateway: { network, allow, trustRelayIdentity | requireOperatorProof, udp, dns,
   reverse } })` from `@johnhenry/wsh/reverse` is the browser-safe form of the reverse host's gateway (#289), with the same owner switches
   and per-operator grants; without `gateway.network` it refuses to start (a page has no sockets).
@@ -730,8 +748,13 @@ const host = createMemoryHost({
   `@johnhenry/wsh/gateway`: no dynamic import.
 
 **Not covered:** wsh cannot vouch for what your network reaches (see the Security model). Not built: a Node-side adapter that
-exposes the machine's own network as a `network` object (the machine's is the built-in default), UNIX sockets over a network, and
-`OpenUdp` as datagrams over a transport that has them for an injected network (UDP rides the reliable stream there).
+exposes the machine's own network as a `network` object (the machine's is the built-in default), and UNIX sockets over a network. The
+`@johnhenry/wsh/gateway` entry's `normalizeGateway` refuses a configuration with no `network` in an environment without Node (a page,
+a Worker), with a sentence, instead of failing at a `node:` import; in Node a configuration without one is the machine's.
+
+**Changed on the machine's gateway (an addition, not a break):** `gateway: { udp: false }` used to throw ("must be an options object"); it
+now turns UDP off (opens are refused with "UDP is not enabled on this gateway" and `gateway-datagram` is not stated), and `gateway: { dns:
+false }`, which was ignored, now turns `ResolveDns` off. A reverse host with UDP not turned on no longer states `gateway-datagram`.
 
 #### Unix-domain sockets (streamlocal) and named endpoints
 
@@ -1038,24 +1061,24 @@ optional ML-KEM backend, is left out of the measurement. What a page ships is wh
 | browser bundle | minified | gzip |
 | --- | ---: | ---: |
 | `@johnhenry/wsh` (whole entry point) | 169.2 kB | 51.4 kB |
-| `@johnhenry/wsh/memory` (whole entry point) | 245.4 kB | 77.0 kB |
-| `@johnhenry/wsh/host` (whole entry point) | 132.4 kB | 43.5 kB |
-| `@johnhenry/wsh/reverse` (whole entry point) | 234.1 kB | 73.0 kB |
+| `@johnhenry/wsh/memory` (whole entry point) | 246.4 kB | 77.3 kB |
+| `@johnhenry/wsh/host` (whole entry point) | 132.7 kB | 43.6 kB |
+| `@johnhenry/wsh/reverse` (whole entry point) | 235.2 kB | 73.3 kB |
 | `@johnhenry/wsh/pipe-relay` (whole entry point) | 8.0 kB | 3.3 kB |
-| `@johnhenry/wsh/testing` (whole entry point) | 254.3 kB | 80.5 kB |
-| `@johnhenry/wsh/page` (whole entry point) | 344.9 kB | 110.5 kB |
+| `@johnhenry/wsh/testing` (whole entry point) | 255.3 kB | 80.8 kB |
+| `@johnhenry/wsh/page` (whole entry point) | 346.0 kB | 110.8 kB |
 | `@johnhenry/wsh/objects` (whole entry point) | 209.2 kB | 64.7 kB |
 | `@johnhenry/wsh/objects-types` (whole entry point) | 10.2 kB | 4.2 kB |
 | `@johnhenry/wsh/capabilities` (whole entry point) | 10.6 kB | 3.8 kB |
 | `@johnhenry/wsh/identity` (whole entry point) | 15.7 kB | 5.7 kB |
 | `@johnhenry/wsh/duplex` (whole entry point) | 144.6 kB | 44.0 kB |
 | `@johnhenry/wsh/address-guard` (whole entry point) | 9.1 kB | 3.6 kB |
-| `@johnhenry/wsh/gateway` (whole entry point) | 55.4 kB | 17.8 kB |
+| `@johnhenry/wsh/gateway` (whole entry point) | 57.9 kB | 18.6 kB |
 | `import { encodeRecord } from '@johnhenry/wsh/testing'` | 1.8 kB | 0.9 kB |
 | `import { generateKeyPair } from '@johnhenry/wsh'` | 0.4 kB | 0.3 kB |
 | `import { WshClient } from '@johnhenry/wsh'` | 140.4 kB | 42.3 kB |
 | `import { isPublicAddress } from '@johnhenry/wsh/address-guard'` | 3.1 kB | 1.3 kB |
-| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 107.4 kB | 35.0 kB |
+| `import { createConnectionFactory } from '@johnhenry/wsh/host'` | 107.7 kB | 35.1 kB |
 <!-- bundle-size:end -->
 
 ### Signing with a page-held signer

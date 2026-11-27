@@ -93,7 +93,7 @@ export function createReverseHost(options = {}) {
   // chunk of its own, and the full validation runs then: `start()` rejects with the reason, nothing is dialled.
   let gateway = null;
   if (options.gateway !== undefined && options.gateway !== null && options.gateway !== false) {
-    checkGatewayShape(options.gateway, 'createReverseHost');
+    checkGatewayShape(options.gateway, 'createReverseHost', ['trustRelayIdentity']);
     checkReverseTrust(options.gateway, options, 'createReverseHost');
     gateway = { cfg: null, createGatewaySession: null, ready: null };
     gateway.ready = import('./reverse-gateway.mjs').then((m) => {

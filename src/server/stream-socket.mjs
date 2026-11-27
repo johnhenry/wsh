@@ -72,6 +72,10 @@ export class StreamSocket extends Emitter {
     this.remoteAddress = remoteAddress;
     this.remotePort = remotePort;
     this.#onDestroy = onDestroy;
+    // A stream the network errors or aborts is noticed even while nothing reads it (an inbound connection that waits to be accepted is paused): a connection the
+    // network dropped is released, not held until the accept timeout.
+    this.#reader.closed.catch((e) => this.#fail(e));
+    this.#writer.closed.catch((e) => this.#fail(e));
   }
 
   setNoDelay() { return this; }
@@ -135,7 +139,8 @@ export class StreamSocket extends Emitter {
     const n = chunk.byteLength;
     this.writableLength += n;
     this.#touch();
-    this.#writer.write(chunk).then(() => { this.writableLength -= n; cb?.(); }, (e) => { this.writableLength -= n; cb?.(e); this.#fail(e); });
+    // A copy, as for a datagram: what the network's sink does with the buffer it is given (it may transfer or keep it) cannot reach the frame this came from.
+    this.#writer.write(chunk.slice()).then(() => { this.writableLength -= n; cb?.(); }, (e) => { this.writableLength -= n; cb?.(e); this.#fail(e); });
     return true;
   }
 
@@ -180,9 +185,11 @@ export class DatagramFlow extends Emitter {
   #reader;
   #writer;
   #onDestroy;
+  #onDrop;
 
-  constructor(flow, { onDestroy } = {}) {
+  constructor(flow, { onDestroy, onDrop } = {}) {
     super();
+    this.#onDrop = onDrop;
     if (!flow || typeof flow.readable?.getReader !== 'function' || typeof flow.writable?.getWriter !== 'function') {
       throw new TypeError('the network must give { readable: ReadableStream, writable: WritableStream } for a UDP flow');
     }
@@ -205,8 +212,15 @@ export class DatagramFlow extends Emitter {
     }
   }
 
+  /**
+   * One datagram to the network. A network whose sink is not keeping up DROPS it (the sink's queue, `writable`'s own `highWaterMark`, is full), as a kernel
+   * drops what a full socket buffer cannot hold: nothing queues without bound behind a sink that never drains, the flow stays open, and `onDrop` counts it.
+   * `cb` is called either way (the datagram is "taken", so the credit that carried it is returned).
+   */
   send(bytes, cb) {
     if (this.closed) { cb?.(new Error('the flow is closed')); return; }
+    const room = this.#writer.desiredSize;
+    if (room !== null && room <= 0) { try { this.#onDrop?.(); } catch { /* a counter */ } cb?.(); return; }
     this.#writer.write(bytes.slice()).then(() => cb?.(), (e) => { cb?.(e); this.#fail(e); });
   }
 

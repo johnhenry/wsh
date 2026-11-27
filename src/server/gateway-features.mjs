@@ -25,11 +25,31 @@ export function normalizeEndpoints(endpoints) {
   return map.size === 0 ? null : map;
 }
 
+/**
+ * Does this gateway serve anything at all that a client reaches through the `gateway` feature (TCP, UDP, DNS, a listener)? On the machine's network that
+ * is `tcp` or reverse tunnels, as ever. On an injected network it is what the network has a method for AND the embedder switched on: a client checks
+ * `gateway` for UDP, DNS and listening as well as for TCP (a released client has no feature of its own for them), so `gateway` is stated when any of them
+ * can be served and a request for the rest is refused with the reason (never stated for a network that can serve none).
+ */
+export function gatewayServes(cfg) {
+  const n = cfg.network;
+  if (!n) return !!(cfg.tcp || cfg.reverse);
+  return typeof n.connectTcp === 'function'
+    || (!!cfg.udpOn && typeof n.openUdp === 'function')
+    || (!!cfg.dnsOn && typeof n.resolve === 'function')
+    || (!!cfg.reverse && typeof n.listenTcp === 'function');
+}
+
+/** Are UDP flows carried as transport datagrams when the transport has them? Only if this gateway serves UDP (on an injected network: its `openUdp` and the switch). */
+export function gatewayDatagrams(cfg) {
+  return !!cfg?.tcp && cfg.udpOn !== false && !!cfg.udp?.datagrams && (!cfg.network || typeof cfg.network.openUdp === 'function');
+}
+
 /** Which gateway-related features a host with this config advertises (besides what the connection adds). */
 export function gatewayFeatures(cfg) {
   const f = [];
   // "gateway" also covers reverse tunnels (the Rust server lists nothing more specific for ListenRequest).
-  if (cfg.tcp || cfg.reverse) f.push('gateway');
+  if (gatewayServes(cfg)) f.push('gateway');
   f.push(GATEWAY_CREDIT_FEATURE);
   if (cfg.unix) f.push('gateway-unix');
   if (cfg.endpoints || cfg.targetEndpoints) f.push('gateway-endpoints');

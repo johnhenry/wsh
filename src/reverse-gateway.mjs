@@ -23,16 +23,16 @@ const GATEWAY_OPTIONS = new Set([
  * instead of the machine's, and UDP, DNS and listening each need the owner's switch and the network's method.
  * @param {unknown} opts
  * @param {{ requireOperatorProof?: boolean }} [hostOptions]
- * @param {{ who?: string, requireNetwork?: boolean }} [how]
+ * @param {{ who?: string, requireNetwork?: boolean, normalize?: Function }} [how] `normalize`: the Node entry's `normalizeGateway` (it gives the session its Node loaders)
  */
-export function buildReverseGateway(opts, hostOptions = {}, { who = 'createReverseHost', requireNetwork = false } = {}) {
+export function buildReverseGateway(opts, hostOptions = {}, { who = 'createReverseHost', requireNetwork = false, normalize = normalizeGateway } = {}) {
   if (opts === undefined || opts === null || opts === false) return null;
   if (opts === true || typeof opts !== 'object' || Array.isArray(opts)) throw new TypeError(`${who}: gateway needs an explicit allow list (default deny): { allow: ["host:port", ...] }`);
   for (const k of Object.keys(opts)) {
     if (k === 'unix' || k === 'endpoints' || k === 'tcp') throw new TypeError(`${who}: gateway.${k} is not carried by a relay; a reverse host serves TCP, and UDP, DNS and reverse tunnels when turned on`);
     if (!GATEWAY_OPTIONS.has(k)) throw new TypeError(`${who}: unknown gateway option "${k}"`);
   }
-  if (requireNetwork) checkGatewayShape(opts, who);
+  if (requireNetwork) checkGatewayShape(opts, who, ['trustRelayIdentity']);
   if (opts.dns !== undefined && typeof opts.dns !== 'boolean') throw new TypeError(`${who}: gateway.dns must be a boolean`);
   if (opts.trustRelayIdentity !== undefined && typeof opts.trustRelayIdentity !== 'boolean') throw new TypeError(`${who}: gateway.trustRelayIdentity must be a boolean`);
   // Who an operator is, on a bridge that is not sealed, is whatever the relay stamps on its messages: a relay can open what any accepted
@@ -43,7 +43,8 @@ export function buildReverseGateway(opts, hostOptions = {}, { who = 'createRever
   const dnsOn = opts.dns === true;
   const { udp, dns, trustRelayIdentity, ...rest } = opts;
   void trustRelayIdentity; void dns;
-  const cfg = normalizeGateway({ ...rest, ...(udpOn ? { udp } : {}), dns: dnsOn });
+  // UDP and name resolution are each OFF unless the owner gave them; the session is told, so `gateway-datagram` is not stated for a host that serves no UDP.
+  const cfg = normalize({ ...rest, udp: udpOn ? udp : false, dns: dnsOn });
   /** The session of one bridged operator: the shared gateway session, with the owner's separate switches in front of it. */
   const session = (c, send, log, ctx) => {
     const inner = createGatewaySession(c, send, log, ctx);
