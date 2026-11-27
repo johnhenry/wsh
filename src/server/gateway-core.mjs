@@ -170,6 +170,15 @@ export function createGatewayCore(cfg, send, log = () => {}, ctx = {}) {
       for (const { channel } of [...conns.values()]) channel.abandon('connection closed');
       conns.clear();
     },
+    /**
+     * The grant behind this connection ran out (#297): every open gateway connection is ended, the peer is told with `reason` and then,
+     * as a side that lost its reader does, with "discarded" (a peer that knows it frees the connection at once; one that predates it sees
+     * the first as an ordinary half-close and ignores the second). What is queued for the peer is not waited for: an expiry is a cut.
+     * The connection itself and its later requests are the caller's (they are refused as expired).
+     */
+    endAll(reason) {
+      for (const { channel } of [...conns.values()]) { channel.end(reason); channel.destroy(); }
+    },
     get size() { return conns.size; },
     /** Bytes received from the client for its origins and not yet taken by them (what the caps bound). */
     get bufferedBytes() { return budget.used; },
