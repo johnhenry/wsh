@@ -279,6 +279,7 @@ const strictUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /**
  * @typedef {object} DecodeOptions
+ * Every option is checked: a wrong type or value throws a TypeError (`strict: 1` is not "strict, roughly"), and an absent one (undefined) takes its default.
  * @property {boolean} [strict] every legacy option off (the default of a later minor; see COMPATIBILITY.md rule 7)
  * @property {boolean} [legacyIndefiniteMap] accept an indefinite-length map as the top-level item at offset 0 (default true)
  * @property {boolean} [legacyNonCanonical] accept key order, float width and NaN forms the released encoders wrote (default true)
@@ -286,15 +287,28 @@ const strictUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
  * @property {number} [maxContainers] arrays and maps one item may hold (default CBOR_MAX_CONTAINERS)
  */
 
+/** An option that is a boolean or absent: anything else is a TypeError, not a silent default (`strict: 1` was "not strict", a security setting that failed open). */
+function booleanOption(options, name) {
+  const v = options[name];
+  if (v !== undefined && typeof v !== 'boolean') throw new TypeError(`cborDecode: ${name} must be a boolean, got ${typeof v === 'symbol' ? 'a symbol' : typeof v === 'bigint' ? `${v}n` : String(v)}`);
+  return v;
+}
+
+/** Check and resolve the decode options. A wrong type or value throws a TypeError (see {@link DecodeOptions}); an absent option takes its default. */
 function resolveOptions(options = {}, offset = 0) {
-  const strict = options.strict === true;
-  const unsafe = options.unsafeIntegers ?? (strict ? 'refuse' : 'round');
+  if (options === null || typeof options !== 'object') throw new TypeError(`cborDecode: options must be an object, got ${options === null ? 'null' : typeof options}`);
+  const strict = booleanOption(options, 'strict') === true;
+  const legacyIndefiniteMap = booleanOption(options, 'legacyIndefiniteMap');
+  const legacyNonCanonical = booleanOption(options, 'legacyNonCanonical');
+  const unsafe = options.unsafeIntegers === undefined ? (strict ? 'refuse' : 'round') : options.unsafeIntegers;
   if (unsafe !== 'round' && unsafe !== 'bigint' && unsafe !== 'refuse') throw new TypeError(`cborDecode: unsafeIntegers must be 'round', 'bigint' or 'refuse', got ${String(unsafe)}`);
+  const maxContainers = options.maxContainers === undefined ? CBOR_MAX_CONTAINERS : options.maxContainers;
+  if (!Number.isSafeInteger(maxContainers) || maxContainers < 1) throw new TypeError(`cborDecode: maxContainers must be a positive integer, got ${typeof maxContainers === 'bigint' ? `${maxContainers}n` : String(maxContainers)}`);
   return {
-    legacyTop: (options.legacyIndefiniteMap ?? !strict) !== false && offset === 0,
-    canonical: (options.legacyNonCanonical ?? !strict) === false,
+    legacyTop: (legacyIndefiniteMap ?? !strict) !== false && offset === 0,
+    canonical: (legacyNonCanonical ?? !strict) === false,
     unsafe,
-    maxContainers: options.maxContainers ?? CBOR_MAX_CONTAINERS,
+    maxContainers,
   };
 }
 
@@ -571,6 +585,7 @@ export class FrameDecoder {
    */
   constructor({ maxFrameSize = DEFAULT_MAX_FRAME_SIZE, ...decodeOptions } = {}) {
     this.#maxFrameSize = maxFrameSize;
+    resolveOptions(decodeOptions); // a bad option is the constructor's TypeError, not the first frame's
     this.#decodeOptions = Object.keys(decodeOptions).length ? decodeOptions : undefined;
   }
 

@@ -26,6 +26,7 @@ export function cborEncode(value: unknown): Uint8Array;
  */
 export function cborDecode(data: Uint8Array, options?: CborDecodeOptions): unknown;
 
+/** Every option is checked: a wrong type or value (`strict: 1`, `maxContainers: 0`) throws a TypeError; `undefined` takes the default. */
 export interface CborDecodeOptions {
   /** Every legacy option off (the default of a later minor). An explicit option below wins. */
   strict?: boolean;
