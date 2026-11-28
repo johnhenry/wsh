@@ -44,7 +44,8 @@ pub const RELAY_GATEWAY_FEATURE: &str = "relay-gateway";
 
 // Re-export commonly used items at crate root.
 pub use codec::{
-    cbor_decode, cbor_decode_with, cbor_encode, decode_envelope, frame_encode, FrameDecoder,
+    cbor_decode, cbor_decode_with, cbor_encode, decode_envelope, decode_envelope_with,
+    frame_encode, FrameDecoder,
 };
 pub use error::{WshError, WshResult};
 pub use identity::{fingerprint, short_fingerprint, FingerprintIndex};

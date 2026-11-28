@@ -13,6 +13,20 @@
 - **Tests.** `test/rust/f64-integral.test.mjs` encodes every `f64` field in the spec with the JS encoder and decodes it with the Rust typed decode
   (`crates/wsh-core/examples/decode_envelope.rs`); the Rust unit tests are in `f64_field.rs` and `codec.rs`.
 
+### CBOR decode options: checked in JS, and the Rust `FrameDecoder` takes options and a container cap (#336; npm and Rust)
+
+- **JS.** A decode option of the wrong type used to be ignored: `strict: 1` meant "not strict", so a security setting failed open. `cborDecode`,
+  `cborDecodePrefix` and `new FrameDecoder(...)` now throw a `TypeError` for a non-boolean `strict`, `legacyIndefiniteMap` or `legacyNonCanonical`, an
+  `unsafeIntegers` that is not `'round'`, `'bigint'` or `'refuse'` (`null` included), and a `maxContainers` that is not a positive integer. An absent
+  option (`undefined`) still takes its default. A caller that passed a truthy non-boolean (`1`, `'true'`) now gets an error and should pass a boolean.
+- **Rust.** `cbor_strict::Options` has `max_containers` (default `MAX_CONTAINERS`, in every mode; `Options::with_max_containers`), the counterpart of the JS
+  `maxContainers`. `FrameDecoder::with_options(opts)` reads every frame of `feed` with those options (`new()` and `default()` read with the defaults, as
+  before), and `decode_envelope_with` is `decode_envelope` with options. Adding a field to `Options` breaks a struct literal of it outside the crate;
+  use `Options::default()` / `Options::strict()` with `..` or `with_max_containers`.
+- **Audit, no code change.** None of the 34 `u64` fields has to exceed 2^53, so JS `strict` refusing such an integer cannot refuse a real message, with one
+  caveat about the signed peer record's `seq` and a proposal: COMPATIBILITY.md rule 4.
+- Item 4 of the issue (`unsafeIntegers: 'round'` is still the default in the window) is as documented.
+
 ## 0.63.0 / Rust `rust-v0.27.0`
 
 ### Test only: `test/rust/wsh-reverse-forward-full-close.test.mjs`, the JS reverse forward case no longer races a kernel reset (#328, #291)
