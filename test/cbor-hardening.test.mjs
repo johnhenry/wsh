@@ -102,13 +102,13 @@ describe('every finite double round-trips exactly', () => {
     assert.equal(cborDecode(cborEncode(-Infinity)), -Infinity);
   });
 
-  it('integers within the 64-bit ranges stay integers on the wire, and larger ones are float64', () => {
+  it('integers within the 64-bit ranges stay integers on the wire, and larger ones are floats in the shortest width', () => {
     assert.equal(cborEncode(2 ** 64 - 2048)[0], 0x1b, 'uint64');
     assert.equal(cborEncode(-(2 ** 64) + 2048)[0], 0x3b, 'nint64');
-    assert.equal(cborEncode(2 ** 64)[0], 0xfb, 'float64');
+    assert.equal(cborEncode(2 ** 64)[0], 0xfa, 'float32 (2^64 is exact in a float32)');
     assert.equal(cborEncode(1e21)[0], 0xfb);
     assert.equal(cborEncode(-(2 ** 64) - 4096)[0], 0xfb);
-    assert.equal(cborEncode(-0)[0], 0xfb);
+    assert.equal(cborEncode(-0)[0], 0xf9, '-0 is a float16');
     assert.equal(cborEncode(2 ** 53)[0], 0x1b);
     assert.equal(cborEncode(1000)[0], 0x19, 'small integers are unchanged');
   });
@@ -117,8 +117,8 @@ describe('every finite double round-trips exactly', () => {
     assert.equal(Buffer.from(cborEncode(2 ** 63)).toString('hex'), '1b8000000000000000');
     assert.equal(Buffer.from(cborEncode(-(2 ** 63))).toString('hex'), '3b7fffffffffffffff');
     assert.equal(Buffer.from(cborEncode(2 ** 64 - 2048)).toString('hex'), '1bfffffffffffff800');
-    assert.equal(Buffer.from(cborEncode(2 ** 64)).toString('hex'), 'fb43f0000000000000');
+    assert.equal(Buffer.from(cborEncode(2 ** 64)).toString('hex'), 'fa5f800000');
     assert.equal(Buffer.from(cborEncode(1e21)).toString('hex'), 'fb444b1ae4d6e2ef50');
-    assert.equal(Buffer.from(cborEncode(-0)).toString('hex'), 'fb8000000000000000');
+    assert.equal(Buffer.from(cborEncode(-0)).toString('hex'), 'f98000');
   });
 });

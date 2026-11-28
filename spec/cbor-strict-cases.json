@@ -1,5 +1,5 @@
 {
- "note": "Shared table for the strict CBOR decoder (#317). Read by test/cbor-strict.test.mjs and by wsh-core codec::tests. `error` is the rule code a decoder must report, null if the bytes are accepted. `legacy: false` runs the case with legacyIndefiniteMap off.",
+ "note": "Shared table for the strict CBOR decoder (#317). Read by test/cbor-strict.test.mjs and by wsh-core codec::tests. `error` is the rule code a decoder must report, null if the bytes are accepted. `legacy: false` runs the case with legacyIndefiniteMap off. `canonical_cases` are run twice: with every legacy option off (`strict`: JS `strict: true`, Rust `Options::strict()`; `error` is the code, null if accepted) and with the defaults of the compatibility window (`default_error`, normally absent: the window accepts what released peers wrote). Integers above 2^53 are read with `unsafeIntegers: \"bigint\"` in JS.",
  "cases": [
   {
    "hex": "7a00011170",
@@ -712,6 +712,296 @@
    "hex": "a2695f5f70726f746f5f5f01695f5f70726f746f5f5f02",
    "error": "duplicate-key",
    "why": "the key __proto__ twice"
+  }
+ ],
+ "canonical_cases": [
+  {
+   "hex": "a2616201616102",
+   "error": "non-canonical-key-order",
+   "why": "keys b, a: not sorted",
+   "default_error": null
+  },
+  {
+   "hex": "a2616102616201",
+   "error": null,
+   "why": "keys a, b: sorted"
+  },
+  {
+   "hex": "a262616101616202",
+   "error": "non-canonical-key-order",
+   "why": "keys aa, b: length-first puts b before aa",
+   "default_error": null
+  },
+  {
+   "hex": "a261620162616102",
+   "error": null,
+   "why": "keys b, aa: length-first order"
+  },
+  {
+   "hex": "a26001616102",
+   "error": null,
+   "why": "the empty key sorts first"
+  },
+  {
+   "hex": "a26161016002",
+   "error": "non-canonical-key-order",
+   "why": "the empty key after a",
+   "default_error": null
+  },
+  {
+   "hex": "a263e4b8800163e4b88102",
+   "error": null,
+   "why": "two 3-byte keys, in byte order"
+  },
+  {
+   "hex": "a263e4b8810163e4b88002",
+   "error": "non-canonical-key-order",
+   "why": "two 3-byte keys, out of byte order",
+   "default_error": null
+  },
+  {
+   "hex": "a263efbfbf0164f09f988002",
+   "error": null,
+   "why": "a 3-byte BMP key before a 4-byte astral key"
+  },
+  {
+   "hex": "a264f09f98800163efbfbf02",
+   "error": "non-canonical-key-order",
+   "why": "the astral key first: UTF-16 order would allow it, UTF-8 length-first does not",
+   "default_error": null
+  },
+  {
+   "hex": "a3616101616202616103",
+   "error": "duplicate-key",
+   "why": "a duplicate is reported before an order problem",
+   "default_error": "duplicate-key"
+  },
+  {
+   "hex": "a2616201616302",
+   "error": null,
+   "why": "keys b, c"
+  },
+  {
+   "hex": "a2616301616202",
+   "error": "non-canonical-key-order",
+   "why": "keys c, b",
+   "default_error": null
+  },
+  {
+   "hex": "82a261620161610200",
+   "error": "non-canonical-key-order",
+   "why": "an unsorted map inside an array",
+   "default_error": null
+  },
+  {
+   "hex": "a16161a2616201616102",
+   "error": "non-canonical-key-order",
+   "why": "an unsorted map as a map value",
+   "default_error": null
+  },
+  {
+   "hex": "a26161a2616101616202616203",
+   "error": null,
+   "why": "sorted at both levels"
+  },
+  {
+   "hex": "f93e00",
+   "error": null,
+   "why": "1.5 as float16"
+  },
+  {
+   "hex": "fa3fc00000",
+   "error": "non-canonical-float",
+   "why": "1.5 as float32 (fits float16)",
+   "default_error": null
+  },
+  {
+   "hex": "fb3ff8000000000000",
+   "error": "non-canonical-float",
+   "why": "1.5 as float64 (fits float16)",
+   "default_error": null
+  },
+  {
+   "hex": "f90001",
+   "error": null,
+   "why": "the smallest float16 subnormal"
+  },
+  {
+   "hex": "fa33800000",
+   "error": "non-canonical-float",
+   "why": "2^-24 as float32 fits float16",
+   "default_error": null
+  },
+  {
+   "hex": "fa47c35000",
+   "error": null,
+   "why": "100000.0 as float32: not a float16 value, float32 is shortest"
+  },
+  {
+   "hex": "fb40f86a0000000000",
+   "error": "non-canonical-float",
+   "why": "100000.0 as float64 fits float32",
+   "default_error": null
+  },
+  {
+   "hex": "fb3ff199999999999a",
+   "error": null,
+   "why": "1.1 needs float64"
+  },
+  {
+   "hex": "fa3dcccccd",
+   "error": null,
+   "why": "0.1 as float32 is a float32 value"
+  },
+  {
+   "hex": "fb3fb999999999999a",
+   "error": null,
+   "why": "0.1 as float64 is not a float32 value"
+  },
+  {
+   "hex": "fa7f7fffff",
+   "error": null,
+   "why": "the largest float32"
+  },
+  {
+   "hex": "fb47efffffe0000000",
+   "error": "non-canonical-float",
+   "why": "the largest float32 as float64",
+   "default_error": null
+  },
+  {
+   "hex": "fa00000001",
+   "error": null,
+   "why": "the smallest float32 subnormal"
+  },
+  {
+   "hex": "f97c00",
+   "error": null,
+   "why": "Infinity as float16"
+  },
+  {
+   "hex": "f9fc00",
+   "error": null,
+   "why": "-Infinity as float16"
+  },
+  {
+   "hex": "fa7f800000",
+   "error": "non-canonical-float",
+   "why": "Infinity as float32",
+   "default_error": null
+  },
+  {
+   "hex": "faff800000",
+   "error": "non-canonical-float",
+   "why": "-Infinity as float32",
+   "default_error": null
+  },
+  {
+   "hex": "fb7ff0000000000000",
+   "error": "non-canonical-float",
+   "why": "Infinity as float64",
+   "default_error": null
+  },
+  {
+   "hex": "f97e00",
+   "error": null,
+   "why": "the canonical NaN"
+  },
+  {
+   "hex": "f97e01",
+   "error": "non-canonical-float",
+   "why": "a NaN with a payload (float16)",
+   "default_error": null
+  },
+  {
+   "hex": "f97d00",
+   "error": "non-canonical-float",
+   "why": "a signalling NaN (float16)",
+   "default_error": null
+  },
+  {
+   "hex": "f9fe00",
+   "error": "non-canonical-float",
+   "why": "a NaN with the sign set (float16)",
+   "default_error": null
+  },
+  {
+   "hex": "fa7fc00000",
+   "error": "non-canonical-float",
+   "why": "NaN as float32",
+   "default_error": null
+  },
+  {
+   "hex": "fa7fc00001",
+   "error": "non-canonical-float",
+   "why": "a NaN with a payload (float32)",
+   "default_error": null
+  },
+  {
+   "hex": "fb7ff8000000000000",
+   "error": "non-canonical-float",
+   "why": "NaN as float64",
+   "default_error": null
+  },
+  {
+   "hex": "fb7ff8000000000001",
+   "error": "non-canonical-float",
+   "why": "a NaN with a payload (float64)",
+   "default_error": null
+  },
+  {
+   "hex": "fbfff8000000000000",
+   "error": "non-canonical-float",
+   "why": "a NaN with the sign set (float64)",
+   "default_error": null
+  },
+  {
+   "hex": "f98000",
+   "error": null,
+   "why": "-0 as float16 (allowed)"
+  },
+  {
+   "hex": "fa80000000",
+   "error": "non-canonical-float",
+   "why": "-0 as float32",
+   "default_error": null
+  },
+  {
+   "hex": "fb8000000000000000",
+   "error": "non-canonical-float",
+   "why": "-0 as float64",
+   "default_error": null
+  },
+  {
+   "hex": "f90000",
+   "error": null,
+   "why": "+0 as float16"
+  },
+  {
+   "hex": "fb0000000000000000",
+   "error": "non-canonical-float",
+   "why": "+0 as float64",
+   "default_error": null
+  },
+  {
+   "hex": "1b0020000000000001",
+   "error": null,
+   "why": "an integer above 2^53 (the JS decoder needs unsafeIntegers: \"bigint\"; Rust reads it exactly)"
+  },
+  {
+   "hex": "1bffffffffffffffff",
+   "error": null,
+   "why": "2^64-1"
+  },
+  {
+   "hex": "3bffffffffffffffff",
+   "error": null,
+   "why": "-2^64"
+  },
+  {
+   "hex": "3b0020000000000000",
+   "error": null,
+   "why": "-1-2^53"
   }
  ]
 }

@@ -102,8 +102,7 @@ impl RpcContext {
 
 /// Encode a message, refusing one over the limit.
 pub fn encode(msg: &Value, max: usize) -> Result<Vec<u8>, RpcError> {
-    let mut bytes = Vec::new();
-    ciborium::into_writer(msg, &mut bytes)
+    let bytes = wsh_core::cbor_canon::value_to_vec(msg)
         .map_err(|e| RpcError::new(code::INTERNAL, format!("encode failed: {e}")))?;
     if bytes.len() > max {
         return Err(RpcError::too_large("message", bytes.len(), max));
@@ -143,8 +142,7 @@ struct Engine {
 impl Engine {
     /// Best-effort send of a small control message (never over-limit-checked, never fails).
     async fn send_raw(&self, msg: Value) {
-        let mut bytes = Vec::new();
-        if ciborium::into_writer(&msg, &mut bytes).is_ok() {
+        if let Ok(bytes) = wsh_core::cbor_canon::value_to_vec(&msg) {
             let _ = self.out.send(bytes).await;
         }
     }

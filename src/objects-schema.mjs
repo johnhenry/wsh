@@ -32,10 +32,15 @@ const NEVER_KEYS = new Set(['__proto__', 'prototype', 'constructor', '__defineGe
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const bad = (what, message) => new TypeError(`${what}: ${message}`);
 
+// Structural equality for `enum` / `const`: objects compare without regard to key order (decoded objects arrive with sorted keys), arrays by position.
 const same = (a, b) => {
   if (a === b) return true;
   if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
-  try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) return a.length === b.length && a.every((x, i) => same(x, b[i]));
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  return ka.every((k) => Object.hasOwn(b, k) && same(a[k], b[k]));
 };
 
 /**

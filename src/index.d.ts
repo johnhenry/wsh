@@ -17,18 +17,32 @@
 export function cborEncode(value: unknown): Uint8Array;
 
 /**
- * Decode CBOR bytes into a JS value. Strict (#317): the whole buffer must be exactly one canonical item, every declared length must fit the
- * buffer, and there are no tags, no indefinite lengths (but see `legacyIndefiniteMap`), no duplicate or non-text map keys, no invalid UTF-8.
- * Throws a {@link CborError}.
+ * Decode CBOR bytes into a JS value. Strict (#317): the whole buffer must be exactly one item, every declared length must fit the
+ * buffer, and there are no tags, no indefinite lengths (but see `legacyIndefiniteMap`), no duplicate or non-text map keys, no invalid UTF-8,
+ * at most CBOR_MAX_CONTAINERS arrays and maps. Throws a {@link CborError}.
  *
- * `legacyIndefiniteMap` (default true): accept an indefinite-length map as the TOP-LEVEL item, which every released wsh Rust encoder wrote.
+ * The encoder writes the canonical form (RFC 8949 4.2.1); the decoder reads what released peers wrote too, until the compatibility window closes
+ * (COMPATIBILITY.md rule 7). `strict: true` turns every legacy option off.
  */
-export function cborDecode(data: Uint8Array, options?: { legacyIndefiniteMap?: boolean }): unknown;
+export function cborDecode(data: Uint8Array, options?: CborDecodeOptions): unknown;
+
+export interface CborDecodeOptions {
+  /** Every legacy option off (the default of a later minor). An explicit option below wins. */
+  strict?: boolean;
+  /** Accept an indefinite-length map as the TOP-LEVEL item (at offset 0), which every released wsh Rust encoder wrote. Default true. */
+  legacyIndefiniteMap?: boolean;
+  /** Accept the map key order, float widths and NaN forms the released encoders wrote (not sorted length-first, not shortest, any NaN). Default true. */
+  legacyNonCanonical?: boolean;
+  /** An integer beyond +-(2^53-1): 'round' (the nearest double; default), 'bigint' (exact), 'refuse' (a CborError `unsafe-integer`; what `strict` selects). */
+  unsafeIntegers?: 'round' | 'bigint' | 'refuse';
+  /** The most arrays and maps one item may hold. Default CBOR_MAX_CONTAINERS. */
+  maxContainers?: number;
+}
 
 /**
  * Decode ONE item starting at `offset` and return where it ended; whatever follows is left to the caller. As strict as `cborDecode` about the item.
  */
-export function cborDecodePrefix(data: Uint8Array, options?: { offset?: number; legacyIndefiniteMap?: boolean }): { value: unknown; end: number };
+export function cborDecodePrefix(data: Uint8Array, options?: CborDecodeOptions & { offset?: number }): { value: unknown; end: number };
 
 /** A malformed CBOR input. `code` is the rule that was broken. */
 export class CborError extends Error {
@@ -39,10 +53,14 @@ export class CborError extends Error {
 
 export type CborErrorCode =
   | 'truncated' | 'length-exceeds-buffer' | 'trailing-bytes' | 'non-shortest' | 'indefinite-length' | 'unexpected-break'
-  | 'reserved-additional-info' | 'duplicate-key' | 'non-text-key' | 'tag' | 'simple-value' | 'invalid-utf8' | 'too-deep';
+  | 'reserved-additional-info' | 'duplicate-key' | 'non-text-key' | 'tag' | 'simple-value' | 'invalid-utf8' | 'too-deep'
+  | 'too-many-containers' | 'non-canonical-key-order' | 'non-canonical-float' | 'unsafe-integer';
 
 /** The deepest nesting a decoded item may have. */
 export const CBOR_MAX_DEPTH: number;
+
+/** The most arrays and maps one decoded item may hold (1,000,000). */
+export const CBOR_MAX_CONTAINERS: number;
 
 /**
  * Frame a CBOR-encoded message with a 4-byte big-endian length prefix.
@@ -72,8 +90,9 @@ export class FrameDecoder {
   /**
    * @param opts.maxFrameSize Maximum allowed claimed frame length in bytes.
    *   Defaults to DEFAULT_MAX_FRAME_SIZE.
+   * @param opts The other options are {@link CborDecodeOptions}, applied to every frame (default: the compatibility window).
    */
-  constructor(opts?: { maxFrameSize?: number });
+  constructor(opts?: { maxFrameSize?: number } & CborDecodeOptions);
 
   /**
    * Feed bytes and return decoded messages.

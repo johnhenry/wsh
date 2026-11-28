@@ -13,17 +13,27 @@
 //! - map keys that are not text (`non-text-key`) or that appear twice in one map (`duplicate-key`);
 //! - text that is not UTF-8, and nesting deeper than [`MAX_DEPTH`].
 //!
-//! Floats of every width are accepted (the JS encoder writes float64 for everything; ciborium writes the shortest exact form). Map keys need not be
-//! sorted: the JS encoder writes insertion order and this crate field order, so no canonical key order exists on the wire to require.
+//! - more than [`MAX_CONTAINERS`] arrays and maps in one item (`too-many-containers`): a 4 MiB frame of empty arrays is 4 million of them.
 //!
-//! One legacy exception ([`Options::legacy_indefinite_map`], on by default): the top-level item may be an indefinite-length map, which every wsh
-//! Rust encoder released before this one wrote for a message envelope (`serde(flatten)` makes ciborium use one). Its contents are held to every rule.
+//! Canonical form (#325; RFC 8949 4.2.1, what [`crate::cbor_canon`] and `src/cbor.mjs` write), which released peers did not write, so it is required
+//! only with [`Options::legacy_non_canonical`] off ([`Options::strict`]) and accepted by default for the compatibility window (COMPATIBILITY.md rule 7):
+//!
+//! - map keys sorted by the bytes of their encoding, shorter first, then bytewise (`non-canonical-key-order`);
+//! - floats in the shortest width that reads back exactly, one NaN (`f97e00`): no float32/float64 that fits a narrower width, no NaN payload or sign
+//!   (`non-canonical-float`); `-0` is `f98000` and allowed.
+//!
+//! Two legacy exceptions, both on by default and both off in [`Options::strict`]: [`Options::legacy_indefinite_map`] (the top-level item, at offset 0, may be an
+//! indefinite-length map, which every wsh Rust encoder released before this one wrote for a message envelope: `serde(flatten)` makes ciborium use one;
+//! its contents are held to every rule) and [`Options::legacy_non_canonical`].
 
 use std::collections::HashSet;
 use std::fmt;
 
 /// The deepest nesting accepted. The rpc channel's scanners use the same bound.
 pub const MAX_DEPTH: usize = 128;
+
+/// The most arrays and maps (counting the top-level item) one item may hold; the JS decoder's `CBOR_MAX_CONTAINERS`.
+pub const MAX_CONTAINERS: usize = 1_000_000;
 
 /// Which rule an input broke (the same strings as `CborError.code` in `src/cbor.mjs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +51,9 @@ pub enum StrictCode {
     SimpleValue,
     InvalidUtf8,
     TooDeep,
+    TooManyContainers,
+    NonCanonicalKeyOrder,
+    NonCanonicalFloat,
 }
 
 impl StrictCode {
@@ -59,6 +72,9 @@ impl StrictCode {
             StrictCode::SimpleValue => "simple-value",
             StrictCode::InvalidUtf8 => "invalid-utf8",
             StrictCode::TooDeep => "too-deep",
+            StrictCode::TooManyContainers => "too-many-containers",
+            StrictCode::NonCanonicalKeyOrder => "non-canonical-key-order",
+            StrictCode::NonCanonicalFloat => "non-canonical-float",
         }
     }
 }
@@ -83,17 +99,63 @@ impl fmt::Display for StrictError {
 
 impl std::error::Error for StrictError {}
 
-/// What to accept beyond the strict rules.
+/// What to accept beyond the strict rules: the compatibility window of COMPATIBILITY.md rule 7. [`Options::default`] is the window as it is now (both
+/// legacy options on); [`Options::strict`] is what the tests and the differential run and what becomes the default when the window closes.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// Accept an indefinite-length map as the top-level item (see the module notes). Default true.
+    /// Accept an indefinite-length map as the top-level item, at offset 0 (see the module notes). Default true.
     pub legacy_indefinite_map: bool,
+    /// Accept the map key order, float widths and NaN forms the released encoders wrote (see the module notes). Default true.
+    pub legacy_non_canonical: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             legacy_indefinite_map: true,
+            legacy_non_canonical: true,
+        }
+    }
+}
+
+impl Options {
+    /// Every legacy option off: exactly one canonical encoding of every value.
+    pub const fn strict() -> Self {
+        Options {
+            legacy_indefinite_map: false,
+            legacy_non_canonical: false,
+        }
+    }
+}
+
+/// What one walk over one item carries: the options, whether a legacy map is allowed here, and the container count.
+struct Walk<'o> {
+    opts: &'o Options,
+    legacy_top: bool,
+    containers: usize,
+}
+
+impl Walk<'_> {
+    fn container(&mut self, at: usize) -> Result<(), StrictError> {
+        self.containers += 1;
+        if self.containers > MAX_CONTAINERS {
+            return Err(err(StrictCode::TooManyContainers, at));
+        }
+        Ok(())
+    }
+}
+
+/// The keys of one map so far: the ones seen (a duplicate is an error) and the last one (canonical order).
+struct Keys<'a> {
+    seen: HashSet<&'a [u8]>,
+    prev: Option<&'a [u8]>,
+}
+
+impl Keys<'_> {
+    fn new() -> Self {
+        Keys {
+            seen: HashSet::new(),
+            prev: None,
         }
     }
 }
@@ -111,15 +173,21 @@ pub fn validate_with(data: &[u8], opts: &Options) -> Result<(), StrictError> {
     Ok(())
 }
 
-/// [`validate_with`] with the default options.
+/// [`validate_with`] with the default options (the compatibility window).
 pub fn validate(data: &[u8]) -> Result<(), StrictError> {
     validate_with(data, &Options::default())
 }
 
-/// Where the ONE item that starts at `offset` ends; whatever follows is the caller's. Every rule that applies to the item applies.
+/// Where the ONE item that starts at `offset` ends; whatever follows is the caller's. Every rule that applies to the item applies. The legacy
+/// indefinite-length map is the top-level item of a message, so it is read at offset 0 only; the container count starts again at each call.
 pub fn item_end(data: &[u8], offset: usize, opts: &Options) -> Result<usize, StrictError> {
     let mut off = offset;
-    item(data, &mut off, 0, opts)?;
+    let mut walk = Walk {
+        opts,
+        legacy_top: opts.legacy_indefinite_map && offset == 0,
+        containers: 0,
+    };
+    item(data, &mut off, 0, &mut walk)?;
     Ok(off)
 }
 
@@ -170,7 +238,7 @@ fn length(
     }
 }
 
-fn item(data: &[u8], off: &mut usize, depth: usize, opts: &Options) -> Result<(), StrictError> {
+fn item(data: &[u8], off: &mut usize, depth: usize, w: &mut Walk) -> Result<(), StrictError> {
     if depth > MAX_DEPTH {
         return Err(err(StrictCode::TooDeep, *off));
     }
@@ -188,7 +256,10 @@ fn item(data: &[u8], off: &mut usize, depth: usize, opts: &Options) -> Result<()
         return match mt {
             0 | 1 | 6 => Err(err(StrictCode::ReservedAdditionalInfo, start)),
             7 => Err(err(StrictCode::UnexpectedBreak, start)),
-            5 if depth == 0 && opts.legacy_indefinite_map => legacy_map(data, off, depth, opts),
+            5 if depth == 0 && w.legacy_top => {
+                w.container(start)?;
+                legacy_map(data, off, depth, w)
+            }
             _ => Err(err(StrictCode::IndefiniteLength, start)),
         };
     }
@@ -209,15 +280,17 @@ fn item(data: &[u8], off: &mut usize, depth: usize, opts: &Options) -> Result<()
         }
         4 => {
             let len = length(data, off, ai, start, 1)?;
+            w.container(start)?;
             for _ in 0..len {
-                item(data, off, depth + 1, opts)?;
+                item(data, off, depth + 1, w)?;
             }
         }
         5 => {
             let len = length(data, off, ai, start, 2)?;
-            let mut keys: HashSet<&[u8]> = HashSet::new();
+            w.container(start)?;
+            let mut keys = Keys::new();
             for _ in 0..len {
-                pair(data, off, depth, opts, &mut keys)?;
+                pair(data, off, depth, w, &mut keys)?;
             }
         }
         6 => return Err(err(StrictCode::Tag, start)),
@@ -228,6 +301,9 @@ fn item(data: &[u8], off: &mut usize, depth: usize, opts: &Options) -> Result<()
                 if *off + size > data.len() {
                     return Err(err(StrictCode::Truncated, start));
                 }
+                if !w.opts.legacy_non_canonical && !float_is_canonical(&data[*off..*off + size]) {
+                    return Err(err(StrictCode::NonCanonicalFloat, start));
+                }
                 *off += size;
             }
             24 if *off >= data.len() => return Err(err(StrictCode::Truncated, start)),
@@ -237,13 +313,35 @@ fn item(data: &[u8], off: &mut usize, depth: usize, opts: &Options) -> Result<()
     Ok(())
 }
 
-/// One key (text, not yet seen in this map) and its value.
+/// Is the float whose 2, 4 or 8 content bytes these are the shortest form of its value? NaN has one form (`f97e00`).
+fn float_is_canonical(raw: &[u8]) -> bool {
+    use crate::cbor_canon::f16_bits_exact;
+    match raw.len() {
+        2 => {
+            let h = u16::from_be_bytes([raw[0], raw[1]]);
+            // a half NaN is exponent all ones and a non-zero mantissa: only the quiet NaN without payload or sign is canonical
+            !(h & 0x7c00 == 0x7c00 && h & 0x03ff != 0) || h == 0x7e00
+        }
+        4 => {
+            let f = f32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            !f.is_nan() && f16_bits_exact(f as f64).is_none()
+        }
+        _ => {
+            let f = f64::from_be_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]);
+            !f.is_nan() && ((f as f32) as f64).to_bits() != f.to_bits()
+        }
+    }
+}
+
+/// One key (text, not yet seen in this map, and with canonical options after the one before it) and its value.
 fn pair<'a>(
     data: &'a [u8],
     off: &mut usize,
     depth: usize,
-    opts: &Options,
-    keys: &mut HashSet<&'a [u8]>,
+    w: &mut Walk,
+    keys: &mut Keys<'a>,
 ) -> Result<(), StrictError> {
     let key_at = *off;
     if let Some(&b) = data.get(key_at) {
@@ -251,21 +349,26 @@ fn pair<'a>(
             return Err(err(StrictCode::NonTextKey, key_at));
         }
     }
-    item(data, off, depth + 1, opts)?;
+    item(data, off, depth + 1, w)?;
     // text in its shortest form and valid UTF-8: equal bytes are equal keys
-    if !keys.insert(&data[key_at..*off]) {
+    let key = &data[key_at..*off];
+    if !keys.seen.insert(key) {
         return Err(err(StrictCode::DuplicateKey, key_at));
     }
-    item(data, off, depth + 1, opts)
+    if !w.opts.legacy_non_canonical {
+        // RFC 8949 4.2.1: shorter encoded keys first, then bytewise
+        if let Some(prev) = keys.prev {
+            if prev.len() > key.len() || (prev.len() == key.len() && prev > key) {
+                return Err(err(StrictCode::NonCanonicalKeyOrder, key_at));
+            }
+        }
+        keys.prev = Some(key);
+    }
+    item(data, off, depth + 1, w)
 }
 
-fn legacy_map(
-    data: &[u8],
-    off: &mut usize,
-    depth: usize,
-    opts: &Options,
-) -> Result<(), StrictError> {
-    let mut keys: HashSet<&[u8]> = HashSet::new();
+fn legacy_map(data: &[u8], off: &mut usize, depth: usize, w: &mut Walk) -> Result<(), StrictError> {
+    let mut keys = Keys::new();
     loop {
         match data.get(*off) {
             None => return Err(err(StrictCode::Truncated, *off)),
@@ -273,7 +376,7 @@ fn legacy_map(
                 *off += 1;
                 return Ok(());
             }
-            Some(_) => pair(data, off, depth, opts, &mut keys)?,
+            Some(_) => pair(data, off, depth, w, &mut keys)?,
         }
     }
 }
@@ -302,6 +405,7 @@ mod tests {
             let hex = c["hex"].as_str().unwrap();
             let opts = Options {
                 legacy_indefinite_map: c.get("legacy").and_then(|v| v.as_bool()).unwrap_or(true),
+                ..Options::default()
             };
             let got = validate_with(&unhex(hex), &opts);
             match (c["error"].as_str(), got) {
@@ -379,15 +483,13 @@ mod tests {
     }
 
     #[test]
-    fn golden_vectors_from_every_encoder_are_accepted_and_the_released_rust_ones_only_by_the_legacy_exception(
+    fn golden_vectors_from_every_encoder_are_accepted_in_the_window_and_the_current_ones_in_strict_mode(
     ) {
         let v = doc(include_str!("../../../spec/cbor-vectors.json"));
-        let strict = Options {
-            legacy_indefinite_map: false,
-        };
+        let strict = Options::strict();
         let mut n = 0;
         for vec in v["vectors"].as_array().unwrap() {
-            for side in ["js", "rust", "rust_released"] {
+            for side in ["js", "rust", "js_released", "rust_released"] {
                 let bytes = unhex(
                     vec[side]
                         .as_str()
@@ -400,13 +502,169 @@ mod tests {
                 let canonical = validate_with(&bytes, &strict);
                 if side == "rust_released" && vec["layer"] == "control" {
                     assert_eq!(canonical.unwrap_err().code.as_str(), "indefinite-length");
+                } else if side.ends_with("_released") {
+                    // a released encoder's bytes are canonical exactly where they equal the current encoders' bytes
+                    let current = vec[side.trim_end_matches("_released")].as_str().unwrap();
+                    let same = vec[side].as_str().unwrap() == current;
+                    match canonical {
+                        Ok(()) => assert!(same, "{}/{side}", vec["name"]),
+                        Err(e) => {
+                            assert!(!same, "{}/{side}: {e}", vec["name"]);
+                            assert!(
+                                ["non-canonical-key-order", "non-canonical-float"]
+                                    .contains(&e.code.as_str()),
+                                "{}/{side}: {e}",
+                                vec["name"]
+                            );
+                        }
+                    }
                 } else {
                     canonical.unwrap_or_else(|e| panic!("{}/{side}: {e}", vec["name"]));
                 }
                 n += 1;
             }
         }
-        assert!(n >= 600, "{n}");
+        assert!(n >= 800, "{n}");
+    }
+
+    #[test]
+    fn the_shared_table_of_canonical_cases_holds_in_strict_mode_and_in_the_window() {
+        let table = doc(include_str!("../../../spec/cbor-strict-cases.json"));
+        let cases = table["canonical_cases"].as_array().unwrap();
+        assert!(cases.len() >= 40, "{}", cases.len());
+        let mut wrong = Vec::new();
+        for c in cases {
+            let hex = c["hex"].as_str().unwrap();
+            let bytes = unhex(hex);
+            let want = c["error"].as_str();
+            let want_default = c.get("default_error").and_then(|v| v.as_str());
+            for (label, opts, want) in [
+                ("strict", Options::strict(), want),
+                ("default", Options::default(), want_default),
+            ] {
+                let got = validate_with(&bytes, &opts).err().map(|e| e.code.as_str());
+                if got != want {
+                    wrong.push(format!("{label} {hex}: wanted {want:?}, got {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn the_options_are_independent_and_strict_turns_both_off() {
+        let unsorted = unhex("a26162016161 02".replace(' ', "").as_str());
+        let indefinite = unhex("bf616101ff");
+        let only_order = Options {
+            legacy_indefinite_map: true,
+            legacy_non_canonical: false,
+        };
+        assert!(validate(&unsorted).is_ok());
+        assert_eq!(
+            validate_with(&unsorted, &Options::strict())
+                .unwrap_err()
+                .code
+                .as_str(),
+            "non-canonical-key-order"
+        );
+        assert!(validate_with(&indefinite, &only_order).is_ok());
+        assert_eq!(
+            validate_with(&indefinite, &Options::strict())
+                .unwrap_err()
+                .code
+                .as_str(),
+            "indefinite-length"
+        );
+        let only_indef_off = Options {
+            legacy_indefinite_map: false,
+            legacy_non_canonical: true,
+        };
+        assert!(validate_with(&unsorted, &only_indef_off).is_ok());
+        assert!(validate_with(&indefinite, &only_indef_off).is_err());
+    }
+
+    #[test]
+    fn the_legacy_map_is_read_at_offset_zero_only() {
+        let o = Options::default();
+        assert_eq!(item_end(&unhex("bf616101ff00"), 0, &o).unwrap(), 5);
+        let after = unhex("0abf616101ff");
+        assert_eq!(item_end(&after, 0, &o).unwrap(), 1);
+        assert_eq!(
+            item_end(&after, 1, &o).unwrap_err().code.as_str(),
+            "indefinite-length"
+        );
+        let two = unhex("00bf616101ff");
+        let end = item_end(&two, 0, &o).unwrap();
+        assert_eq!(
+            item_end(&two, end, &o).unwrap_err().code.as_str(),
+            "indefinite-length"
+        );
+    }
+
+    #[test]
+    fn every_half_float_is_canonical_as_a_half_and_never_as_a_single_or_double() {
+        use crate::cbor_canon::f16_to_f64;
+        let strict = Options::strict();
+        let mut halves = 0;
+        for h in 0u32..0x1_0000 {
+            let h = h as u16;
+            let half = [vec![0xf9], h.to_be_bytes().to_vec()].concat();
+            let v = f16_to_f64(h);
+            if v.is_nan() {
+                // only the quiet NaN with no payload and no sign is canonical
+                assert_eq!(
+                    validate_with(&half, &strict).is_ok(),
+                    h == 0x7e00,
+                    "{h:04x}"
+                );
+                continue;
+            }
+            assert!(validate_with(&half, &strict).is_ok(), "{h:04x}");
+            let single = [vec![0xfa], (v as f32).to_be_bytes().to_vec()].concat();
+            let double = [vec![0xfb], v.to_be_bytes().to_vec()].concat();
+            for wide in [single, double] {
+                assert_eq!(
+                    validate_with(&wide, &strict).unwrap_err().code.as_str(),
+                    "non-canonical-float",
+                    "{h:04x}"
+                );
+                assert!(validate(&wide).is_ok(), "{h:04x} (the window reads it)");
+            }
+            halves += 1;
+        }
+        assert_eq!(halves, 0x1_0000 - 2046);
+    }
+
+    #[test]
+    fn a_container_cap_bounds_what_a_frame_of_empty_arrays_can_cost() {
+        let strict = Options::strict();
+        // an array of N empty arrays holds N + 1 containers
+        let arrays = |n: usize| {
+            let mut b = vec![0x9a];
+            b.extend_from_slice(&(n as u32).to_be_bytes());
+            b.resize(5 + n, 0x80);
+            b
+        };
+        assert!(validate_with(&arrays(MAX_CONTAINERS - 1), &strict).is_ok());
+        for opts in [strict, Options::default()] {
+            assert_eq!(
+                validate_with(&arrays(MAX_CONTAINERS), &opts)
+                    .unwrap_err()
+                    .code
+                    .as_str(),
+                "too-many-containers"
+            );
+        }
+        let t0 = Instant::now();
+        let four_mib = arrays(4 * 1024 * 1024 - 5);
+        assert_eq!(
+            validate(&four_mib).unwrap_err().code.as_str(),
+            "too-many-containers"
+        );
+        assert!(t0.elapsed().as_millis() < 1500, "{:?}", t0.elapsed());
+        // maps count, scalars and byte strings do not, and the legacy map counts as one
+        assert!(validate(&unhex("85016161 41ff f6 f5".replace(' ', "").as_str())).is_ok());
+        assert!(validate(&unhex("bf616101ff")).is_ok());
     }
 
     /// A fixed-seed xorshift: the same mutations on every run.

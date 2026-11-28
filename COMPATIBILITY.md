@@ -102,9 +102,11 @@ last release is breaking in the sense of rule "versions" above even when no depl
 - If you change `spec/wsh-v1.yaml`: `npm run codegen`, then the matrix with `npm run matrix`; `npm run codegen:check` and
   `npm run matrix:check` are both CI gates.
 
-### 7. CBOR is read strictly, and the two decoders are one rule set (#317)
+### 7. CBOR is written canonically, read strictly, and the two decoders are one rule set (#317, #325, #326)
 
-A message is accepted only if it is exactly one well-formed CBOR item with no non-canonical *head* (integers, lengths) and none of the constructs listed below. That is strict, but it is **not** "exactly one canonical encoding": the residual list is under the table. `cborDecode` (`src/cbor.mjs`) and `cbor_decode` /
+**Written.** Both encoders (`cborEncode` in `src/cbor.mjs`; `cbor_encode`, `frame_encode` and the rpc encoders in `crates/wsh-core/src/cbor_canon.rs`) write the deterministic form of RFC 8949 section 4.2.1 and nothing else, so one value has one byte string, and the two encoders write the same bytes: map keys sorted by the bytes of their encoding (shorter first, then bytewise; for text keys the UTF-8 length, then the UTF-8 bytes; `type` is no longer first), the shortest integer head, the shortest float that reads back exactly (half, single, double; one NaN, `f97e00`; `-0` is `f98000`), definite lengths only. `spec/cbor-vectors.json` records what each encoder writes for every message (`js` and `rust`: canonical, and byte-equal to themselves after a decode and a re-encode in either language; `js_released`: npm 0.62.x; `rust_released`: rust-v0.26.2) and `test/rust/cbor-differential.test.mjs` holds the two encoders to each other on 3000 random values and on the vectors. The JS encoder also takes a BigInt (exact, `-2^64 .. 2^64-1`).
+
+**Read.** A message is accepted only if it is exactly one well-formed CBOR item with no non-canonical *head* (integers, lengths) and none of the constructs listed below. What is canonical beyond that (key order, float width, NaN, integers a JS number cannot carry) is a separate set of rules with its own switch, `legacyNonCanonical`, because the released encoders did not write it: see "The compatibility window and its sunset" below. `cborDecode` (`src/cbor.mjs`) and `cbor_decode` /
 `cbor_strict::validate` (`crates/wsh-core/src/cbor_strict.rs`) refuse, with the same rule code (`CborError.code`, `StrictCode::as_str()`), the
 same inputs (`spec/cbor-strict-cases.json` is the shared table; `test/rust/cbor-differential.test.mjs` compares the two on 20000 mutations):
 
@@ -120,22 +122,50 @@ same inputs (`spec/cbor-strict-cases.json` is the shared table; `test/rust/cbor-
 | any tag; any simple value but `false`, `true`, `null` | `tag`, `simple-value` |
 | a text string that is not UTF-8; nesting deeper than 128 | `invalid-utf8`, `too-deep` |
 
-What is **not** required, so more than one byte string decodes to the same value (tracked in #325): **the order of map keys** (the JS encoder
-writes insertion order, the Rust encoder field order; neither is the RFC 8949 length-first order), and **the width of a float** (the JS encoder
-writes every float as float64, ciborium the shortest exact width; all three widths are read), **NaN payloads and -0** (any NaN bit pattern is read; -0 is a float and stays one), **JS integers above 2^53** (the JS decoder returns a double, so two integers that round to the same double decode alike), and **JS integer/float conflation** (an integral float reads as the same JS number as the integer). The Rust and JS decoders agree on accept/reject for all of these; they differ only in the value a JS caller sees. The legacy top-level map (next paragraph) is the last residual.
+| Rule (canonical; refused only with `legacyNonCanonical: false` / `strict`) | Code |
+|---|---|
+| a map whose keys are not sorted length-first, then bytewise | `non-canonical-key-order` |
+| a float that is not in the shortest width that reads back exactly: a float32 that fits a float16, a float64 that fits a float32; any NaN but `f97e00` (no payload, no sign); an infinity or a zero in a wider form | `non-canonical-float` |
+| (JS only) an integer outside `+-(2^53-1)` with `unsafeIntegers: 'refuse'` | `unsafe-integer` |
+| (always) more than 1,000,000 arrays and maps in one item (`CBOR_MAX_CONTAINERS`, `cbor_strict::MAX_CONTAINERS`) | `too-many-containers` |
+
+How each gap #325 listed is handled:
+
+1. **Key order** and 2. **float width**: required in canonical mode, as above; both encoders now write the canonical form.
+3. **NaN payloads and -0**: a NaN with a payload or the sign set is `non-canonical-float` in canonical mode, and the encoders write one NaN. `-0` is canonical (`f98000`) and stays `-0` in JS.
+4. **JS integers above 2^53**: an integer a JS number cannot carry is read per `unsafeIntegers`: `'round'` (the released behaviour, the nearest double; the default of the window), `'bigint'` (exact, a BigInt; the differential uses it, and the Rust decoder reads these exactly), `'refuse'` (`unsafe-integer`; what `strict` selects: a message field is a JS number and cannot carry it, and refusing is better than silently rounding). No message field carries one today (the largest are millisecond timestamps and byte counts).
+5. **JS float/integer conflation**: *not changed, and it cannot be without breaking released peers.* `f93c00` (1.0) and `01` read as the same JS number, because a JS number has no integer/float split and message fields are plain numbers; a decoder that returned a wrapper for floats would break every field. The JS encoder never writes an integral number as a float. The Rust typed decoder keeps the split: an integer field refuses a float (`f93c00` in a `u64`), and ciborium also refuses an integer in an `f64` field, so a JS peer that sends an integral number in one of the three `f64` fields (`cpu`, `confidence`, `load`) is refused by Rust. That predates this change and is unchanged; it is also the one place the two encoders differ for the same value (a Rust `f64` 1.0 is `f93c00`, JS 1 is `01`). Tested: `cbor_canon::tests::float_is_not_integer_in_typed_decode`, `test/cbor-canonical.test.mjs`.
+6. **`cborDecodePrefix`** with an offset that is not in the buffer throws (done in #324); the legacy indefinite map is now read at offset 0 only (see below).
+7. **A container-count cap**: 1,000,000 arrays and maps per item, on in every mode (a 4 MiB frame of empty arrays was 4 million containers, about 160 MiB of heap and 2.4 s). A real message is orders of magnitude below it (20,000 records of three containers each is 60,000); `maxContainers` overrides it in JS.
 
 **The one legacy exception.** Every released `wsh-core` encoder wrote a message envelope as an **indefinite-length map** (`0xbf ... 0xff`):
 `Envelope` has a `#[serde(flatten)]` payload, which makes serde ask for an unsized map and ciborium write the indefinite form. All 110
 message types did this (`spec/cbor-vectors.json`, `rust_released`), so refusing it would refuse every message a released `wsh`,
 `wsh-server` or `wsh-client` sends. Decoders therefore accept an indefinite-length map as the **top-level item** (`legacyIndefiniteMap`,
-default true), and nowhere else; what is inside it is held to every rule above. The Rust encoder in this tree writes a definite-length
-map (`Envelope` serializes by hand, generated from `spec/codegen.mjs`), so the exception is only for peers that predate it, and can be
-removed when `rust-v0.26.x` leaves the supported window (rule "versions": the latest release and the one before it), tracked in #326. The rpc channel (a CBOR sequence of JSON-RPC messages) never had the exception: no released encoder wrote
+default true), at **offset 0 only** (`cborDecodePrefix` and `item_end` read it at the start of a buffer and refuse it after another item or at any other offset), and nowhere else; what is inside it is held to every rule above. The Rust encoder in this tree writes a definite-length
+map (`Envelope` serializes by hand, generated from `spec/codegen.mjs`), so the exception is only for peers that predate it. It goes away with the rest of the
+window, below. The rpc channel (a CBOR sequence of JSON-RPC messages) never had the exception: no released encoder wrote
 an indefinite-length rpc item, and its decoders refuse one.
+
+### The compatibility window and its sunset (#326)
+
+The decoders have three legacy switches, all on by default today and all off in `strict` mode (JS `strict: true`, Rust `Options::strict()`): `legacyIndefiniteMap` (a Rust peer up to rust-v0.26.2 wrote an indefinite top-level map), `legacyNonCanonical` (npm up to 0.62.x wrote insertion order and float64; Rust up to v0.26.x wrote field order; a Rust NaN may carry a sign), and the `unsafeIntegers` default (`'round'` in the window, `'refuse'` in strict mode). `strict` is what every test and the differential run, and what the default becomes. An explicit option beats `strict`. The rpc channel never had the indefinite map (its decoders pass `legacy_indefinite_map: false` / `legacyIndefiniteMap: false`) and keeps `legacyNonCanonical` on for the same window, because released rpc peers wrote non-canonical key order and float64 too.
+
+The window is rule "versions": the latest release of each side and the one before it. The first releases that contain this change write canonical bytes: the next Rust minor (assumed rust-v0.27.0) and the next npm minor (assumed 0.63.0). Then:
+
+| Step | When | What |
+|---|---|---|
+| 0, this change | now | Encoders canonical; decoders canonical-capable; defaults unchanged: every released peer is read |
+| 1, the window closes | the later of: the second Rust minor after rust-v0.26 is published (rust-v0.28.0, when 0.26.x is no longer "the one before the latest"), and the second npm minor after 0.62 (0.64.0, likewise) | No code change. Both release notes say the flip is next. The flip waits for the *later* of the two because `legacyNonCanonical` is also for released JS peers, not only for the Rust ones #326 is about |
+| 2, the flip | the first minor of each side published after step 1 | The default becomes strict (`legacyIndefiniteMap` and `legacyNonCanonical` false, `unsafeIntegers: 'refuse'`). A CHANGELOG line says so, as breaking for a released peer. `legacyIndefiniteMap: true` / `legacy_indefinite_map: true` and the other options stay as an opt-in for a deployment that still has an old peer |
+| 3 | the minor after the flip | The last minor that has the options |
+| 4 | the minor after that | The options and the exceptions are removed: the decoders are strict, with no switch |
+
+A new encoder's bytes need nothing from this: every released decoder reads them (key order and float widths are just data to it; checked against npm 0.62.2 and rust-v0.26.2 when this change was made). What the window protects is a new decoder reading an old encoder.
 
 **What happens on a decode error** (the frame is delimited by its length prefix, so the stream stays in step): the Rust server and client close the session (they read frames with `feed_raw` and `decode_envelope` and end on the first error); the JS WebSocket server logs the error and drops the frame, and handles the good frames around it; the JS WebSocket client emits the error (`onError`) and continues; the JS WebTransport client does the same since this change (before it left its read loop and the connection half-open), and so does the JS WebTransport server. An oversized claimed length ends the connection everywhere. On a sealed session a dropped frame is a gap in the strict counter, so the next frame ends the session. `FrameDecoder.feedAll` is the helper the JS transports share: it returns every good message and every error of a chunk. `FrameDecoder.feed` throws at the first bad frame, with the messages before it in `error.decoded`.
 
-**An older peer.** What the released encoders write is recorded and checked: `test/cbor-vectors.test.mjs` (JS encoder, current Rust
+**An older peer.** What the released encoders write is recorded and checked: `test/cbor-vectors.test.mjs` (the JS encoder before and after the canonical change, the current Rust
 encoder and the released Rust encoder, every message type), `scripts/cbor-interop-old.mjs` (the encoder of an older `@johnhenry/wsh` install
 against this decoder: 0.47.0 to 0.62.2 are byte-identical to this encoder over 291 values; 0.0.0 to 0.45.0 differ only for the value 2^64,
 which they wrote as the non-canonical zero `1b 00..00`, for -2^63 (one too low) and for -0 (as 0): bugs fixed in 0.47.0, in values no wsh message carries). A peer written by someone else that emits indefinite lengths, non-shortest integers, tags

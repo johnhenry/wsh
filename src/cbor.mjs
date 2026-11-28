@@ -4,6 +4,10 @@
  * Wire format: [4-byte big-endian length][CBOR payload]
  * Uses a minimal CBOR encoder/decoder (subset: maps, arrays, strings, ints,
  * bytes, booleans, null, floats).
+ *
+ * The encoder writes the deterministic form of RFC 8949 section 4.2.1 and nothing else: map keys sorted length-first then bytewise, the shortest
+ * integer, the shortest float that reads back exactly (NaN is f97e00, -0 is f98000). The Rust encoder (crates/wsh-core/src/cbor_canon.rs) writes the
+ * same bytes for the same value, and the golden vectors and the differential test hold them to it (#325).
  */
 
 // ── CBOR major types ──────────────────────────────────────────────────
@@ -52,9 +56,21 @@ function encodeValue(value, parts) {
     parts.push(new Uint8Array([0xf4]));
     return;
   }
+  if (typeof value === 'bigint') {
+    // exact, in the 64-bit ranges CBOR integers cover: 0 .. 2^64-1 and -2^64 .. -1
+    if (value >= 0n) {
+      if (value >= 2n ** 64n) throw new RangeError(`cborEncode: ${value} does not fit a CBOR integer (0 .. 2^64-1, -2^64 .. -1)`);
+      parts.push(value <= BigInt(Number.MAX_SAFE_INTEGER) ? encodeHead(MT_UNSIGNED, Number(value)) : encodeHead64(MT_UNSIGNED, value));
+    } else {
+      if (value < -(2n ** 64n)) throw new RangeError(`cborEncode: ${value} does not fit a CBOR integer (0 .. 2^64-1, -2^64 .. -1)`);
+      const n = -1n - value;
+      parts.push(n <= BigInt(Number.MAX_SAFE_INTEGER) ? encodeHead(MT_NEGATIVE, Number(n)) : encodeHead64(MT_NEGATIVE, n));
+    }
+    return;
+  }
   if (typeof value === 'number') {
     // An integral double within the 64-bit ranges is an integer (exactly: BigInt past 2^53); anything else -- a fraction, NaN,
-    // an infinity, -0, or an integer at or beyond 2^64 in magnitude -- is a float64, so every finite double round-trips.
+    // an infinity, -0, or an integer at or beyond 2^64 in magnitude -- is a float, in the shortest width that reads back exactly.
     if (Number.isInteger(value) && !Object.is(value, -0) && value >= -TWO_64 && value < TWO_64) {
       if (Number.isSafeInteger(value)) {
         parts.push(value >= 0 ? encodeHead(MT_UNSIGNED, value) : encodeHead(MT_NEGATIVE, -1 - value));
@@ -62,12 +78,7 @@ function encodeValue(value, parts) {
         parts.push(value >= 0 ? encodeHead64(MT_UNSIGNED, BigInt(value)) : encodeHead64(MT_NEGATIVE, -1n - BigInt(value)));
       }
     } else {
-      // float64
-      const buf = new ArrayBuffer(9);
-      const view = new DataView(buf);
-      view.setUint8(0, (MT_SIMPLE << 5) | FLOAT_64);
-      view.setFloat64(1, value);
-      parts.push(new Uint8Array(buf));
+      parts.push(encodeFloat(value));
     }
     return;
   }
@@ -96,8 +107,20 @@ function encodeValue(value, parts) {
   if (typeof value === 'object') {
     const keys = Object.keys(value);
     parts.push(encodeHead(MT_MAP, keys.length));
-    for (const key of keys) {
-      encodeValue(key, parts);
+    if (keys.length === 1) {
+      encodeValue(keys[0], parts);
+      encodeValue(value[keys[0]], parts);
+      return;
+    }
+    // RFC 8949 4.2.1: sorted by the bytes of the encoded key, shorter first, then bytewise. A text key's head grows with its length, so that is
+    // the UTF-8 length first and then the UTF-8 bytes (not JS's UTF-16 order, and not the engine's order for integer-like names).
+    const entries = keys.map((key) => { const bytes = []; encodeValue(key, bytes); return { key, bytes: concat(bytes) }; });
+    entries.sort((a, b) => compareKeyBytes(a.bytes, b.bytes));
+    for (let i = 1; i < entries.length; i++) {
+      if (compareKeyBytes(entries[i - 1].bytes, entries[i].bytes) === 0) throw new Error(`cborEncode: the keys ${JSON.stringify(entries[i - 1].key)} and ${JSON.stringify(entries[i].key)} encode to the same text`);
+    }
+    for (const { key, bytes } of entries) {
+      parts.push(bytes);
       encodeValue(value[key], parts);
     }
     return;
@@ -106,6 +129,56 @@ function encodeValue(value, parts) {
 }
 
 const TWO_64 = 2 ** 64;
+
+/** Encoded keys in canonical order: shorter first, then bytewise (RFC 8949 4.2.1). */
+function compareKeyBytes(a, b) {
+  if (a.length !== b.length) return a.length - b.length;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+
+const f64view = new DataView(new ArrayBuffer(8));
+
+/**
+ * The IEEE half-precision bits of `v` if `v` is exactly a half-precision value (or +-0, +-Infinity), else -1. NaN is not handled here
+ * (it has one canonical form, f97e00).
+ */
+function halfBitsExact(v) {
+  if (v === 0) return Object.is(v, -0) ? 0x8000 : 0;
+  if (v === Infinity) return 0x7c00;
+  if (v === -Infinity) return 0xfc00;
+  const sign = v < 0 ? 0x8000 : 0;
+  const a = Math.abs(v);
+  if (a > 65504) return -1;
+  if (a < 2 ** -14) { // subnormal: a multiple of 2^-24 below 2^-14
+    const m = a * 2 ** 24;
+    return Number.isInteger(m) ? sign | m : -1;
+  }
+  f64view.setFloat64(0, a);
+  const hi = f64view.getUint32(0);
+  if ((hi & 0x3ff) !== 0 || f64view.getUint32(4) !== 0) return -1; // more than 10 mantissa bits
+  const exp = ((hi >>> 20) & 0x7ff) - 1023; // -14 .. 15
+  return sign | ((exp + 15) << 10) | ((hi >>> 10) & 0x3ff);
+}
+
+/** A float in the shortest width that reads back exactly: half, then single, then double; one NaN. */
+function encodeFloat(value) {
+  if (Number.isNaN(value)) return new Uint8Array([0xf9, 0x7e, 0x00]);
+  const half = halfBitsExact(value);
+  if (half >= 0) return new Uint8Array([0xf9, half >> 8, half & 0xff]);
+  if (Math.fround(value) === value) {
+    const buf = new ArrayBuffer(5);
+    const view = new DataView(buf);
+    view.setUint8(0, (MT_SIMPLE << 5) | FLOAT_32);
+    view.setFloat32(1, value);
+    return new Uint8Array(buf);
+  }
+  const buf = new ArrayBuffer(9);
+  const view = new DataView(buf);
+  view.setUint8(0, (MT_SIMPLE << 5) | FLOAT_64);
+  view.setFloat64(1, value);
+  return new Uint8Array(buf);
+}
 
 /** An 8-byte head for a value that is beyond the safe-integer range (exact, from a BigInt in 0 .. 2^64-1). */
 function encodeHead64(majorType, big) {
@@ -152,29 +225,45 @@ function encodeHead(majorType, value) {
 
 // ── Decoder ───────────────────────────────────────────────────────────
 //
-// Strict (#317). The decoder accepts exactly one well-formed, canonical encoding of every value wsh sends, and nothing else:
+// Strict (#317, #325). Two kinds of rule:
 //
+// ALWAYS (a malformed item, whoever sent it):
 //   - every declared length (string, bytes, array, map) must fit in what is left of the buffer, checked BEFORE anything is allocated or looped over
 //     (an array needs one byte per element, a map two per pair), so a head that claims 2^32 elements fails at once;
 //   - after the top-level item there must be no bytes (`cborDecodePrefix` is the explicit way to read one item out of a longer buffer);
 //   - integers and lengths use the shortest form of their head; indefinite-length strings, arrays and maps are refused (RFC 8949 section 4.2.1);
 //   - no tags, no simple values but false/true/null, no reserved additional-info values, no stray break;
-//   - a map has text keys only, each once (so the order of keys is not meaningful: the JS encoder writes insertion order and the Rust encoder field order,
-//     and neither is sorted, so sorted order is NOT required);
-//   - text is valid UTF-8; nesting is at most MAX_DEPTH deep;
-//   - floats of any width are read (the JS encoder writes float64 for every float, the Rust encoder the shortest form that is exact).
+//   - a map has text keys only, each once;
+//   - text is valid UTF-8; nesting is at most MAX_DEPTH deep and an item holds at most `maxContainers` arrays and maps (CBOR_MAX_CONTAINERS).
 //
-// One legacy exception, switched off with `legacyIndefiniteMap: false`: the TOP-LEVEL item may be an indefinite-length map. Every released wsh Rust encoder
-// wrote its message envelope that way (serde's `flatten` made ciborium use an indefinite-length map), so a decoder that refused it would refuse every
-// message a released Rust peer sends. The Rust encoder in this tree writes a definite-length map; the exception exists for peers that predate it.
-// It covers the top-level map only: whatever it contains is held to every rule above. See COMPATIBILITY.md.
+// CANONICAL (RFC 8949 4.2.1: the one byte string the encoders write for a value). Released peers did not write it, so while the compatibility
+// window is open these are accepted by default and refused with `legacyNonCanonical: false`:
+//   - map keys sorted length-first, then bytewise (`non-canonical-key-order`); the released JS encoder wrote insertion order, the released Rust encoder field order;
+//   - floats in the shortest width that reads back exactly, one NaN (f97e00): so no f32/f64 that fits a narrower width, no NaN payload or sign
+//     (`non-canonical-float`); the released JS encoder wrote every float as float64. -0 is f98000, allowed, and stays -0;
+//   - an integer above 2^53 is not a JS number: `unsafeIntegers` says what to do ('round': the released behaviour and the default of the window, the
+//     nearest double; 'bigint': a BigInt, exact; 'refuse': `unsafe-integer`, which is what `strict` selects).
+//
+// One more legacy exception, switched off with `legacyIndefiniteMap: false`: the TOP-LEVEL item (offset 0) may be an indefinite-length map. Every released
+// wsh Rust encoder wrote its message envelope that way (serde's `flatten` made ciborium use an indefinite-length map). It covers the top-level map
+// only: whatever it contains is held to every rule above.
+//
+// `strict: true` is the shorthand for every legacy option off. It is what the tests and the differential run, and what becomes the default when the
+// window closes (COMPATIBILITY.md rule 7: when and how). An explicit option wins over `strict`.
+//
+// Not distinguished, by design: `f93c00` (1.0) and `01` both read as the JS number 1. A JS number has no integer/float split, and message fields are
+// plain numbers; the Rust typed decoder keeps the split (an integer field refuses a float). The JS encoder never writes an integral number as a float.
 
 /** The most deeply nested items a message may have. The rpc channel's scanner (src/rpc.mjs) uses the same bound. */
 export const CBOR_MAX_DEPTH = 128;
 
+/** The most arrays and maps (counting the top-level item) one decoded item may hold. A 4 MiB frame of empty arrays is 4 million of them (about 160 MiB of heap). */
+export const CBOR_MAX_CONTAINERS = 1_000_000;
+
 /**
  * A malformed input. `code` names the rule: `truncated`, `length-exceeds-buffer`, `trailing-bytes`, `non-shortest`, `indefinite-length`,
- * `unexpected-break`, `reserved-additional-info`, `duplicate-key`, `non-text-key`, `tag`, `simple-value`, `invalid-utf8`, `too-deep`.
+ * `unexpected-break`, `reserved-additional-info`, `duplicate-key`, `non-text-key`, `tag`, `simple-value`, `invalid-utf8`, `too-deep`,
+ * `too-many-containers`, and the canonical rules `non-canonical-key-order`, `non-canonical-float`, `unsafe-integer`.
  */
 export class CborError extends Error {
   /** @param {string} code @param {string} message @param {number} [offset] byte offset the rule was broken at */
@@ -189,9 +278,30 @@ export class CborError extends Error {
 const strictUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /**
+ * @typedef {object} DecodeOptions
+ * @property {boolean} [strict] every legacy option off (the default of a later minor; see COMPATIBILITY.md rule 7)
+ * @property {boolean} [legacyIndefiniteMap] accept an indefinite-length map as the top-level item at offset 0 (default true)
+ * @property {boolean} [legacyNonCanonical] accept key order, float width and NaN forms the released encoders wrote (default true)
+ * @property {'round'|'bigint'|'refuse'} [unsafeIntegers] an integer beyond +-(2^53-1): 'round' (default), 'bigint', or 'refuse' (what `strict` selects)
+ * @property {number} [maxContainers] arrays and maps one item may hold (default CBOR_MAX_CONTAINERS)
+ */
+
+function resolveOptions(options = {}, offset = 0) {
+  const strict = options.strict === true;
+  const unsafe = options.unsafeIntegers ?? (strict ? 'refuse' : 'round');
+  if (unsafe !== 'round' && unsafe !== 'bigint' && unsafe !== 'refuse') throw new TypeError(`cborDecode: unsafeIntegers must be 'round', 'bigint' or 'refuse', got ${String(unsafe)}`);
+  return {
+    legacyTop: (options.legacyIndefiniteMap ?? !strict) !== false && offset === 0,
+    canonical: (options.legacyNonCanonical ?? !strict) === false,
+    unsafe,
+    maxContainers: options.maxContainers ?? CBOR_MAX_CONTAINERS,
+  };
+}
+
+/**
  * Decode CBOR bytes into a JS value. The whole buffer must be exactly one item; see the notes above for what is refused (a {@link CborError}).
  * @param {Uint8Array} data
- * @param {{ legacyIndefiniteMap?: boolean }} [options]
+ * @param {DecodeOptions} [options]
  * @returns {*}
  */
 export function cborDecode(data, options) {
@@ -203,15 +313,16 @@ export function cborDecode(data, options) {
 /**
  * Decode ONE item that starts at `offset` and say where it ended, leaving whatever follows to the caller. Every rule that applies to the item
  * applies; only the check that nothing follows it is left out. Nothing in wsh needs this today (the framing layer hands the decoder exactly one
- * item); it is the explicit API for a caller that reads a sequence out of one buffer.
+ * item); it is the explicit API for a caller that reads a sequence out of one buffer. The legacy indefinite-length map is the top-level item of a
+ * message, so it is read at offset 0 only: after another item it is an `indefinite-length` error. The container count starts again for each call.
  * @param {Uint8Array} data
- * @param {{ offset?: number, legacyIndefiniteMap?: boolean }} [options]
+ * @param {DecodeOptions & { offset?: number }} [options]
  * @returns {{ value: *, end: number }}
  */
-export function cborDecodePrefix(data, { offset = 0, legacyIndefiniteMap = true } = {}) {
+export function cborDecodePrefix(data, options = {}) {
+  const offset = options.offset === undefined ? 0 : options.offset;
   if (!Number.isInteger(offset) || offset < 0 || offset > data.length) throw new RangeError(`cborDecodePrefix: offset must be an integer from 0 to ${data.length}, got ${String(offset)}`);
-  // the item this call reads is its own top level, at whatever offset: the legacy indefinite map is accepted there too
-  const state = { data, offset, legacy: legacyIndefiniteMap !== false, view: new DataView(data.buffer, data.byteOffset, data.byteLength) };
+  const state = { data, offset, ...resolveOptions(options, offset), containers: 0, view: new DataView(data.buffer, data.byteOffset, data.byteLength) };
   const value = decodeItem(state, 0);
   return { value, end: state.offset };
 }
@@ -243,6 +354,23 @@ function readLength(state, ai, start, perItem) {
   return len;
 }
 
+/** An integer head of major type 0 or 1: a number while it is a safe integer, and past that what `unsafeIntegers` says. */
+function readInteger(state, ai, start, negative) {
+  const arg = readArgument(state, ai, start);
+  // value is arg (major 0) or -1 - arg (major 1); it is unsafe beyond +-(2^53-1), i.e. arg > MAX_SAFE (major 0) or arg >= MAX_SAFE (major 1)
+  if (ai !== 27 || (negative ? arg < Number.MAX_SAFE_INTEGER : arg <= Number.MAX_SAFE_INTEGER)) return negative ? -1 - arg : arg;
+  const big = state.view.getBigUint64(state.offset - 8);
+  if (state.unsafe === 'bigint') return negative ? -1n - big : big;
+  if (state.unsafe === 'refuse') throw new CborError('unsafe-integer', `${negative ? -1n - big : big} is beyond the safe integer range of a JS number`, start);
+  // 'round': -1 - n would round twice (n, then the sum): take the nearest double of the exact value once
+  return negative ? Number(-1n - big) : Number(big);
+}
+
+/** Count one more array or map against the cap (before anything is made for it). */
+function countContainer(state, start) {
+  if (++state.containers > state.maxContainers) throw new CborError('too-many-containers', `more than ${state.maxContainers} arrays and maps in one item`, start);
+}
+
 function decodeItem(state, depth) {
   const { data } = state;
   if (depth > CBOR_MAX_DEPTH) throw new CborError('too-deep', `nested more than ${CBOR_MAX_DEPTH} deep`, state.offset);
@@ -255,20 +383,13 @@ function decodeItem(state, depth) {
   if (ai === 31) {
     if (mt === MT_UNSIGNED || mt === MT_NEGATIVE || mt === MT_TAG) throw new CborError('reserved-additional-info', `additional info 31 on major type ${mt}`, start);
     if (mt === MT_SIMPLE) throw new CborError('unexpected-break', 'a break outside an indefinite-length item', start);
-    if (mt === MT_MAP && depth === 0 && state.legacy) return decodeLegacyIndefiniteMap(state, depth);
+    if (mt === MT_MAP && depth === 0 && state.legacyTop) { countContainer(state, start); return decodeLegacyIndefiniteMap(state, depth); }
     throw new CborError('indefinite-length', 'indefinite-length items are not accepted', start);
   }
 
   switch (mt) {
-    case MT_UNSIGNED: return readArgument(state, ai, start);
-    case MT_NEGATIVE: {
-      if (ai === 27) {
-        // Past 2^53 `-1 - n` would round twice (n, then the sum): take the nearest double of the exact value once.
-        readArgument(state, ai, start); // the shortest-form check; the exact value is read below
-        return Number(-1n - state.view.getBigUint64(state.offset - 8));
-      }
-      return -1 - readArgument(state, ai, start);
-    }
+    case MT_UNSIGNED: return readInteger(state, ai, start, false);
+    case MT_NEGATIVE: return readInteger(state, ai, start, true);
     case MT_BYTES: {
       const len = readLength(state, ai, start, 1);
       const bytes = data.slice(state.offset, state.offset + len);
@@ -284,15 +405,17 @@ function decodeItem(state, depth) {
     }
     case MT_ARRAY: {
       const len = readLength(state, ai, start, 1);
-      const arr = new Array(len);
-      for (let i = 0; i < len; i++) arr[i] = decodeItem(state, depth + 1);
+      countContainer(state, start);
+      const arr = [];
+      for (let i = 0; i < len; i++) arr.push(decodeItem(state, depth + 1));
       return arr;
     }
     case MT_MAP: {
       const len = readLength(state, ai, start, 2);
+      countContainer(state, start);
       const obj = {};
-      const seen = new Set();
-      for (let i = 0; i < len; i++) addPair(state, depth, obj, seen);
+      const keys = { seen: new Set(), prevAt: -1, prevEnd: -1 };
+      for (let i = 0; i < len; i++) addPair(state, depth, obj, keys);
       return obj;
     }
     case MT_TAG:
@@ -306,7 +429,9 @@ function decodeItem(state, depth) {
         if (state.offset + size > data.length) throw new CborError('truncated', 'the float is cut off', start);
         const at = state.offset;
         state.offset += size;
-        return ai === FLOAT_16 ? decodeFloat16(state.view.getUint16(at)) : ai === FLOAT_32 ? state.view.getFloat32(at) : state.view.getFloat64(at);
+        const value = ai === FLOAT_16 ? decodeFloat16(state.view.getUint16(at)) : ai === FLOAT_32 ? state.view.getFloat32(at) : state.view.getFloat64(at);
+        if (state.canonical && !isCanonicalFloat(ai, state.view, at, value)) throw new CborError('non-canonical-float', `${ai === FLOAT_16 ? 'a float16' : ai === FLOAT_32 ? 'a float32' : 'a float64'} that is not in its shortest form`, start);
+        return value;
       }
       if (ai === 24 && state.offset >= data.length) throw new CborError('truncated', 'the simple value is cut off', start);
       throw new CborError('simple-value', `simple value ${ai === 24 ? data[state.offset] : ai} is not used by the protocol`, start);
@@ -314,24 +439,49 @@ function decodeItem(state, depth) {
   }
 }
 
-/** One key and its value into `obj`: the key must be a text string and not seen in this map. */
-function addPair(state, depth, obj, seen) {
+/** Is the float at `at` (of width `ai`, read as `value`) the shortest form of its value? NaN has one form (f97e00). */
+function isCanonicalFloat(ai, view, at, value) {
+  if (ai === FLOAT_16) return !Number.isNaN(value) || view.getUint16(at) === 0x7e00;
+  if (Number.isNaN(value)) return false;
+  if (ai === FLOAT_32) return halfBitsExact(value) < 0;
+  return !Object.is(Math.fround(value), value);
+}
+
+/** Compare data[aAt, aEnd) with data[bAt, bEnd): shorter first, then bytewise (RFC 8949 4.2.1). */
+function compareRanges(data, aAt, aEnd, bAt, bEnd) {
+  const la = aEnd - aAt;
+  const lb = bEnd - bAt;
+  if (la !== lb) return la - lb;
+  for (let i = 0; i < la; i++) {
+    const d = data[aAt + i] - data[bAt + i];
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/** One key and its value into `obj`: the key must be a text string, not seen in this map, and (canonical) after the one before it. */
+function addPair(state, depth, obj, keys) {
   const keyAt = state.offset;
   if (keyAt < state.data.length && (state.data[keyAt] >> 5) !== MT_TEXT) throw new CborError('non-text-key', 'map keys are text strings', keyAt);
   const key = decodeItem(state, depth + 1);
-  if (seen.has(key)) throw new CborError('duplicate-key', `the key ${JSON.stringify(key)} is in the map twice`, keyAt);
-  seen.add(key);
+  if (keys.seen.has(key)) throw new CborError('duplicate-key', `the key ${JSON.stringify(key)} is in the map twice`, keyAt);
+  keys.seen.add(key);
+  if (state.canonical) {
+    if (keys.prevAt >= 0 && compareRanges(state.data, keys.prevAt, keys.prevEnd, keyAt, state.offset) > 0) throw new CborError('non-canonical-key-order', `the key ${JSON.stringify(key)} is out of order (shorter keys first, then bytewise)`, keyAt);
+    keys.prevAt = keyAt;
+    keys.prevEnd = state.offset;
+  }
   setOwn(obj, key, decodeItem(state, depth + 1));
 }
 
 /** The legacy exception: the top-level item is a map with no count and a break at its end (what a released wsh Rust encoder wrote). Its contents are strict. */
 function decodeLegacyIndefiniteMap(state, depth) {
   const obj = {};
-  const seen = new Set();
+  const keys = { seen: new Set(), prevAt: -1, prevEnd: -1 };
   for (;;) {
     if (state.offset >= state.data.length) throw new CborError('truncated', 'the indefinite-length map is not closed', state.offset);
     if (state.data[state.offset] === 0xff) { state.offset += 1; return obj; }
-    addPair(state, depth, obj, seen);
+    addPair(state, depth, obj, keys);
   }
 }
 
@@ -408,6 +558,7 @@ export class FrameSizeError extends Error {
 export class FrameDecoder {
   #buffer = new Uint8Array(0);
   #maxFrameSize;
+  #decodeOptions;
 
   /**
    * @param {object} [opts]
@@ -415,9 +566,12 @@ export class FrameDecoder {
    *   length, in bytes. Frames claiming more than this are rejected as
    *   soon as their length prefix is parsed, before any payload bytes
    *   are buffered. Defaults to {@link DEFAULT_MAX_FRAME_SIZE}.
+   * @param {boolean} [opts.strict] and the other {@link DecodeOptions} (`legacyIndefiniteMap`, `legacyNonCanonical`, `unsafeIntegers`,
+   *   `maxContainers`) are passed to {@link cborDecode} for every frame. The default is the compatibility window of COMPATIBILITY.md rule 7.
    */
-  constructor({ maxFrameSize = DEFAULT_MAX_FRAME_SIZE } = {}) {
+  constructor({ maxFrameSize = DEFAULT_MAX_FRAME_SIZE, ...decodeOptions } = {}) {
     this.#maxFrameSize = maxFrameSize;
+    this.#decodeOptions = Object.keys(decodeOptions).length ? decodeOptions : undefined;
   }
 
   /**
@@ -446,7 +600,7 @@ export class FrameDecoder {
       const payload = this.#buffer.slice(4, 4 + len);
       this.#buffer = this.#buffer.slice(4 + len);
       try {
-        messages.push(cborDecode(payload));
+        messages.push(cborDecode(payload, this.#decodeOptions));
       } catch (err) {
         // The length prefix kept the stream in step: the bad frame is consumed and the frames after it stay buffered.
         // What was decoded before it travels with the error (`err.decoded`) so a caller that catches does not lose it.

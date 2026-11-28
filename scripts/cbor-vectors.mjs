@@ -6,7 +6,7 @@
  * integers at the head-size edges) plus a set of JSON-RPC (rpc channel) messages, encodes them with the JS encoder
  * (`src/cbor.mjs`) and records the bytes as hex under `js`. `crates/wsh-core/examples/cbor_vectors.rs` then reads the same
  * file, decodes each `js` vector with the (lenient) typed Rust decoder, re-encodes it with the Rust encoder and records that
- * under `rust`. `rust_released` is what the SHIPPED Rust encoder wrote (recorded once, before the Envelope encoder was fixed to write a definite map; never regenerated). `test/cbor-vectors.test.mjs` and the Rust test `codec::tests::golden_vectors` hold BOTH sets against the strict
+ * under `rust`. Both write canonical CBOR (#325). `rust_released` is what the SHIPPED Rust encoder wrote (recorded once, before the Envelope encoder was fixed to write a definite map; never regenerated); `js_released` is what the JS encoder of npm 0.62.x wrote (insertion order, float64; recorded once before the canonical encoder, never regenerated). `test/cbor-vectors.test.mjs` and the Rust test `codec::tests::golden_vectors` hold BOTH sets against the strict
  * decoder, so a change to either encoder that stops being accepted by either decoder fails.
  *
  *   node scripts/cbor-vectors.mjs            # write the `js` side to spec/cbor-vectors.json (keeps an existing `rust` side)
@@ -115,7 +115,7 @@ export function jsVectors() {
 }
 
 /** The recorded encoder sides of an existing vector: kept when the JS side is regenerated. */
-const pick = (v) => (v ? Object.fromEntries(["rust", "rust_error", "rust_released"].filter((k) => v[k] !== undefined).map((k) => [k, v[k]])) : {});
+const pick = (v) => (v ? Object.fromEntries(["rust", "rust_error", "rust_released", "js_released"].filter((k) => v[k] !== undefined).map((k) => [k, v[k]])) : {});
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   let prev = { vectors: [] };

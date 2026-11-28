@@ -7,9 +7,10 @@ use crate::messages::{Envelope, MsgType, Payload};
 use std::io::Cursor;
 
 /// Encode a serializable value into a length-prefixed CBOR frame.
+///
+/// The payload is canonical CBOR (RFC 8949 4.2.1, [`crate::cbor_canon`]): map keys sorted, the shortest float, definite lengths.
 pub fn frame_encode<T: serde::Serialize>(value: &T) -> WshResult<Vec<u8>> {
-    let mut payload = Vec::new();
-    ciborium::into_writer(value, &mut payload)?;
+    let payload = cbor_encode(value)?;
 
     let len = payload.len() as u32;
     let mut frame = Vec::with_capacity(4 + payload.len());
@@ -20,11 +21,22 @@ pub fn frame_encode<T: serde::Serialize>(value: &T) -> WshResult<Vec<u8>> {
 
 /// Decode a CBOR payload (without length prefix) into a typed value.
 ///
-/// Strict (#317, [`crate::cbor_strict`]): `data` must be exactly one well-formed, canonical item. A declared length past the end of the buffer, a
-/// byte after the item, a non-shortest integer or length, an indefinite-length string or array, a duplicate or non-text map key, a tag and invalid UTF-8
-/// are errors. The one legacy exception is an indefinite-length map as the top-level item, which every wsh Rust encoder before this one wrote.
+/// Strict (#317, [`crate::cbor_strict`]): `data` must be exactly one well-formed item. A declared length past the end of the buffer, a
+/// byte after the item, a non-shortest integer or length, an indefinite-length string or array, a duplicate or non-text map key, a tag, invalid UTF-8
+/// and more than [`crate::cbor_strict::MAX_CONTAINERS`] arrays and maps are errors. Two legacy exceptions are on, for the compatibility window
+/// (COMPATIBILITY.md rule 7): an indefinite-length map as the top-level item, and any key order, float width or NaN form (what the released encoders
+/// wrote). [`cbor_decode_with`] with [`crate::cbor_strict::Options::strict`] refuses them; that becomes the default when the window closes.
 pub fn cbor_decode<T: serde::de::DeserializeOwned>(data: &[u8]) -> WshResult<T> {
-    crate::cbor_strict::validate(data).map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
+    cbor_decode_with(data, &crate::cbor_strict::Options::default())
+}
+
+/// [`cbor_decode`] with the legacy exceptions chosen by the caller.
+pub fn cbor_decode_with<T: serde::de::DeserializeOwned>(
+    data: &[u8],
+    opts: &crate::cbor_strict::Options,
+) -> WshResult<T> {
+    crate::cbor_strict::validate_with(data, opts)
+        .map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
     decode_checked(data)
 }
 
@@ -35,11 +47,9 @@ fn decode_checked<T: serde::de::DeserializeOwned>(data: &[u8]) -> WshResult<T> {
     Ok(value)
 }
 
-/// Encode a value into a bare CBOR payload (without length prefix).
+/// Encode a value into a bare canonical CBOR payload (without length prefix): [`crate::cbor_canon::to_vec`].
 pub fn cbor_encode<T: serde::Serialize>(value: &T) -> WshResult<Vec<u8>> {
-    let mut payload = Vec::new();
-    ciborium::into_writer(value, &mut payload)?;
-    Ok(payload)
+    crate::cbor_canon::to_vec(value).map_err(|e| crate::error::WshError::Codec(e.to_string()))
 }
 
 /// Decode an envelope using the message type to disambiguate flattened payloads.
@@ -472,6 +482,7 @@ mod tests {
                 &out,
                 &crate::cbor_strict::Options {
                     legacy_indefinite_map: false,
+                    legacy_non_canonical: false,
                 },
             )
             .unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));

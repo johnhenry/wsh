@@ -7,7 +7,9 @@
  *
  * For each install it encodes every golden vector's message (spec/cbor-vectors.json, read back by this tree's decoder) and a table of edge values
  * (integers at every head-size edge, floats, strings, nesting, empty containers, undefined, typed arrays) with THAT version's `cborEncode`, then
- * checks that this tree's `cborDecode` accepts each result and reads the same value. Prints one line per install and exits 1 on any refusal.
+ * checks that this tree's `cborDecode` accepts each result and reads the same value. The other direction too (#325): THAT version's `cborDecode` must read
+ * what this tree's canonical encoder writes (sorted keys, shortest floats) for every value, and the Rust-written canonical bytes of every golden vector, and read the
+ * same value. Prints one line per install and exits 1 on any refusal.
  */
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -30,24 +32,35 @@ for (const dir of process.argv.slice(2)) {
   const pkgRoot = path.join(path.resolve(dir), 'node_modules', '@johnhenry', 'wsh');
   const version = JSON.parse(readFileSync(path.join(pkgRoot, 'package.json'), 'utf8')).version;
   const old = await import(pathToFileURL(path.join(pkgRoot, 'src', 'cbor.mjs')).href);
-  let same = 0; let differentButAccepted = 0; let refused = 0; let total = 0;
+  let same = 0; let differentButAccepted = 0; let refused = 0; let total = 0; let oldReads = 0;
+  // key order is not part of a value (the encoders now sort; the old ones did not), so the comparison sorts keys
+  const flat = (v) => JSON.stringify(v, (k, x) => (typeof x === 'number' && !Number.isFinite(x) ? String(x) : typeof x === 'bigint' ? `${x}n` : x instanceof Uint8Array ? hex(x) : x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : x));
+  /** The old decoder must read these bytes, and to the value this tree reads. */
+  const oldReads_ = (label, bytes) => {
+    let got;
+    try { got = old.cborDecode(bytes); } catch (e) { refused++; bad++; notes.push(`${label}: the old decoder refuses ${hex(bytes).slice(0, 80)}: ${e.message}`); return; }
+    oldReads++;
+    if (flat(got) !== flat(cborDecode(bytes))) { bad++; notes.push(`${label}: the old decoder reads ${hex(bytes).slice(0, 80)} as a different value`); }
+  };
   const notes = [];
   const check = (label, value) => {
     total++;
     const oldBytes = old.cborEncode(value);
     const mine = newEncode(value);
+    oldReads_(label + ' (this encoder)', mine);
     let read;
     try { read = cborDecode(oldBytes); } catch (e) { refused++; bad++; notes.push(`${label}: refused (${e.code}) ${hex(oldBytes).slice(0, 80)}`); return; }
     if (hex(oldBytes) === hex(mine)) same++;
     else { differentButAccepted++; notes.push(`${label}: old ${hex(oldBytes).slice(0, 60)} / now ${hex(mine).slice(0, 60)}`); }
     const want = cborDecode(mine);
-    if (JSON.stringify(read, (k, v) => (typeof v === 'number' && !Number.isFinite(v) ? String(v) : v instanceof Uint8Array ? hex(v) : v)) !== JSON.stringify(want, (k, v) => (typeof v === 'number' && !Number.isFinite(v) ? String(v) : v instanceof Uint8Array ? hex(v) : v))) {
+    if (flat(read) !== flat(want)) {
       bad++; notes.push(`${label}: the old bytes decode to a different value`);
     }
   };
-  for (const v of vectors) check(`${v.name}/${v.kind}`, cborDecode(Uint8Array.from(Buffer.from(v.js, 'hex'))));
+  for (const v of vectors) check(`${v.name}/${v.kind}`, cborDecode(Uint8Array.from(Buffer.from(v.js_released ?? v.js, 'hex'))));
+  for (const v of vectors) { oldReads_(`${v.name}/${v.kind} js`, Uint8Array.from(Buffer.from(v.js, 'hex'))); oldReads_(`${v.name}/${v.kind} rust`, Uint8Array.from(Buffer.from(v.rust, 'hex'))); }
   edge.forEach((v, i) => check(`edge[${i}]`, v));
-  console.log(`@johnhenry/wsh ${version}: ${total} values encoded by that version, ${same} byte-identical to this encoder, ${differentButAccepted} different but accepted and equal, ${refused} refused by the strict decoder`);
+  console.log(`@johnhenry/wsh ${version}: ${total} values encoded by that version, ${same} byte-identical to this encoder, ${differentButAccepted} different but accepted and equal, ${refused} refused by a decoder; ${oldReads} reads by that version's decoder of this tree's bytes`);
   for (const n of notes.slice(0, 12)) console.log(`    ${n}`);
 }
 if (bad) process.exit(1);

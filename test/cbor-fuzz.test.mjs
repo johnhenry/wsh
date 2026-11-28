@@ -7,13 +7,17 @@ import { cborEncode, cborDecode, CborError } from '../src/cbor.mjs';
 import { mutate, xorshift } from './helpers/cbor-fuzz.mjs';
 
 const read = (p) => JSON.parse(readFileSync(new URL(p, import.meta.url), 'utf8'));
-const corpus = read('../spec/cbor-vectors.json').vectors.flatMap((v) => [v.js, v.rust, v.rust_released].map((h) => Uint8Array.from(Buffer.from(h, 'hex'))));
+const corpus = read('../spec/cbor-vectors.json').vectors.flatMap((v) => [v.js, v.rust, v.js_released, v.rust_released].map((h) => Uint8Array.from(Buffer.from(h, 'hex'))));
 const hex = (b) => Buffer.from(b).toString('hex');
-/** Bytes whose presence lets a valid input re-encode differently: floats of a shorter width, and integers past 2^53 (the decoder returns a double). */
-const loose = (b) => b[0] === 0xbf || b.some((x) => x === 0xf9 || x === 0xfa || x === 0xfb || x === 0x1b || x === 0x3b);
+/**
+ * Bytes whose presence lets a valid input re-encode differently even in strict mode: a float with an integral value is read as the integer (JS has one
+ * number type, COMPATIBILITY.md rule 7). Everything else accepted by strict mode is the canonical encoding of what it decodes to.
+ */
+const loose = (b) => b.some((x) => x === 0xf9 || x === 0xfa || x === 0xfb);
+const STRICT = { strict: true, unsafeIntegers: 'bigint' };
 
 describe('fuzz: fixed seed, mutated golden vectors', () => {
-  it('30000 mutations: only CborError is ever thrown, nothing hangs, and what is accepted is canonical', () => {
+  it('30000 mutations: only CborError is ever thrown, nothing hangs, and what strict mode accepts is canonical (the window accepts it re-encoded)', () => {
     const rng = xorshift(0x9e3779b97f4a7c15n);
     const t0 = Date.now(); let accepted = 0; let refused = 0; let slowest = 0;
     const codes = new Set();
@@ -21,7 +25,7 @@ describe('fuzz: fixed seed, mutated golden vectors', () => {
       const input = mutate(rng, corpus[rng.below(corpus.length)]);
       const t = performance.now();
       let value;
-      try { value = cborDecode(input); } catch (e) {
+      try { value = cborDecode(input, STRICT); } catch (e) {
         assert.ok(e instanceof CborError, `${hex(input)}: ${e.stack}`);
         codes.add(e.code); refused++;
         slowest = Math.max(slowest, performance.now() - t);
@@ -30,13 +34,28 @@ describe('fuzz: fixed seed, mutated golden vectors', () => {
       slowest = Math.max(slowest, performance.now() - t);
       accepted++;
       const again = cborEncode(value);
-      assert.deepEqual(cborDecode(again), value, `idempotent: ${hex(input)}`);
+      assert.deepEqual(cborDecode(again, STRICT), value, `idempotent: ${hex(input)}`);
       if (!loose(input)) assert.equal(hex(again), hex(input), `accepted but not canonical: ${hex(input)}`);
     }
     assert.ok(accepted > 1000 && refused > 1000, `${accepted} accepted, ${refused} refused`);
     assert.ok(Date.now() - t0 < 30000, 'finishes in seconds');
     assert.ok(slowest < 100, `no single input took ${slowest} ms`);
-    for (const c of ['length-exceeds-buffer', 'trailing-bytes', 'non-shortest', 'truncated']) assert.ok(codes.has(c), `the mutations reached ${c}`);
+    for (const c of ['length-exceeds-buffer', 'trailing-bytes', 'non-shortest', 'truncated', 'non-canonical-key-order', 'non-canonical-float']) assert.ok(codes.has(c), `the mutations reached ${c}`);
+  });
+
+  it('30000 mutations in the compatibility window: only CborError, and whatever is read re-encodes to bytes that strict mode reads back as the same value', () => {
+    const rng = xorshift(0x51ed270b1f2e3d4cn);
+    let accepted = 0;
+    for (let i = 0; i < 30000; i++) {
+      const input = mutate(rng, corpus[rng.below(corpus.length)]);
+      let value;
+      try { value = cborDecode(input, { unsafeIntegers: 'bigint' }); } catch (e) { assert.ok(e instanceof CborError, `${hex(input)}: ${e.stack}`); continue; }
+      accepted++;
+      const again = cborEncode(value);
+      assert.deepEqual(cborDecode(again, STRICT), value, `${hex(input)}`);
+      assert.equal(hex(cborEncode(cborDecode(again, STRICT))), hex(again), 'the encoder output is a fixed point');
+    }
+    assert.ok(accepted > 1000, `${accepted} accepted`);
   });
 
   it('random heads with huge declared lengths on short buffers: refused at once, with bounded allocation', () => {

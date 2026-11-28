@@ -225,6 +225,8 @@ impl CborSequenceDecoder {
                     &self.buf[off..end],
                     &crate::cbor_strict::Options {
                         legacy_indefinite_map: false,
+                        // the canonical rules stay in their compatibility window here too: released rpc peers wrote insertion/field order and float64
+                        ..crate::cbor_strict::Options::default()
                     },
                 )
                 .map_err(|e| RpcCodecError {
@@ -256,22 +258,18 @@ impl CborSequenceDecoder {
 
 /// One message as the CBOR data item that goes on the stream.
 pub fn encode_message(message: &Json) -> Result<Vec<u8>, RpcCodecError> {
-    let mut out = Vec::new();
-    ciborium::into_writer(message, &mut out).map_err(|e| RpcCodecError {
+    crate::cbor_canon::to_vec(message).map_err(|e| RpcCodecError {
         code: PARSE,
         message: format!("cannot encode the message: {e}"),
-    })?;
-    Ok(out)
+    })
 }
 
 /// One CBOR value as the data item that goes on the stream.
 pub fn encode_cbor(message: &Cbor) -> Result<Vec<u8>, RpcCodecError> {
-    let mut out = Vec::new();
-    ciborium::into_writer(message, &mut out).map_err(|e| RpcCodecError {
+    crate::cbor_canon::value_to_vec(message).map_err(|e| RpcCodecError {
         code: PARSE,
         message: format!("cannot encode the message: {e}"),
-    })?;
-    Ok(out)
+    })
 }
 
 /// A decoded message as JSON; a byte string, and a map key that is not text, cannot be.
