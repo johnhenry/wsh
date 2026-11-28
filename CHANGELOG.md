@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.64.0 / Rust `rust-v0.28.0`
+
 ### Rust: an `f64` field accepts an integer item, so a JS peer's `cpu: 1` is no longer refused (#335; Rust)
 
 - **What was wrong.** A JS peer writes an integral number as a CBOR integer (`cpu: 1` is `01`; the JS decoder cannot tell it from `f93c00`), and the
