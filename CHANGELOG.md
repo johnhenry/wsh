@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Rust: an `f64` field accepts an integer item, so a JS peer's `cpu: 1` is no longer refused (#335; Rust)
+
+- **What was wrong.** A JS peer writes an integral number as a CBOR integer (`cpu: 1` is `01`; the JS decoder cannot tell it from `f93c00`), and the
+  Rust typed decode of an `f64` field refused an integer item. So a Rust peer refused `Metrics.cpu`, `CopilotSuggest.confidence` and
+  `NodeAnnounce.load` (the only `f64` fields in the spec) whenever a JS peer reported a whole number.
+- **Now.** Those three fields read a float of any width or an integer item (`crate::f64_field`, emitted by `spec/codegen.mjs` for every `f64` field, so
+  a future one gets it too). Nothing else is loosened: a float in an integer field, and a text, boolean, array or byte string in an `f64` field, are
+  still refused. No wire change and no JS change; released peers interoperate as before (a Rust peer's floats are read as they were).
+- **Tests.** `test/rust/f64-integral.test.mjs` encodes every `f64` field in the spec with the JS encoder and decodes it with the Rust typed decode
+  (`crates/wsh-core/examples/decode_envelope.rs`); the Rust unit tests are in `f64_field.rs` and `codec.rs`.
+
 ## 0.63.0 / Rust `rust-v0.27.0`
 
 ### Test only: `test/rust/wsh-reverse-forward-full-close.test.mjs`, the JS reverse forward case no longer races a kernel reset (#328, #291)

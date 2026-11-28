@@ -519,6 +519,11 @@ function rustType(yamlType, required, hasDefault) {
   return inner;
 }
 
+/** The serde attribute that lets an f64 field (a required `f64` or an `Option<f64>`) read an integer item as well as a float (#335). */
+function f64Deserializer(rType) {
+  return `deserialize_with = "crate::f64_field::${rType.startsWith('Option<') ? 'option_number' : 'number'}"`;
+}
+
 function rustInnerType(yamlType) {
   if (yamlType === 'string') return 'String';
   if (yamlType === 'bytes') return 'Vec<u8>';
@@ -817,6 +822,9 @@ function emitRust(schema) {
           attrs.push('skip_serializing_if = "Option::is_none"');
         }
 
+        // An f64 field also takes an integer item (#335): a JS peer writes an integral number as one.
+        if (fieldDef.type === 'f64') attrs.push(f64Deserializer(rType));
+
         // Bytes handling
         if (isBytes && isRequired) {
           attrs.push('with = "serde_bytes"');
@@ -867,6 +875,9 @@ function emitRust(schema) {
         attrs.push('default');
         attrs.push('skip_serializing_if = "Option::is_none"');
       }
+
+      // An f64 field also takes an integer item (#335).
+      if (fieldDef.type === 'f64') attrs.push(f64Deserializer(rType));
 
       // Bytes handling: without this, a `Vec<u8>`/`Option<Vec<u8>>` field
       // serializes via serde's default derive as a CBOR array of per-byte
