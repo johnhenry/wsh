@@ -834,7 +834,7 @@ pub struct ControlChangedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsPayload {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::f64_field::option_number")]
     pub cpu: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<u64>,
@@ -1385,7 +1385,7 @@ pub struct CopilotAttachPayload {
 pub struct CopilotSuggestPayload {
     pub session_id: String,
     pub suggestion: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::f64_field::option_number")]
     pub confidence: Option<f64>,
 }
 
@@ -1464,6 +1464,7 @@ pub struct TermDiffPayload {
 pub struct NodeAnnouncePayload {
     pub node_id: String,
     pub endpoint: String,
+    #[serde(deserialize_with = "crate::f64_field::number")]
     pub load: f64,
     pub capacity: u32,
 }

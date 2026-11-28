@@ -543,4 +543,29 @@ mod tests {
             assert_eq!(env.msg_type as u8 as u64, vec["code"].as_u64().unwrap());
         }
     }
+
+    /// What the JS encoder writes for an integral value in an `f64` field is an integer item (#335): `cpu: 1`, `confidence: 1`, `load: 0`.
+    #[test]
+    fn an_integer_item_in_an_f64_field_is_read() {
+        use crate::messages::Payload;
+        let metrics = decode_envelope(&hex::decode("a2636370750164747970651838").unwrap()).unwrap();
+        assert!(matches!(metrics.payload, Payload::Metrics(ref m) if m.cpu == Some(1.0)));
+        let suggest = decode_envelope(
+            &hex::decode("a46474797065188c6a636f6e666964656e6365016a73657373696f6e5f696461736a73756767657374696f6e6178").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(suggest.payload, Payload::CopilotSuggest(ref c) if c.confidence == Some(1.0))
+        );
+        let announce = decode_envelope(
+            &hex::decode("a5646c6f61640064747970651894676e6f64655f6964616e6863617061636974790168656e64706f696e746165").unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(announce.payload, Payload::NodeAnnounce(ref n) if n.load == 0.0));
+        // a float in an integer field is still refused
+        assert!(decode_envelope(&hex::decode("a263637075f93c0064747970651838").unwrap()).is_ok());
+        assert!(
+            decode_envelope(&hex::decode("a2666d656d6f7279f93c0064747970651838").unwrap()).is_err()
+        );
+    }
 }

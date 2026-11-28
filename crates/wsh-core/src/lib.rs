@@ -13,6 +13,7 @@ pub mod channel_binding;
 pub mod codec;
 pub mod e2e_exchange;
 pub mod error;
+pub mod f64_field;
 pub mod gateway;
 pub mod gateway_credit;
 pub mod gateway_datagram;
