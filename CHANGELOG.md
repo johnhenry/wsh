@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.63.0 / Rust `rust-v0.27.0`
+
 ### Test only: `test/rust/wsh-reverse-forward-full-close.test.mjs`, the JS reverse forward case no longer races a kernel reset (#328, #291)
 
 - The test's service answered 3 MiB and closed without reading the request; the kernel resets such a socket when the request arrives and the reset
