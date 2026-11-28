@@ -32,7 +32,7 @@ use std::fmt;
 /// The deepest nesting accepted. The rpc channel's scanners use the same bound.
 pub const MAX_DEPTH: usize = 128;
 
-/// The most arrays and maps (counting the top-level item) one item may hold; the JS decoder's `CBOR_MAX_CONTAINERS`.
+/// The most arrays and maps (counting the top-level item) one item may hold by default (`Options::max_containers`); the JS decoder's `CBOR_MAX_CONTAINERS`.
 pub const MAX_CONTAINERS: usize = 1_000_000;
 
 /// Which rule an input broke (the same strings as `CborError.code` in `src/cbor.mjs`).
@@ -107,6 +107,8 @@ pub struct Options {
     pub legacy_indefinite_map: bool,
     /// Accept the map key order, float widths and NaN forms the released encoders wrote (see the module notes). Default true.
     pub legacy_non_canonical: bool,
+    /// The most arrays and maps one item may hold (the JS decoder's `maxContainers`; #336). Default [`MAX_CONTAINERS`], in every mode.
+    pub max_containers: usize,
 }
 
 impl Default for Options {
@@ -114,6 +116,7 @@ impl Default for Options {
         Options {
             legacy_indefinite_map: true,
             legacy_non_canonical: true,
+            max_containers: MAX_CONTAINERS,
         }
     }
 }
@@ -124,7 +127,14 @@ impl Options {
         Options {
             legacy_indefinite_map: false,
             legacy_non_canonical: false,
+            max_containers: MAX_CONTAINERS,
         }
+    }
+
+    /// These options with the container cap set to `max_containers` (the other options unchanged).
+    pub const fn with_max_containers(mut self, max_containers: usize) -> Self {
+        self.max_containers = max_containers;
+        self
     }
 }
 
@@ -138,7 +148,7 @@ struct Walk<'o> {
 impl Walk<'_> {
     fn container(&mut self, at: usize) -> Result<(), StrictError> {
         self.containers += 1;
-        if self.containers > MAX_CONTAINERS {
+        if self.containers > self.opts.max_containers {
             return Err(err(StrictCode::TooManyContainers, at));
         }
         Ok(())
@@ -558,6 +568,7 @@ mod tests {
         let only_order = Options {
             legacy_indefinite_map: true,
             legacy_non_canonical: false,
+            ..Options::default()
         };
         assert!(validate(&unsorted).is_ok());
         assert_eq!(
@@ -578,6 +589,7 @@ mod tests {
         let only_indef_off = Options {
             legacy_indefinite_map: false,
             legacy_non_canonical: true,
+            ..Options::default()
         };
         assert!(validate_with(&unsorted, &only_indef_off).is_ok());
         assert!(validate_with(&indefinite, &only_indef_off).is_err());
@@ -633,6 +645,40 @@ mod tests {
             halves += 1;
         }
         assert_eq!(halves, 0x1_0000 - 2046);
+    }
+
+    /// `Options::max_containers` is the Rust `maxContainers` of the JS decoder (#336): the cap is the option's, the default is MAX_CONTAINERS.
+    #[test]
+    fn the_container_cap_is_an_option() {
+        // an array of N empty arrays holds N + 1 containers
+        let arrays = |n: u8| {
+            let mut b = vec![0x80 + n];
+            b.resize(1 + n as usize, 0x80);
+            b
+        };
+        assert_eq!(Options::default().max_containers, MAX_CONTAINERS);
+        assert_eq!(Options::strict().max_containers, MAX_CONTAINERS);
+        for base in [Options::default(), Options::strict()] {
+            let three = base.with_max_containers(3);
+            assert!(
+                validate_with(&arrays(2), &three).is_ok(),
+                "3 containers under a cap of 3"
+            );
+            assert_eq!(
+                validate_with(&arrays(3), &three).unwrap_err().code.as_str(),
+                "too-many-containers"
+            );
+            assert!(validate_with(&arrays(3), &base.with_max_containers(4)).is_ok());
+            // the cap is the option's alone: the other options are as they were
+            assert_eq!(three.legacy_indefinite_map, base.legacy_indefinite_map);
+            assert_eq!(three.legacy_non_canonical, base.legacy_non_canonical);
+            // the walk reports it at the container that crossed the cap
+            assert_eq!(validate_with(&arrays(3), &three).unwrap_err().offset, 3);
+        }
+        assert!(
+            validate_with(&arrays(20), &Options::default()).is_ok(),
+            "the default is the old constant"
+        );
     }
 
     #[test]

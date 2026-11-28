@@ -54,13 +54,22 @@ pub fn cbor_encode<T: serde::Serialize>(value: &T) -> WshResult<Vec<u8>> {
 
 /// Decode an envelope using the message type to disambiguate flattened payloads.
 pub fn decode_envelope(data: &[u8]) -> WshResult<Envelope> {
+    decode_envelope_with(data, &crate::cbor_strict::Options::default())
+}
+
+/// [`decode_envelope`] with the legacy exceptions and the container cap chosen by the caller (#336).
+pub fn decode_envelope_with(
+    data: &[u8],
+    opts: &crate::cbor_strict::Options,
+) -> WshResult<Envelope> {
     #[derive(serde::Deserialize)]
     struct EnvelopeTypeOnly {
         #[serde(rename = "type")]
         msg_type: MsgType,
     }
 
-    crate::cbor_strict::validate(data).map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
+    crate::cbor_strict::validate_with(data, opts)
+        .map_err(|e| crate::error::WshError::Codec(e.to_string()))?;
     let header: EnvelopeTypeOnly = decode_checked(data)?;
     let value: ciborium::value::Value = decode_checked(data)?;
     let payload_value = match value {
@@ -90,14 +99,31 @@ pub fn decode_envelope(data: &[u8]) -> WshResult<Envelope> {
 }
 
 /// Streaming frame decoder: accumulates bytes and yields complete messages.
+///
+/// [`FrameDecoder::new`] reads with the default [`crate::cbor_strict::Options`] (the compatibility window of COMPATIBILITY.md rule 7);
+/// [`FrameDecoder::with_options`] chooses them, as the JS `FrameDecoder({ strict, maxContainers })` does (#336).
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
+    opts: crate::cbor_strict::Options,
 }
 
 impl FrameDecoder {
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self::default()
+    }
+
+    /// A decoder whose typed [`feed`](Self::feed) reads every frame with `opts` (for example `Options::strict()`, or a different container cap).
+    pub fn with_options(opts: crate::cbor_strict::Options) -> Self {
+        Self {
+            buffer: Vec::new(),
+            opts,
+        }
+    }
+
+    /// The options [`feed`](Self::feed) reads with.
+    pub fn options(&self) -> &crate::cbor_strict::Options {
+        &self.opts
     }
 
     /// Feed bytes into the decoder and return all complete CBOR-decoded messages.
@@ -125,7 +151,7 @@ impl FrameDecoder {
                 break;
             }
 
-            let decoded = cbor_decode::<T>(&self.buffer[4..4 + len]);
+            let decoded = cbor_decode_with::<T>(&self.buffer[4..4 + len], &self.opts);
             // the bad frame is consumed either way: the length prefix keeps the stream in step, and leaving it in front would fail every later call
             self.buffer.drain(..4 + len);
             messages.push(decoded?);
@@ -478,14 +504,8 @@ mod tests {
             let out = cbor_encode(&env).unwrap();
             assert_ne!(out[0], 0xbf, "{}: indefinite-length map", vec["name"]);
             assert_eq!(out[0] >> 5, 5, "{}: a map", vec["name"]);
-            crate::cbor_strict::validate_with(
-                &out,
-                &crate::cbor_strict::Options {
-                    legacy_indefinite_map: false,
-                    legacy_non_canonical: false,
-                },
-            )
-            .unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
+            crate::cbor_strict::validate_with(&out, &crate::cbor_strict::Options::strict())
+                .unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
             // and what it says is unchanged
             let back = decode_envelope(&out).unwrap();
             assert_eq!(back.msg_type, env.msg_type);
@@ -542,5 +562,64 @@ mod tests {
             let env = decode_envelope(&old).unwrap_or_else(|e| panic!("{}: {e}", vec["name"]));
             assert_eq!(env.msg_type as u8 as u64, vec["code"].as_u64().unwrap());
         }
+    }
+
+    /// `FrameDecoder::with_options` reads every frame with the caller's options (#336), as the JS `FrameDecoder({ strict, maxContainers })` does.
+    #[test]
+    fn a_frame_decoder_reads_with_its_options() {
+        use crate::cbor_strict::Options;
+        use ciborium::value::Value;
+        let frame = |payload: &[u8]| {
+            let mut f = (payload.len() as u32).to_be_bytes().to_vec();
+            f.extend_from_slice(payload);
+            f
+        };
+        let indefinite = frame(&hex::decode("bf616101ff").unwrap()); // {"a": 1} as the released encoders wrote it
+        let unsorted = frame(&hex::decode("a2616201616102").unwrap()); // {"b": 1, "a": 2}
+        let canonical = frame(&hex::decode("a2616102616201").unwrap());
+        let three_arrays = frame(&hex::decode("83808080").unwrap()); // 4 containers
+
+        // the default is the compatibility window
+        assert_eq!(FrameDecoder::new().options().legacy_non_canonical, true);
+        for f in [&indefinite, &unsorted, &canonical, &three_arrays] {
+            assert_eq!(FrameDecoder::new().feed::<Value>(f).unwrap().len(), 1);
+        }
+        // strict refuses the two legacy forms and keeps the canonical one
+        for f in [&indefinite, &unsorted] {
+            let mut strict = FrameDecoder::with_options(Options::strict());
+            assert!(strict.feed::<Value>(f).is_err());
+        }
+        let mut strict = FrameDecoder::with_options(Options::strict());
+        assert_eq!(strict.feed::<Value>(&canonical).unwrap().len(), 1);
+        // a refused frame is consumed, the next one is read
+        let mut both = unsorted.clone();
+        both.extend_from_slice(&canonical);
+        let mut strict = FrameDecoder::with_options(Options::strict());
+        assert!(strict.feed::<Value>(&both).is_err());
+        assert_eq!(strict.feed::<Value>(&[]).unwrap().len(), 1);
+        // the container cap
+        let mut capped = FrameDecoder::with_options(Options::default().with_max_containers(3));
+        assert!(capped.feed::<Value>(&three_arrays).is_err());
+        let mut roomy = FrameDecoder::with_options(Options::default().with_max_containers(4));
+        assert_eq!(roomy.feed::<Value>(&three_arrays).unwrap().len(), 1);
+        // the options come back as given
+        assert_eq!(capped.options().max_containers, 3);
+        assert_eq!(
+            FrameDecoder::default().options().max_containers,
+            crate::cbor_strict::MAX_CONTAINERS
+        );
+    }
+
+    /// `decode_envelope_with` applies the same options to an envelope (#336).
+    #[test]
+    fn an_envelope_is_decoded_with_the_options() {
+        use crate::cbor_strict::Options;
+        // {"type": 0x38 (Metrics), "cpu": 0.5} written with the keys out of canonical order
+        let out_of_order = hex::decode("a26474797065183863637075".to_string() + "f93800").unwrap();
+        assert!(decode_envelope(&out_of_order).is_ok());
+        assert!(decode_envelope_with(&out_of_order, &Options::default()).is_ok());
+        assert!(decode_envelope_with(&out_of_order, &Options::strict()).is_err());
+        let canonical = hex::decode("a263637075f9380064747970651838").unwrap();
+        assert!(decode_envelope_with(&canonical, &Options::strict()).is_ok());
     }
 }
